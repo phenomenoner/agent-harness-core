@@ -276,11 +276,74 @@ fn validate_orchestration_features_object(path: &str, value: &Value, errors: &mu
             "ownedCodexEventsV2" => {
                 validate_owned_codex_events_v2_object(&path_key(path, key), child, errors)
             }
+            "productiveDeadlineV1" => {
+                validate_productive_deadline_v1_object(&path_key(path, key), child, errors)
+            }
             "executionModeV1" => {
                 validate_execution_mode_v1_object(&path_key(path, key), child, errors)
             }
             other => errors.push(format!("unknown orchestration feature `{other}` at {path}")),
         }
+    }
+}
+
+fn validate_productive_deadline_v1_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    if !object.contains_key("mode") {
+        errors.push(format!("{path}.mode is required"));
+    }
+    if matches!(
+        object.get("mode").and_then(Value::as_str),
+        Some("shadow" | "authoritative")
+    ) && !object.contains_key("enabledAgentIds")
+    {
+        errors.push(format!(
+            "{path}.enabledAgentIds is required for shadow or authoritative mode"
+        ));
+    }
+    for (key, child) in object {
+        match key.as_str() {
+            "mode" => expect_enum(
+                path_key(path, key),
+                child,
+                &["off", "shadow", "authoritative"],
+                errors,
+            ),
+            "enabledAgentIds" => validate_string_array(path_key(path, key), child, errors),
+            "renewalIncrementMs" | "productiveWindowMs" | "hardCapMs" => {
+                expect_positive_u64(path_key(path, key), child, errors)
+            }
+            "maxRenewals" => expect_u64(path_key(path, key), child, errors),
+            "pendingExactLaneWorkBlocksRenewal" => expect_bool(path_key(path, key), child, errors),
+            other => errors.push(format!(
+                "unknown productiveDeadlineV1 config key `{other}` at {path}"
+            )),
+        }
+    }
+    let number = |key: &str| object.get(key).and_then(Value::as_u64);
+    if number("renewalIncrementMs")
+        .is_some_and(|value| !(60_000..=30 * 60 * 1_000).contains(&value))
+    {
+        errors.push(format!(
+            "{path}.renewalIncrementMs must be between 60000 and 1800000"
+        ));
+    }
+    if number("productiveWindowMs")
+        .is_some_and(|value| !(30_000..=15 * 60 * 1_000).contains(&value))
+    {
+        errors.push(format!(
+            "{path}.productiveWindowMs must be between 30000 and 900000"
+        ));
+    }
+    if number("hardCapMs").is_some_and(|value| !(60_000..=8 * 60 * 60 * 1_000).contains(&value)) {
+        errors.push(format!(
+            "{path}.hardCapMs must be between 60000 and 28800000"
+        ));
+    }
+    if number("maxRenewals").is_some_and(|value| value > 32) {
+        errors.push(format!("{path}.maxRenewals must be at most 32"));
     }
 }
 
@@ -1957,6 +2020,60 @@ mod tests {
 
         assert_eq!(report.status, HarnessConfigValidationStatus::Valid);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn productive_deadline_config_accepts_bounded_rollout_policy() {
+        let root = temp_root("productive_deadline_config_accepts_bounded_rollout_policy");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "orchestration": {"features": {"productiveDeadlineV1": {
+                "mode": "shadow",
+                "enabledAgentIds": ["main"],
+                "renewalIncrementMs": 900000,
+                "productiveWindowMs": 300000,
+                "hardCapMs": 7200000,
+                "maxRenewals": 6
+              }}}
+            }"#,
+        )
+        .unwrap();
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Valid);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn productive_deadline_config_rejects_unbounded_policy() {
+        let root = temp_root("productive_deadline_config_rejects_unbounded_policy");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"orchestration":{"features":{"productiveDeadlineV1":{
+              "mode":"authoritative","hardCapMs":999999999,"maxRenewals":999
+            }}}}"#,
+        )
+        .unwrap();
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("hardCapMs"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("maxRenewals"))
+        );
         let _ = fs::remove_dir_all(root);
     }
 

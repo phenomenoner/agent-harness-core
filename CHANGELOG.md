@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## v0.11.0 - 2026-07-20
+
+### Added
+
+- Added default-off, agent-cohorted productive deadline grants for ordinary interactive turns.
+  Exact-owned, deduplicated progress can renew a bounded deadline only after the runtime proves
+  owner-generation-fenced queue lease coverage through the candidate deadline.
+- Added harness-owned ordinary task families, typed generation-bound drain dispositions, bounded
+  task-family budgets, and restart-safe commit-before-enqueue continuation intents.
+
+### Changed
+
+- Cooperative deadline drain is now an irreversible reclaim boundary with cause-specific guidance.
+  A responsive drained turn selects exactly one logical final, continuation child, parked notice,
+  or one observation-only disposition recovery before parking.
+- Queue leases for active runs can heartbeat atomically without recreating missing, expired,
+  terminal, legacy-owner, wrong-lane, or wrong-generation ownership.
 
 ### Fixed
 
@@ -9,11 +25,22 @@
   provider-safe text chunks before rich delivery.
 - Delivery receipts now report full-text preservation only after all required ordered text units
   are represented and accepted; partial fallback failures remain explicit and retryable.
+- Productive long-running work no longer has to be stopped solely because its initial absolute
+  deadline was reached when bounded renewal is explicitly enabled and every safety gate passes.
+
+### Security
+
+- Deadline and lease receipts retain only bounded event kinds, counts, timestamps, digests, policy
+  identifiers, and ownership proofs; prompt text, commands, arguments, outputs, files, narration,
+  credentials, and connector approval capabilities are excluded.
 
 ### Verification
 
 - Added 16/17-block boundary tests, both-provider legacy fallback and chunk-failure seams, and a
   durable outbox re-open/terminal-receipt replay that proves completed delivery is not duplicated.
+- Added sanitized replay fixtures and focused scenarios for lease-before-timer renewal, exact task
+  continuation with one eventual final, bounded disposition recovery, hard caps, and non-resurrecting
+  queue ownership.
 
 ## v0.10.0 - 2026-07-18
 

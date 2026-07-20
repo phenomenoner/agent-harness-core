@@ -1,0 +1,22 @@
+{
+  "schema": "agent-harness.continuity-effects.ordinary-task-drain-recovery-replay.v1",
+  "authority": {
+    "kind": "explicit-checkpoint",
+    "taskFamilySource": "harness",
+    "exactLaneDigest": "sha256:synthetic-lane",
+    "taskFamilyVersion": 1
+  },
+  "events": [
+    { "kind": "accepted-deadline-drain", "atMs": 1000 },
+    { "kind": "missing-disposition", "atMs": 2000 },
+    { "kind": "observation-only-recovery-child", "atMs": 3000 },
+    { "kind": "recovery-missing-disposition", "atMs": 4000 }
+  ],
+  "expected": {
+    "recoveryChildCount": 1,
+    "recoveryDepth": 1,
+    "parentLogicalFinalCount": 0,
+    "needsUserNoticeCount": 1,
+    "externalEffectAuthorizationCount": 0
+  }
+}

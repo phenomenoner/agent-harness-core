@@ -1,0 +1,24 @@
+{
+  "schema": "agent-harness.continuity-effects.productive-deadline-renewal-replay.v1",
+  "policy": {
+    "mode": "authoritative",
+    "initialGrantMs": 60000,
+    "renewalIncrementMs": 60000,
+    "productiveWindowMs": 30000,
+    "hardCapMs": 180000,
+    "maxRenewals": 2
+  },
+  "events": [
+    { "kind": "turn-started", "atMs": 0 },
+    { "kind": "owned-command-completed", "atMs": 45000, "digest": "sha256:synthetic-command-result" },
+    { "kind": "original-drain-boundary", "atMs": 54000 },
+    { "kind": "assistant-final", "atMs": 62000 }
+  ],
+  "expected": {
+    "deadlineDecision": "applied",
+    "deadlineGeneration": 1,
+    "queueLeaseCoveredFirst": true,
+    "deadlineDrainCount": 0,
+    "logicalFinalCount": 1
+  }
+}

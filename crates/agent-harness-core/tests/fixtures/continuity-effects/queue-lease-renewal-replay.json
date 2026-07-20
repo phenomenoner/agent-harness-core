@@ -1,0 +1,24 @@
+{
+  "schema": "agent-harness.continuity-effects.queue-lease-renewal-replay.v1",
+  "owner": {
+    "queueId": "synthetic-queue",
+    "runtimeClass": "interactive",
+    "canonicalLaneDigest": "sha256:synthetic-lane",
+    "serviceId": "runtime-loop",
+    "generationId": "synthetic-generation-a",
+    "pid": 4242,
+    "processStartTimeMs": 900000,
+    "acquiredAtMs": 1000000
+  },
+  "lease": {
+    "expiresAtMs": 2800000,
+    "safetyMarginMs": 180000
+  },
+  "expected": {
+    "matchingOwner": "applied",
+    "missingLease": "lost",
+    "expiredLease": "lost",
+    "wrongGeneration": "lost",
+    "resurrectedLeaseCount": 0
+  }
+}

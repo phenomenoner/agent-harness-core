@@ -85,8 +85,12 @@ contracts. Exact channel-session identity is canonicalized before dispatch, queu
 distinct from leased work, continuation parents cannot impersonate logical success, and structured
 provider overload recovery is gated by durable mutation evidence and retry eligibility.
 
-Deadline-drain completion can continue unfinished OperationPlan work only from a current exact-lane,
-versioned checkpoint with bounded breakers and one deterministic child. Recognized MCP connector
+Eligible ordinary interactive turns can use a default-off productive-deadline policy: exact-owned,
+deduplicated progress may extend a bounded deadline only after the runtime proves queue-lease coverage,
+while pending same-lane work, hard caps, task budgets, and control boundaries reclaim the lane. Once
+drain begins it is irreversible; a generation-bound typed disposition selects exactly one logical final,
+deterministic continuation child, parked notice, or one bounded observation-only recovery child.
+OperationPlan continuation still requires a current exact-lane, versioned checkpoint. Recognized MCP connector
 elicitations park as `WaitingForApproval`; exact-lane expiring approve/deny capabilities and
 connector-specific readback prevent ambiguous writes from being blindly resubmitted. Provider error
 diagnostics are retained without absolute request URLs or credentials.
@@ -103,7 +107,7 @@ Reasoning remains authorized against the exact effective provider/model route. E
 
 Multi-agent dispatch is heterogeneous by design: siblings need not share a model or effort. Each child receives an immutable dispatch-time policy and an exact master owner. Terminal output is reduced to a bounded, redacted summary plus opaque artifact references in a durable mailbox; a missing or invalid expected result becomes an explicit failed-omission envelope instead of disappearing from the batch. Runtime class and origin are derived from the trusted worker job kind and checked against typed terminal receipts. Any active work in the exact master lane suppresses resumption; after confirmed lane release, duplicate and restarted watchdog passes coalesce into exactly one logical resume intent and typed continuation. Child progress, final text, and errors are internal evidence and never become parent user-facing output directly.
 
-These are v0.9.0 source and compatibility contracts; release evidence and owner-machine receipts are tracked separately from the public interface description. See [Configuration](docs/configuration.md), [0.7 to 0.8.0 Migration](docs/migration-0.8.md), [Invariants](docs/invariants.md), and [Schema Registry](docs/schema-registry.md) for the public operator and compatibility details.
+These are source and compatibility contracts; release evidence and owner-machine receipts are tracked separately from the public interface description. See [Configuration](docs/configuration.md), [0.7 to 0.8.0 Migration](docs/migration-0.8.md), [Invariants](docs/invariants.md), and [Schema Registry](docs/schema-registry.md) for the public operator and compatibility details.
 
 ## Quick Start
 

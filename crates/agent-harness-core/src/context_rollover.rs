@@ -96,6 +96,16 @@ pub struct RuntimeContinuationMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub campaign_slice_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_family_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_family_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_root_queue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_slice_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_recovery_depth: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_intent_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_kind: Option<String>,
@@ -313,6 +323,12 @@ pub struct ContextRolloverRequeuePreparedOptions {
     /// rollover callers leave this false so their recovery depth still moves.
     pub preserve_continuation_index: bool,
     pub campaign_slice_generation: Option<u64>,
+    pub task_slice_generation: Option<u64>,
+    pub task_family_id: Option<String>,
+    pub task_family_version: Option<u64>,
+    pub task_root_queue_id: Option<String>,
+    pub disposition_recovery_depth: Option<u64>,
+    pub replacement_message_text: Option<String>,
     pub continuation_intent_key: Option<String>,
     pub completion_kind: Option<String>,
     pub allow_exact_state_bootstrap: bool,
@@ -329,6 +345,8 @@ pub struct ContextRolloverPreparedRequeueReport {
     pub virtual_session_id: Option<String>,
     pub continuation_index: u64,
     pub campaign_slice_generation: Option<u64>,
+    pub task_slice_generation: Option<u64>,
+    pub disposition_recovery_depth: Option<u64>,
     pub continuation_intent_key: Option<String>,
     pub completion_kind: String,
     pub pending_queue_file: PathBuf,
@@ -599,11 +617,13 @@ pub fn load_context_rollover_config(harness_home: &Path) -> io::Result<ContextRo
         if let Some(value) = json_string(context, &["rolloverMode", "rollover_mode"]) {
             config.rollover_mode = parse_rollover_mode(&value);
         }
-        if let Some(value) = json_bool(
+        if json_bool(
             context,
             &["cooperativeMidTurnDrain", "cooperative_mid_turn_drain"],
-        ) {
-            config.cooperative_mid_turn_drain = value;
+        )
+        .is_some()
+        {
+            config.cooperative_mid_turn_drain = false;
         }
         break;
     }
@@ -2187,6 +2207,39 @@ fn requeue_prepared_context_rollover_legacy(
                 Value::Number(serde_json::Number::from(generation)),
             );
         }
+        if let Some(generation) = options.task_slice_generation {
+            object.insert(
+                "taskSliceGeneration".to_string(),
+                Value::Number(serde_json::Number::from(generation)),
+            );
+        }
+        if let Some(family_id) = options.task_family_id.as_ref() {
+            object.insert("taskFamilyId".to_string(), Value::String(family_id.clone()));
+        }
+        if let Some(version) = options.task_family_version {
+            object.insert(
+                "taskFamilyVersion".to_string(),
+                Value::Number(serde_json::Number::from(version)),
+            );
+        }
+        if let Some(root_queue_id) = options.task_root_queue_id.as_ref() {
+            object.insert(
+                "taskRootQueueId".to_string(),
+                Value::String(root_queue_id.clone()),
+            );
+        }
+        if let Some(depth) = options.disposition_recovery_depth {
+            object.insert(
+                "dispositionRecoveryDepth".to_string(),
+                Value::Number(serde_json::Number::from(depth)),
+            );
+        }
+        if let Some(message_text) = options.replacement_message_text.as_ref() {
+            object.insert(
+                "messageText".to_string(),
+                Value::String(message_text.clone()),
+            );
+        }
         if let Some(intent_key) = options.continuation_intent_key.as_ref() {
             object.insert(
                 "continuationIntentKey".to_string(),
@@ -2318,6 +2371,8 @@ fn requeue_prepared_context_rollover_legacy(
         virtual_session_id,
         continuation_index,
         campaign_slice_generation: options.campaign_slice_generation,
+        task_slice_generation: options.task_slice_generation,
+        disposition_recovery_depth: options.disposition_recovery_depth,
         continuation_intent_key: options.continuation_intent_key,
         completion_kind,
         pending_queue_file: queue_file,
@@ -2550,6 +2605,39 @@ fn requeue_prepared_context_rollover_for_lane(
             Value::Number(serde_json::Number::from(generation)),
         );
     }
+    if let Some(generation) = options.task_slice_generation {
+        object.insert(
+            "taskSliceGeneration".to_string(),
+            Value::Number(serde_json::Number::from(generation)),
+        );
+    }
+    if let Some(family_id) = options.task_family_id.as_ref() {
+        object.insert("taskFamilyId".to_string(), Value::String(family_id.clone()));
+    }
+    if let Some(version) = options.task_family_version {
+        object.insert(
+            "taskFamilyVersion".to_string(),
+            Value::Number(serde_json::Number::from(version)),
+        );
+    }
+    if let Some(root_queue_id) = options.task_root_queue_id.as_ref() {
+        object.insert(
+            "taskRootQueueId".to_string(),
+            Value::String(root_queue_id.clone()),
+        );
+    }
+    if let Some(depth) = options.disposition_recovery_depth {
+        object.insert(
+            "dispositionRecoveryDepth".to_string(),
+            Value::Number(serde_json::Number::from(depth)),
+        );
+    }
+    if let Some(message_text) = options.replacement_message_text.as_ref() {
+        object.insert(
+            "messageText".to_string(),
+            Value::String(message_text.clone()),
+        );
+    }
     if let Some(intent_key) = options.continuation_intent_key.as_ref() {
         object.insert(
             "continuationIntentKey".to_string(),
@@ -2696,6 +2784,8 @@ fn requeue_prepared_context_rollover_for_lane(
         virtual_session_id: Some(virtual_session_id),
         continuation_index,
         campaign_slice_generation: options.campaign_slice_generation,
+        task_slice_generation: options.task_slice_generation,
+        disposition_recovery_depth: options.disposition_recovery_depth,
         continuation_intent_key: options.continuation_intent_key,
         completion_kind,
         pending_queue_file: queue_file,
@@ -5050,6 +5140,12 @@ mod tests {
             now_ms: 42,
             preserve_continuation_index: false,
             campaign_slice_generation: None,
+            task_slice_generation: None,
+            task_family_id: None,
+            task_family_version: None,
+            task_root_queue_id: None,
+            disposition_recovery_depth: None,
+            replacement_message_text: None,
             continuation_intent_key: None,
             completion_kind: None,
             allow_exact_state_bootstrap: false,
@@ -5185,6 +5281,12 @@ mod tests {
                 now_ms: 42,
                 preserve_continuation_index: false,
                 campaign_slice_generation: None,
+                task_slice_generation: None,
+                task_family_id: None,
+                task_family_version: None,
+                task_root_queue_id: None,
+                disposition_recovery_depth: None,
+                replacement_message_text: None,
                 continuation_intent_key: None,
                 completion_kind: None,
                 allow_exact_state_bootstrap: false,
@@ -5300,6 +5402,12 @@ mod tests {
                 now_ms: 42,
                 preserve_continuation_index: false,
                 campaign_slice_generation: None,
+                task_slice_generation: None,
+                task_family_id: None,
+                task_family_version: None,
+                task_root_queue_id: None,
+                disposition_recovery_depth: None,
+                replacement_message_text: None,
                 continuation_intent_key: None,
                 completion_kind: None,
                 allow_exact_state_bootstrap: false,

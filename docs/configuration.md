@@ -351,6 +351,36 @@ The optional model/token keys are passed through to generated Codex TOML as `mod
 
 Each `codex-run` writes per-execution `codex-context-preflight.json` and appends `state/runtime-queue/codex-context-preflight-receipts.jsonl`. When a resumed thread is over the compact threshold, the harness calls official app-server `thread/compact/start` before `turn/start` and waits for the `contextCompaction` item to complete. Hard context-window failures are classified as `context-exhausted`; the harness retries once after official compact, then writes `codex-context-checkpoint.json` and `codex-context-rollover.json` and opens a fresh Codex thread when fallback is enabled.
 
+## Productive Deadline Grants
+
+`orchestration.features.productiveDeadlineV1` is a default-off, agent-cohorted policy for ordinary parent-channel `interactive` turns:
+
+```json
+{
+  "orchestration": {
+    "features": {
+      "productiveDeadlineV1": {
+        "mode": "off",
+        "enabledAgentIds": [],
+        "renewalIncrementMs": 900000,
+        "productiveWindowMs": 300000,
+        "hardCapMs": 7200000,
+        "maxRenewals": 6,
+        "pendingExactLaneWorkBlocksRenewal": true
+      }
+    }
+  }
+}
+```
+
+Modes are `off`, `shadow`, and `authoritative`. `off` preserves the fixed absolute timeout. `shadow` records deterministic `would-renew` or denial decisions without changing the timer, active binding, or deadline-coupled lease. `authoritative` may advance the current deadline by `renewalIncrementMs`, always from the previous deadline and never beyond the start-relative hard cap. Shadow or authoritative mode requires a non-empty `enabledAgentIds` cohort.
+
+Only recent, exact-owned, deduplicated productive evidence can qualify. Narration alone, usage updates, reasoning deltas, handshakes, malformed or foreign events, and tool starts do not renew a turn. Before applying a renewal, the runtime must extend the exact owner-generation-fenced queue lease through the candidate deadline plus its safety margin and persist the new active-turn binding. A lost, expired, terminal, legacy-owner, wrong-lane, or wrong-generation lease fails closed and is never recreated. Pending effective same-lane user work, stop/new/supersession controls, external-authority boundaries, task-family budgets, active Goal ownership, renewal count, and the hard cap can all deny renewal.
+
+Once cooperative drain begins, the turn cannot return to running. A responsive drained turn must return one bounded `agent-harness.drain-disposition.v1` marker: logical completion, continuation required, needs user, needs authority, or blocked. Missing or invalid control data receives at most one observation-only recovery child before the task parks. The harness owns ordinary task-family identity and commit-before-enqueue continuation state, so model output cannot grant itself authority or produce both a parent final and a child.
+
+Static bounds are 60,000–1,800,000 ms for `renewalIncrementMs`, 30,000–900,000 ms for `productiveWindowMs`, 60,000–28,800,000 ms for `hardCapMs`, and 0–32 for `maxRenewals`. Runtime preflight also rejects a productive window larger than the effective initial timeout or a hard cap smaller than it. Active Goal slices retain their existing Goal timeout and budget policy in this version. `codexContext.cooperativeMidTurnDrain` and its snake-case alias remain accepted only as deprecated no-op compatibility keys.
+
 ## Codex Web Search
 
 The harness always selects Codex built-in web search explicitly and independently of sandbox mode:

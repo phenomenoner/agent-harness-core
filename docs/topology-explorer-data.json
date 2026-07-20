@@ -4,7 +4,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "0a4df84cf8a2d55809bd982609b570b0363e1ab803a83134b348570d8fe0c029"
+      "sha256": "99e4d3e67be60c4286837d5bb7b53781e53c7bb4f5c31df65bfbd4cd7525a954"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -164,10 +164,10 @@
       "label": "codex_runtime",
       "group": "component",
       "state": "implemented",
-      "summary": "app-server plan/executable resolution, exact 0.144.5 protocol handling, preflight, startup/run, completion capture, deadline-drain checkpoint extraction, MCP elicitation response/parking, tool-timeout recovery, interrupted-command evidence, and explicit thread-level web-search mode",
-      "reads": "prompt bundle, Codex config, connector approval policy, provider request policy, same-connection provider capabilities, exact-lane web-search policy",
-      "writes": "execution receipts, bounded protocol failures, typed drain checkpoint, external-effect intent/state, terminal protocol-error receipts, transcripts, completions, and web-search receipts",
-      "invariants": "I2, I3, I5, I6, I7, I10, I19, I31, I38",
+      "summary": "app-server protocol, preflight/start/run, exact-owned productive-evidence tracking, lease-coupled deadline grants, irreversible cause-specific drain, typed disposition capture, MCP elicitation parking, tool-timeout recovery, interruption evidence, and thread-level web-search mode",
+      "reads": "prompt/config, queue lease guard, task-family budget, connector approval policy, provider capabilities, exact-lane policy",
+      "writes": "run/deadline/lease/steer receipts, bounded protocol failures, typed disposition/checkpoint, effect state, transcript/completion, and web-search evidence",
+      "invariants": "I2, I3, I5, I6, I7, I10, I13, I19, I31, I37, I38",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -212,13 +212,13 @@
       ]
     },
     {
-      "id": "component-runtime-pipeline-task-transition",
-      "label": "runtime_pipeline / task_transition",
+      "id": "component-runtime-pipeline-task-transition-task-budget",
+      "label": "runtime_pipeline / task_transition / task_budget",
       "group": "component",
       "state": "implemented",
-      "summary": "run-once orchestration, mutation-aware retry/dead-letter, final-outbox repair, typed OperationPlan deadline-drain authority, interruption classification, outbound media resolution, and terminal skill evidence",
-      "reads": "queue item, Codex receipts, exact-lane OperationPlan/checkpoint, channel state, media policy, prepared virtual evidence",
-      "writes": "typed run-once disposition/link/retry/task/effect fields, one commit-before-enqueue continuation, dead-letter/final outbox, and terminal review",
+      "summary": "run-once orchestration, mutation-aware retry/dead-letter, final-outbox repair, harness-owned task families, generation-bound drain disposition, bounded recovery, exact authority revalidation, interruption classification, media resolution, and terminal skill evidence",
+      "reads": "queue item, Codex and lease receipts, exact-lane Goal/OperationPlan/task-family state, budgets, channel state, media policy, prepared virtual evidence",
+      "writes": "exactly one final/continuation/parked outcome, commit-before-enqueue intent, task budget ledger, dead-letter/final outbox, and terminal review",
       "invariants": "I2, I3, I5, I7, I8, I9, I10, I13, I17, I22, I31, I35, I37",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -433,11 +433,11 @@
       ]
     },
     {
-      "id": "impact-retry-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
-      "label": "Retry, deadline-drain task continuation, MCP elicitation, or external connector effects",
+      "id": "impact-retry-productive-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
+      "label": "Retry, productive deadline/drain task continuation, MCP elicitation, or external connector effects",
       "group": "gate",
       "state": "release-gate",
-      "summary": "structured failure plus mutation evidence; persisted not-before and restart/compaction retention; exact-lane OperationPlan version/checkpoint/breaker matrix; one child and one eventual final; one elicitation response; explicit approval token isolation/fencing; readback before ambiguous resubmission; Telegram/Discord waiting-for-approval parity",
+      "summary": "queue-owner renewal before deadline renewal; scored exact-owned progress; irreversible drain; generation-bound disposition; harness-owned task family and budget; one child/final/parked surface; restart-safe intent; one elicitation response; approval-token isolation/fencing; readback before ambiguous resubmission",
       "reviewDocs": "docs/configuration.md, docs/invariants.md, docs/schema-registry.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -703,14 +703,14 @@
       ]
     },
     {
-      "id": "gap-codex-absolute-deadline-drain-gap",
-      "label": "codex-absolute-deadline-drain-gap",
+      "id": "gap-productive-deadline-live-evidence-gap",
+      "label": "productive-deadline-live-evidence-gap",
       "group": "gap",
       "state": "open-gap",
-      "summary": "Codex absolute deadline drain and productive continuation",
-      "designTarget": "A fixed interactive wall-clock deadline must not replay a turn that already changed files, ran tools, or emitted substantive narration, and it must not invite new long work or same-turn steering in its final minutes.",
-      "currentEvidence": "Staging classifies productive absolute timeouts from concrete Codex stdout item evidence rather than raw event volume, resolves sibling eligibility through effective queue terminal state, sends one receipted deadline-drain turn/steer in the final 10% capped at three minutes, and defers late user steering to retained next-turn/passive context. Focused replays cover productive versus handshake-only timeout, historical-terminal versus genuinely pending sibling, one-shot drain steering, and deadline-window user-steer deferral.",
-      "promotionGate": "Promote only after a candidate or controlled long-turn replay shows no new long command after the drain receipt, one guarded continuation for productive timeout, no continuation for handshake-only timeout, no original prepared-turn replay, and retained late steering visible on the next exact-lane prompt.",
+      "summary": "Productive deadline grant and typed drain outcome",
+      "designTarget": "A healthy ordinary interactive turn may receive bounded deadline grants while it is making exact-owned progress and still owns its queue lease. Responsive reclaim uses one irreversible drain and typed outcome; unresponsive idle/hard boundaries remain terminal.",
+      "currentEvidence": "Default-off off/shadow/authoritative policy, scored/deduplicated progress watermarks, previous-deadline arithmetic, hard cap/count/task-budget limits, owner-generation lease renewal, effective same-lane fairness, task-family authority, commit-before-enqueue continuation, one disposition recovery, and sanitized replay fixtures are implemented. Focused scenario replays cover authoritative lease-before-timer renewal, exact task-family continuation with one eventual final, and bounded indeterminate recovery.",
+      "promotionGate": "Promote beyond the reviewed cohort only after candidate shadow/authoritative/off comparison and controlled live soak prove one owner, no post-drain renewal, bounded same-lane access, one final/child/parked surface, restart idempotency, no duplicate external effect, and privacy-safe receipts.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -877,9 +877,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Rich message presentation",
-      "designTarget": "Final replies, attachments, links, buttons/actions, captions, and provider-native rich UI should be modeled as a semantic presentation payload rendered by channel adapters, not as raw model-authored Telegram/Discord syntax.",
-      "currentEvidence": "Agent Harness already has durable ChannelOutboundMessage text/attachment outbox, Telegram HTML-capable final sends through scoped formatting config, Discord 2000-character chunking with allowed_mentions.parse=[], provider reply/thread intent, attachment delivery, and progress/final separation. Package A-D staging adds optional agent-harness.rich-message-presentation.v1, fail-closed validation, old-outbox compatibility, Telegram/Discord render fixtures, rendered text/media/action units, per-unit delivery receipt fields, partial retry semantics, provider send helpers, and ordinary final-to-presentation conversion. Round14 backlog staging adds rich_presentation::tests::plain_final_bridge_renders_markdown_subset_as_semantic_blocks, channel_delivery::tests::rich_delivery_receipt_records_units_and_retries_partial_failure, channel_delivery::tests::delivery_receipt_without_presentation_field_stays_readable, the Telegram closed-loop delivery receipt test, and Telegram/Discord rich sender fallback tests, proving plain-final Markdown subset parsing, Telegram HTML provider payload rendering, provider render-mode capture, fallback reason telemetry, and full-text-preserved fallback receipts for both channel adapters. Remaining gaps are live cutover/soak, Telegram inline action sends, Discord component sends, live preview integration, artifact/provider URL redaction coverage for generated presentation payloads, and clicked-action ingress re-entry evidence.",
-      "promotionGate": "Promote only after an optional agent-harness.rich-message-presentation.v1 schema exists, Telegram and Discord render fixtures prove escaping/chunking/no-ping behavior, ordinary final replies emit presentation payloads without progress/narration, provider receipts capture rendered units plus render/fallback/full-text status, multi-unit rich batches record per-unit provider receipts, partial delivery cannot be marked complete, media captions do not duplicate text/media sends, raw artifacts/provider URLs/file IDs are excluded, and Telegram/Discord action interactions re-enter through normal channel identity, agentId, session, and permission gates.",
+      "designTarget": "Final replies, attachments, links, buttons/actions, captions, and provider-native rich UI should be modeled as a semantic presentation payload rendered by channel adapters, not as raw model-authored Telegram/Discord syntax. Automatic projection is eligible only when every canonical text segment is represented.",
+      "currentEvidence": "Agent Harness has durable canonical ChannelOutboundMessage.text, optional agent-harness.rich-message-presentation.v1, provider renderers, safe chunking, attachment delivery, and progress/final separation. The issue #9 hotpatch makes the bridge loss-aware at the 16-block and per-block limits, revalidates persisted auto-bridge-like rows before any rich send, routes lossy rows through Discord <=2,000-character or Telegram UTF-16 canonical chunks, and derives fullTextPreserved from complete accepted text units. rich-final-fidelity-and-fallback re-opens a durable legacy outbox row, delivers it through both adapter seams, records a terminal receipt, and proves replay suppression.",
+      "promotionGate": "Keep bridge boundary, legacy assessment, safe renderer, provider fallback, partial-failure, media, and restart/idempotency replays green. Promotion additionally requires public hygiene and candidate catalog readback; live Telegram/Discord long-final observation, action interaction re-entry, live preview, and generated artifact/provider URL redaction remain separately authorized gates.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -1028,7 +1028,7 @@
     },
     {
       "source": "canon-topology-contract",
-      "target": "component-runtime-pipeline-task-transition",
+      "target": "component-runtime-pipeline-task-transition-task-budget",
       "label": "owns boundary"
     },
     {
@@ -1208,7 +1208,7 @@
     },
     {
       "source": "axis-agentid",
-      "target": "component-runtime-pipeline-task-transition",
+      "target": "component-runtime-pipeline-task-transition-task-budget",
       "label": "must survive through"
     },
     {
@@ -1268,7 +1268,7 @@
     },
     {
       "source": "axis-sessionkey",
-      "target": "component-runtime-pipeline-task-transition",
+      "target": "component-runtime-pipeline-task-transition-task-budget",
       "label": "must survive through"
     },
     {
@@ -1432,7 +1432,7 @@
       "label": "changes trigger"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
       "label": "changes trigger"
     },
@@ -1467,7 +1467,7 @@
       "label": "changes trigger"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "label": "changes trigger"
     },
@@ -1482,18 +1482,18 @@
       "label": "changes trigger"
     },
     {
-      "source": "impact-retry-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
+      "source": "impact-retry-productive-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
       "target": "canon-topology-contract",
       "label": "reviewed by"
     },
     {
       "source": "component-external-effect",
-      "target": "impact-retry-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
+      "target": "impact-retry-productive-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
       "label": "changes trigger"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
-      "target": "impact-retry-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "impact-retry-productive-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
       "label": "changes trigger"
     },
     {
@@ -1567,7 +1567,7 @@
       "label": "changes trigger"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "impact-supervisor-task-scheduler-or-cutover-ownership",
       "label": "changes trigger"
     },
@@ -1602,7 +1602,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-bounded-ledger-maintenance-live-gap",
       "label": "has gap"
     },
@@ -1642,7 +1642,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-supervisor-plan-configured-loop-parity-live-gap",
       "label": "has gap"
     },
@@ -1707,7 +1707,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
       "label": "has gap"
     },
@@ -1738,6 +1738,11 @@
     },
     {
       "source": "component-provider-request-policy",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
       "label": "has gap"
     },
@@ -1782,7 +1787,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-interrupted-command-observability-live-gap",
       "label": "has gap"
     },
@@ -1932,7 +1937,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-multi-agent-full-matrix-gap",
       "label": "has gap"
     },
@@ -1992,7 +1997,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
@@ -2052,7 +2057,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-virtual-session-v2-authority-gap",
       "label": "has gap"
     },
@@ -2172,7 +2177,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-progress-final-surface-gap",
       "label": "has gap"
     },
@@ -2227,7 +2232,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-tool-use-timeout-recovery-gap",
       "label": "has gap"
     },
@@ -2242,33 +2247,43 @@
       "label": "has gap"
     },
     {
-      "source": "gap-codex-absolute-deadline-drain-gap",
+      "source": "gap-productive-deadline-live-evidence-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
     },
     {
-      "source": "component-channel-state",
-      "target": "gap-codex-absolute-deadline-drain-gap",
-      "label": "has gap"
-    },
-    {
       "source": "component-runtime-queue-runtime-worker",
-      "target": "gap-codex-absolute-deadline-drain-gap",
+      "target": "gap-productive-deadline-live-evidence-gap",
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
-      "target": "gap-codex-absolute-deadline-drain-gap",
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-productive-deadline-live-evidence-gap",
       "label": "has gap"
     },
     {
       "source": "component-external-effect",
-      "target": "gap-codex-absolute-deadline-drain-gap",
+      "target": "gap-productive-deadline-live-evidence-gap",
       "label": "has gap"
     },
     {
-      "source": "component-codex-web-search",
-      "target": "gap-codex-absolute-deadline-drain-gap",
+      "source": "component-provider-request-policy",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-productive-deadline-live-evidence-gap",
       "label": "has gap"
     },
     {
@@ -2317,7 +2332,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-codex-startup-executable-stability-gap",
       "label": "has gap"
     },
@@ -2362,7 +2377,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-runtime-terminal-control-gap",
       "label": "has gap"
     },
@@ -2457,7 +2472,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-external-review-loop-resilience-gap",
       "label": "has gap"
     },
@@ -2517,7 +2532,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-context-capacity-correlation-gap",
       "label": "has gap"
     },
@@ -2647,7 +2662,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-goal-autonomy-activation-gap",
       "label": "has gap"
     },
@@ -2727,7 +2742,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
@@ -2792,7 +2807,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-skill-ecosystem-closed-loop-gap",
       "label": "has gap"
     },
@@ -2917,11 +2932,6 @@
       "label": "has gap"
     },
     {
-      "source": "component-media-artifact-hygiene",
-      "target": "gap-rich-message-presentation-gap",
-      "label": "has gap"
-    },
-    {
       "source": "component-provider-request-policy",
       "target": "gap-rich-message-presentation-gap",
       "label": "has gap"
@@ -2982,7 +2992,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline-task-transition",
+      "source": "component-runtime-pipeline-task-transition-task-budget",
       "target": "gap-generic-artifact-context-hygiene-gap",
       "label": "has gap"
     },

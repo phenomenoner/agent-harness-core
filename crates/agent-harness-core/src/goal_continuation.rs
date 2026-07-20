@@ -81,6 +81,8 @@ pub struct GoalContinuationIntentV1 {
     pub active_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_item_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_recovery_depth: Option<u64>,
     pub reason: String,
     pub observed_at_ms: i64,
 }
@@ -235,6 +237,7 @@ pub fn commit_goal_continuation_intent(
         checkpoint_digest: None,
         active_item_id: None,
         active_item_version: None,
+        disposition_recovery_depth: None,
         reason: "continuation intent committed before child enqueue".to_string(),
         observed_at_ms: now_ms,
     };
@@ -256,6 +259,7 @@ pub fn commit_task_continuation_intent(
     authority: &crate::ContinuationAuthoritySnapshotV1,
     source_slice_generation: u64,
     decision_generation: u64,
+    disposition_recovery: bool,
     now_ms: i64,
 ) -> io::Result<GoalContinuationIntentV1> {
     if parent_queue_id.trim().is_empty() || working_session_key.trim().is_empty() {
@@ -281,6 +285,11 @@ pub fn commit_task_continuation_intent(
         &authority.authority_id,
         &authority.authority_version.to_string(),
         &authority.checkpoint_digest,
+        if disposition_recovery {
+            "disposition-recovery"
+        } else {
+            "task-continuation"
+        },
     ]));
     let receipt = GoalContinuationIntentV1 {
         schema: TASK_CONTINUATION_INTENT_SCHEMA.to_string(),
@@ -307,7 +316,13 @@ pub fn commit_task_continuation_intent(
         checkpoint_digest: Some(authority.checkpoint_digest.clone()),
         active_item_id: authority.active_item_id.clone(),
         active_item_version: authority.active_item_version,
-        reason: "task continuation intent committed before child enqueue".to_string(),
+        disposition_recovery_depth: disposition_recovery.then_some(1),
+        reason: if disposition_recovery {
+            "disposition recovery intent committed before observation-only child enqueue"
+                .to_string()
+        } else {
+            "task continuation intent committed before child enqueue".to_string()
+        },
         observed_at_ms: now_ms,
     };
     if let Some(existing) =
@@ -351,6 +366,18 @@ pub fn ensure_goal_continuation_enqueued(
         );
     }
     validate_parent_lane_for_intent(harness_home, &latest)?;
+    let task_family = if latest.schema == TASK_CONTINUATION_INTENT_SCHEMA
+        && latest.authority_kind == Some(crate::ContinuationAuthorityKindV1::ExplicitCheckpoint)
+    {
+        Some(crate::task_transition::read_task_family(
+            harness_home,
+            latest.authority_id.as_deref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "task intent has no family id")
+            })?,
+        )?)
+    } else {
+        None
+    };
     let report = requeue_prepared_context_rollover(ContextRolloverRequeuePreparedOptions {
         harness_home: harness_home.to_path_buf(),
         queue_id: latest.parent_queue_id.clone(),
@@ -361,11 +388,35 @@ pub fn ensure_goal_continuation_enqueued(
         ),
         now_ms,
         preserve_continuation_index: true,
-        campaign_slice_generation: Some(latest.campaign_slice_generation),
+        campaign_slice_generation: (latest.schema != TASK_CONTINUATION_INTENT_SCHEMA)
+            .then_some(latest.campaign_slice_generation),
+        task_slice_generation: (latest.schema == TASK_CONTINUATION_INTENT_SCHEMA
+            && latest.authority_kind
+                == Some(crate::ContinuationAuthorityKindV1::ExplicitCheckpoint))
+        .then_some(latest.campaign_slice_generation),
+        task_family_id: task_family.as_ref().map(|family| family.family_id.clone()),
+        task_family_version: task_family.as_ref().map(|family| family.authority_version),
+        task_root_queue_id: task_family
+            .as_ref()
+            .map(|family| family.root_queue_id.clone()),
+        disposition_recovery_depth: latest.disposition_recovery_depth,
+        replacement_message_text: latest.disposition_recovery_depth.map(|_| {
+            "Disposition recovery only: inspect the current task-family state without starting new long work or authorizing/replaying any external effect. Return exactly one valid agent-harness.drain-disposition.v1 marker for the current outcome."
+                .to_string()
+        }),
         continuation_intent_key: Some(latest.intent_key.clone()),
         completion_kind: Some(
             if latest.schema == TASK_CONTINUATION_INTENT_SCHEMA {
-                "operation-plan-continuation"
+                match latest.authority_kind {
+                    Some(crate::ContinuationAuthorityKindV1::ExplicitCheckpoint)
+                        if latest.disposition_recovery_depth.is_some() => {
+                            "task-disposition-recovery"
+                        }
+                    Some(crate::ContinuationAuthorityKindV1::ExplicitCheckpoint) => {
+                        "task-checkpoint-continuation"
+                    }
+                    _ => "operation-plan-continuation",
+                }
             } else {
                 "goal-continuation"
             }
@@ -585,7 +636,7 @@ fn validate_parent_lane_for_intent(
         ));
     }
     if intent.schema == TASK_CONTINUATION_INTENT_SCHEMA {
-        crate::task_transition::revalidate_operation_plan_snapshot(
+        crate::task_transition::revalidate_continuation_snapshot(
             harness_home,
             &crate::ContinuationAuthoritySnapshotV1 {
                 kind: intent.authority_kind.ok_or_else(|| {
@@ -669,6 +720,7 @@ fn ensure_same_intent(
         || existing.checkpoint_digest != candidate.checkpoint_digest
         || existing.active_item_id != candidate.active_item_id
         || existing.active_item_version != candidate.active_item_version
+        || existing.disposition_recovery_depth != candidate.disposition_recovery_depth
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

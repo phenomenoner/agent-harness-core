@@ -108,6 +108,7 @@ pub mod subagents;
 pub mod supervision;
 pub mod supervisor;
 pub mod supervisor_inventory;
+pub mod task_budget;
 pub mod task_transition;
 pub mod token_efficiency;
 pub mod trace;
@@ -792,12 +793,24 @@ pub use supervisor_inventory::{
     SupervisorInventoryServiceSummary, SupervisorInventoryStatus, SupervisorLaunchCommand,
     reconcile_supervisor_inventory,
 };
+pub use task_budget::{
+    DEFAULT_MAX_DISPOSITION_RECOVERY, DEFAULT_MAX_NO_PROGRESS_SLICES, DEFAULT_MAX_RECOVERY_SLICES,
+    DEFAULT_MAX_TASK_SLICES, DEFAULT_MAX_TASK_TOKENS, DEFAULT_TASK_WALL_CLOCK_BUDGET_MS,
+    TASK_BUDGET_LEDGER_SCHEMA, TaskBudgetSliceV1, TaskBudgetStatusV1, record_task_budget_slice,
+    task_budget_status,
+};
 pub use task_transition::{
-    ContinuationAuthorityKindV1, ContinuationAuthoritySnapshotV1, DrainDispositionV1,
-    OperationPlanAuthorityOptions, TASK_CONTINUATION_CHECKPOINT_SCHEMA,
-    TASK_CONTINUATION_MARKER_CLOSE, TASK_CONTINUATION_MARKER_OPEN, TASK_TRANSITION_SCHEMA,
-    TaskContinuationBreakers, TaskContinuationCheckpointV1, TaskDrainEvaluationV1,
-    evaluate_operation_plan_drain, extract_task_continuation_checkpoint, logical_complete_drain,
+    ContinuationAuthorityKindV1, ContinuationAuthoritySnapshotV1, DRAIN_DISPOSITION_MARKER_CLOSE,
+    DRAIN_DISPOSITION_MARKER_OPEN, DRAIN_DISPOSITION_SCHEMA, DrainDispositionCaptureV1,
+    DrainDispositionKindV1, DrainDispositionMarkerV1, DrainDispositionV1,
+    ExplicitCheckpointAuthorityOptions, OperationPlanAuthorityOptions,
+    TASK_CONTINUATION_CHECKPOINT_SCHEMA, TASK_CONTINUATION_MARKER_CLOSE,
+    TASK_CONTINUATION_MARKER_OPEN, TASK_FAMILY_SCHEMA, TASK_TRANSITION_SCHEMA,
+    TaskContinuationBreakers, TaskContinuationCheckpointV1, TaskDrainEvaluationV1, TaskFamilyV1,
+    drain_marker_checkpoint, ensure_task_family, evaluate_explicit_checkpoint_drain,
+    evaluate_operation_plan_drain, extract_drain_disposition_marker,
+    extract_task_continuation_checkpoint, find_task_family_for_root_queue, logical_complete_drain,
+    task_family_checksum,
 };
 pub use token_efficiency::{
     PromptReductionOptions, PromptReductionReport, TokenEfficiencyOptions, TokenEfficiencyReport,

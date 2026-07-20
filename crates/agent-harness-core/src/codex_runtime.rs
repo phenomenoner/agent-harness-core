@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -129,7 +130,145 @@ const CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
 const CODEX_WEB_SEARCH_CAPABILITY_TIMEOUT_MS: u64 = 5_000;
 const CODEX_DEADLINE_DRAIN_MAX_WINDOW_MS: u64 = 180_000;
 const CODEX_DEADLINE_DRAIN_DIVISOR: u64 = 10;
-const CODEX_DEADLINE_DRAIN_MESSAGE: &str = "Runtime deadline guard: this turn entered its final drain window. Do not start new long-running commands. Finish the current bounded action, persist checkpoint and verification receipts, summarize remaining work, and return a continuation handoff before the hard deadline. If an exact-lane OperationPlan remains open with a running/review item, append exactly one <agent-harness-continuation-checkpoint> JSON marker using schema agent-harness.task-continuation-checkpoint.v1, authorityKind operation-plan, the current plan/item ids and versions, a bounded checkpoint string, and its lowercase SHA-256 checkpointDigest. Do not emit this marker for todo/ready, blocked, completed, canceled, needs-user, or needs-authority work.";
+const PRODUCTIVE_DEADLINE_RENEW_INCREMENT_MS: u64 = 15 * 60 * 1_000;
+const PRODUCTIVE_DEADLINE_EVIDENCE_WINDOW_MS: u64 = 5 * 60 * 1_000;
+const PRODUCTIVE_DEADLINE_HARD_CAP_MS: u64 = 2 * 60 * 60 * 1_000;
+const PRODUCTIVE_DEADLINE_MAX_RENEWALS: u32 = 6;
+const PRODUCTIVE_DEADLINE_RECEIPT_SCHEMA: &str = "agent-harness.codex-deadline-renewal.v1";
+const CODEX_DEADLINE_DRAIN_MESSAGE: &str = "Runtime deadline guard: this responsive turn is yielding control. Do not start new long-running actions. Finish only the current bounded action and append exactly one <agent-harness-drain-disposition> JSON marker using schema agent-harness.drain-disposition.v1. Choose one disposition: logical-complete only when completion criteria are satisfied; continuation-required with exact authority and a bounded checkpoint plus lowercase SHA-256 digest; needs-user with a bounded question/reasonCode; needs-authority with a bounded reasonCode; or blocked with a bounded reasonCode/recoveryHint. The marker, not a Markdown file, controls continuation. Preserve approval, idempotency, and ambiguous-effect readback boundaries.";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProductiveDeadlineRolloutMode {
+    #[default]
+    Off,
+    Shadow,
+    Authoritative,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProductiveDeadlineConfig {
+    mode: ProductiveDeadlineRolloutMode,
+    renew_increment: Duration,
+    evidence_window: Duration,
+    hard_cap: Duration,
+    max_renewals: u32,
+    pending_exact_lane_work_blocks_renewal: bool,
+}
+
+impl Default for ProductiveDeadlineConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProductiveDeadlineRolloutMode::Off,
+            renew_increment: Duration::from_millis(PRODUCTIVE_DEADLINE_RENEW_INCREMENT_MS),
+            evidence_window: Duration::from_millis(PRODUCTIVE_DEADLINE_EVIDENCE_WINDOW_MS),
+            hard_cap: Duration::from_millis(PRODUCTIVE_DEADLINE_HARD_CAP_MS),
+            max_renewals: PRODUCTIVE_DEADLINE_MAX_RENEWALS,
+            pending_exact_lane_work_blocks_renewal: true,
+        }
+    }
+}
+
+impl ProductiveDeadlineConfig {
+    fn policy_digest(self) -> String {
+        crate::task_transition::sha256_hex(
+            format!(
+                "{:?}|{}|{}|{}|{}|{}",
+                self.mode,
+                self.renew_increment.as_millis(),
+                self.evidence_window.as_millis(),
+                self.hard_cap.as_millis(),
+                self.max_renewals,
+                self.pending_exact_lane_work_blocks_renewal
+            )
+            .as_bytes(),
+        )
+    }
+}
+
+fn productive_deadline_config(
+    harness_home: &Path,
+    agent_id: Option<&str>,
+) -> io::Result<ProductiveDeadlineConfig> {
+    let mut config = ProductiveDeadlineConfig::default();
+    let Some(config_file) = crate::harness_config_candidates(harness_home)
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
+        return Ok(config);
+    };
+    let Ok(text) = fs::read_to_string(config_file) else {
+        return Ok(config);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Ok(config);
+    };
+    let Some(feature) = value
+        .pointer("/orchestration/features/productiveDeadlineV1")
+        .and_then(Value::as_object)
+    else {
+        return Ok(config);
+    };
+    config.mode = match feature.get("mode").and_then(Value::as_str).map(str::trim) {
+        Some("shadow") => ProductiveDeadlineRolloutMode::Shadow,
+        Some("authoritative") => ProductiveDeadlineRolloutMode::Authoritative,
+        _ => ProductiveDeadlineRolloutMode::Off,
+    };
+    if let Some(cohort) = feature.get("enabledAgentIds") {
+        let enabled = cohort.as_array().is_some_and(|cohort| {
+            cohort.iter().filter_map(Value::as_str).any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*" || agent_id.is_some_and(|agent_id| candidate == agent_id.trim())
+            })
+        });
+        if !enabled {
+            config.mode = ProductiveDeadlineRolloutMode::Off;
+        }
+    }
+    if let Some(value) = feature.get("renewalIncrementMs").and_then(Value::as_u64) {
+        config.renew_increment = Duration::from_millis(value);
+    }
+    if let Some(value) = feature.get("productiveWindowMs").and_then(Value::as_u64) {
+        config.evidence_window = Duration::from_millis(value);
+    }
+    if let Some(value) = feature.get("hardCapMs").and_then(Value::as_u64) {
+        config.hard_cap = Duration::from_millis(value);
+    }
+    if let Some(value) = feature.get("maxRenewals").and_then(Value::as_u64) {
+        config.max_renewals = value.min(u32::MAX as u64) as u32;
+    }
+    if let Some(value) = feature
+        .get("pendingExactLaneWorkBlocksRenewal")
+        .and_then(Value::as_bool)
+    {
+        config.pending_exact_lane_work_blocks_renewal = value;
+    }
+    Ok(config)
+}
+
+fn resolve_productive_deadline_config(
+    harness_home: &Path,
+    agent_id: Option<&str>,
+    effective_initial_grant_ms: u64,
+) -> io::Result<ProductiveDeadlineConfig> {
+    let config = productive_deadline_config(harness_home, agent_id)?;
+    if config.mode != ProductiveDeadlineRolloutMode::Off {
+        let initial = Duration::from_millis(effective_initial_grant_ms.max(1));
+        if config.evidence_window > initial {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "productive-deadline-preflight: productiveWindowMs exceeds effective initial grant",
+            ));
+        }
+        if config.hard_cap < initial {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "productive-deadline-preflight: hardCapMs is below effective initial grant",
+            ));
+        }
+    }
+    Ok(config)
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum OwnedCodexEventsRolloutMode {
@@ -663,6 +802,10 @@ pub struct CodexRuntimeRunReceipt {
     pub external_effect: Option<ExternalEffectIntentV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_checkpoint: Option<crate::TaskContinuationCheckpointV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_disposition: Option<crate::DrainDispositionMarkerV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_disposition_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1036,6 +1179,13 @@ impl CodexGoalProjectionObserver {
 
     fn set_current_thread(&mut self, thread_id: &str) {
         self.current_thread_id = Some(thread_id.to_string());
+    }
+
+    fn has_active_goal(&self) -> bool {
+        self.current_thread_id
+            .as_deref()
+            .and_then(|thread_id| self.latest_by_thread.get(thread_id))
+            .is_some_and(|projection| projection.status.eq_ignore_ascii_case("active"))
     }
 
     fn observe(&mut self, value: &Value, observation_order: u64) -> io::Result<bool> {
@@ -1440,6 +1590,22 @@ struct CodexActiveTurnBindingRecord {
     absolute_deadline_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     deadline_drain_at_ms: Option<i64>,
+    #[serde(default)]
+    deadline_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    initial_deadline_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hard_cap_at_ms: Option<i64>,
+    #[serde(default)]
+    deadline_generation: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_renewal_id: Option<String>,
+    #[serde(default)]
+    instruction_generation: u64,
+    #[serde(default)]
+    drain_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drain_cause: Option<String>,
     updated_at_ms: i64,
     reason: String,
 }
@@ -2096,6 +2262,8 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 mutation_evidence: None,
                 external_effect: None,
                 drain_checkpoint: None,
+                drain_disposition: None,
+                drain_disposition_error: None,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -2148,6 +2316,8 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 mutation_evidence: None,
                 external_effect: None,
                 drain_checkpoint: None,
+                drain_disposition: None,
+                drain_disposition_error: None,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -2203,6 +2373,8 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             mutation_evidence: None,
             external_effect: None,
             drain_checkpoint: None,
+            drain_disposition: None,
+            drain_disposition_error: None,
         };
         append_codex_run_log(
             &options.harness_home,
@@ -2264,6 +2436,8 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             mutation_evidence: None,
             external_effect: None,
             drain_checkpoint: None,
+            drain_disposition: None,
+            drain_disposition_error: None,
         };
         append_codex_run_log(
             &options.harness_home,
@@ -2474,6 +2648,53 @@ fn finish_codex_runtime_run(
     let mut reason = run_result.reason.clone();
     warnings.append(&mut run_result.warnings);
     let mut drain_checkpoint = None;
+    let mut drain_disposition = None;
+    let mut drain_disposition_error = None;
+    let accepted_deadline_drain = status == CodexRuntimeRunStatus::Completed
+        && reason.contains("completed after deadline drain");
+    let accepted_disposition_recovery = status == CodexRuntimeRunStatus::Completed
+        && plan
+            .continuation
+            .disposition_recovery_depth
+            .is_some_and(|depth| depth > 0);
+    let accepted_disposition_capture = accepted_deadline_drain || accepted_disposition_recovery;
+    let (visible, disposition_capture) =
+        crate::extract_drain_disposition_marker(&run_result.assistant_message);
+    if !matches!(
+        disposition_capture,
+        crate::DrainDispositionCaptureV1::Missing
+    ) {
+        run_result.assistant_message = visible;
+        let (visible_raw, _) =
+            crate::extract_drain_disposition_marker(&run_result.assistant_raw_message);
+        run_result.assistant_raw_message = visible_raw;
+    }
+    match disposition_capture {
+        crate::DrainDispositionCaptureV1::Missing => {}
+        crate::DrainDispositionCaptureV1::Valid(marker) if accepted_disposition_capture => {
+            drain_disposition = Some(marker);
+        }
+        crate::DrainDispositionCaptureV1::Valid(_) => {
+            status = CodexRuntimeRunStatus::ProtocolError;
+            reason =
+                "typed drain disposition appeared outside an accepted deadline-drain completion"
+                    .to_string();
+            warnings.push(reason.clone());
+        }
+        crate::DrainDispositionCaptureV1::Invalid { reason_code }
+            if accepted_disposition_capture =>
+        {
+            warnings.push(format!(
+                "accepted deadline drain returned indeterminate disposition: {reason_code}"
+            ));
+            drain_disposition_error = Some(reason_code);
+        }
+        crate::DrainDispositionCaptureV1::Invalid { reason_code } => {
+            status = CodexRuntimeRunStatus::ProtocolError;
+            reason = format!("invalid typed drain disposition: {reason_code}");
+            warnings.push(reason.clone());
+        }
+    }
     if run_result
         .assistant_message
         .contains(crate::TASK_CONTINUATION_MARKER_OPEN)
@@ -2490,9 +2711,7 @@ fn finish_codex_runtime_run(
                 {
                     run_result.assistant_raw_message = visible_raw;
                 }
-                if status == CodexRuntimeRunStatus::Completed
-                    && reason.contains("completed after deadline drain")
-                {
+                if accepted_deadline_drain {
                     drain_checkpoint = checkpoint;
                 } else {
                     status = CodexRuntimeRunStatus::ProtocolError;
@@ -2507,6 +2726,17 @@ fn finish_codex_runtime_run(
                 warnings.push(reason.clone());
             }
         }
+    }
+    if accepted_disposition_capture
+        && drain_disposition.is_none()
+        && drain_checkpoint.is_none()
+        && drain_disposition_error.is_none()
+    {
+        drain_disposition_error = Some("missing-drain-disposition".to_string());
+        warnings.push(
+            "accepted drain or disposition-recovery turn returned no typed disposition; treating outcome as indeterminate"
+                .to_string(),
+        );
     }
     let raw_fallback_forbidden = !run_result.assistant_final_found
         && !run_result.assistant_raw_message.trim().is_empty()
@@ -2615,6 +2845,8 @@ fn finish_codex_runtime_run(
         mutation_evidence,
         external_effect,
         drain_checkpoint,
+        drain_disposition,
+        drain_disposition_error,
     };
     let log_level = match receipt.status {
         CodexRuntimeRunStatus::Completed => HarnessLogLevel::Info,
@@ -3964,11 +4196,13 @@ fn load_codex_context_policy(harness_home: &Path) -> io::Result<CodexContextPoli
         if let Some(value) = context_string(context, &["rolloverMode", "rollover_mode"]) {
             policy.rollover_mode = normalize_context_rollover_mode(&value);
         }
-        if let Some(value) = context_bool(
+        if context_bool(
             context,
             &["cooperativeMidTurnDrain", "cooperative_mid_turn_drain"],
-        ) {
-            policy.cooperative_mid_turn_drain = value;
+        )
+        .is_some()
+        {
+            policy.cooperative_mid_turn_drain = false;
         }
         break;
     }
@@ -4113,10 +4347,25 @@ struct RuntimeCancelCheck {
     receipt_file: PathBuf,
     session_key: String,
     queue_id: Option<String>,
+    lease_guard: RefCell<Option<crate::runtime_worker::RuntimeQueueLeaseGuard>>,
+    lease_capture_error: Option<String>,
 }
 
 impl RuntimeCancelCheck {
     fn new(harness_home: &Path, session_key: &str, queue_id: Option<String>) -> Self {
+        let (lease_guard, lease_capture_error) = match queue_id.as_deref() {
+            Some(queue_id) => match current_log_time_ms().and_then(|now_ms| {
+                crate::runtime_worker::capture_runtime_queue_lease_guard(
+                    harness_home,
+                    queue_id,
+                    now_ms,
+                )
+            }) {
+                Ok(guard) => (guard, None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            None => (None, None),
+        };
         Self {
             path: harness_home
                 .join("state")
@@ -4129,10 +4378,34 @@ impl RuntimeCancelCheck {
                 .join("cancel-consumptions.jsonl"),
             session_key: session_key.to_string(),
             queue_id,
+            lease_guard: RefCell::new(lease_guard),
+            lease_capture_error,
         }
     }
 
     fn poll(&self) -> io::Result<Option<String>> {
+        if let Some(error) = self.lease_capture_error.as_deref() {
+            return Ok(Some(format!(
+                "runtime queue lease guard capture failed: {error}"
+            )));
+        }
+        let now_ms = current_log_time_ms()?;
+        if let Some(guard) = self.lease_guard.borrow_mut().as_mut()
+            && guard.heartbeat_due(now_ms)
+        {
+            let required_through_at_ms = now_ms.saturating_add(guard.safety_margin_ms());
+            let renewal = crate::runtime_worker::renew_runtime_queue_lease(
+                guard,
+                now_ms,
+                required_through_at_ms,
+            );
+            if !renewal.keeps_ownership() {
+                return Ok(Some(format!(
+                    "runtime queue lease ownership lost: {}",
+                    renewal.reason_code
+                )));
+            }
+        }
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -4141,7 +4414,6 @@ impl RuntimeCancelCheck {
         };
         let request: RuntimeCancelRequest =
             serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        let now_ms = current_log_time_ms()?;
         if now_ms.saturating_sub(request.at_ms) > RUNTIME_CANCEL_REQUEST_MAX_AGE_MS {
             return Ok(None);
         }
@@ -4161,6 +4433,47 @@ impl RuntimeCancelCheck {
             },
         )?;
         Ok(Some(reason))
+    }
+
+    fn ensure_queue_lease_through(
+        &self,
+        required_through_at_ms: i64,
+    ) -> io::Result<Option<crate::runtime_worker::RuntimeQueueLeaseRenewalReceipt>> {
+        if let Some(error) = self.lease_capture_error.as_deref() {
+            return Err(io::Error::other(format!(
+                "runtime queue lease guard capture failed: {error}"
+            )));
+        }
+        let now_ms = current_log_time_ms()?;
+        let mut guard = self.lease_guard.borrow_mut();
+        let Some(guard) = guard.as_mut() else {
+            return Ok(None);
+        };
+        let required_through_at_ms =
+            required_through_at_ms.saturating_add(guard.safety_margin_ms());
+        let receipt =
+            crate::runtime_worker::renew_runtime_queue_lease(guard, now_ms, required_through_at_ms);
+        if receipt.keeps_ownership() {
+            Ok(Some(receipt))
+        } else {
+            Err(io::Error::other(format!(
+                "runtime queue lease cannot cover renewed deadline: {}",
+                receipt.reason_code
+            )))
+        }
+    }
+
+    fn has_pending_exact_lane_work(&self) -> io::Result<bool> {
+        if let Some(error) = self.lease_capture_error.as_deref() {
+            return Err(io::Error::other(format!(
+                "runtime queue lease guard capture failed: {error}"
+            )));
+        }
+        let guard = self.lease_guard.borrow();
+        let Some(guard) = guard.as_ref() else {
+            return Ok(false);
+        };
+        guard.has_pending_exact_lane_work()
     }
 }
 
@@ -4274,6 +4587,8 @@ fn drive_codex_app_server(
     context_policy: &CodexContextPolicy,
     compact_before_turn: bool,
 ) -> io::Result<CodexAppServerRunResult> {
+    let productive_deadline_config =
+        resolve_productive_deadline_config(harness_home, plan.agent_id.as_deref(), timeout_ms)?;
     let execution_dir = runtime_execution_dir(plan);
     fs::create_dir_all(&execution_dir)?;
     fs::create_dir_all(&plan.invocation.working_directory)?;
@@ -4368,6 +4683,7 @@ fn drive_codex_app_server(
     };
     let (line_rx, mut reader_handle) = spawn_stdout_reader(stdout, stdout_log.clone());
     let mut timeouts = CodexProtocolTimeouts::new(timeout_ms, idle_timeout_ms);
+    timeouts.configure_productive_deadline(productive_deadline_config);
     let mut state = CodexProtocolState {
         goal_projection_observer: Some(CodexGoalProjectionObserver::new(harness_home, plan)?),
         external_effect_context: codex_external_effect_runtime_context(harness_home, plan)?,
@@ -9340,6 +9656,49 @@ fn bounded_codex_scope(value: Option<&str>) -> String {
     preview
 }
 
+fn codex_task_family_for_plan(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+) -> io::Result<Option<crate::TaskFamilyV1>> {
+    if let Some(family_id) = plan.continuation.task_family_id.as_deref() {
+        return crate::task_transition::read_task_family(harness_home, family_id).map(Some);
+    }
+    let Some(queue_id) = plan.queue_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(lane_digest) = plan.prompt_authority.lane_digest.as_deref() else {
+        return Ok(None);
+    };
+    let Some(agent_id) = plan.agent_id.as_deref() else {
+        return Ok(None);
+    };
+    let virtual_session_id = plan.continuation.virtual_session_id.clone().or_else(|| {
+        plan.channel_lane.as_ref().map(|lane| {
+            crate::context_rollover::derive_virtual_session_id_v2(
+                lane,
+                &crate::context_rollover::root_working_session_key(&plan.session_key),
+            )
+        })
+    });
+    let Some(virtual_session_id) = virtual_session_id else {
+        return Ok(None);
+    };
+    let prompt_digest = crate::task_transition::sha256_hex(&fs::read(&plan.prompt_markdown)?);
+    crate::ensure_task_family(
+        harness_home,
+        plan.continuation
+            .task_root_queue_id
+            .as_deref()
+            .unwrap_or(queue_id),
+        lane_digest,
+        &virtual_session_id,
+        &plan.session_key,
+        agent_id,
+        &prompt_digest,
+    )
+    .map(Some)
+}
+
 struct CodexTurnSteerBridge {
     harness_home: PathBuf,
     binding_file: PathBuf,
@@ -9353,6 +9712,7 @@ struct CodexTurnSteerBridge {
     owned_turn_id: Option<String>,
     owned_item_ids: Vec<String>,
     divergent_event_count: usize,
+    task_family: Option<crate::TaskFamilyV1>,
 }
 
 impl CodexTurnSteerBridge {
@@ -9367,6 +9727,15 @@ impl CodexTurnSteerBridge {
         let now_ms = current_log_time_ms()?;
         let (absolute_deadline_at_ms, deadline_drain_at_ms) =
             timeouts.deadline_epoch_bounds(now_ms);
+        let hard_cap_at_ms = now_ms.saturating_add(
+            i64::try_from(
+                timeouts
+                    .hard_cap_deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(i64::MAX),
+        );
         let binding_file = codex_active_turn_binding_file(harness_home, &plan.session_key);
         let binding = CodexActiveTurnBindingRecord {
             schema: CODEX_ACTIVE_TURN_SCHEMA.to_string(),
@@ -9387,10 +9756,24 @@ impl CodexTurnSteerBridge {
             started_at_ms: now_ms,
             absolute_deadline_at_ms: Some(absolute_deadline_at_ms),
             deadline_drain_at_ms: Some(deadline_drain_at_ms),
+            deadline_mode: match timeouts.productive_config.mode {
+                ProductiveDeadlineRolloutMode::Off => "off",
+                ProductiveDeadlineRolloutMode::Shadow => "shadow",
+                ProductiveDeadlineRolloutMode::Authoritative => "authoritative",
+            }
+            .to_string(),
+            initial_deadline_at_ms: Some(absolute_deadline_at_ms),
+            hard_cap_at_ms: Some(hard_cap_at_ms),
+            deadline_generation: 0,
+            last_renewal_id: None,
+            instruction_generation: 0,
+            drain_state: "running".to_string(),
+            drain_cause: None,
             updated_at_ms: now_ms,
             reason: "turn/start sent; waiting for active Codex turn id".to_string(),
         };
         write_codex_active_turn_binding(&binding_file, &binding)?;
+        let task_family = codex_task_family_for_plan(harness_home, plan)?;
         Ok(Self {
             harness_home: harness_home.to_path_buf(),
             binding_file,
@@ -9404,6 +9787,7 @@ impl CodexTurnSteerBridge {
             owned_turn_id: None,
             owned_item_ids: Vec::new(),
             divergent_event_count: 0,
+            task_family,
         })
     }
 
@@ -9576,6 +9960,25 @@ impl CodexTurnSteerBridge {
                     .unwrap_or(&self.binding.session_key)
             )
         );
+        let deadline_drain_message = self.task_family.as_ref().map_or_else(
+            || {
+                format!(
+                    "{CODEX_DEADLINE_DRAIN_MESSAGE} Drain cause is {}. Set observedDeadlineGeneration to {}.",
+                    timeouts.drain_cause, timeouts.renewal_count
+                )
+            },
+            |family| {
+                format!(
+                    "{CODEX_DEADLINE_DRAIN_MESSAGE} Drain cause is {}. Set observedDeadlineGeneration to {}. If no current OperationPlan owns unfinished work but this ordinary task is incomplete, use disposition continuation-required, authorityKind explicit-checkpoint, authorityId {}, authorityVersion {}, taskFamilyId {}, taskFamilyVersion {}, activeItemId null, and activeItemVersion null. This task-family authority is harness-issued and must not be changed or invented.",
+                    timeouts.drain_cause,
+                    timeouts.renewal_count,
+                    family.family_id,
+                    family.authority_version,
+                    family.family_id,
+                    family.authority_version
+                )
+            },
+        );
         write_json_rpc(
             stdin,
             &json!({
@@ -9585,7 +9988,7 @@ impl CodexTurnSteerBridge {
                     "threadId": self.binding.thread_id.clone(),
                     "expectedTurnId": active_turn_id.clone(),
                     "clientUserMessageId": format!("agent-harness:{request_id}"),
-                    "input": [{"type": "text", "text": CODEX_DEADLINE_DRAIN_MESSAGE}]
+                    "input": [{"type": "text", "text": deadline_drain_message}]
                 }
             }),
         )?;
@@ -9594,11 +9997,17 @@ impl CodexTurnSteerBridge {
             "sent-deadline-drain",
             "same-turn-deadline-drain-pending",
             Some(active_turn_id),
-            "deadline drain guard sent before the hard turn timeout".to_string(),
+            format!(
+                "deadline drain guard sent before the hard turn timeout; cause={}",
+                timeouts.drain_cause
+            ),
         )?;
         self.deadline_drain_rpc = Some((rpc_id, request_id));
         self.deadline_drain_sent = true;
         self.binding.updated_at_ms = at_ms;
+        self.binding.deadline_generation = timeouts.renewal_count;
+        self.binding.drain_state = "draining".to_string();
+        self.binding.drain_cause = Some(timeouts.drain_cause.clone());
         self.binding.reason =
             "deadline drain guard sent; late steering will be deferred".to_string();
         write_codex_active_turn_binding(&self.binding_file, &self.binding)?;
@@ -9779,6 +10188,13 @@ impl CodexTurnSteerBridge {
             accepted_turn_id,
             "Codex app-server accepted turn/steer request".to_string(),
         )?;
+        self.binding.instruction_generation = self.binding.instruction_generation.saturating_add(1);
+        self.binding.updated_at_ms = current_log_time_ms()?;
+        self.binding.reason = format!(
+            "accepted same-turn instruction generation {}",
+            self.binding.instruction_generation
+        );
+        write_codex_active_turn_binding(&self.binding_file, &self.binding)?;
         move_steer_request_file(&self.harness_home, &in_flight.file, "accepted")?;
         Ok(true)
     }
@@ -9786,6 +10202,11 @@ impl CodexTurnSteerBridge {
     fn finish(&mut self, status: CodexActiveTurnStatus, reason: &str) -> io::Result<()> {
         self.finish_pending(reason)?;
         self.binding.status = status;
+        self.binding.drain_state = if self.deadline_drain_sent {
+            "disposition-pending-validation".to_string()
+        } else {
+            "not-drained".to_string()
+        };
         self.binding.updated_at_ms = current_log_time_ms()?;
         self.binding.reason = reason.to_string();
         write_codex_active_turn_binding(&self.binding_file, &self.binding)
@@ -9923,13 +10344,209 @@ impl CodexTurnSteerBridge {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductiveDeadlineDecision {
+    None,
+    ShadowWouldRenew { proposed_deadline: Instant },
+    Renew { proposed_deadline: Instant },
+}
+
+#[derive(Debug, Clone)]
+struct ProductiveDeadlineEvidence {
+    sequence: u64,
+    kind: &'static str,
+    score: u8,
+    digest: String,
+    observed_at: Instant,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProductiveDeadlineEvidenceSummary {
+    score: u32,
+    count: u32,
+    newest_sequence: u64,
+    digests: Vec<String>,
+    kind_counts: BTreeMap<&'static str, u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductiveDeadlineDecisionReceipt {
+    schema: &'static str,
+    renewal_id: String,
+    at_ms: i64,
+    queue_id: Option<String>,
+    session_key: String,
+    exact_lane_digest: Option<String>,
+    thread_id: String,
+    turn_id: Option<String>,
+    mode: ProductiveDeadlineRolloutMode,
+    decision: &'static str,
+    reason_code: &'static str,
+    deadline_generation: u32,
+    instruction_generation: u64,
+    previous_deadline_at_ms: i64,
+    candidate_deadline_at_ms: Option<i64>,
+    hard_cap_at_ms: i64,
+    pending_exact_lane_work: bool,
+    progress_watermark_before: u64,
+    progress_watermark_after: u64,
+    progress_score: u32,
+    progress_count: u32,
+    progress_digests: Vec<String>,
+    progress_kinds: BTreeMap<&'static str, u32>,
+    blocker_codes: Vec<&'static str>,
+    queue_lease_renewal_id: Option<String>,
+    policy_digest: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_productive_deadline_decision(
+    bridge: &mut CodexTurnSteerBridge,
+    timeouts: &CodexProtocolTimeouts,
+    renewal_id: String,
+    prior_deadline: Instant,
+    proposed_deadline: Option<Instant>,
+    pending_exact_lane_work: bool,
+    evidence: Option<&ProductiveDeadlineEvidenceSummary>,
+    progress_watermark_before: u64,
+    lease_renewal_id: Option<String>,
+    decision: &'static str,
+    reason_code: &'static str,
+) -> io::Result<()> {
+    let at_ms = current_log_time_ms()?;
+    let now = Instant::now();
+    let epoch = |deadline: Instant| {
+        at_ms.saturating_add(
+            i64::try_from(deadline.saturating_duration_since(now).as_millis()).unwrap_or(i64::MAX),
+        )
+    };
+    let proposed_deadline_at_ms = proposed_deadline.map(epoch);
+    append_json_line(
+        &bridge
+            .harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("productive-deadline-decisions.jsonl"),
+        &ProductiveDeadlineDecisionReceipt {
+            schema: PRODUCTIVE_DEADLINE_RECEIPT_SCHEMA,
+            renewal_id,
+            at_ms,
+            queue_id: bridge.binding.queue_id.clone(),
+            session_key: bridge.binding.session_key.clone(),
+            exact_lane_digest: bridge
+                .task_family
+                .as_ref()
+                .map(|family| family.exact_lane_digest.clone()),
+            thread_id: bridge.binding.thread_id.clone(),
+            turn_id: bridge.binding.active_turn_id.clone(),
+            mode: timeouts.productive_config.mode,
+            decision,
+            reason_code,
+            deadline_generation: timeouts.renewal_count,
+            instruction_generation: bridge.binding.instruction_generation,
+            previous_deadline_at_ms: epoch(prior_deadline),
+            candidate_deadline_at_ms: proposed_deadline_at_ms,
+            hard_cap_at_ms: epoch(timeouts.hard_cap_deadline),
+            pending_exact_lane_work,
+            progress_watermark_before,
+            progress_watermark_after: if matches!(decision, "applied" | "would-renew") {
+                evidence.map_or(timeouts.progress_watermark, |summary| {
+                    summary.newest_sequence
+                })
+            } else {
+                timeouts.progress_watermark
+            },
+            progress_score: evidence.map_or(0, |summary| summary.score),
+            progress_count: evidence.map_or(0, |summary| summary.count),
+            progress_digests: evidence
+                .map(|summary| summary.digests.clone())
+                .unwrap_or_default(),
+            progress_kinds: evidence
+                .map(|summary| summary.kind_counts.clone())
+                .unwrap_or_default(),
+            blocker_codes: matches!(decision, "denied" | "failed")
+                .then_some(vec![reason_code])
+                .unwrap_or_default(),
+            queue_lease_renewal_id: lease_renewal_id,
+            policy_digest: timeouts.productive_config.policy_digest(),
+        },
+    )?;
+    Ok(())
+}
+
+fn productive_deadline_renewal_id(
+    bridge: &CodexTurnSteerBridge,
+    timeouts: &CodexProtocolTimeouts,
+    evidence: Option<&ProductiveDeadlineEvidenceSummary>,
+    decision: &str,
+) -> String {
+    crate::task_transition::sha256_hex(
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            bridge.binding.queue_id.as_deref().unwrap_or("none"),
+            bridge.binding.session_key,
+            bridge.binding.thread_id,
+            bridge.binding.active_turn_id.as_deref().unwrap_or("none"),
+            timeouts.renewal_count,
+            bridge.binding.instruction_generation,
+            evidence.map_or(0, |summary| summary.newest_sequence),
+            decision
+        )
+        .as_bytes(),
+    )
+}
+
+fn prepare_productive_deadline_binding(
+    bridge: &mut CodexTurnSteerBridge,
+    timeouts: &CodexProtocolTimeouts,
+    proposed_deadline: Instant,
+    renewal_id: &str,
+) -> io::Result<()> {
+    let now_ms = current_log_time_ms()?;
+    let now = Instant::now();
+    let epoch = |deadline: Instant| {
+        now_ms.saturating_add(
+            i64::try_from(deadline.saturating_duration_since(now).as_millis()).unwrap_or(i64::MAX),
+        )
+    };
+    let mut candidate = bridge.binding.clone();
+    candidate.absolute_deadline_at_ms = Some(epoch(proposed_deadline));
+    candidate.deadline_drain_at_ms = Some(epoch(
+        proposed_deadline
+            .checked_sub(timeouts.deadline_drain_window)
+            .unwrap_or(proposed_deadline),
+    ));
+    candidate.deadline_generation = timeouts.renewal_count.saturating_add(1);
+    candidate.last_renewal_id = Some(renewal_id.to_string());
+    candidate.updated_at_ms = now_ms;
+    candidate.reason = format!(
+        "productive deadline renewal prepared; deadlineGeneration={}",
+        candidate.deadline_generation
+    );
+    write_codex_active_turn_binding(&bridge.binding_file, &candidate)?;
+    bridge.binding = candidate;
+    Ok(())
+}
+
 struct CodexProtocolTimeouts {
+    started_at: Instant,
     absolute_deadline: Instant,
     idle_deadline: Instant,
     idle_timeout: Duration,
     deadline_drain_window: Duration,
     max_turn_ms: u64,
     idle_timeout_ms: u64,
+    productive_config: ProductiveDeadlineConfig,
+    hard_cap_deadline: Instant,
+    productive_evidence: Vec<ProductiveDeadlineEvidence>,
+    next_productive_sequence: u64,
+    progress_watermark: u64,
+    consumed_productive_digests: Vec<String>,
+    renewal_count: u32,
+    drain_started: bool,
+    drain_cause: String,
+    shadow_recorded_deadline: Option<Instant>,
 }
 
 impl CodexProtocolTimeouts {
@@ -9944,17 +10561,222 @@ impl CodexProtocolTimeouts {
                 .min(CODEX_DEADLINE_DRAIN_MAX_WINDOW_MS),
         );
         Self {
+            started_at: now,
             absolute_deadline: now + Duration::from_millis(max_turn_ms),
             idle_deadline: now + idle_timeout,
             idle_timeout,
             deadline_drain_window,
             max_turn_ms,
             idle_timeout_ms,
+            productive_config: ProductiveDeadlineConfig::default(),
+            hard_cap_deadline: now + Duration::from_millis(max_turn_ms),
+            productive_evidence: Vec::new(),
+            next_productive_sequence: 1,
+            progress_watermark: 0,
+            consumed_productive_digests: Vec::new(),
+            renewal_count: 0,
+            drain_started: false,
+            drain_cause: "legacy-fixed-deadline".to_string(),
+            shadow_recorded_deadline: None,
         }
+    }
+
+    fn configure_productive_deadline(&mut self, config: ProductiveDeadlineConfig) {
+        self.productive_config = config;
+        self.hard_cap_deadline =
+            self.started_at + config.hard_cap.max(Duration::from_millis(self.max_turn_ms));
     }
 
     fn note_event(&mut self) {
         self.idle_deadline = Instant::now() + self.idle_timeout;
+    }
+
+    #[cfg(test)]
+    fn note_productive_event(&mut self, evidence_id: String, observed_at: Instant) {
+        let digest = crate::task_transition::sha256_hex(evidence_id.as_bytes());
+        self.note_productive_evidence("successful-tool", 2, digest, observed_at);
+    }
+
+    fn note_productive_evidence(
+        &mut self,
+        kind: &'static str,
+        score: u8,
+        digest: String,
+        observed_at: Instant,
+    ) {
+        if self.drain_started
+            || self
+                .productive_evidence
+                .iter()
+                .any(|seen| seen.digest == digest)
+        {
+            return;
+        }
+        if self.productive_evidence.len() >= 128 {
+            self.productive_evidence.remove(0);
+        }
+        let sequence = self.next_productive_sequence;
+        self.next_productive_sequence = self.next_productive_sequence.saturating_add(1);
+        self.productive_evidence.push(ProductiveDeadlineEvidence {
+            sequence,
+            kind,
+            score,
+            digest,
+            observed_at,
+        });
+    }
+
+    fn observe_owned_event(&mut self, value: &Value, observed_at: Instant) {
+        if let Some((kind, score, digest)) = productive_deadline_evidence(value) {
+            self.note_productive_evidence(kind, score, digest, observed_at);
+        }
+    }
+
+    fn productive_evidence_summary(
+        &self,
+        now: Instant,
+    ) -> Option<ProductiveDeadlineEvidenceSummary> {
+        let mut summary = ProductiveDeadlineEvidenceSummary::default();
+        let mut accepted_digests = BTreeSet::new();
+        for evidence in self.productive_evidence.iter().filter(|evidence| {
+            evidence.sequence > self.progress_watermark
+                && now.saturating_duration_since(evidence.observed_at)
+                    <= self.productive_config.evidence_window
+                && !self
+                    .consumed_productive_digests
+                    .iter()
+                    .any(|digest| digest == &evidence.digest)
+        }) {
+            if !accepted_digests.insert(evidence.digest.clone()) {
+                continue;
+            }
+            let cap = match evidence.kind {
+                "file-change" => 2,
+                "successful-tool" => 4,
+                "verification" => 3,
+                "narration" => 1,
+                "failed-tool-diagnostic" => 2,
+                _ => 0,
+            };
+            let count = summary.kind_counts.entry(evidence.kind).or_default();
+            if *count >= cap {
+                continue;
+            }
+            *count += 1;
+            summary.score = summary.score.saturating_add(u32::from(evidence.score));
+            summary.count = summary.count.saturating_add(1);
+            summary.newest_sequence = summary.newest_sequence.max(evidence.sequence);
+            summary.digests.push(evidence.digest.clone());
+        }
+        (summary.score >= 2 && summary.newest_sequence > self.progress_watermark).then_some(summary)
+    }
+
+    fn consume_productive_evidence(&mut self, summary: &ProductiveDeadlineEvidenceSummary) {
+        self.progress_watermark = self.progress_watermark.max(summary.newest_sequence);
+        for digest in &summary.digests {
+            if !self
+                .consumed_productive_digests
+                .iter()
+                .any(|seen| seen == digest)
+            {
+                if self.consumed_productive_digests.len() >= 128 {
+                    self.consumed_productive_digests.remove(0);
+                }
+                self.consumed_productive_digests.push(digest.clone());
+            }
+        }
+    }
+
+    fn productive_deadline_decision(
+        &self,
+        now: Instant,
+        pending_exact_lane_work: bool,
+        eligibility_blocked: bool,
+    ) -> ProductiveDeadlineDecision {
+        if self.productive_config.mode == ProductiveDeadlineRolloutMode::Off
+            || self.drain_started
+            || !self.is_deadline_drain_window(now)
+            || eligibility_blocked
+            || (pending_exact_lane_work
+                && self
+                    .productive_config
+                    .pending_exact_lane_work_blocks_renewal)
+            || self.renewal_count >= self.productive_config.max_renewals
+        {
+            return ProductiveDeadlineDecision::None;
+        }
+        if self.productive_evidence_summary(now).is_none() {
+            return ProductiveDeadlineDecision::None;
+        }
+        let proposed_deadline = (self.absolute_deadline + self.productive_config.renew_increment)
+            .min(self.hard_cap_deadline);
+        if proposed_deadline <= self.absolute_deadline {
+            return ProductiveDeadlineDecision::None;
+        }
+        match self.productive_config.mode {
+            ProductiveDeadlineRolloutMode::Off => ProductiveDeadlineDecision::None,
+            ProductiveDeadlineRolloutMode::Shadow => {
+                ProductiveDeadlineDecision::ShadowWouldRenew { proposed_deadline }
+            }
+            ProductiveDeadlineRolloutMode::Authoritative => {
+                ProductiveDeadlineDecision::Renew { proposed_deadline }
+            }
+        }
+    }
+
+    fn apply_productive_renewal(&mut self, proposed_deadline: Instant) {
+        self.absolute_deadline = proposed_deadline.min(self.hard_cap_deadline);
+        self.renewal_count = self.renewal_count.saturating_add(1);
+    }
+
+    fn mark_drain_started(&mut self) {
+        self.drain_started = true;
+    }
+
+    fn set_drain_cause(&mut self, cause: impl Into<String>) {
+        if !self.drain_started {
+            self.drain_cause = cause.into();
+        }
+    }
+
+    fn renewal_denial_reason(
+        &self,
+        now: Instant,
+        pending_exact_lane_work: bool,
+        task_budget_exhausted: bool,
+        active_goal: bool,
+    ) -> &'static str {
+        if self.productive_config.mode == ProductiveDeadlineRolloutMode::Off {
+            "legacy-fixed-deadline"
+        } else if self.productive_config.mode == ProductiveDeadlineRolloutMode::Shadow {
+            "legacy-fixed-deadline"
+        } else if active_goal {
+            "active-goal-policy"
+        } else if task_budget_exhausted {
+            "task-budget-exhausted"
+        } else if pending_exact_lane_work
+            && self
+                .productive_config
+                .pending_exact_lane_work_blocks_renewal
+        {
+            "pending-exact-lane-work"
+        } else if self.renewal_count >= self.productive_config.max_renewals {
+            "renewal-count-exhausted"
+        } else if self.absolute_deadline >= self.hard_cap_deadline {
+            "hard-cap-reached"
+        } else if self.productive_evidence_summary(now).is_none() {
+            "no-recent-productive-progress"
+        } else {
+            "renewal-ineligible"
+        }
+    }
+
+    fn shadow_decision_already_recorded(&self, proposed_deadline: Instant) -> bool {
+        self.shadow_recorded_deadline == Some(proposed_deadline)
+    }
+
+    fn mark_shadow_decision_recorded(&mut self, proposed_deadline: Instant) {
+        self.shadow_recorded_deadline = Some(proposed_deadline);
     }
 
     fn timed_out_reason(&self, now: Instant) -> Option<String> {
@@ -10994,6 +11816,165 @@ fn compact_attempt_bounded_text(value: &str) -> String {
     crate::progress::sanitize_progress_preview(value, 256)
 }
 
+fn handle_codex_deadline_boundary(
+    stdin: &mut impl Write,
+    state: &mut CodexProtocolState,
+    timeouts: &mut CodexProtocolTimeouts,
+    cancel_check: Option<&RuntimeCancelCheck>,
+    bridge: &mut CodexTurnSteerBridge,
+) -> io::Result<()> {
+    let now = Instant::now();
+    if timeouts.drain_started {
+        bridge.drain_pending(stdin, state, true)?;
+        return Ok(());
+    }
+    if !timeouts.is_deadline_drain_window(now) {
+        bridge.drain_pending(stdin, state, false)?;
+        return Ok(());
+    }
+    let pending_exact_lane_work = cancel_check
+        .map(RuntimeCancelCheck::has_pending_exact_lane_work)
+        .transpose()?
+        .unwrap_or(false);
+    let task_budget_exhausted = bridge
+        .task_family
+        .as_ref()
+        .map(|family| crate::task_budget_status(&bridge.harness_home, &family.family_id))
+        .transpose()?
+        .is_some_and(|status| status.exhausted);
+    if task_budget_exhausted {
+        state
+            .warnings
+            .push("productive deadline renewal denied by ordinary task budget".to_string());
+    }
+    let active_goal = state
+        .goal_projection_observer
+        .as_ref()
+        .is_some_and(CodexGoalProjectionObserver::has_active_goal);
+    let prior_deadline = timeouts.absolute_deadline;
+    let progress_watermark_before = timeouts.progress_watermark;
+    let evidence = timeouts.productive_evidence_summary(now);
+    let drain_cause_code = timeouts.renewal_denial_reason(
+        now,
+        pending_exact_lane_work,
+        task_budget_exhausted,
+        active_goal,
+    );
+    let mut drain_cause = drain_cause_code.to_string();
+    match timeouts.productive_deadline_decision(
+        now,
+        pending_exact_lane_work,
+        task_budget_exhausted || active_goal,
+    ) {
+        ProductiveDeadlineDecision::Renew { proposed_deadline } => {
+            let renewal_id =
+                productive_deadline_renewal_id(bridge, timeouts, evidence.as_ref(), "applied");
+            let at_ms = current_log_time_ms()?;
+            let required_through_at_ms = at_ms.saturating_add(
+                i64::try_from(proposed_deadline.saturating_duration_since(now).as_millis())
+                    .unwrap_or(i64::MAX),
+            );
+            let lease = cancel_check
+                .map(|check| check.ensure_queue_lease_through(required_through_at_ms))
+                .transpose()?;
+            if let Some(lease) = lease.flatten() {
+                prepare_productive_deadline_binding(
+                    bridge,
+                    timeouts,
+                    proposed_deadline,
+                    &renewal_id,
+                )?;
+                timeouts.apply_productive_renewal(proposed_deadline);
+                if let Some(evidence) = evidence.as_ref() {
+                    timeouts.consume_productive_evidence(evidence);
+                }
+                record_productive_deadline_decision(
+                    bridge,
+                    timeouts,
+                    renewal_id,
+                    prior_deadline,
+                    Some(proposed_deadline),
+                    pending_exact_lane_work,
+                    evidence.as_ref(),
+                    progress_watermark_before,
+                    Some(lease.renewal_id),
+                    "applied",
+                    "recent-owned-productive-evidence",
+                )?;
+                bridge.drain_pending(stdin, state, false)?;
+                return Ok(());
+            }
+            let failed_id =
+                productive_deadline_renewal_id(bridge, timeouts, evidence.as_ref(), "failed");
+            record_productive_deadline_decision(
+                bridge,
+                timeouts,
+                failed_id,
+                prior_deadline,
+                Some(proposed_deadline),
+                pending_exact_lane_work,
+                evidence.as_ref(),
+                progress_watermark_before,
+                None,
+                "failed",
+                "queue-lease-proof-unavailable",
+            )?;
+            drain_cause = "queue-lease-proof-unavailable".to_string();
+        }
+        ProductiveDeadlineDecision::ShadowWouldRenew { proposed_deadline } => {
+            if !timeouts.shadow_decision_already_recorded(proposed_deadline) {
+                let renewal_id = productive_deadline_renewal_id(
+                    bridge,
+                    timeouts,
+                    evidence.as_ref(),
+                    "would-renew",
+                );
+                record_productive_deadline_decision(
+                    bridge,
+                    timeouts,
+                    renewal_id,
+                    prior_deadline,
+                    Some(proposed_deadline),
+                    pending_exact_lane_work,
+                    evidence.as_ref(),
+                    progress_watermark_before,
+                    None,
+                    "would-renew",
+                    "recent-owned-productive-evidence",
+                )?;
+                if let Some(evidence) = evidence.as_ref() {
+                    timeouts.consume_productive_evidence(evidence);
+                }
+                timeouts.mark_shadow_decision_recorded(proposed_deadline);
+            }
+        }
+        ProductiveDeadlineDecision::None => {
+            if timeouts.productive_config.mode != ProductiveDeadlineRolloutMode::Off {
+                let denial_id =
+                    productive_deadline_renewal_id(bridge, timeouts, evidence.as_ref(), "denied");
+                record_productive_deadline_decision(
+                    bridge,
+                    timeouts,
+                    denial_id,
+                    prior_deadline,
+                    None,
+                    pending_exact_lane_work,
+                    evidence.as_ref(),
+                    progress_watermark_before,
+                    None,
+                    "denied",
+                    drain_cause_code,
+                )?;
+            }
+        }
+    }
+    timeouts.set_drain_cause(drain_cause);
+    timeouts.mark_drain_started();
+    bridge.maybe_send_deadline_drain(stdin, state, timeouts)?;
+    bridge.drain_pending(stdin, state, true)?;
+    Ok(())
+}
+
 fn wait_for_turn_completed(
     line_rx: &mpsc::Receiver<Result<String, String>>,
     child: &mut std::process::Child,
@@ -11007,11 +11988,6 @@ fn wait_for_turn_completed(
     mut steer_bridge: Option<&mut CodexTurnSteerBridge>,
 ) -> io::Result<ProtocolWait> {
     loop {
-        if let Some(bridge) = steer_bridge.as_deref_mut() {
-            let deadline_drain = timeouts.is_deadline_drain_window(Instant::now());
-            bridge.maybe_send_deadline_drain(stdin, state, timeouts)?;
-            bridge.drain_pending(stdin, state, deadline_drain)?;
-        }
         let poll_interval = steer_bridge.as_ref().map(|_| Duration::from_millis(250));
         match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, poll_interval)?
         {
@@ -11022,6 +11998,7 @@ fn wait_for_turn_completed(
                     continue;
                 }
                 record_protocol_usage_event(&value, state);
+                timeouts.observe_owned_event(&value, Instant::now());
 
                 if let Some(bridge) = steer_bridge.as_deref_mut()
                     && bridge.observe_json(&value, stdin, state)?
@@ -11032,9 +12009,18 @@ fn wait_for_turn_completed(
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
                 }
+                if !is_turn_completed(&value)
+                    && let Some(bridge) = steer_bridge.as_deref_mut()
+                {
+                    handle_codex_deadline_boundary(stdin, state, timeouts, cancel_check, bridge)?;
+                }
                 emit_codex_progress(progress, &value, state);
                 if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
                     if let Some(wait) = external_effect_protocol_wait(state) {
+                        // The response is flushed before this point, but the peer still needs a
+                        // bounded scheduling window to consume it before parked-run teardown.
+                        // This runs only at an external-effect authority boundary.
+                        thread::sleep(Duration::from_millis(250));
                         return Ok(wait);
                     }
                     continue;
@@ -11062,7 +12048,12 @@ fn wait_for_turn_completed(
                     return Ok(ProtocolWait::ThreadStarted(thread_id));
                 }
             }
-            ProtocolEvent::Poll => continue,
+            ProtocolEvent::Poll => {
+                if let Some(bridge) = steer_bridge.as_deref_mut() {
+                    handle_codex_deadline_boundary(stdin, state, timeouts, cancel_check, bridge)?;
+                }
+                continue;
+            }
             ProtocolEvent::TimedOut(reason) => {
                 if let Some(tool) = state
                     .active_tool_use
@@ -11711,6 +12702,133 @@ fn extract_turn_id(value: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn productive_deadline_evidence(value: &Value) -> Option<(&'static str, u8, String)> {
+    if !matches!(json_method(value), Some("item/completed")) {
+        return None;
+    }
+    let item = value.pointer("/params/item")?;
+    let item_type = string_field(item, &["type"])?
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_', ' '], "");
+    let failed = value
+        .pointer("/params/item/error")
+        .is_some_and(|error| !error.is_null())
+        || value
+            .pointer("/params/error")
+            .is_some_and(|error| !error.is_null())
+        || first_string_pointer(value, &["/params/item/status", "/params/status"]).is_some_and(
+            |status| {
+                matches!(
+                    status.trim().to_ascii_lowercase().as_str(),
+                    "failed" | "error" | "canceled" | "cancelled" | "interrupted"
+                )
+            },
+        );
+    let item_id = first_string_pointer(value, &["/params/item/id", "/params/itemId"])?;
+    let turn_id = extract_turn_id(value).unwrap_or_else(|| "unscoped-turn".to_string());
+    let item_digest = crate::task_transition::sha256_hex(
+        serde_json::to_vec(&json!({
+            "turnId": turn_id,
+            "itemId": item_id,
+            "itemType": item_type,
+            "item": item,
+        }))
+        .ok()?
+        .as_slice(),
+    );
+    if failed {
+        let has_diagnostic = [
+            "/params/item/error/message",
+            "/params/item/error",
+            "/params/error/message",
+            "/params/error",
+        ]
+        .iter()
+        .any(|pointer| {
+            value
+                .pointer(pointer)
+                .is_some_and(value_has_bounded_content)
+        });
+        return (matches!(
+            item_type.as_str(),
+            "commandexecution" | "mcptoolcall" | "toolcall" | "websearch" | "test" | "verification"
+        ) && has_diagnostic)
+            .then_some(("failed-tool-diagnostic", 1, item_digest));
+    }
+    match item_type.as_str() {
+        "filechange" => ["changes", "files", "diff", "patch"]
+            .iter()
+            .filter_map(|key| item.get(*key))
+            .any(value_has_bounded_content)
+            .then_some(("file-change", 3, item_digest)),
+        "commandexecution" | "mcptoolcall" | "toolcall" | "websearch" => {
+            Some(("successful-tool", 2, item_digest))
+        }
+        "test" | "verification" => Some(("verification", 2, item_digest)),
+        "agentmessage" => ["text", "content", "message"]
+            .iter()
+            .filter_map(|key| item.get(*key))
+            .any(|value| value.as_str().is_some_and(|text| text.trim().len() >= 24))
+            .then_some(("narration", 1, item_digest)),
+        _ => None,
+    }
+}
+
+pub(crate) fn codex_jsonl_has_productive_progress(text: &str) -> bool {
+    let values = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    let owned_turn_id = values.iter().find_map(|value| {
+        matches!(json_method(value), Some("turn/started"))
+            .then(|| extract_turn_id(value))
+            .flatten()
+    });
+    let Some(owned_turn_id) = owned_turn_id else {
+        return false;
+    };
+    let mut score = 0_u32;
+    let mut digests = BTreeSet::new();
+    let mut kind_counts = BTreeMap::new();
+    for value in values {
+        if extract_turn_id(&value).as_deref() != Some(owned_turn_id.as_str()) {
+            continue;
+        }
+        let Some((kind, evidence_score, digest)) = productive_deadline_evidence(&value) else {
+            continue;
+        };
+        if !digests.insert(digest) {
+            continue;
+        }
+        let cap = match kind {
+            "file-change" => 2,
+            "successful-tool" => 4,
+            "verification" => 3,
+            "narration" => 1,
+            "failed-tool-diagnostic" => 2,
+            _ => 0,
+        };
+        let count = kind_counts.entry(kind).or_insert(0_u32);
+        if *count >= cap {
+            continue;
+        }
+        *count += 1;
+        score = score.saturating_add(u32::from(evidence_score));
+    }
+    score >= 2
+}
+
+fn value_has_bounded_content(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(_) | Value::Number(_) => true,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+    }
 }
 
 fn extract_active_turn_started_id(value: &Value, turn_start_request_id: i64) -> Option<String> {
@@ -15295,7 +16413,7 @@ mod tests {
         assert!(policy.configured);
         assert_eq!(policy.max_successful_compacts_before_rollover, 3);
         assert_eq!(policy.rollover_mode, "disabled");
-        assert!(policy.cooperative_mid_turn_drain);
+        assert!(!policy.cooperative_mid_turn_drain);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -17928,13 +19046,216 @@ mod tests {
         let request: Value = serde_json::from_str(wire.lines().next().unwrap()).unwrap();
         assert_eq!(request["method"], "turn/steer");
         assert_eq!(request["params"]["expectedTurnId"], "turn-deadline-drain");
-        assert_eq!(
-            request["params"]["input"][0]["text"],
-            CODEX_DEADLINE_DRAIN_MESSAGE
+        assert!(
+            request["params"]["input"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with(CODEX_DEADLINE_DRAIN_MESSAGE))
         );
         let receipts = fs::read_to_string(codex_turn_steer_receipts_file(&harness_home)).unwrap();
         assert_eq!(receipts.matches("sent-deadline-drain").count(), 1);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn productive_event_renews_absolute_deadline_before_drain() {
+        let mut timeouts = CodexProtocolTimeouts::new(30_000, 5_000);
+        timeouts.configure_productive_deadline(ProductiveDeadlineConfig {
+            mode: ProductiveDeadlineRolloutMode::Authoritative,
+            renew_increment: Duration::from_secs(15),
+            evidence_window: Duration::from_secs(10),
+            hard_cap: Duration::from_secs(60),
+            max_renewals: 2,
+            pending_exact_lane_work_blocks_renewal: true,
+        });
+        let original_deadline = timeouts.absolute_deadline;
+        let observed_at = original_deadline - Duration::from_secs(2);
+
+        timeouts.note_productive_event("turn:item:commandexecution".to_string(), observed_at);
+        let decision = timeouts.productive_deadline_decision(observed_at, false, false);
+        let ProductiveDeadlineDecision::Renew { proposed_deadline } = decision else {
+            panic!("recent productive evidence should propose a bounded renewal");
+        };
+        timeouts.apply_productive_renewal(proposed_deadline);
+
+        assert!(
+            timeouts.absolute_deadline > original_deadline,
+            "I10/T3 fail-first: concrete productive progress must renew the bounded deadline grant before cooperative drain"
+        );
+    }
+
+    #[test]
+    fn productive_deadline_blocks_narration_pending_work_and_post_drain_renewal() {
+        let mut timeouts = CodexProtocolTimeouts::new(30_000, 5_000);
+        timeouts.configure_productive_deadline(ProductiveDeadlineConfig {
+            mode: ProductiveDeadlineRolloutMode::Authoritative,
+            renew_increment: Duration::from_secs(15),
+            evidence_window: Duration::from_secs(10),
+            hard_cap: Duration::from_secs(60),
+            max_renewals: 2,
+            pending_exact_lane_work_blocks_renewal: true,
+        });
+        let boundary = timeouts.absolute_deadline - Duration::from_secs(2);
+        let narration = serde_json::json!({
+            "method": "item/completed",
+            "params": {"turnId":"turn-1", "item":{"id":"msg-1", "type":"agentMessage", "phase":"commentary"}}
+        });
+        timeouts.observe_owned_event(&narration, boundary);
+        assert_eq!(
+            timeouts.productive_deadline_decision(boundary, false, false),
+            ProductiveDeadlineDecision::None
+        );
+        timeouts.note_productive_event("turn-1:cmd-1:commandexecution".to_string(), boundary);
+        assert_eq!(
+            timeouts.productive_deadline_decision(boundary, true, false),
+            ProductiveDeadlineDecision::None
+        );
+        timeouts.mark_drain_started();
+        assert_eq!(
+            timeouts.productive_deadline_decision(boundary, false, false),
+            ProductiveDeadlineDecision::None
+        );
+    }
+
+    #[test]
+    fn productive_deadline_uses_previous_deadline_increment_and_hard_cap() {
+        let mut timeouts = CodexProtocolTimeouts::new(30_000, 5_000);
+        timeouts.configure_productive_deadline(ProductiveDeadlineConfig {
+            mode: ProductiveDeadlineRolloutMode::Authoritative,
+            renew_increment: Duration::from_secs(20),
+            evidence_window: Duration::from_secs(10),
+            hard_cap: Duration::from_secs(45),
+            max_renewals: 3,
+            pending_exact_lane_work_blocks_renewal: true,
+        });
+        let first_deadline = timeouts.absolute_deadline;
+        let boundary = first_deadline - Duration::from_secs(2);
+        timeouts.note_productive_event("turn-1:cmd-1:commandexecution".to_string(), boundary);
+        let ProductiveDeadlineDecision::Renew { proposed_deadline } =
+            timeouts.productive_deadline_decision(boundary, false, false)
+        else {
+            panic!("first renewal should be eligible");
+        };
+        assert_eq!(proposed_deadline, timeouts.hard_cap_deadline);
+        timeouts.apply_productive_renewal(proposed_deadline);
+        assert_eq!(timeouts.absolute_deadline, timeouts.hard_cap_deadline);
+    }
+
+    #[test]
+    fn productive_deadline_multiple_generations_are_incremental_and_bounded() {
+        let mut timeouts = CodexProtocolTimeouts::new(30_000, 5_000);
+        timeouts.configure_productive_deadline(ProductiveDeadlineConfig {
+            mode: ProductiveDeadlineRolloutMode::Authoritative,
+            renew_increment: Duration::from_secs(10),
+            evidence_window: Duration::from_secs(10),
+            hard_cap: Duration::from_secs(55),
+            max_renewals: 4,
+            pending_exact_lane_work_blocks_renewal: true,
+        });
+        let started = timeouts.started_at;
+
+        for (generation, expected_seconds) in [(1_u32, 40_u64), (2, 50), (3, 55)] {
+            let observed_at = timeouts.absolute_deadline - Duration::from_secs(1);
+            timeouts
+                .note_productive_event(format!("turn-1:completed-tool-{generation}"), observed_at);
+            let evidence = timeouts.productive_evidence_summary(observed_at).unwrap();
+            let ProductiveDeadlineDecision::Renew { proposed_deadline } =
+                timeouts.productive_deadline_decision(observed_at, false, false)
+            else {
+                panic!("generation {generation} should be renewable");
+            };
+            assert_eq!(
+                proposed_deadline.duration_since(started),
+                Duration::from_secs(expected_seconds),
+                "renewal arithmetic must advance from the previous deadline and clamp only at the hard cap"
+            );
+            timeouts.apply_productive_renewal(proposed_deadline);
+            timeouts.consume_productive_evidence(&evidence);
+            assert_eq!(timeouts.renewal_count, generation);
+        }
+
+        let observed_at = timeouts.absolute_deadline;
+        timeouts.note_productive_event("turn-1:completed-tool-4".to_string(), observed_at);
+        assert_eq!(
+            timeouts.productive_deadline_decision(observed_at, false, false),
+            ProductiveDeadlineDecision::None,
+            "fresh progress cannot extend the turn beyond its hard cap"
+        );
+        assert_eq!(
+            timeouts.renewal_denial_reason(observed_at, false, false, false),
+            "hard-cap-reached"
+        );
+    }
+
+    #[test]
+    fn productive_tracker_scores_dedupes_and_consumes_a_watermark() {
+        let mut timeouts = CodexProtocolTimeouts::new(30_000, 5_000);
+        timeouts.configure_productive_deadline(ProductiveDeadlineConfig {
+            mode: ProductiveDeadlineRolloutMode::Authoritative,
+            renew_increment: Duration::from_secs(15),
+            evidence_window: Duration::from_secs(10),
+            hard_cap: Duration::from_secs(60),
+            max_renewals: 2,
+            pending_exact_lane_work_blocks_renewal: true,
+        });
+        let boundary = timeouts.absolute_deadline - Duration::from_secs(2);
+        let narration = json!({
+            "method":"item/completed",
+            "params":{"turnId":"turn-1","item":{"id":"msg-1","type":"agentMessage","text":"A substantive but narration-only progress update."}}
+        });
+        timeouts.observe_owned_event(&narration, boundary);
+        timeouts.observe_owned_event(&narration, boundary);
+        assert_eq!(
+            timeouts.productive_deadline_decision(boundary, false, false),
+            ProductiveDeadlineDecision::None,
+            "narration alone and duplicate evidence cannot renew"
+        );
+
+        for (id, message) in [
+            ("tool-1", "bounded diagnostic one"),
+            ("tool-2", "bounded diagnostic two"),
+        ] {
+            timeouts.observe_owned_event(
+                &json!({
+                    "method":"item/completed",
+                    "params":{"turnId":"turn-1","item":{"id":id,"type":"toolCall","status":"failed","error":{"message":message}}}
+                }),
+                boundary,
+            );
+        }
+        let summary = timeouts.productive_evidence_summary(boundary).unwrap();
+        assert_eq!(
+            summary.score, 3,
+            "one capped narration plus two diagnostics scores three"
+        );
+        assert_eq!(summary.kind_counts.get("narration"), Some(&1));
+        assert_eq!(summary.kind_counts.get("failed-tool-diagnostic"), Some(&2));
+        timeouts.consume_productive_evidence(&summary);
+        assert_eq!(
+            timeouts.productive_deadline_decision(boundary, false, false),
+            ProductiveDeadlineDecision::None,
+            "consumed evidence cannot renew a second generation"
+        );
+    }
+
+    #[test]
+    fn productive_deadline_preflight_rejects_effective_grant_mismatch() {
+        let root = temp_root("productive-deadline-effective-grant");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"orchestration":{"features":{"productiveDeadlineV1":{"mode":"authoritative","enabledAgentIds":["main"],"renewalIncrementMs":60000,"productiveWindowMs":30000,"hardCapMs":60000,"maxRenewals":1,"pendingExactLaneWorkBlocksRenewal":true}}}}"#,
+        )
+        .unwrap();
+        let short =
+            resolve_productive_deadline_config(&harness_home, Some("main"), 20_000).unwrap_err();
+        assert_eq!(short.kind(), io::ErrorKind::InvalidInput);
+        assert!(short.to_string().contains("productiveWindowMs"));
+        let long =
+            resolve_productive_deadline_config(&harness_home, Some("main"), 90_000).unwrap_err();
+        assert_eq!(long.kind(), io::ErrorKind::InvalidInput);
+        assert!(long.to_string().contains("hardCapMs"));
         let _ = fs::remove_dir_all(root);
     }
 
