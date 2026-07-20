@@ -13272,6 +13272,20 @@ fn supervisor_launch_owner_conflict(
     if agent_harness_core::loop_health::process_alive_for_pid(process_id) != Some(true) {
         return Ok(None);
     }
+    const PROCESS_START_MATCH_TOLERANCE_MS: i64 = 5_000;
+    let recorded_process_start_time_ms = value
+        .get("processStartTimeMs")
+        .and_then(serde_json::Value::as_i64);
+    let observed_process_start_time_ms =
+        agent_harness_core::loop_health::process_start_time_ms_for_pid(process_id);
+    if recorded_process_start_time_ms
+        .zip(observed_process_start_time_ms)
+        .is_some_and(|(recorded, observed)| {
+            recorded.abs_diff(observed) > PROCESS_START_MATCH_TOLERANCE_MS as u64
+        })
+    {
+        return Ok(None);
+    }
     let supervisor_pid = value
         .get("supervisorPid")
         .and_then(serde_json::Value::as_i64);
@@ -13292,6 +13306,8 @@ fn supervisor_launch_owner_conflict(
     Ok(Some(serde_json::json!({
         "serviceFile": service_file,
         "pid": process_id,
+        "recordedProcessStartTimeMs": recorded_process_start_time_ms,
+        "observedProcessStartTimeMs": observed_process_start_time_ms,
         "supervisorPid": supervisor_pid,
         "generationId": value.get("generationId").and_then(serde_json::Value::as_str),
         "launchOwner": launch_owner,
@@ -25975,6 +25991,39 @@ mod tests {
         supervisor_launch_guard_detects_live_observed_owner();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn supervisor_launch_guard_ignores_reused_pid_from_stale_generation() {
+        let root = cli_temp_root("supervisor_launch_guard_ignores_reused_pid");
+        let harness_home = root.join(".agent-harness");
+        write_cli_supervisor_service_state(
+            &harness_home,
+            "worker-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "worker-loop",
+                "serviceKind": "worker",
+                "pid": std::process::id(),
+                "processId": std::process::id(),
+                "processStartTimeMs": 1,
+                "generationId": "stale-worker-generation",
+                "launchOwner": "windows-supervisor-runner",
+                "observedOnly": false,
+                "status": "stale",
+                "actualState": "stale",
+            }),
+        );
+
+        let conflict = supervisor_launch_owner_conflict(&harness_home, "worker-loop", None)
+            .expect("owner identity check");
+        assert!(
+            conflict.is_none(),
+            "a reused PID with a different process start time must not fence recovery"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn supervisor_reconcile_apply_receipts_refused_live_owner() {
         let root = cli_temp_root("supervisor_reconcile_apply_receipts_refused_live_owner");
@@ -26177,7 +26226,15 @@ mod tests {
             "telegram-loop-generation-2",
         );
         let _parent_pid = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_PARENT_PID", "54321");
-        let _started_at = EnvVarRestore::set("AGENT_HARNESS_SERVICE_STARTED_AT_MS", "121000");
+        let current_process_start_time_ms =
+            agent_harness_core::loop_health::process_start_time_ms_for_pid(i64::from(
+                std::process::id(),
+            ))
+            .expect("current process start identity");
+        let _started_at = EnvVarRestore::set(
+            "AGENT_HARNESS_SERVICE_STARTED_AT_MS",
+            &current_process_start_time_ms.to_string(),
+        );
         let _stop_file = EnvVarRestore::set(
             "AGENT_HARNESS_SUPERVISOR_STOP_FILE",
             &watched_stop_file.display().to_string(),
@@ -26208,7 +26265,10 @@ mod tests {
             Some("telegram-loop-generation-2")
         );
         assert_eq!(running.parent_pid, Some(54321));
-        assert_eq!(running.process_start_time_ms, Some(121000));
+        assert_eq!(
+            running.process_start_time_ms,
+            Some(current_process_start_time_ms)
+        );
         assert_eq!(running.watched_stop_file.as_ref(), Some(&watched_stop_file));
 
         let duplicate_launch =

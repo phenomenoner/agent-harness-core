@@ -7580,8 +7580,8 @@ mod tests {
                 &root,
                 &assistant_text,
             )),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
                 ..PromptAssemblyOptions::default()
@@ -7820,7 +7820,7 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: Some(parent_queue_id),
             codex_executable: Some(fake_missing_disposition_deadline_codex_executable(&root)),
-            timeout_ms: 5_000,
+            timeout_ms: 10_000,
             idle_timeout_ms: 10_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),

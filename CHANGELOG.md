@@ -20,6 +20,9 @@
 
 ### Fixed
 
+- Supervisor recovery now validates a recorded process start time before treating an alive Windows
+  PID as the same loop owner, so PID reuse by an unrelated process cannot permanently fence stale
+  service reconciliation.
 - Long Telegram and Discord finals no longer lose content when automatic rich presentation would
   exceed its bounded semantic block budget. Persisted affected outbox rows fall back to canonical
   provider-safe text chunks before rich delivery.

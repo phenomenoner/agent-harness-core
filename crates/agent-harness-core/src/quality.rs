@@ -79,7 +79,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I5",
-            statement: "crash recovery loses no work and duplicates no side effects; retry schedules, task/effect dispositions, commit-before-enqueue continuation intents, and readback-required ambiguous mutations remain reconstructable",
+            statement: "crash recovery loses no work and duplicates no side effects; retry schedules, task/effect dispositions, commit-before-enqueue continuation intents, readback-required ambiguous mutations, and supervisor process-instance fencing remain reconstructable",
             owner: "queue_shadow/supervision/runtime_worker/runtime_pipeline/goal_continuation/external_effect",
         },
         InvariantEntry {

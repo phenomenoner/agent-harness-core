@@ -108,6 +108,14 @@ pub fn process_alive_for_pid(process_id: i64) -> Option<bool> {
     process_alive_for_pid_u32(process_id)
 }
 
+pub fn process_start_time_ms_for_pid(process_id: i64) -> Option<i64> {
+    if process_id <= 0 {
+        return None;
+    }
+    let process_id = u32::try_from(process_id).ok()?;
+    process_start_time_ms_for_pid_u32(process_id)
+}
+
 #[cfg(windows)]
 fn process_alive_for_pid_u32(process_id: u32) -> Option<bool> {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
@@ -131,8 +139,45 @@ fn process_alive_for_pid_u32(process_id: u32) -> Option<bool> {
     }
 }
 
+#[cfg(windows)]
+fn process_start_time_ms_for_pid_u32(process_id: u32) -> Option<i64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if handle == 0 {
+            return None;
+        }
+        let mut created = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exited = created;
+        let mut kernel = created;
+        let mut user = created;
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+        let _ = CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        let created_100ns =
+            (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        let unix_100ns = created_100ns.checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS)?;
+        i64::try_from(unix_100ns / 10_000).ok()
+    }
+}
+
 #[cfg(not(windows))]
 fn process_alive_for_pid_u32(_process_id: u32) -> Option<bool> {
+    None
+}
+
+#[cfg(not(windows))]
+fn process_start_time_ms_for_pid_u32(_process_id: u32) -> Option<i64> {
     None
 }
 
