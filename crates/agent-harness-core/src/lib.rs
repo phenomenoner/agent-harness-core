@@ -108,6 +108,7 @@ pub mod subagents;
 pub mod supervision;
 pub mod supervisor;
 pub mod supervisor_inventory;
+pub mod task_budget;
 pub mod task_transition;
 pub mod token_efficiency;
 pub mod trace;
@@ -244,11 +245,12 @@ pub use codex_runtime::{
     CodexRuntimeLaunchProbeStatus, CodexRuntimeLaunchProcess, CodexRuntimePlan,
     CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightCheck,
     CodexRuntimePreflightCheckStatus, CodexRuntimePreflightOptions, CodexRuntimePreflightReceipt,
-    CodexRuntimePreflightReport, CodexRuntimePreflightStatus, CodexRuntimeReceipt,
-    CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
-    CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexSandboxInspection, CodexTransportPlan,
-    CodexTurnSteerQueueStatus, CodexTurnSteerRequestOptions, CodexTurnSteerRequestReport,
-    RuntimeMutationEvidenceClass, inspect_codex_approval_policy, inspect_codex_sandbox,
+    CodexRuntimePreflightReport, CodexRuntimePreflightStatus, CodexRuntimePrimaryOutcomeV1,
+    CodexRuntimeReceipt, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
+    CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexRuntimeSecondaryDiagnosticV1,
+    CodexSandboxInspection, CodexTransportPlan, CodexTurnSteerQueueStatus,
+    CodexTurnSteerRequestOptions, CodexTurnSteerRequestReport, RuntimeMutationEvidenceClass,
+    WorkAuthorityClassV1, inspect_codex_approval_policy, inspect_codex_sandbox,
     inspect_codex_sandbox_policy, load_assistant_narration_config, plan_codex_runtime,
     preflight_codex_runtime, probe_codex_runtime_launch, queue_codex_turn_steer_request,
     record_codex_runtime_completion, run_codex_runtime,
@@ -639,19 +641,21 @@ pub use runtime_terminal::{
     RuntimeTerminalDispositionV1,
 };
 pub use runtime_worker::{
-    RuntimeDispatchClassConfig, RuntimeDispatchConfig, RuntimeExecutionReceipt,
-    RuntimeExecutionReceiptStatus, RuntimeQueueCapacityOptions, RuntimeQueueCapacityReport,
-    RuntimeQueueClassCapacity, RuntimeQueueLeaseObservationOptions,
-    RuntimeQueueLeaseObservationReceipt, RuntimeQueueLeaseObservationStatus,
-    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
-    RuntimeQueueReceiptCompactionOptions, RuntimeQueueReceiptCompactionReport,
-    RuntimeQueueReceiptCompactionStatus, RuntimeQueueTypingContext,
-    RuntimeSessionIdentityCollisionGroup, RuntimeSessionIdentityInventoryEntry,
-    RuntimeSessionIdentityInventoryReport, RuntimeSessionIdentityInventorySource,
-    RuntimeSessionIdentityInventoryStatus, compact_runtime_queue_receipts_if_needed,
+    QueueTerminalControl, QueueTerminalControlMatch, RuntimeDispatchClassConfig,
+    RuntimeDispatchConfig, RuntimeExecutionReceipt, RuntimeExecutionReceiptStatus,
+    RuntimeQueueCapacityOptions, RuntimeQueueCapacityReport, RuntimeQueueClassCapacity,
+    RuntimeQueueLeaseObservationOptions, RuntimeQueueLeaseObservationReceipt,
+    RuntimeQueueLeaseObservationStatus, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
+    RuntimeQueuePreparedItem, RuntimeQueueReceiptCompactionOptions,
+    RuntimeQueueReceiptCompactionReport, RuntimeQueueReceiptCompactionStatus,
+    RuntimeQueueTypingContext, RuntimeSessionIdentityCollisionGroup,
+    RuntimeSessionIdentityInventoryEntry, RuntimeSessionIdentityInventoryReport,
+    RuntimeSessionIdentityInventorySource, RuntimeSessionIdentityInventoryStatus,
+    TerminalControlSource, compact_runtime_queue_receipts_if_needed,
     inspect_runtime_queue_capacity, inspect_runtime_session_identity, load_runtime_dispatch_config,
     observe_runtime_queue_lease, prepare_runtime_queue_item, release_runtime_queue_lease,
-    resolve_runtime_queue_terminal_ids, resolve_runtime_queue_terminal_ids_nonblocking,
+    resolve_queue_terminal_control_nonblocking, resolve_runtime_queue_terminal_ids,
+    resolve_runtime_queue_terminal_ids_nonblocking,
     resolve_runtime_queue_typing_context_nonblocking, write_runtime_queue_quarantine_marker,
 };
 pub use security::{SecurityScanOptions, SecurityScanReport, scan_security_boundaries};
@@ -792,12 +796,24 @@ pub use supervisor_inventory::{
     SupervisorInventoryServiceSummary, SupervisorInventoryStatus, SupervisorLaunchCommand,
     reconcile_supervisor_inventory,
 };
+pub use task_budget::{
+    DEFAULT_MAX_DISPOSITION_RECOVERY, DEFAULT_MAX_NO_PROGRESS_SLICES, DEFAULT_MAX_RECOVERY_SLICES,
+    DEFAULT_MAX_TASK_SLICES, DEFAULT_MAX_TASK_TOKENS, DEFAULT_TASK_WALL_CLOCK_BUDGET_MS,
+    TASK_BUDGET_LEDGER_SCHEMA, TaskBudgetSliceV1, TaskBudgetStatusV1, record_task_budget_slice,
+    task_budget_status,
+};
 pub use task_transition::{
-    ContinuationAuthorityKindV1, ContinuationAuthoritySnapshotV1, DrainDispositionV1,
-    OperationPlanAuthorityOptions, TASK_CONTINUATION_CHECKPOINT_SCHEMA,
-    TASK_CONTINUATION_MARKER_CLOSE, TASK_CONTINUATION_MARKER_OPEN, TASK_TRANSITION_SCHEMA,
-    TaskContinuationBreakers, TaskContinuationCheckpointV1, TaskDrainEvaluationV1,
-    evaluate_operation_plan_drain, extract_task_continuation_checkpoint, logical_complete_drain,
+    ContinuationAuthorityKindV1, ContinuationAuthoritySnapshotV1, DRAIN_DISPOSITION_MARKER_CLOSE,
+    DRAIN_DISPOSITION_MARKER_OPEN, DRAIN_DISPOSITION_SCHEMA, DrainDispositionCaptureV1,
+    DrainDispositionKindV1, DrainDispositionMarkerV1, DrainDispositionV1,
+    ExplicitCheckpointAuthorityOptions, OperationPlanAuthorityOptions,
+    TASK_CONTINUATION_CHECKPOINT_SCHEMA, TASK_CONTINUATION_MARKER_CLOSE,
+    TASK_CONTINUATION_MARKER_OPEN, TASK_FAMILY_SCHEMA, TASK_TRANSITION_SCHEMA,
+    TaskContinuationBreakers, TaskContinuationCheckpointV1, TaskDrainEvaluationV1, TaskFamilyV1,
+    drain_marker_checkpoint, ensure_task_family, evaluate_explicit_checkpoint_drain,
+    evaluate_operation_plan_drain, extract_drain_disposition_marker,
+    extract_task_continuation_checkpoint, find_task_family_for_root_queue, logical_complete_drain,
+    task_family_checksum,
 };
 pub use token_efficiency::{
     PromptReductionOptions, PromptReductionReport, TokenEfficiencyOptions, TokenEfficiencyReport,

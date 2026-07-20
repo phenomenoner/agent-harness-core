@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -51,6 +52,7 @@ const RUNTIME_QUEUE_LEASE_RECONCILIATION_SCHEMA: &str =
     "agent-harness.runtime-queue-lease-reconciliation.v1";
 const RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA: &str =
     "agent-harness.runtime-queue-lease-observation.v1";
+const RUNTIME_QUEUE_LEASE_RENEWAL_SCHEMA: &str = "agent-harness.runtime-queue-lease-renewal.v1";
 const RUNTIME_QUEUE_STATE_INDEX_SCHEMA: &str = "agent-harness.runtime-queue-state-index.v1";
 const RUNTIME_QUEUE_STATE_INDEX_REVISION: u32 = 4;
 const RUNTIME_QUEUE_RECEIPT_COMPACTION_SCHEMA: &str =
@@ -68,10 +70,14 @@ const RUNTIME_QUEUE_RECEIPT_COMPACTION_RETRY_INTERVAL_MS: i64 = 5 * 60 * 1000;
 const RUNTIME_QUEUE_QUARANTINE_SCHEMA: &str = "agent-harness.runtime-queue-quarantine.v1";
 const TERMINAL_CONTROL_SUPPRESSION_REASON: &str = "terminal-control-present";
 const RUNTIME_LOOP_SERVICE_ID: &str = "runtime-loop";
+static RUNTIME_LOOP_PROCESS_STARTED_AT_MS: OnceLock<i64> = OnceLock::new();
 const DEFAULT_RUNTIME_LEASE_MS: i64 = 30 * 60 * 1000;
 const RUNTIME_LEASE_ACQUIRE_LOCK_RETRY_MS: u64 = 2_000;
 const RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS: u64 = 2_000;
 const RUNTIME_LEASE_RELEASE_LOCK_RETRY_SLEEP_MS: u64 = 25;
+const RUNTIME_LEASE_RENEW_AHEAD_MS: i64 = 10 * 60 * 1000;
+const RUNTIME_LEASE_SAFETY_MARGIN_MS: i64 = 3 * 60 * 1000;
+const RUNTIME_LEASE_BUSY_RETRY_INTERVAL_MS: i64 = 5 * 1000;
 #[cfg(not(windows))]
 const RUNTIME_LEASE_LOCK_STALE_MS: i64 = 30_000;
 
@@ -555,6 +561,98 @@ struct RuntimeQueueLeaseOwnerEnvelope {
     #[serde(alias = "processStartTime")]
     process_start_time_ms: i64,
     acquired_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeQueueLeaseGuard {
+    harness_home: PathBuf,
+    queue_id: String,
+    runtime_class: String,
+    canonical_lane_digest: String,
+    owner: RuntimeQueueLeaseOwnerEnvelope,
+    proven_expires_at_ms: i64,
+    next_renewal_check_at_ms: i64,
+    lost: bool,
+}
+
+impl RuntimeQueueLeaseGuard {
+    pub(crate) fn safety_margin_ms(&self) -> i64 {
+        RUNTIME_LEASE_SAFETY_MARGIN_MS
+    }
+
+    pub(crate) fn heartbeat_due(&self, observed_at_ms: i64) -> bool {
+        !self.lost && observed_at_ms >= self.next_renewal_check_at_ms
+    }
+
+    pub(crate) fn has_pending_exact_lane_work(&self) -> io::Result<bool> {
+        let queue_dir = self.harness_home.join("state").join("runtime-queue");
+        let mut warnings = Vec::new();
+        let values = read_queued_pending_values_from_index(&queue_dir, &mut warnings)?;
+        if !warnings.is_empty() {
+            return Err(io::Error::other(format!(
+                "pending exact-lane work could not be proven: {}",
+                warnings.join("; ")
+            )));
+        }
+        for value in values {
+            let Ok(item) = parse_pending_item(&value) else {
+                continue;
+            };
+            if item.queue_id == self.queue_id {
+                continue;
+            }
+            let Some(class_config) = default_runtime_class_config_for_item(&item) else {
+                continue;
+            };
+            let Some(lane_key) = item_session_lane_key(&item, &class_config) else {
+                continue;
+            };
+            let digest = format!("{:016x}", runtime_queue_bytes_digest(lane_key.as_bytes()));
+            if digest == self.canonical_lane_digest {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum RuntimeQueueLeaseRenewalStatus {
+    Applied,
+    NotRequired,
+    BusyRetryable,
+    Rejected,
+    Lost,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeQueueLeaseRenewalReceipt {
+    pub schema: &'static str,
+    pub at_ms: i64,
+    pub renewal_id: String,
+    pub queue_id: String,
+    pub runtime_class: String,
+    pub owner_generation_digest: String,
+    pub canonical_lane_digest: String,
+    pub previous_expires_at_ms: Option<i64>,
+    pub required_through_at_ms: i64,
+    pub renewed_expires_at_ms: Option<i64>,
+    pub status: RuntimeQueueLeaseRenewalStatus,
+    pub reason_code: String,
+}
+
+impl RuntimeQueueLeaseRenewalReceipt {
+    pub(crate) fn keeps_ownership(&self) -> bool {
+        matches!(
+            self.status,
+            RuntimeQueueLeaseRenewalStatus::Applied
+                | RuntimeQueueLeaseRenewalStatus::NotRequired
+                | RuntimeQueueLeaseRenewalStatus::BusyRetryable
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2899,6 +2997,343 @@ pub fn release_runtime_queue_lease(
     Ok(())
 }
 
+pub(crate) fn renew_runtime_queue_lease(
+    guard: &mut RuntimeQueueLeaseGuard,
+    observed_at_ms: i64,
+    required_through_at_ms: i64,
+) -> RuntimeQueueLeaseRenewalReceipt {
+    let owner_generation_digest = runtime_queue_lease_owner_digest(&guard.owner);
+    let renewal_id = runtime_queue_lease_renewal_id(
+        guard,
+        observed_at_ms,
+        required_through_at_ms,
+        &owner_generation_digest,
+    );
+    let mut receipt = RuntimeQueueLeaseRenewalReceipt {
+        schema: RUNTIME_QUEUE_LEASE_RENEWAL_SCHEMA,
+        at_ms: observed_at_ms,
+        renewal_id,
+        queue_id: guard.queue_id.clone(),
+        runtime_class: guard.runtime_class.clone(),
+        owner_generation_digest,
+        canonical_lane_digest: guard.canonical_lane_digest.clone(),
+        previous_expires_at_ms: Some(guard.proven_expires_at_ms),
+        required_through_at_ms,
+        renewed_expires_at_ms: None,
+        status: RuntimeQueueLeaseRenewalStatus::Failed,
+        reason_code: "lease-renewal-failed".to_string(),
+    };
+    if guard.lost {
+        receipt.status = RuntimeQueueLeaseRenewalStatus::Lost;
+        receipt.reason_code = "guard-already-lost".to_string();
+        let _ = append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt);
+        return receipt;
+    }
+    if observed_at_ms < 0
+        || required_through_at_ms < observed_at_ms
+        || required_through_at_ms > observed_at_ms.saturating_add(DEFAULT_RUNTIME_LEASE_MS)
+    {
+        receipt.status = RuntimeQueueLeaseRenewalStatus::Rejected;
+        receipt.reason_code = "invalid-or-unbounded-required-through".to_string();
+        let _ = append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt);
+        return receipt;
+    }
+    if observed_at_ms < guard.next_renewal_check_at_ms
+        && required_through_at_ms <= guard.proven_expires_at_ms
+    {
+        receipt.status = RuntimeQueueLeaseRenewalStatus::NotRequired;
+        receipt.renewed_expires_at_ms = Some(guard.proven_expires_at_ms);
+        receipt.reason_code = "lease-coverage-already-sufficient".to_string();
+        let _ = append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt);
+        return receipt;
+    }
+
+    let queue_dir = guard.harness_home.join("state").join("runtime-queue");
+    let lease_lock = match acquire_runtime_queue_lease_lock_with_retry(
+        &queue_dir,
+        &guard.runtime_class,
+        Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+    ) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            guard.next_renewal_check_at_ms =
+                observed_at_ms.saturating_add(RUNTIME_LEASE_BUSY_RETRY_INTERVAL_MS);
+            if guard.proven_expires_at_ms
+                <= observed_at_ms.saturating_add(RUNTIME_LEASE_SAFETY_MARGIN_MS)
+            {
+                guard.lost = true;
+                receipt.status = RuntimeQueueLeaseRenewalStatus::Lost;
+                receipt.reason_code = "lease-lock-busy-inside-safety-margin".to_string();
+            } else {
+                receipt.status = RuntimeQueueLeaseRenewalStatus::BusyRetryable;
+                receipt.renewed_expires_at_ms = Some(guard.proven_expires_at_ms);
+                receipt.reason_code = "lease-lock-busy-retryable".to_string();
+            }
+            let _ = append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt);
+            return receipt;
+        }
+        Err(error) => {
+            guard.lost = true;
+            receipt.status = RuntimeQueueLeaseRenewalStatus::Failed;
+            receipt.reason_code = format!("lease-lock-error-{}", error.kind());
+            let _ = append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt);
+            return receipt;
+        }
+    };
+    let mut state = match read_runtime_queue_leases_strict(&queue_dir, &guard.runtime_class) {
+        Ok(state) => state,
+        Err(error) => {
+            drop(lease_lock);
+            guard.lost = true;
+            receipt.status = RuntimeQueueLeaseRenewalStatus::Failed;
+            receipt.reason_code = format!("lease-state-read-error-{}", error.kind());
+            let _ = append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt);
+            return receipt;
+        }
+    };
+    let Some(lease) = state.leases.get_mut(&guard.queue_id) else {
+        drop(lease_lock);
+        guard.lost = true;
+        receipt.status = RuntimeQueueLeaseRenewalStatus::Lost;
+        receipt.reason_code = "lease-missing".to_string();
+        let _ = append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt);
+        return receipt;
+    };
+    receipt.previous_expires_at_ms = Some(lease.lease_expires_at_ms);
+    if lease.lease_expires_at_ms <= observed_at_ms {
+        drop(lease_lock);
+        guard.lost = true;
+        receipt.status = RuntimeQueueLeaseRenewalStatus::Lost;
+        receipt.reason_code = "lease-expired-no-resurrection".to_string();
+        let _ = append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt);
+        return receipt;
+    }
+    let owner_matches = matches!(
+        &lease.owner,
+        RuntimeQueueLeaseOwner::Envelope(owner)
+            if runtime_queue_lease_owner_identity_matches(owner, &guard.owner)
+    );
+    let lane_digest = runtime_queue_lease_canonical_lane_digest(lease);
+    if !owner_matches
+        || lease.runtime_class != guard.runtime_class
+        || lane_digest.as_deref() != Some(guard.canonical_lane_digest.as_str())
+    {
+        drop(lease_lock);
+        guard.lost = true;
+        receipt.status = RuntimeQueueLeaseRenewalStatus::Lost;
+        receipt.reason_code = "lease-owner-or-lane-mismatch".to_string();
+        let _ = append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt);
+        return receipt;
+    }
+    if matches!(
+        resolve_queue_terminal_control(
+            &guard.harness_home,
+            &guard.queue_id,
+            Some(lease.session_key.as_str()),
+        ),
+        Ok(QueueTerminalControl::Terminal(_))
+    ) {
+        drop(lease_lock);
+        guard.lost = true;
+        receipt.status = RuntimeQueueLeaseRenewalStatus::Lost;
+        receipt.reason_code = "terminal-control-present".to_string();
+        let _ = append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt);
+        return receipt;
+    }
+
+    let renewed_expires_at_ms = lease
+        .lease_expires_at_ms
+        .max(observed_at_ms.saturating_add(DEFAULT_RUNTIME_LEASE_MS))
+        .max(required_through_at_ms);
+    lease.lease_expires_at_ms = renewed_expires_at_ms;
+    if let Err(error) = write_runtime_queue_leases(&queue_dir, &guard.runtime_class, &state) {
+        drop(lease_lock);
+        guard.lost = true;
+        receipt.status = RuntimeQueueLeaseRenewalStatus::Failed;
+        receipt.reason_code = format!("lease-state-write-error-{}", error.kind());
+        let _ = append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt);
+        return receipt;
+    }
+    drop(lease_lock);
+    guard.proven_expires_at_ms = renewed_expires_at_ms;
+    guard.next_renewal_check_at_ms = renewed_expires_at_ms
+        .saturating_sub(RUNTIME_LEASE_RENEW_AHEAD_MS)
+        .max(observed_at_ms.saturating_add(RUNTIME_LEASE_BUSY_RETRY_INTERVAL_MS));
+    receipt.status = RuntimeQueueLeaseRenewalStatus::Applied;
+    receipt.renewed_expires_at_ms = Some(renewed_expires_at_ms);
+    receipt.reason_code = "owner-generation-fenced-renewal-applied".to_string();
+    if append_runtime_queue_lease_renewal_receipt(&guard.harness_home, &receipt).is_err() {
+        guard.lost = true;
+        receipt.status = RuntimeQueueLeaseRenewalStatus::Failed;
+        receipt.reason_code = "lease-renewal-receipt-write-failed".to_string();
+    }
+    receipt
+}
+
+fn append_runtime_queue_lease_renewal_receipt(
+    harness_home: &Path,
+    receipt: &RuntimeQueueLeaseRenewalReceipt,
+) -> io::Result<()> {
+    append_json_line(
+        &harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("lease-renewal-receipts.jsonl"),
+        receipt,
+    )
+}
+
+pub(crate) fn capture_runtime_queue_lease_guard(
+    harness_home: &Path,
+    queue_id: &str,
+    observed_at_ms: i64,
+) -> io::Result<Option<RuntimeQueueLeaseGuard>> {
+    if queue_id.trim().is_empty() || observed_at_ms < 0 {
+        return Ok(None);
+    }
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let mut found = None;
+    for runtime_class in runtime_classes_for_observation(&queue_dir)? {
+        let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
+            &queue_dir,
+            &runtime_class,
+            Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+        )?
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("runtime queue lease lock is busy for class `{runtime_class}`"),
+            ));
+        };
+        let state = read_runtime_queue_leases_strict(&queue_dir, &runtime_class)?;
+        let Some(lease) = state.leases.get(queue_id) else {
+            continue;
+        };
+        if found.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "queue lease appears in more than one runtime class",
+            ));
+        }
+        if lease.lease_expires_at_ms <= observed_at_ms {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "runtime queue lease expired before guard capture",
+            ));
+        }
+        let RuntimeQueueLeaseOwner::Envelope(owner) = &lease.owner else {
+            return Ok(None);
+        };
+        let RuntimeQueueLeaseOwner::Envelope(current_owner) =
+            runtime_queue_lease_owner_from_env(observed_at_ms)
+        else {
+            return Ok(None);
+        };
+        if !runtime_queue_lease_owner_process_matches(owner, &current_owner) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "runtime queue lease belongs to a different process generation",
+            ));
+        }
+        let Some(canonical_lane_digest) = runtime_queue_lease_canonical_lane_digest(lease) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "runtime queue lease has no canonical lane identity",
+            ));
+        };
+        found = Some(RuntimeQueueLeaseGuard {
+            harness_home: harness_home.to_path_buf(),
+            queue_id: queue_id.to_string(),
+            runtime_class: runtime_class.clone(),
+            canonical_lane_digest,
+            owner: owner.clone(),
+            proven_expires_at_ms: lease.lease_expires_at_ms,
+            next_renewal_check_at_ms: lease
+                .lease_expires_at_ms
+                .saturating_sub(RUNTIME_LEASE_RENEW_AHEAD_MS),
+            lost: false,
+        });
+    }
+    Ok(found)
+}
+
+fn runtime_queue_lease_owner_process_matches(
+    left: &RuntimeQueueLeaseOwnerEnvelope,
+    right: &RuntimeQueueLeaseOwnerEnvelope,
+) -> bool {
+    left.service_id == right.service_id
+        && left.generation_id == right.generation_id
+        && left.pid == right.pid
+        && left.process_start_time_ms == right.process_start_time_ms
+}
+
+fn runtime_queue_lease_owner_identity_matches(
+    left: &RuntimeQueueLeaseOwnerEnvelope,
+    right: &RuntimeQueueLeaseOwnerEnvelope,
+) -> bool {
+    runtime_queue_lease_owner_process_matches(left, right)
+        && left.kind == right.kind
+        && left.acquired_at_ms == right.acquired_at_ms
+}
+
+fn runtime_queue_lease_canonical_lane_digest(lease: &RuntimeQueueLease) -> Option<String> {
+    // Lease renewal identity applies to every runtime class.  Do not reuse
+    // `lease_session_lane_key`: it intentionally excludes non-interactive
+    // classes because it answers the narrower FIFO-scheduling question.
+    let lane_key = lease
+        .session_lane_key
+        .as_ref()
+        .filter(|key| key.starts_with("v2:"))
+        .cloned()
+        .unwrap_or_else(|| {
+            runtime_session_lane_key(
+                &lease.runtime_class,
+                &lease.agent_id,
+                &lease.platform,
+                lease.account_id.as_deref(),
+                &lease.channel_id,
+                lease.user_id.as_deref().unwrap_or(""),
+                &lease.session_key,
+            )
+        });
+    Some(format!(
+        "{:016x}",
+        runtime_queue_bytes_digest(lane_key.as_bytes())
+    ))
+}
+
+fn runtime_queue_lease_owner_digest(owner: &RuntimeQueueLeaseOwnerEnvelope) -> String {
+    let bytes = serde_json::to_vec(&(
+        owner.kind.as_str(),
+        owner.service_id.as_str(),
+        owner.generation_id.as_str(),
+        owner.pid,
+        owner.process_start_time_ms,
+        owner.acquired_at_ms,
+    ))
+    .unwrap_or_default();
+    crate::task_transition::sha256_hex(&bytes)
+}
+
+fn runtime_queue_lease_renewal_id(
+    guard: &RuntimeQueueLeaseGuard,
+    observed_at_ms: i64,
+    required_through_at_ms: i64,
+    owner_generation_digest: &str,
+) -> String {
+    crate::task_transition::sha256_hex(
+        format!(
+            "{}\0{}\0{}\0{}\0{}",
+            guard.queue_id,
+            guard.runtime_class,
+            owner_generation_digest,
+            observed_at_ms,
+            required_through_at_ms
+        )
+        .as_bytes(),
+    )
+}
+
 /// Observes one exact runtime queue lease under every known runtime-class
 /// lease lock. This API never converts malformed, unreadable, or lock-busy
 /// state into `Released`; all such cases fail closed as `Unknown`.
@@ -3460,6 +3895,31 @@ pub fn resolve_queue_terminal_control(
         terminal_disposition,
         continuation_link,
     }))
+}
+
+/// Resolves live terminal control for an exact queue without waiting behind a
+/// receipt-index maintenance transaction. Marker-backed controls remain
+/// authoritative even when the hot receipt index is momentarily busy. Cold
+/// compacted history is intentionally omitted because this path is used only
+/// to interrupt a queue item already owned by the current runtime process.
+pub fn resolve_queue_terminal_control_nonblocking(
+    harness_home: impl AsRef<Path>,
+    queue_id: &str,
+    session_key: Option<&str>,
+) -> io::Result<QueueTerminalControl> {
+    let queue_dir = harness_home.as_ref().join("state").join("runtime-queue");
+    let mut warnings = Vec::new();
+    let index = match refresh_runtime_queue_state_index_nonblocking(&queue_dir, &mut warnings) {
+        Ok(index) => Some(index),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+        Err(error) => return Err(error),
+    };
+    resolve_queue_terminal_control_from_index(
+        &queue_dir,
+        queue_id,
+        session_key,
+        index.as_ref().and_then(|index| index.queues.get(queue_id)),
+    )
 }
 
 fn cold_terminal_history_reasons(
@@ -5359,7 +5819,8 @@ impl RuntimeQueueLeaseOwner {
 
 fn runtime_queue_lease_owner_from_env(now_ms: i64) -> RuntimeQueueLeaseOwner {
     let generation_id = nonempty_env("AGENT_HARNESS_SERVICE_GENERATION_ID");
-    let process_start_time_ms = env_i64("AGENT_HARNESS_SERVICE_STARTED_AT_MS");
+    let process_start_time_ms = env_i64("AGENT_HARNESS_SERVICE_STARTED_AT_MS")
+        .or_else(|| Some(*RUNTIME_LOOP_PROCESS_STARTED_AT_MS.get_or_init(|| now_ms.max(1))));
     let launch_owner = nonempty_env("AGENT_HARNESS_SUPERVISOR_LAUNCH_OWNER");
     runtime_queue_lease_owner_from_metadata(
         now_ms,
@@ -5564,7 +6025,11 @@ fn runtime_session_lane_key(
 fn default_runtime_class_config_for_item(
     item: &PendingQueueItem,
 ) -> Option<RuntimeDispatchClassConfig> {
-    Some(match item.runtime_class.as_str() {
+    Some(default_runtime_class_config(&item.runtime_class))
+}
+
+fn default_runtime_class_config(runtime_class: &str) -> RuntimeDispatchClassConfig {
+    match runtime_class {
         "interactive" => RuntimeDispatchClassConfig {
             max_active: usize::MAX,
             per_agent_max_active: usize::MAX,
@@ -5585,7 +6050,7 @@ fn default_runtime_class_config_for_item(
             per_job_max_active: usize::MAX,
             max_queued_per_agent: usize::MAX,
         },
-    })
+    }
 }
 
 fn is_interactive_channel_main_lane(
@@ -6857,6 +7322,22 @@ fn continuation_metadata_from_value(value: &Value) -> RuntimeContinuationMetadat
         campaign_slice_generation: value
             .get("campaignSliceGeneration")
             .or_else(|| value.get("campaign_slice_generation"))
+            .and_then(Value::as_u64),
+        task_family_id: string_field(value, &["taskFamilyId", "task_family_id"])
+            .map(ToString::to_string),
+        task_family_version: value
+            .get("taskFamilyVersion")
+            .or_else(|| value.get("task_family_version"))
+            .and_then(Value::as_u64),
+        task_root_queue_id: string_field(value, &["taskRootQueueId", "task_root_queue_id"])
+            .map(ToString::to_string),
+        task_slice_generation: value
+            .get("taskSliceGeneration")
+            .or_else(|| value.get("task_slice_generation"))
+            .and_then(Value::as_u64),
+        disposition_recovery_depth: value
+            .get("dispositionRecoveryDepth")
+            .or_else(|| value.get("disposition_recovery_depth"))
             .and_then(Value::as_u64),
         continuation_intent_key: string_field(
             value,
@@ -8517,6 +8998,222 @@ mod tests {
             serde_json::to_value(legacy).unwrap(),
             Value::String("pid:0".to_string())
         );
+    }
+
+    #[test]
+    fn runtime_queue_lease_renewal_is_owner_generation_fenced() {
+        let root = temp_root("runtime_queue_lease_renewal_is_owner_generation_fenced");
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let observed_at_ms = 1_000_000;
+        let owner = RuntimeQueueLeaseOwnerEnvelope {
+            kind: "process".to_string(),
+            service_id: RUNTIME_LOOP_SERVICE_ID.to_string(),
+            generation_id: "generation-a".to_string(),
+            pid: i64::from(std::process::id()),
+            process_start_time_ms: 900_000,
+            acquired_at_ms: observed_at_ms,
+        };
+        let session_lane_key =
+            "v2:interactive:main:discord:default:channel:user:session".to_string();
+        let lease = RuntimeQueueLease {
+            queue_id: "queue-a".to_string(),
+            agent_id: "main".to_string(),
+            runtime_class: "interactive".to_string(),
+            origin: "channel".to_string(),
+            cron_run_id: None,
+            platform: "discord".to_string(),
+            account_id: Some("default".to_string()),
+            channel_id: "channel".to_string(),
+            user_id: Some("user".to_string()),
+            session_key: "discord:channel:user:main".to_string(),
+            virtual_session_id: Some("virtual-session".to_string()),
+            session_lane_key: Some(session_lane_key.clone()),
+            owner: RuntimeQueueLeaseOwner::Envelope(owner.clone()),
+            started_at_ms: observed_at_ms,
+            lease_expires_at_ms: observed_at_ms + DEFAULT_RUNTIME_LEASE_MS,
+        };
+        let state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::from([("queue-a".to_string(), lease.clone())]),
+        };
+        write_runtime_queue_leases(&queue_dir, "interactive", &state).unwrap();
+        let mut guard = RuntimeQueueLeaseGuard {
+            harness_home: root.clone(),
+            queue_id: "queue-a".to_string(),
+            runtime_class: "interactive".to_string(),
+            canonical_lane_digest: format!(
+                "{:016x}",
+                runtime_queue_bytes_digest(session_lane_key.as_bytes())
+            ),
+            owner,
+            proven_expires_at_ms: lease.lease_expires_at_ms,
+            next_renewal_check_at_ms: observed_at_ms,
+            lost: false,
+        };
+        let required_through_at_ms = lease.lease_expires_at_ms + 15 * 60 * 1000;
+
+        let receipt = renew_runtime_queue_lease(
+            &mut guard,
+            observed_at_ms + 20 * 60 * 1000,
+            required_through_at_ms,
+        );
+
+        assert_eq!(
+            receipt.status,
+            RuntimeQueueLeaseRenewalStatus::Applied,
+            "I3/I13 T3 fail-first: the exact live owner must extend queue ownership before a productive deadline renewal"
+        );
+        let renewed = read_runtime_queue_leases_strict(&queue_dir, "interactive").unwrap();
+        assert!(renewed.leases["queue-a"].lease_expires_at_ms >= required_through_at_ms);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_queue_lease_guard_captures_non_interactive_exact_lane_identity() {
+        let root = temp_root("runtime_queue_lease_guard_non_interactive");
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let observed_at_ms = current_log_time_ms().unwrap();
+        let owner = match runtime_queue_lease_owner_from_env(observed_at_ms) {
+            RuntimeQueueLeaseOwner::Envelope(owner) => owner,
+            RuntimeQueueLeaseOwner::Legacy(_) => unreachable!("current owner must be enveloped"),
+        };
+        let lease = RuntimeQueueLease {
+            queue_id: "queue-worker".to_string(),
+            agent_id: "worker-7".to_string(),
+            runtime_class: "agent".to_string(),
+            origin: "agent".to_string(),
+            cron_run_id: None,
+            platform: "discord".to_string(),
+            account_id: Some("default".to_string()),
+            channel_id: "channel".to_string(),
+            user_id: Some("user".to_string()),
+            session_key: "discord:channel:user:worker-7".to_string(),
+            virtual_session_id: Some("virtual-worker".to_string()),
+            session_lane_key: None,
+            owner: RuntimeQueueLeaseOwner::Envelope(owner),
+            started_at_ms: observed_at_ms,
+            lease_expires_at_ms: observed_at_ms + DEFAULT_RUNTIME_LEASE_MS,
+        };
+        write_runtime_queue_leases(
+            &queue_dir,
+            "agent",
+            &RuntimeQueueLeaseState {
+                schema: runtime_queue_leases_schema(),
+                leases: BTreeMap::from([("queue-worker".to_string(), lease.clone())]),
+            },
+        )
+        .unwrap();
+
+        let guard = capture_runtime_queue_lease_guard(&root, "queue-worker", observed_at_ms)
+            .unwrap()
+            .expect("all leased runtime classes need an exact renewal identity");
+        let expected_lane = runtime_session_lane_key(
+            &lease.runtime_class,
+            &lease.agent_id,
+            &lease.platform,
+            lease.account_id.as_deref(),
+            &lease.channel_id,
+            lease.user_id.as_deref().unwrap_or(""),
+            &lease.session_key,
+        );
+        assert_eq!(
+            guard.canonical_lane_digest,
+            format!(
+                "{:016x}",
+                runtime_queue_bytes_digest(expected_lane.as_bytes())
+            )
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_queue_lease_renewal_never_resurrects_or_crosses_owner_generation() {
+        for (case, expected_reason) in [
+            ("missing", "lease-missing"),
+            ("expired", "lease-expired-no-resurrection"),
+            ("wrong-owner", "lease-owner-or-lane-mismatch"),
+        ] {
+            let root = temp_root(&format!("runtime_queue_lease_renewal_{case}"));
+            let queue_dir = root.join("state").join("runtime-queue");
+            fs::create_dir_all(&queue_dir).unwrap();
+            let observed_at_ms = 1_000_000;
+            let owner = RuntimeQueueLeaseOwnerEnvelope {
+                kind: "process".to_string(),
+                service_id: RUNTIME_LOOP_SERVICE_ID.to_string(),
+                generation_id: "generation-a".to_string(),
+                pid: i64::from(std::process::id()),
+                process_start_time_ms: 900_000,
+                acquired_at_ms: 990_000,
+            };
+            let session_lane_key =
+                "v2:interactive:main:discord:default:channel:user:session".to_string();
+            let canonical_lane_digest = format!(
+                "{:016x}",
+                runtime_queue_bytes_digest(session_lane_key.as_bytes())
+            );
+            let mut lease = RuntimeQueueLease {
+                queue_id: "queue-a".to_string(),
+                agent_id: "main".to_string(),
+                runtime_class: "interactive".to_string(),
+                origin: "channel".to_string(),
+                cron_run_id: None,
+                platform: "discord".to_string(),
+                account_id: Some("default".to_string()),
+                channel_id: "channel".to_string(),
+                user_id: Some("user".to_string()),
+                session_key: "discord:channel:user:main".to_string(),
+                virtual_session_id: Some("virtual-session".to_string()),
+                session_lane_key: Some(session_lane_key),
+                owner: RuntimeQueueLeaseOwner::Envelope(owner.clone()),
+                started_at_ms: 990_000,
+                lease_expires_at_ms: observed_at_ms + 10_000,
+            };
+            if case == "expired" {
+                lease.lease_expires_at_ms = observed_at_ms - 1;
+            } else if case == "wrong-owner" {
+                let mut other = owner.clone();
+                other.generation_id = "generation-b".to_string();
+                lease.owner = RuntimeQueueLeaseOwner::Envelope(other);
+            }
+            let original_expiry = lease.lease_expires_at_ms;
+            let leases = if case == "missing" {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([("queue-a".to_string(), lease)])
+            };
+            write_runtime_queue_leases(
+                &queue_dir,
+                "interactive",
+                &RuntimeQueueLeaseState {
+                    schema: runtime_queue_leases_schema(),
+                    leases,
+                },
+            )
+            .unwrap();
+            let mut guard = RuntimeQueueLeaseGuard {
+                harness_home: root.clone(),
+                queue_id: "queue-a".to_string(),
+                runtime_class: "interactive".to_string(),
+                canonical_lane_digest,
+                owner,
+                proven_expires_at_ms: observed_at_ms + 10_000,
+                next_renewal_check_at_ms: observed_at_ms,
+                lost: false,
+            };
+            let receipt =
+                renew_runtime_queue_lease(&mut guard, observed_at_ms, observed_at_ms + 5_000);
+            assert_eq!(receipt.status, RuntimeQueueLeaseRenewalStatus::Lost);
+            assert_eq!(receipt.reason_code, expected_reason);
+            let state = read_runtime_queue_leases_strict(&queue_dir, "interactive").unwrap();
+            if case == "missing" {
+                assert!(state.leases.is_empty());
+            } else {
+                assert_eq!(state.leases["queue-a"].lease_expires_at_ms, original_expiry);
+            }
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -10453,6 +11150,35 @@ mod tests {
         assert!(report.receipt.reason.contains("terminal control"));
         let leases = read_runtime_queue_leases(&queue_dir, "interactive", &mut Vec::new()).unwrap();
         assert!(!leases.leases.contains_key(&queue_id));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nonblocking_terminal_control_observes_active_queue_scoped_stop() {
+        let root = temp_root("nonblocking_terminal_control_observes_active_queue_scoped_stop");
+        let harness_home = root.join(".agent-harness");
+        record_scoped_stop(ScopedStopOptions {
+            harness_home: harness_home.clone(),
+            target: ScopedStopTarget::QueueItem {
+                queue_id: "queue-active".to_string(),
+            },
+            reason: "operator stop".to_string(),
+            now_ms: 10,
+        })
+        .unwrap();
+
+        let control =
+            resolve_queue_terminal_control_nonblocking(&harness_home, "queue-active", None)
+                .unwrap();
+        let QueueTerminalControl::Terminal(control) = control else {
+            panic!("scoped stop must be visible to the active runtime-loop watchdog");
+        };
+        assert_eq!(control.source, TerminalControlSource::ScopedStop);
+        assert_eq!(
+            control.terminal_disposition,
+            Some(crate::RuntimeTerminalDispositionV1::LogicalCanceled)
+        );
 
         let _ = fs::remove_dir_all(root);
     }

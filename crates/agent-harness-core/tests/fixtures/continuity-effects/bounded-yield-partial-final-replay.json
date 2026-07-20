@@ -1,0 +1,28 @@
+{
+  "schema": "agent-harness.continuity-effects.bounded-yield-partial-final-replay.v1",
+  "authority": {
+    "preparedClass": "ordinary-task-family",
+    "streamedGoalProjection": "active",
+    "durableGoalCampaignBound": false,
+    "queueLeaseCovered": true,
+    "pendingExactLaneWork": false
+  },
+  "events": [
+    { "kind": "owned-file-change-completed", "atMs": 99 },
+    { "kind": "renewal-boundary", "atMs": 100 },
+    { "kind": "yield-steer-accepted", "atMs": 101 },
+    { "kind": "yield-prompt-observed", "atMs": 197 },
+    { "kind": "final-item-started", "atMs": 199 },
+    { "kind": "partial-disposition", "atMs": 200 },
+    { "kind": "absolute-deadline", "atMs": 201 }
+  ],
+  "expected": {
+    "projectionCanChangePreparedAuthority": false,
+    "primaryOutcome": "absolute-timeout",
+    "secondaryDiagnostics": ["disposition-partial", "steer-observed-late"],
+    "failedTerminalProtocolError": false,
+    "logicalFinalCount": 0,
+    "recoveryChildOrParkCount": 1,
+    "externalEffectAuthorizationCount": 0
+  }
+}

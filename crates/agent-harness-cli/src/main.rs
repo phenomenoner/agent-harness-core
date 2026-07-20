@@ -10,7 +10,7 @@ use std::sync::{
     mpsc,
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ring::digest;
 use serde::Serialize;
@@ -74,29 +74,29 @@ use agent_harness_core::{
     OpsCutoverApplyOptions, OpsCutoverApproveOptions, OpsCutoverReceiptOptions,
     OpsCutoverRequestOptions, OpsCutoverStatusOptions, PlainFinalPresentationAssessment,
     PromptAssemblyOptions, PromptBundle, PromptReductionOptions, PublicHygieneOptions,
-    QueueShadowCompareOptions, QueueShadowRecordOptions, RenderedRichUnit, RenderedRichUnitKind,
-    RichPresentationValidationOptions, RuntimeQueueCapacityOptions, RuntimeQueueControlAction,
-    RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
-    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueueReceiptCompactionOptions,
-    RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions,
-    ScopedStopTarget, SecurityScanOptions, SkillApplyOptions, SkillArchiveOptions,
-    SkillAutonomousApplyOptions, SkillDoctorOptions, SkillDoctorStatus, SkillGuardOptions,
-    SkillIndex, SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
-    SkillLifecycleCuratorOptions, SkillLifecycleCuratorReport, SkillLintOptions,
-    SkillPackConflictPolicy, SkillPackExportOptions, SkillPackImportOptions,
-    SkillPackRemoveOptions, SkillPinOptions, SkillProposalActionOptions, SkillProposalListOptions,
-    SkillProposeOptions, SkillRestoreOptions, SkillSelectionQuery, SkillSynthesisOptions,
-    SkillViewOptions, SubagentLifecycleCloseOptions, SubagentLifecycleRecordOptions,
-    SubagentLifecycleShowOptions, SubagentLifecycleShowReport, SubagentLifecycleState,
-    SubagentPlan, SubagentPlanInput, SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions,
-    SupervisionEvaluateOptions, SupervisorChildState, SupervisorInventoryOptions,
-    SupervisorInventoryServiceConfig, SupervisorLaunchCommand, TaskEntityOptions, TaskStatus,
-    TokenEfficiencyOptions, TraceOptions, TurnPlan, TurnPlanInput, VaultGetOptions,
-    VaultPutOptions, VirtualSessionContextQuery, VirtualSessionWorkingContext,
-    WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport, WorkerCancelOptions,
-    WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind, WorkerReapStaleOptions,
-    WorkerRunOnceOptions, WorkerRunOnceReport, WorkerRunOnceStatus, WorkerStatusOptions,
-    acquire_budget, add_operation_plan_item, append_channel_outbox_message,
+    QueueShadowCompareOptions, QueueShadowRecordOptions, QueueTerminalControl, RenderedRichUnit,
+    RenderedRichUnitKind, RichPresentationValidationOptions, RuntimeQueueCapacityOptions,
+    RuntimeQueueControlAction, RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions,
+    RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
+    RuntimeQueueReceiptCompactionOptions, RuntimeRunOnceOptions, RuntimeRunOnceReport,
+    RuntimeRunOnceStatus, ScopedStopOptions, ScopedStopTarget, SecurityScanOptions,
+    SkillApplyOptions, SkillArchiveOptions, SkillAutonomousApplyOptions, SkillDoctorOptions,
+    SkillDoctorStatus, SkillGuardOptions, SkillIndex, SkillLearningProposalOperation,
+    SkillLearningProposalStatus, SkillLearningSignal, SkillLifecycleCuratorOptions,
+    SkillLifecycleCuratorReport, SkillLintOptions, SkillPackConflictPolicy, SkillPackExportOptions,
+    SkillPackImportOptions, SkillPackRemoveOptions, SkillPinOptions, SkillProposalActionOptions,
+    SkillProposalListOptions, SkillProposeOptions, SkillRestoreOptions, SkillSelectionQuery,
+    SkillSynthesisOptions, SkillViewOptions, SubagentLifecycleCloseOptions,
+    SubagentLifecycleRecordOptions, SubagentLifecycleShowOptions, SubagentLifecycleShowReport,
+    SubagentLifecycleState, SubagentPlan, SubagentPlanInput, SubagentWorkerEnqueueOptions,
+    SuperviseDeployCanaryOptions, SupervisionEvaluateOptions, SupervisorChildState,
+    SupervisorInventoryOptions, SupervisorInventoryServiceConfig, SupervisorLaunchCommand,
+    TaskEntityOptions, TaskStatus, TerminalControlSource, TokenEfficiencyOptions, TraceOptions,
+    TurnPlan, TurnPlanInput, VaultGetOptions, VaultPutOptions, VirtualSessionContextQuery,
+    VirtualSessionWorkingContext, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
+    WorkerCancelOptions, WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind,
+    WorkerReapStaleOptions, WorkerRunOnceOptions, WorkerRunOnceReport, WorkerRunOnceStatus,
+    WorkerStatusOptions, acquire_budget, add_operation_plan_item, append_channel_outbox_message,
     append_goal_lineage_supersession, append_harness_log, append_jsonl_value,
     apply_channel_command_step, apply_skill_proposal, assemble_prompt_bundle,
     assess_plain_final_presentation, autonomous_apply_skill_proposal, block_operation_plan,
@@ -139,14 +139,14 @@ use agent_harness_core::{
     release_checklist, remove_skill_pack, render_rich_presentation_batch_for_discord,
     render_rich_presentation_batch_for_telegram, request_backend_auth_cancel,
     request_memory_owner_promotion, requeue_prepared_context_rollover, resolve_channel_identity,
-    resolve_or_create_provider_codex_home, resolve_runtime_queue_typing_context_nonblocking,
-    resolve_virtual_session_working_context, restore_skill_from_archive,
-    rotate_harness_log_if_needed, run_backend_auth_cli_operation, run_channel_once,
-    run_codex_runtime, run_cron_scheduler_once, run_dream_director_send, run_goal_lineage_doctor,
-    run_ledger_maintenance_once as run_ledger_maintenance_once_core, run_memory_canvas_worker,
-    run_memory_embedding_backfill, run_memory_hook_adapter, run_openclaw_mem_read_path_smoke,
-    run_public_hygiene, run_runtime_queue_once, run_skill_doctor, run_skill_guard,
-    run_skill_lifecycle_curator, run_worker_once,
+    resolve_or_create_provider_codex_home, resolve_queue_terminal_control_nonblocking,
+    resolve_runtime_queue_typing_context_nonblocking, resolve_virtual_session_working_context,
+    restore_skill_from_archive, rotate_harness_log_if_needed, run_backend_auth_cli_operation,
+    run_channel_once, run_codex_runtime, run_cron_scheduler_once, run_dream_director_send,
+    run_goal_lineage_doctor, run_ledger_maintenance_once as run_ledger_maintenance_once_core,
+    run_memory_canvas_worker, run_memory_embedding_backfill, run_memory_hook_adapter,
+    run_openclaw_mem_read_path_smoke, run_public_hygiene, run_runtime_queue_once, run_skill_doctor,
+    run_skill_guard, run_skill_lifecycle_curator, run_worker_once,
     runtime_worker::reconcile_runtime_queue_leases_for_generation,
     scan_security_boundaries, scenario_matrix_catalog, schema_registry_entries,
     search_imported_memory, search_imported_vector_memory, select_skills, set_skill_pin,
@@ -165,6 +165,8 @@ use agent_harness_core::{
 const DEFAULT_CODEX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 const DEFAULT_RUNTIME_SAFE_MODE_RESTART_MS: u64 = 60_000;
+const DEFAULT_RUNTIME_ACTIVE_TASK_SHUTDOWN_GRACE_MS: u64 = 15_000;
+const DEFAULT_RUNTIME_CONTROL_POLL_MS: u64 = 1_000;
 const DISCORD_ATTACHMENT_TEXT_EXTRACT_MAX_BYTES: usize = 16 * 1024;
 const DISCORD_ATTACHMENT_DOWNLOAD_MAX_BYTES: usize =
     DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM as usize;
@@ -7570,6 +7572,8 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
     let mut failed = false;
     let mut stop_reason: Option<String> = None;
     let mut stop_requested = false;
+    let mut stop_requested_at: Option<Instant> = None;
+    let mut terminal_control_requested_at: Option<Instant> = None;
     let mut active = 0usize;
     let mut runtime_concurrency = args.runtime_concurrency.max(1);
     let mut active_queue_ids = HashSet::new();
@@ -7599,6 +7603,7 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                     &mut runtime_concurrency,
                 )? {
                     stop_requested = false;
+                    stop_requested_at = None;
                     stop_reason = None;
                 } else {
                     failed = true;
@@ -7619,7 +7624,23 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
             stop_requested = true;
             stop_reason.get_or_insert_with(|| "stopped after stop file request".to_string());
         }
+        if !stop_requested && active > 0 {
+            match count_active_runtime_terminal_controls(&args.target_home, &active_queue_ids) {
+                Ok(0) => terminal_control_requested_at = None,
+                Ok(_) => {
+                    terminal_control_requested_at.get_or_insert_with(Instant::now);
+                }
+                Err(error) => {
+                    last_reason = Some(format!(
+                        "active runtime terminal-control inspection failed open: {error}"
+                    ));
+                }
+            }
+        } else if active == 0 {
+            terminal_control_requested_at = None;
+        }
         if stop_requested {
+            let requested_at = stop_requested_at.get_or_insert_with(Instant::now);
             if active == 0 {
                 write_loop_heartbeat(
                     &args.target_home,
@@ -7630,12 +7651,67 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                 )?;
                 break;
             }
+            if matches!(
+                runtime_active_task_shutdown_outcome(
+                    RuntimeActiveTaskShutdownKind::ServiceStop,
+                    requested_at.elapsed(),
+                    args.active_task_shutdown_grace_ms,
+                ),
+                RuntimeActiveTaskShutdownOutcome::ExitClean
+            ) {
+                stop_reason = Some(format!(
+                    "stopped after {}ms active-task shutdown grace with {active} task(s) still running",
+                    args.active_task_shutdown_grace_ms
+                ));
+                write_loop_heartbeat(
+                    &args.target_home,
+                    &args.loop_name,
+                    "stopped",
+                    iterations,
+                    stop_reason
+                        .as_deref()
+                        .unwrap_or("active-task shutdown grace expired"),
+                )?;
+                break;
+            }
             write_loop_heartbeat(
                 &args.target_home,
                 &args.loop_name,
                 "stopping",
                 iterations,
                 &format!("waiting for {active} active runtime task(s)"),
+            )?;
+        } else if let Some(requested_at) = terminal_control_requested_at {
+            if matches!(
+                runtime_active_task_shutdown_outcome(
+                    RuntimeActiveTaskShutdownKind::TerminalControl,
+                    requested_at.elapsed(),
+                    args.active_task_shutdown_grace_ms,
+                ),
+                RuntimeActiveTaskShutdownOutcome::ExitForRestart
+            ) {
+                failed = true;
+                stop_reason = Some(format!(
+                    "restarting after {}ms terminal-control grace with {active} task(s) still running",
+                    args.active_task_shutdown_grace_ms
+                ));
+                write_loop_heartbeat(
+                    &args.target_home,
+                    &args.loop_name,
+                    "restart-required",
+                    iterations,
+                    stop_reason
+                        .as_deref()
+                        .unwrap_or("terminal-control shutdown grace expired"),
+                )?;
+                break;
+            }
+            write_loop_heartbeat(
+                &args.target_home,
+                &args.loop_name,
+                "stopping",
+                iterations,
+                &format!("terminal control observed; waiting for {active} active runtime task(s)"),
             )?;
         } else {
             iterations += 1;
@@ -7743,6 +7819,7 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                                 &mut runtime_concurrency,
                             )? {
                                 stop_requested = false;
+                                stop_requested_at = None;
                                 stop_reason = None;
                             } else {
                                 failed = true;
@@ -7770,7 +7847,8 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
         }
 
         if active > 0 {
-            match task_rx.recv_timeout(Duration::from_millis(args.idle_ms)) {
+            let control_poll_ms = args.idle_ms.min(DEFAULT_RUNTIME_CONTROL_POLL_MS).max(1);
+            match task_rx.recv_timeout(Duration::from_millis(control_poll_ms)) {
                 Ok(task) => {
                     active = active.saturating_sub(1);
                     active_queue_ids.remove(&task.queue_id);
@@ -7794,6 +7872,7 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                             &mut runtime_concurrency,
                         )? {
                             stop_requested = false;
+                            stop_requested_at = None;
                             stop_reason = None;
                         } else {
                             failed = true;
@@ -7893,6 +7972,57 @@ fn enter_runtime_loop_safe_mode(
     thread::sleep(Duration::from_millis(restart_ms));
     *consecutive_errors = 0;
     Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeActiveTaskShutdownKind {
+    ServiceStop,
+    TerminalControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeActiveTaskShutdownOutcome {
+    Wait,
+    ExitClean,
+    ExitForRestart,
+}
+
+fn runtime_active_task_shutdown_outcome(
+    kind: RuntimeActiveTaskShutdownKind,
+    elapsed: Duration,
+    grace_ms: u64,
+) -> RuntimeActiveTaskShutdownOutcome {
+    if elapsed < Duration::from_millis(grace_ms) {
+        return RuntimeActiveTaskShutdownOutcome::Wait;
+    }
+    match kind {
+        RuntimeActiveTaskShutdownKind::ServiceStop => RuntimeActiveTaskShutdownOutcome::ExitClean,
+        RuntimeActiveTaskShutdownKind::TerminalControl => {
+            RuntimeActiveTaskShutdownOutcome::ExitForRestart
+        }
+    }
+}
+
+fn count_active_runtime_terminal_controls(
+    harness_home: &Path,
+    active_queue_ids: &HashSet<String>,
+) -> Result<usize, String> {
+    let mut terminal = 0usize;
+    for queue_id in active_queue_ids {
+        if let QueueTerminalControl::Terminal(control) =
+            resolve_queue_terminal_control_nonblocking(harness_home, queue_id, None)
+                .map_err(|error| error.to_string())?
+            && matches!(
+                control.source,
+                TerminalControlSource::QueueSkip
+                    | TerminalControlSource::ScopedStop
+                    | TerminalControlSource::Quarantine
+            )
+        {
+            terminal += 1;
+        }
+    }
+    Ok(terminal)
 }
 
 fn spawn_runtime_loop_task(
@@ -8839,6 +8969,12 @@ fn run_context_rollover(args: &[String]) -> Result<(), String> {
                 now_ms: args.now_ms,
                 preserve_continuation_index: false,
                 campaign_slice_generation: None,
+                task_slice_generation: None,
+                task_family_id: None,
+                task_family_version: None,
+                task_root_queue_id: None,
+                disposition_recovery_depth: None,
+                replacement_message_text: None,
                 continuation_intent_key: None,
                 completion_kind: None,
                 allow_exact_state_bootstrap: false,
@@ -10638,6 +10774,7 @@ struct RuntimeLoopArgs {
     idle_ms: u64,
     max_consecutive_errors: usize,
     safe_mode_restart_ms: Option<u64>,
+    active_task_shutdown_grace_ms: u64,
     stop_when_idle: bool,
     stop_file: Option<PathBuf>,
 }
@@ -13266,6 +13403,20 @@ fn supervisor_launch_owner_conflict(
     if agent_harness_core::loop_health::process_alive_for_pid(process_id) != Some(true) {
         return Ok(None);
     }
+    const PROCESS_START_MATCH_TOLERANCE_MS: i64 = 5_000;
+    let recorded_process_start_time_ms = value
+        .get("processStartTimeMs")
+        .and_then(serde_json::Value::as_i64);
+    let observed_process_start_time_ms =
+        agent_harness_core::loop_health::process_start_time_ms_for_pid(process_id);
+    if recorded_process_start_time_ms
+        .zip(observed_process_start_time_ms)
+        .is_some_and(|(recorded, observed)| {
+            recorded.abs_diff(observed) > PROCESS_START_MATCH_TOLERANCE_MS as u64
+        })
+    {
+        return Ok(None);
+    }
     let supervisor_pid = value
         .get("supervisorPid")
         .and_then(serde_json::Value::as_i64);
@@ -13286,6 +13437,8 @@ fn supervisor_launch_owner_conflict(
     Ok(Some(serde_json::json!({
         "serviceFile": service_file,
         "pid": process_id,
+        "recordedProcessStartTimeMs": recorded_process_start_time_ms,
+        "observedProcessStartTimeMs": observed_process_start_time_ms,
         "supervisorPid": supervisor_pid,
         "generationId": value.get("generationId").and_then(serde_json::Value::as_str),
         "launchOwner": launch_owner,
@@ -15674,6 +15827,7 @@ fn runtime_loop_args_from_args(args: &[String]) -> Result<RuntimeLoopArgs, Strin
     let mut max_consecutive_errors = 5usize;
     let mut safe_mode_restart_ms = None;
     let mut safe_mode_restart_overridden = false;
+    let mut active_task_shutdown_grace_ms = DEFAULT_RUNTIME_ACTIVE_TASK_SHUTDOWN_GRACE_MS;
     let mut stop_when_idle = false;
     let mut stop_file = None;
     let mut i = 0;
@@ -15775,6 +15929,15 @@ fn runtime_loop_args_from_args(args: &[String]) -> Result<RuntimeLoopArgs, Strin
                 safe_mode_restart_ms = None;
                 safe_mode_restart_overridden = true;
             }
+            "--active-task-shutdown-grace-ms" => {
+                i += 1;
+                active_task_shutdown_grace_ms = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--active-task-shutdown-grace-ms requires a positive integer".to_string()
+                    })
+                    .and_then(|value| parse_u64(value, "--active-task-shutdown-grace-ms"))?;
+            }
             "--stop-when-idle" => {
                 stop_when_idle = true;
             }
@@ -15808,6 +15971,7 @@ fn runtime_loop_args_from_args(args: &[String]) -> Result<RuntimeLoopArgs, Strin
         idle_ms,
         max_consecutive_errors,
         safe_mode_restart_ms,
+        active_task_shutdown_grace_ms,
         stop_when_idle,
         stop_file,
     })
@@ -23930,6 +24094,9 @@ fn print_help() {
     println!("  --safe-mode-restart-ms <n> Runtime-loop cooldown before service-mode retry");
     println!("  --no-safe-mode-restart Disable runtime-loop service-mode retry");
     println!(
+        "  --active-task-shutdown-grace-ms <n> Grace before runtime-loop exits to interrupt a stuck active task"
+    );
+    println!(
         "  --loop-name <name>      Heartbeat component name for loop commands that support it"
     );
     println!("  --runtime-concurrency <n> Bounded in-process runtime tasks for runtime-loop");
@@ -25969,6 +26136,39 @@ mod tests {
         supervisor_launch_guard_detects_live_observed_owner();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn supervisor_launch_guard_ignores_reused_pid_from_stale_generation() {
+        let root = cli_temp_root("supervisor_launch_guard_ignores_reused_pid");
+        let harness_home = root.join(".agent-harness");
+        write_cli_supervisor_service_state(
+            &harness_home,
+            "worker-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "worker-loop",
+                "serviceKind": "worker",
+                "pid": std::process::id(),
+                "processId": std::process::id(),
+                "processStartTimeMs": 1,
+                "generationId": "stale-worker-generation",
+                "launchOwner": "windows-supervisor-runner",
+                "observedOnly": false,
+                "status": "stale",
+                "actualState": "stale",
+            }),
+        );
+
+        let conflict = supervisor_launch_owner_conflict(&harness_home, "worker-loop", None)
+            .expect("owner identity check");
+        assert!(
+            conflict.is_none(),
+            "a reused PID with a different process start time must not fence recovery"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn supervisor_reconcile_apply_receipts_refused_live_owner() {
         let root = cli_temp_root("supervisor_reconcile_apply_receipts_refused_live_owner");
@@ -26171,7 +26371,15 @@ mod tests {
             "telegram-loop-generation-2",
         );
         let _parent_pid = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_PARENT_PID", "54321");
-        let _started_at = EnvVarRestore::set("AGENT_HARNESS_SERVICE_STARTED_AT_MS", "121000");
+        let current_process_start_time_ms =
+            agent_harness_core::loop_health::process_start_time_ms_for_pid(i64::from(
+                std::process::id(),
+            ))
+            .expect("current process start identity");
+        let _started_at = EnvVarRestore::set(
+            "AGENT_HARNESS_SERVICE_STARTED_AT_MS",
+            &current_process_start_time_ms.to_string(),
+        );
         let _stop_file = EnvVarRestore::set(
             "AGENT_HARNESS_SUPERVISOR_STOP_FILE",
             &watched_stop_file.display().to_string(),
@@ -26202,7 +26410,10 @@ mod tests {
             Some("telegram-loop-generation-2")
         );
         assert_eq!(running.parent_pid, Some(54321));
-        assert_eq!(running.process_start_time_ms, Some(121000));
+        assert_eq!(
+            running.process_start_time_ms,
+            Some(current_process_start_time_ms)
+        );
         assert_eq!(running.watched_stop_file.as_ref(), Some(&watched_stop_file));
 
         let duplicate_launch =
@@ -26790,6 +27001,82 @@ mod tests {
     }
 
     #[test]
+    fn runtime_loop_active_task_shutdown_grace_is_bounded_and_configurable() {
+        let defaults = runtime_loop_args_from_args(&[]).unwrap();
+        assert_eq!(
+            defaults.active_task_shutdown_grace_ms,
+            DEFAULT_RUNTIME_ACTIVE_TASK_SHUTDOWN_GRACE_MS
+        );
+
+        let overridden = runtime_loop_args_from_args(&[
+            "--active-task-shutdown-grace-ms".to_string(),
+            "250".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(overridden.active_task_shutdown_grace_ms, 250);
+        assert_eq!(
+            runtime_active_task_shutdown_outcome(
+                RuntimeActiveTaskShutdownKind::ServiceStop,
+                Duration::from_millis(249),
+                overridden.active_task_shutdown_grace_ms,
+            ),
+            RuntimeActiveTaskShutdownOutcome::Wait
+        );
+        assert_eq!(
+            runtime_active_task_shutdown_outcome(
+                RuntimeActiveTaskShutdownKind::ServiceStop,
+                Duration::from_millis(250),
+                overridden.active_task_shutdown_grace_ms,
+            ),
+            RuntimeActiveTaskShutdownOutcome::ExitClean
+        );
+        assert_eq!(
+            runtime_active_task_shutdown_outcome(
+                RuntimeActiveTaskShutdownKind::TerminalControl,
+                Duration::from_millis(250),
+                overridden.active_task_shutdown_grace_ms,
+            ),
+            RuntimeActiveTaskShutdownOutcome::ExitForRestart
+        );
+
+        let root = cli_temp_root("runtime_loop_active_task_shutdown_terminal_control_sources");
+        record_scoped_stop(ScopedStopOptions {
+            harness_home: root.clone(),
+            target: ScopedStopTarget::QueueItem {
+                queue_id: "queue-stopped".to_string(),
+            },
+            reason: "test stop".to_string(),
+            now_ms: 10,
+        })
+        .unwrap();
+        let active = HashSet::from(["queue-stopped".to_string()]);
+        assert_eq!(
+            count_active_runtime_terminal_controls(&root, &active),
+            Ok(1)
+        );
+
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            serde_json::json!({
+                "queueId": "queue-completed",
+                "status": "completed",
+                "reason": "normal completion"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let active = HashSet::from(["queue-completed".to_string()]);
+        assert_eq!(
+            count_active_runtime_terminal_controls(&root, &active),
+            Ok(0)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_loop_lease_busy_does_not_count_as_error() {
         let root = cli_temp_root("runtime_loop_lease_busy_does_not_count_as_error");
         fs::create_dir_all(
@@ -26811,6 +27098,7 @@ mod tests {
             idle_ms: 1,
             max_consecutive_errors: 5,
             safe_mode_restart_ms: Some(60_000),
+            active_task_shutdown_grace_ms: DEFAULT_RUNTIME_ACTIVE_TASK_SHUTDOWN_GRACE_MS,
             stop_when_idle: false,
             stop_file: None,
         };

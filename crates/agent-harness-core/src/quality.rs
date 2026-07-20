@@ -69,17 +69,17 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I3",
-            statement: "terminal states are irreversible, pending or retryable work at its attempt cap becomes terminal before selection or lease, append-only queued admission rows cannot override effective terminal state, and typed continuation/external-effect states never resurrect a fenced parent generation",
+            statement: "terminal states and lost queue ownership are irreversible: pending or retryable work at its attempt cap becomes terminal before selection or lease, lease renewal is exact owner-generation and lane fenced, missing or expired leases are never recreated, append-only queued admission rows cannot override effective terminal state, and typed continuation/external-effect states never resurrect a fenced parent generation",
             owner: "runtime_pipeline/workers",
         },
         InvariantEntry {
             id: "I4",
-            statement: "cancel only affects the requested turn, queue item, job, declared scope, or the selected deterministic job's descendant process tree",
-            owner: "admission/channel_state/workers",
+            statement: "cancel only affects the requested turn, queue item, job, declared scope, or the selected child process tree; active runtime tasks receive bounded cooperative shutdown before exact queue terminal control restarts only the runtime-loop process, and Windows backend-auth cleanup terminates its selected descendants",
+            owner: "admission/channel_state/runtime_worker/agent-harness-cli/backend_auth/workers",
         },
         InvariantEntry {
             id: "I5",
-            statement: "crash recovery loses no work and duplicates no side effects; retry schedules, task/effect dispositions, commit-before-enqueue continuation intents, and readback-required ambiguous mutations remain reconstructable",
+            statement: "crash recovery loses no work and duplicates no side effects; retry schedules, task/effect dispositions, commit-before-enqueue continuation intents, readback-required ambiguous mutations, supervisor process-instance fencing, and dead-generation lease recovery after bounded active-task shutdown remain reconstructable",
             owner: "queue_shadow/supervision/runtime_worker/runtime_pipeline/goal_continuation/external_effect",
         },
         InvariantEntry {
@@ -104,7 +104,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I10",
-            statement: "active Codex tool-use idle timeouts, productive absolute turn timeouts, and approval-required MCP elicitations are routed through bounded typed recovery; the final deadline window drains work to exact task authority and defers late steering instead of starting another long action",
+            statement: "active Codex tool-use idle timeouts, bounded productive deadline grants, and approval-required MCP elicitations are distinct: exact-owned scored progress may renew an eligible ordinary turn only through its hard cap and proven queue lease, while an ineligible responsive turn drains once to a typed disposition and unresponsive idle or reached deadlines remain terminal timeouts",
             owner: "codex_runtime/runtime_pipeline/task_transition/external_effect/trace/context_rollover/prompt",
         },
         InvariantEntry {
@@ -119,7 +119,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I13",
-            statement: "inline-image, native-image-input, oversized-output polluted Codex threads, interrupted productive long-task failures, and repeated high-usage stream-unstable retries feed bounded context-rollover continuity when exact-lane depth and effective-sibling-state gates allow it",
+            statement: "inline-image, native-image-input, oversized-output polluted Codex threads, interrupted productive long-task failures, repeated high-usage stream-unstable retries, and long active slices retain bounded continuity only while exact-lane depth, effective-sibling state, task budget, and renewable queue-owner authority allow it",
             owner: "codex_runtime/context_rollover/runtime_queue/prompt/runtime_pipeline",
         },
         InvariantEntry {
@@ -239,7 +239,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I37",
-            statement: "every goal or typed deadline-drain task completion passes transition authority before final-outbox selection; authorized work commits one deterministic exact-lane continuation intent before enqueue, reconciles restart/replay to one child, keeps campaign generation separate from recovery depth, and acknowledges only after child lease ownership",
+            statement: "every goal or typed deadline-drain task completion passes transition authority before final-outbox selection; a harness-owned ordinary task family and generation-bound disposition select exactly one final, continuation child, parked notice, or one bounded observation-only recovery child; authorized work commits one deterministic exact-lane intent before enqueue, reconciles restart/replay to one child, keeps campaign/task/recovery generations separate, and acknowledges only after child lease ownership",
             owner: "goal_transition/task_transition/goal_continuation/runtime_pipeline/context_rollover/runtime_worker",
         },
         InvariantEntry {
@@ -310,7 +310,12 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.codex-active-turn.v1",
             owner_module: "codex_runtime",
-            compatibility: "per-session state JSON; absoluteDeadlineAtMs and deadlineDrainAtMs are optional additive fields, and legacy bindings without them remain readable",
+            compatibility: "per-session state JSON; deadline mode, initial/current/hard-cap epochs, deadline and instruction generations, last renewal id, and drain state/cause are optional additive fields, and legacy bindings without them remain readable",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-deadline-renewal.v1",
+            owner_module: "codex_runtime",
+            compatibility: "append-only privacy-safe deadline decisions; deterministic renewal id, exact queue/lane/turn identity, generation, bounded score/kinds/digests, blocker codes, policy digest, and queue-lease proof are stable while raw prompts, commands, arguments, outputs, files, and narration are forbidden",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.codex-turn-steer-receipt.v1",
@@ -356,6 +361,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.runtime-queue-leases.v1",
             owner_module: "runtime_worker",
             compatibility: "class-scoped state JSON accepts legacy owner strings and structured owner envelopes in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.runtime-queue-lease-renewal.v1",
+            owner_module: "runtime_worker/codex_runtime",
+            compatibility: "append-only bounded receipt; renewal id, exact queue/class/lane and owner-generation digests, previous/required/renewed expiry, and applied/not-required/busy-retryable/rejected/lost/failed semantics are stable; missing or expired ownership is never recreated",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.runtime-queue-lease-reconciliation.v1",
@@ -461,6 +471,26 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.task-continuation-checkpoint.v1",
             owner_module: "task_transition/codex_runtime",
             compatibility: "bounded typed assistant marker; authority kind/id/version, active item id/version, checkpoint body, and lowercase SHA-256 digest are immutable; the marker is removed from visible assistant output after validation",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.drain-disposition.v1",
+            owner_module: "task_transition/codex_runtime/runtime_pipeline",
+            compatibility: "bounded hidden control marker; observed deadline generation and disposition-specific authority, digest, question, blocker, or evidence fields are validated before final selection; missing, malformed, stale, wrong-family, multiple, and oversized data fail closed as indeterminate",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.task-family.v1",
+            owner_module: "task_transition/codex_runtime",
+            compatibility: "write-once harness authority keyed by exact lane, root virtual session, root queue, and prompt digest; additive metadata may expand while family id, version, runnable status, agent/runtime class, session root, and policy digest remain exact",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.task-budget-ledger.v1",
+            owner_module: "task_budget/runtime_pipeline",
+            compatibility: "append-only per-family slice accounting; family and slice generation, wall time, tokens, progress digest, context recovery, and disposition-recovery classification are idempotent, while observation timestamps are non-authoritative replay metadata",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.task-continuation-intent.v1",
+            owner_module: "goal_continuation/runtime_pipeline/context_rollover",
+            compatibility: "append-only commit/enqueue/ack lifecycle for OperationPlan, explicit-checkpoint, and disposition-recovery children; deterministic intent and child ids plus exact authority and task-family lineage are immutable",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.task-transition.v1",
@@ -1187,30 +1217,46 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
         },
         ScenarioMatrixEntry {
             id: "codex-deadline-continuation",
-            title: "Codex absolute deadline drain and productive continuation",
+            title: "Productive deadline renewal, fenced drain, and ordinary-task continuation",
             changed_areas: vec![
                 "codex runtime",
                 "context rollover",
                 "runtime pipeline",
                 "runtime queue",
+                "task transition and budget",
             ],
-            required_invariants: vec!["I2", "I3", "I7", "I8", "I10", "I13"],
+            required_invariants: vec!["I2", "I3", "I5", "I7", "I8", "I10", "I13", "I17", "I37"],
             required_evidence: vec![
-                "the final bounded fraction of an absolute runtime deadline emits one receipted drain steer and defers later user steering",
-                "absolute timeout continuation requires bounded stdout evidence of productive tool, file-change, or completed assistant progress",
-                "handshake-only event volume cannot classify an absolute timeout as productive work",
-                "historical terminal queue rows cannot block a fresh continuation sibling",
-                "late compact completion notifications cannot satisfy an unrelated capability handshake",
+                "default-off and cohort-gated shadow/authoritative configuration validate with effective initial-grant preflight",
+                "scored exact-owned productive evidence before the boundary renews from the previous deadline only after exact queue lease coverage",
+                "duplicate or narration-only evidence, handshake traffic, foreign events, pending exact-lane work, active Goal authority, stop/new, and task-budget breakers cannot renew",
+                "missing, expired, wrong-generation, wrong-class/lane, terminal, or unsafe-lock queue ownership never renews or resurrects a lease",
+                "once drain starts, one cause-specific steer produces one generation-bound typed disposition and never returns to running",
+                "harness-owned ordinary task-family continuation emits one child and no parent final, with task budget and commit-before-enqueue restart reconciliation",
+                "one indeterminate disposition creates one observation-only recovery child; a second indeterminate result parks with one needs-user notice",
+                "post-hoc interrupted-timeout recovery shares the productive event normalizer and narration alone is insufficient",
+                "sanitized renewal, lease, and ordinary-task drain fixtures remain checksum-bound and contain no private payload",
             ],
             runnable_tests: vec![
+                "continuity_effect_fixture_integrity::continuity_and_effect_replay_fixtures_are_checksum_bound_and_sanitized",
+                "config::tests::productive_deadline_config_accepts_bounded_rollout_policy",
+                "codex_runtime::tests::productive_deadline_preflight_rejects_effective_grant_mismatch",
+                "codex_runtime::tests::productive_tracker_scores_dedupes_and_consumes_a_watermark",
+                "runtime_worker::tests::runtime_queue_lease_renewal_is_owner_generation_fenced",
+                "runtime_worker::tests::runtime_queue_lease_renewal_never_resurrects_or_crosses_owner_generation",
+                "runtime_pipeline::tests::productive_deadline_authoritative_replay_renews_lease_before_timer",
                 "codex_runtime::tests::queue_codex_turn_steer_request_defers_inside_deadline_drain_window",
                 "codex_runtime::tests::deadline_drain_guard_is_sent_once_with_receipt",
+                "task_transition::tests::typed_drain_disposition_strips_control_data_and_preserves_exact_authority",
+                "task_transition::tests::malformed_drain_disposition_is_hidden_and_fail_closed",
+                "runtime_pipeline::tests::deadline_drain_explicit_task_family_replay_creates_one_child_and_one_final",
+                "runtime_pipeline::tests::indeterminate_drain_uses_one_bounded_recovery_then_needs_user",
                 "runtime_pipeline::tests::productive_absolute_timeout_retry_requeues_continuation_instead_of_replaying_parent",
                 "runtime_pipeline::tests::absolute_timeout_without_productive_progress_does_not_requeue_continuation",
                 "context_rollover::tests::prepared_auto_requeue_ignores_historical_completed_parent_session_sibling",
                 "codex_runtime::tests::managed_reasoning_ignores_late_compact_turn_completed_during_capability_handshake",
             ],
-            promotion_gate: "Run the focused deadline-drain, absolute-timeout, sibling-state, and compact-handshake regressions plus the broader codex-runtime/context-rollover/runtime-pipeline packs. Live promotion remains a separate operator-authorized cutover with exact-lane receipts and rollback evidence.",
+            promotion_gate: "Run the checksum-bound replay fixtures and focused lease/deadline/disposition/task-family tests twice against fresh isolated homes, then pass the full serial workspace and isolated shadow, authoritative, and rollback candidate gates. Live activation remains a separately observed cutover with exact-lane lease/deadline/final receipts and rollback evidence.",
         },
         ScenarioMatrixEntry {
             id: "channel-continuity-and-safe-recovery",

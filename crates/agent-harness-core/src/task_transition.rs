@@ -1,3 +1,4 @@
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -13,8 +14,12 @@ use crate::operation_plan::{
 pub const TASK_CONTINUATION_CHECKPOINT_SCHEMA: &str =
     "agent-harness.task-continuation-checkpoint.v1";
 pub const TASK_TRANSITION_SCHEMA: &str = "agent-harness.task-transition.v1";
+pub const TASK_FAMILY_SCHEMA: &str = "agent-harness.task-family.v1";
+pub const DRAIN_DISPOSITION_SCHEMA: &str = "agent-harness.drain-disposition.v1";
 pub const TASK_CONTINUATION_MARKER_OPEN: &str = "<agent-harness-continuation-checkpoint>";
 pub const TASK_CONTINUATION_MARKER_CLOSE: &str = "</agent-harness-continuation-checkpoint>";
+pub const DRAIN_DISPOSITION_MARKER_OPEN: &str = "<agent-harness-drain-disposition>";
+pub const DRAIN_DISPOSITION_MARKER_CLOSE: &str = "</agent-harness-drain-disposition>";
 const MAX_CHECKPOINT_BYTES: usize = 2 * 1024;
 const MAX_MARKER_BYTES: usize = 4 * 1024;
 pub const DEFAULT_MAX_TASK_CONTINUATION_DEPTH: u64 = 32;
@@ -55,6 +60,38 @@ pub struct ContinuationAuthoritySnapshotV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFamilyV1 {
+    pub schema: String,
+    pub family_id: String,
+    pub authority_version: u64,
+    pub root_queue_id: String,
+    pub exact_lane_digest: String,
+    pub virtual_session_id: String,
+    pub root_working_session_key: String,
+    pub agent_id: String,
+    #[serde(default = "default_interactive_runtime_class")]
+    pub runtime_class: String,
+    pub prompt_digest: String,
+    pub policy_digest: String,
+    #[serde(default = "default_runnable_task_family_status")]
+    pub status: String,
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub observation_order: u64,
+}
+
+fn default_interactive_runtime_class() -> String {
+    "interactive".to_string()
+}
+
+fn default_runnable_task_family_status() -> String {
+    "runnable".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DrainDispositionV1 {
     LogicalComplete,
@@ -62,6 +99,58 @@ pub enum DrainDispositionV1 {
     NeedsUser,
     NeedsAuthority,
     Blocked,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DrainDispositionKindV1 {
+    LogicalComplete,
+    ContinuationRequired,
+    NeedsUser,
+    NeedsAuthority,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrainDispositionMarkerV1 {
+    pub schema: String,
+    pub disposition: DrainDispositionKindV1,
+    pub observed_deadline_generation: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_kind: Option<ContinuationAuthorityKindV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_family_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_family_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_item_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completion_evidence_digests: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainDispositionCaptureV1 {
+    Missing,
+    Valid(DrainDispositionMarkerV1),
+    Invalid { reason_code: String },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -78,6 +167,19 @@ pub struct TaskContinuationBreakers {
 pub struct OperationPlanAuthorityOptions {
     pub harness_home: PathBuf,
     pub checkpoint: TaskContinuationCheckpointV1,
+    pub exact_lane_digest: String,
+    pub virtual_session_id: String,
+    pub working_session_key: String,
+    pub agent_id: String,
+    pub breakers: TaskContinuationBreakers,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitCheckpointAuthorityOptions {
+    pub harness_home: PathBuf,
+    pub checkpoint: TaskContinuationCheckpointV1,
+    pub expected_family_id: String,
+    pub expected_root_queue_id: String,
     pub exact_lane_digest: String,
     pub virtual_session_id: String,
     pub working_session_key: String,
@@ -140,6 +242,134 @@ pub fn extract_task_continuation_checkpoint(
     Ok((visible, Some(checkpoint)))
 }
 
+pub fn extract_drain_disposition_marker(
+    assistant_text: &str,
+) -> (String, DrainDispositionCaptureV1) {
+    let open_count = assistant_text
+        .matches(DRAIN_DISPOSITION_MARKER_OPEN)
+        .count();
+    let close_count = assistant_text
+        .matches(DRAIN_DISPOSITION_MARKER_CLOSE)
+        .count();
+    if open_count == 0 && close_count == 0 {
+        return (
+            assistant_text.to_string(),
+            DrainDispositionCaptureV1::Missing,
+        );
+    }
+    let open_at = assistant_text.find(DRAIN_DISPOSITION_MARKER_OPEN);
+    let close_at = assistant_text.rfind(DRAIN_DISPOSITION_MARKER_CLOSE);
+    let visible = match (open_at, close_at) {
+        (Some(open), Some(close)) if close >= open => format!(
+            "{}{}",
+            &assistant_text[..open],
+            &assistant_text[close + DRAIN_DISPOSITION_MARKER_CLOSE.len()..]
+        )
+        .trim()
+        .to_string(),
+        (Some(open), _) => assistant_text[..open].trim().to_string(),
+        (_, Some(close)) => format!(
+            "{}{}",
+            &assistant_text[..close],
+            &assistant_text[close + DRAIN_DISPOSITION_MARKER_CLOSE.len()..]
+        )
+        .trim()
+        .to_string(),
+        _ => assistant_text.to_string(),
+    };
+    if open_count != 1 || close_count != 1 {
+        return (
+            visible,
+            DrainDispositionCaptureV1::Invalid {
+                reason_code: "multiple-or-unbalanced-disposition-markers".to_string(),
+            },
+        );
+    }
+    let Some(open_at) = open_at else {
+        return (
+            visible,
+            DrainDispositionCaptureV1::Invalid {
+                reason_code: "disposition-marker-close-without-open".to_string(),
+            },
+        );
+    };
+    let json_start = open_at + DRAIN_DISPOSITION_MARKER_OPEN.len();
+    let Some(close_at) = assistant_text[json_start..]
+        .find(DRAIN_DISPOSITION_MARKER_CLOSE)
+        .map(|relative| json_start + relative)
+    else {
+        return (
+            visible,
+            DrainDispositionCaptureV1::Invalid {
+                reason_code: "disposition-marker-not-closed".to_string(),
+            },
+        );
+    };
+    if close_at.saturating_sub(json_start) > MAX_MARKER_BYTES {
+        return (
+            visible,
+            DrainDispositionCaptureV1::Invalid {
+                reason_code: "disposition-marker-oversized".to_string(),
+            },
+        );
+    }
+    let marker = match serde_json::from_str::<DrainDispositionMarkerV1>(
+        assistant_text[json_start..close_at].trim(),
+    ) {
+        Ok(marker) => marker,
+        Err(_) => {
+            return (
+                visible,
+                DrainDispositionCaptureV1::Invalid {
+                    reason_code: "disposition-marker-invalid-json".to_string(),
+                },
+            );
+        }
+    };
+    match validate_drain_disposition_marker(&marker) {
+        Ok(()) => (visible, DrainDispositionCaptureV1::Valid(marker)),
+        Err(error) => (
+            visible,
+            DrainDispositionCaptureV1::Invalid {
+                reason_code: error.to_string(),
+            },
+        ),
+    }
+}
+
+pub fn drain_marker_checkpoint(
+    marker: &DrainDispositionMarkerV1,
+) -> io::Result<TaskContinuationCheckpointV1> {
+    if marker.disposition != DrainDispositionKindV1::ContinuationRequired {
+        return Err(invalid("drain disposition is not continuation-required"));
+    }
+    let checkpoint = TaskContinuationCheckpointV1 {
+        schema: TASK_CONTINUATION_CHECKPOINT_SCHEMA.to_string(),
+        authority_kind: marker
+            .authority_kind
+            .ok_or_else(|| invalid("continuation disposition has no authority kind"))?,
+        authority_id: marker
+            .authority_id
+            .clone()
+            .ok_or_else(|| invalid("continuation disposition has no authority id"))?,
+        authority_version: marker
+            .authority_version
+            .ok_or_else(|| invalid("continuation disposition has no authority version"))?,
+        active_item_id: marker.active_item_id.clone(),
+        active_item_version: marker.active_item_version,
+        checkpoint: marker
+            .checkpoint
+            .clone()
+            .ok_or_else(|| invalid("continuation disposition has no checkpoint"))?,
+        checkpoint_digest: marker
+            .checkpoint_digest
+            .clone()
+            .ok_or_else(|| invalid("continuation disposition has no checkpoint digest"))?,
+    };
+    validate_checkpoint(&checkpoint)?;
+    Ok(checkpoint)
+}
+
 pub fn evaluate_operation_plan_drain(
     options: OperationPlanAuthorityOptions,
 ) -> TaskDrainEvaluationV1 {
@@ -150,6 +380,142 @@ pub fn evaluate_operation_plan_drain(
             schedule_continuation: true,
             allow_logical_final: false,
             reason: "deadline drain has current exact-lane OperationPlan authority and a typed checkpoint"
+                .to_string(),
+        },
+        Err(error) => TaskDrainEvaluationV1 {
+            schema: TASK_TRANSITION_SCHEMA.to_string(),
+            disposition: if options.breakers.operator_stop
+                || options.breakers.newer_steer
+                || options.breakers.budget_exhausted
+                || options.breakers.no_progress_exhausted
+                || depth_exhausted(options.breakers)
+            {
+                DrainDispositionV1::Blocked
+            } else {
+                DrainDispositionV1::NeedsAuthority
+            },
+            schedule_continuation: false,
+            allow_logical_final: false,
+            reason: error.to_string(),
+        },
+    }
+}
+
+pub fn ensure_task_family(
+    harness_home: &Path,
+    root_queue_id: &str,
+    exact_lane_digest: &str,
+    virtual_session_id: &str,
+    working_session_key: &str,
+    agent_id: &str,
+    prompt_digest: &str,
+) -> io::Result<TaskFamilyV1> {
+    for (name, value) in [
+        ("root queue id", root_queue_id),
+        ("exact lane digest", exact_lane_digest),
+        ("virtual session id", virtual_session_id),
+        ("working session key", working_session_key),
+        ("agent id", agent_id),
+        ("prompt digest", prompt_digest),
+    ] {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(invalid(format!("task family {name} is unavailable")));
+        }
+    }
+    if exact_lane_digest.len() != 64 || !is_lower_hex(exact_lane_digest) {
+        return Err(invalid("task family exact lane digest is non-canonical"));
+    }
+    let root_working_session_key = root_working_session_key(working_session_key);
+    let policy_digest = sha256_hex(
+        format!("task-family-policy-v1\0max-depth={DEFAULT_MAX_TASK_CONTINUATION_DEPTH}")
+            .as_bytes(),
+    );
+    let family_id = sha256_hex(
+        format!(
+            "task-family-v1\0{exact_lane_digest}\0{virtual_session_id}\0{root_queue_id}\0{prompt_digest}"
+        )
+        .as_bytes(),
+    );
+    let now_ms = crate::current_log_time_ms()?;
+    let candidate = TaskFamilyV1 {
+        schema: TASK_FAMILY_SCHEMA.to_string(),
+        family_id: family_id.clone(),
+        authority_version: 1,
+        root_queue_id: root_queue_id.to_string(),
+        exact_lane_digest: exact_lane_digest.to_string(),
+        virtual_session_id: virtual_session_id.to_string(),
+        root_working_session_key,
+        agent_id: agent_id.to_string(),
+        runtime_class: "interactive".to_string(),
+        prompt_digest: prompt_digest.to_string(),
+        policy_digest,
+        status: "runnable".to_string(),
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        observation_order: 1,
+    };
+    let file = task_family_file(harness_home, &family_id);
+    if file.is_file() {
+        let existing: TaskFamilyV1 =
+            serde_json::from_slice(&fs::read(&file)?).map_err(io::Error::other)?;
+        if task_family_identity(&existing) != task_family_identity(&candidate) {
+            return Err(invalid(
+                "existing task family authority does not match exact identity",
+            ));
+        }
+        return Ok(existing);
+    }
+    crate::write_json_atomic(&file, &candidate)?;
+    Ok(candidate)
+}
+
+pub fn find_task_family_for_root_queue(
+    harness_home: &Path,
+    root_queue_id: &str,
+) -> io::Result<Option<TaskFamilyV1>> {
+    if root_queue_id.trim().is_empty() {
+        return Ok(None);
+    }
+    let dir = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("task-families");
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut found = None;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let family: TaskFamilyV1 =
+            serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?;
+        if family.schema != TASK_FAMILY_SCHEMA || family.root_queue_id != root_queue_id {
+            continue;
+        }
+        if found.is_some() {
+            return Err(invalid(
+                "multiple task families claim the same root queue authority",
+            ));
+        }
+        found = Some(family);
+    }
+    Ok(found)
+}
+
+pub fn evaluate_explicit_checkpoint_drain(
+    options: ExplicitCheckpointAuthorityOptions,
+) -> TaskDrainEvaluationV1 {
+    match resolve_explicit_checkpoint_authority(&options) {
+        Ok(snapshot) => TaskDrainEvaluationV1 {
+            schema: TASK_TRANSITION_SCHEMA.to_string(),
+            disposition: DrainDispositionV1::ContinuationRequired(snapshot),
+            schedule_continuation: true,
+            allow_logical_final: false,
+            reason: "deadline drain has exact harness-owned task-family authority and a typed checkpoint"
                 .to_string(),
         },
         Err(error) => TaskDrainEvaluationV1 {
@@ -225,6 +591,181 @@ pub fn revalidate_operation_plan_snapshot(
         ));
     }
     Ok(())
+}
+
+pub fn revalidate_continuation_snapshot(
+    harness_home: &Path,
+    snapshot: &ContinuationAuthoritySnapshotV1,
+    working_session_key: &str,
+    agent_id: &str,
+) -> io::Result<()> {
+    match snapshot.kind {
+        ContinuationAuthorityKindV1::OperationPlan => revalidate_operation_plan_snapshot(
+            harness_home,
+            snapshot,
+            working_session_key,
+            agent_id,
+        ),
+        ContinuationAuthorityKindV1::ExplicitCheckpoint => revalidate_explicit_checkpoint_snapshot(
+            harness_home,
+            snapshot,
+            working_session_key,
+            agent_id,
+        ),
+        ContinuationAuthorityKindV1::Goal => {
+            Err(invalid("task snapshot cannot use Goal authority"))
+        }
+    }
+}
+
+pub fn revalidate_explicit_checkpoint_snapshot(
+    harness_home: &Path,
+    snapshot: &ContinuationAuthoritySnapshotV1,
+    working_session_key: &str,
+    agent_id: &str,
+) -> io::Result<()> {
+    if snapshot.kind != ContinuationAuthorityKindV1::ExplicitCheckpoint {
+        return Err(invalid("task snapshot is not ExplicitCheckpoint authority"));
+    }
+    let family = read_task_family(harness_home, &snapshot.authority_id)?;
+    if family.authority_version != snapshot.authority_version
+        || family.agent_id != agent_id
+        || family.exact_lane_digest != snapshot.exact_lane_digest
+        || family.virtual_session_id != snapshot.virtual_session_id
+        || family.root_working_session_key != root_working_session_key(working_session_key)
+        || family.runtime_class != "interactive"
+        || family.status != "runnable"
+        || task_family_checksum(&family)? != snapshot.authority_checksum
+    {
+        return Err(invalid(
+            "ExplicitCheckpoint task-family authority changed before child admission",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_explicit_checkpoint_authority(
+    options: &ExplicitCheckpointAuthorityOptions,
+) -> io::Result<ContinuationAuthoritySnapshotV1> {
+    validate_checkpoint(&options.checkpoint)?;
+    if options.checkpoint.authority_kind != ContinuationAuthorityKindV1::ExplicitCheckpoint {
+        return Err(invalid("checkpoint authority is not ExplicitCheckpoint"));
+    }
+    if options.checkpoint.authority_id != options.expected_family_id {
+        return Err(invalid(
+            "checkpoint did not name the harness-owned task family",
+        ));
+    }
+    if options.breakers.operator_stop {
+        return Err(invalid("operator stop fences task continuation"));
+    }
+    if options.breakers.newer_steer {
+        return Err(invalid("newer steer fences the drained task slice"));
+    }
+    if options.breakers.budget_exhausted {
+        return Err(invalid("task continuation budget is exhausted"));
+    }
+    if options.breakers.no_progress_exhausted {
+        return Err(invalid(
+            "task continuation no-progress breaker is exhausted",
+        ));
+    }
+    if depth_exhausted(options.breakers) {
+        return Err(invalid("task continuation depth breaker is exhausted"));
+    }
+    let family = read_task_family(&options.harness_home, &options.expected_family_id)?;
+    if family.authority_version != options.checkpoint.authority_version
+        || family.root_queue_id != options.expected_root_queue_id
+        || family.agent_id != options.agent_id
+        || family.exact_lane_digest != options.exact_lane_digest
+        || family.virtual_session_id != options.virtual_session_id
+        || family.root_working_session_key != root_working_session_key(&options.working_session_key)
+        || family.runtime_class != "interactive"
+        || family.status != "runnable"
+    {
+        return Err(invalid(
+            "task family does not own the current exact lane/slice",
+        ));
+    }
+    if options.checkpoint.active_item_id.is_some()
+        || options.checkpoint.active_item_version.is_some()
+    {
+        return Err(invalid(
+            "ExplicitCheckpoint authority cannot claim an OperationPlan item",
+        ));
+    }
+    Ok(ContinuationAuthoritySnapshotV1 {
+        kind: ContinuationAuthorityKindV1::ExplicitCheckpoint,
+        authority_id: family.family_id.clone(),
+        authority_version: family.authority_version,
+        authority_checksum: task_family_checksum(&family)?,
+        exact_lane_digest: family.exact_lane_digest.clone(),
+        virtual_session_id: family.virtual_session_id.clone(),
+        active_item_id: None,
+        active_item_version: None,
+        checkpoint_digest: options.checkpoint.checkpoint_digest.clone(),
+    })
+}
+
+fn task_family_file(harness_home: &Path, family_id: &str) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("task-families")
+        .join(format!("{family_id}.json"))
+}
+
+pub(crate) fn read_task_family(harness_home: &Path, family_id: &str) -> io::Result<TaskFamilyV1> {
+    if family_id.len() != 64 || !is_lower_hex(family_id) {
+        return Err(invalid("task family id is non-canonical"));
+    }
+    let family: TaskFamilyV1 =
+        serde_json::from_slice(&fs::read(task_family_file(harness_home, family_id))?)
+            .map_err(io::Error::other)?;
+    if family.schema != TASK_FAMILY_SCHEMA
+        || family.family_id != family_id
+        || family.runtime_class != "interactive"
+        || family.status != "runnable"
+    {
+        return Err(invalid("task family file has mismatched identity/schema"));
+    }
+    Ok(family)
+}
+
+pub fn task_family_checksum(family: &TaskFamilyV1) -> io::Result<String> {
+    Ok(sha256_hex(
+        &serde_json::to_vec(family).map_err(io::Error::other)?,
+    ))
+}
+
+fn task_family_identity(
+    family: &TaskFamilyV1,
+) -> (
+    &str,
+    u64,
+    &str,
+    &str,
+    &str,
+    &str,
+    &str,
+    &str,
+    &str,
+    &str,
+    &str,
+) {
+    (
+        &family.schema,
+        family.authority_version,
+        &family.root_queue_id,
+        &family.exact_lane_digest,
+        &family.virtual_session_id,
+        &family.root_working_session_key,
+        &family.agent_id,
+        &family.runtime_class,
+        &family.prompt_digest,
+        &family.policy_digest,
+        &family.status,
+    )
 }
 
 fn resolve_operation_plan_authority(
@@ -350,6 +891,66 @@ fn validate_checkpoint(checkpoint: &TaskContinuationCheckpointV1) -> io::Result<
     Ok(())
 }
 
+fn validate_drain_disposition_marker(marker: &DrainDispositionMarkerV1) -> io::Result<()> {
+    if marker.schema != DRAIN_DISPOSITION_SCHEMA {
+        return Err(invalid("unsupported-drain-disposition-schema"));
+    }
+    for value in [
+        marker.reason_code.as_deref(),
+        marker.question.as_deref(),
+        marker.recovery_hint.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+            return Err(invalid("disposition-bounded-text-invalid"));
+        }
+    }
+    if marker.completion_evidence_digests.len() > 16
+        || marker
+            .completion_evidence_digests
+            .iter()
+            .any(|digest| digest.len() != 64 || !is_lower_hex(digest))
+    {
+        return Err(invalid("completion-evidence-digest-invalid"));
+    }
+    match marker.disposition {
+        DrainDispositionKindV1::ContinuationRequired => {
+            let checkpoint = drain_marker_checkpoint(marker)?;
+            if checkpoint.authority_kind == ContinuationAuthorityKindV1::ExplicitCheckpoint
+                && (marker.task_family_id.as_deref() != Some(checkpoint.authority_id.as_str())
+                    || marker.task_family_version != Some(checkpoint.authority_version))
+            {
+                return Err(invalid("explicit-checkpoint-task-family-mismatch"));
+            }
+        }
+        DrainDispositionKindV1::LogicalComplete => {
+            if marker.authority_kind.is_some()
+                || marker.authority_id.is_some()
+                || marker.authority_version.is_some()
+                || marker.checkpoint.is_some()
+                || marker.checkpoint_digest.is_some()
+            {
+                return Err(invalid(
+                    "logical-complete-cannot-claim-continuation-authority",
+                ));
+            }
+        }
+        DrainDispositionKindV1::NeedsUser => {
+            if marker.question.is_none() || marker.reason_code.is_none() {
+                return Err(invalid("needs-user-requires-question-and-reason"));
+            }
+        }
+        DrainDispositionKindV1::NeedsAuthority | DrainDispositionKindV1::Blocked => {
+            if marker.reason_code.is_none() {
+                return Err(invalid("parked-disposition-requires-reason"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn authority_checksum(
     plan: &crate::operation_plan::OperationPlan,
     item: &OperationPlanItem,
@@ -420,6 +1021,7 @@ mod tests {
             &authority,
             2,
             7,
+            false,
             10,
         )
         .unwrap();
@@ -644,6 +1246,208 @@ mod tests {
         let (visible, parsed) = extract_task_continuation_checkpoint(&marker).unwrap();
         assert_eq!(visible, "Work is checkpointed.");
         assert_eq!(parsed, Some(checkpoint));
+    }
+
+    #[test]
+    fn harness_owned_task_family_authorizes_exact_explicit_checkpoint_once() {
+        let (root, operation) = fixture(OperationPlanItemStatus::Running);
+        let family = ensure_task_family(
+            &root,
+            "root-queue",
+            &operation.exact_lane_digest,
+            &operation.virtual_session_id,
+            &operation.working_session_key,
+            &operation.agent_id,
+            &sha256_hex(b"root prompt"),
+        )
+        .unwrap();
+        let body = "bounded ordinary-task checkpoint".to_string();
+        let checkpoint = TaskContinuationCheckpointV1 {
+            schema: TASK_CONTINUATION_CHECKPOINT_SCHEMA.to_string(),
+            authority_kind: ContinuationAuthorityKindV1::ExplicitCheckpoint,
+            authority_id: family.family_id.clone(),
+            authority_version: family.authority_version,
+            active_item_id: None,
+            active_item_version: None,
+            checkpoint_digest: sha256_hex(body.as_bytes()),
+            checkpoint: body,
+        };
+        let evaluation = evaluate_explicit_checkpoint_drain(ExplicitCheckpointAuthorityOptions {
+            harness_home: root.clone(),
+            checkpoint,
+            expected_family_id: family.family_id.clone(),
+            expected_root_queue_id: family.root_queue_id.clone(),
+            exact_lane_digest: operation.exact_lane_digest.clone(),
+            virtual_session_id: operation.virtual_session_id.clone(),
+            working_session_key: operation.working_session_key.clone(),
+            agent_id: operation.agent_id.clone(),
+            breakers: TaskContinuationBreakers::default(),
+        });
+        let DrainDispositionV1::ContinuationRequired(snapshot) = evaluation.disposition else {
+            panic!("explicit checkpoint should schedule one exact task child");
+        };
+        assert!(evaluation.schedule_continuation);
+        assert!(!evaluation.allow_logical_final);
+        revalidate_continuation_snapshot(
+            &root,
+            &snapshot,
+            &operation.working_session_key,
+            &operation.agent_id,
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_checkpoint_rejects_wrong_root_or_breaker() {
+        let (root, operation) = fixture(OperationPlanItemStatus::Running);
+        let family = ensure_task_family(
+            &root,
+            "root-queue",
+            &operation.exact_lane_digest,
+            &operation.virtual_session_id,
+            &operation.working_session_key,
+            &operation.agent_id,
+            &sha256_hex(b"root prompt"),
+        )
+        .unwrap();
+        let body = "checkpoint".to_string();
+        let checkpoint = TaskContinuationCheckpointV1 {
+            schema: TASK_CONTINUATION_CHECKPOINT_SCHEMA.to_string(),
+            authority_kind: ContinuationAuthorityKindV1::ExplicitCheckpoint,
+            authority_id: family.family_id.clone(),
+            authority_version: 1,
+            active_item_id: None,
+            active_item_version: None,
+            checkpoint_digest: sha256_hex(body.as_bytes()),
+            checkpoint: body,
+        };
+        for (root_queue, stopped) in [("wrong-root", false), ("root-queue", true)] {
+            let evaluation =
+                evaluate_explicit_checkpoint_drain(ExplicitCheckpointAuthorityOptions {
+                    harness_home: root.clone(),
+                    checkpoint: checkpoint.clone(),
+                    expected_family_id: family.family_id.clone(),
+                    expected_root_queue_id: root_queue.to_string(),
+                    exact_lane_digest: operation.exact_lane_digest.clone(),
+                    virtual_session_id: operation.virtual_session_id.clone(),
+                    working_session_key: operation.working_session_key.clone(),
+                    agent_id: operation.agent_id.clone(),
+                    breakers: TaskContinuationBreakers {
+                        operator_stop: stopped,
+                        ..TaskContinuationBreakers::default()
+                    },
+                });
+            assert!(!evaluation.schedule_continuation);
+            assert!(!evaluation.allow_logical_final);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typed_drain_disposition_strips_control_data_and_preserves_exact_authority() {
+        let checkpoint = "bounded remaining work";
+        let family_id = "a".repeat(64);
+        let marker = DrainDispositionMarkerV1 {
+            schema: DRAIN_DISPOSITION_SCHEMA.to_string(),
+            disposition: DrainDispositionKindV1::ContinuationRequired,
+            observed_deadline_generation: 2,
+            authority_kind: Some(ContinuationAuthorityKindV1::ExplicitCheckpoint),
+            authority_id: Some(family_id.clone()),
+            authority_version: Some(3),
+            task_family_id: Some(family_id.clone()),
+            task_family_version: Some(3),
+            active_item_id: None,
+            active_item_version: None,
+            checkpoint: Some(checkpoint.to_string()),
+            checkpoint_digest: Some(sha256_hex(checkpoint.as_bytes())),
+            reason_code: None,
+            question: None,
+            recovery_hint: None,
+            completion_evidence_digests: Vec::new(),
+        };
+        let assistant = format!(
+            "Visible handoff\n{DRAIN_DISPOSITION_MARKER_OPEN}{}{DRAIN_DISPOSITION_MARKER_CLOSE}",
+            serde_json::to_string(&marker).unwrap()
+        );
+        let (visible, capture) = extract_drain_disposition_marker(&assistant);
+        assert_eq!(visible, "Visible handoff");
+        let DrainDispositionCaptureV1::Valid(parsed) = capture else {
+            panic!("valid typed disposition must be captured");
+        };
+        assert_eq!(parsed, marker);
+        let checkpoint = drain_marker_checkpoint(&parsed).unwrap();
+        assert_eq!(checkpoint.authority_id, family_id);
+        assert_eq!(checkpoint.authority_version, 3);
+    }
+
+    #[test]
+    fn typed_drain_disposition_rejects_authority_on_logical_completion() {
+        let marker = serde_json::json!({
+            "schema": DRAIN_DISPOSITION_SCHEMA,
+            "disposition": "logical-complete",
+            "observedDeadlineGeneration": 0,
+            "authorityKind": "explicit-checkpoint",
+            "authorityId": "a".repeat(64),
+            "authorityVersion": 1,
+            "completionEvidenceDigests": []
+        });
+        let assistant = format!(
+            "Visible\n{DRAIN_DISPOSITION_MARKER_OPEN}{marker}{DRAIN_DISPOSITION_MARKER_CLOSE}"
+        );
+        let (visible, capture) = extract_drain_disposition_marker(&assistant);
+        assert_eq!(visible, "Visible");
+        assert!(matches!(capture, DrainDispositionCaptureV1::Invalid { .. }));
+    }
+
+    #[test]
+    fn malformed_drain_disposition_is_hidden_and_fail_closed() {
+        let assistant = format!(
+            "Visible\n{DRAIN_DISPOSITION_MARKER_OPEN}{{bad json{DRAIN_DISPOSITION_MARKER_CLOSE}"
+        );
+        let (visible, capture) = extract_drain_disposition_marker(&assistant);
+        assert_eq!(visible, "Visible");
+        assert_eq!(
+            capture,
+            DrainDispositionCaptureV1::Invalid {
+                reason_code: "disposition-marker-invalid-json".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_and_oversized_drain_dispositions_are_hidden_and_fail_closed() {
+        let valid = serde_json::json!({
+            "schema": DRAIN_DISPOSITION_SCHEMA,
+            "disposition": "needs-user",
+            "observedDeadlineGeneration": 1,
+            "reasonCode": "missing-input",
+            "question": "Which target should be used?"
+        });
+        let duplicate = format!(
+            "Visible\n{DRAIN_DISPOSITION_MARKER_OPEN}{valid}{DRAIN_DISPOSITION_MARKER_CLOSE}\n{DRAIN_DISPOSITION_MARKER_OPEN}{valid}{DRAIN_DISPOSITION_MARKER_CLOSE}"
+        );
+        let (visible, capture) = extract_drain_disposition_marker(&duplicate);
+        assert_eq!(visible, "Visible");
+        assert_eq!(
+            capture,
+            DrainDispositionCaptureV1::Invalid {
+                reason_code: "multiple-or-unbalanced-disposition-markers".to_string()
+            }
+        );
+
+        let oversized = format!(
+            "Visible\n{DRAIN_DISPOSITION_MARKER_OPEN}{}{DRAIN_DISPOSITION_MARKER_CLOSE}",
+            "x".repeat(MAX_MARKER_BYTES + 1)
+        );
+        let (visible, capture) = extract_drain_disposition_marker(&oversized);
+        assert_eq!(visible, "Visible");
+        assert_eq!(
+            capture,
+            DrainDispositionCaptureV1::Invalid {
+                reason_code: "disposition-marker-oversized".to_string()
+            }
+        );
     }
 
     fn fixture(target_status: OperationPlanItemStatus) -> (PathBuf, OperationPlanAuthorityOptions) {

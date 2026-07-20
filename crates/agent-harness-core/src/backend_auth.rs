@@ -753,8 +753,7 @@ fn probe_backend_account_under_lease(
         }
     };
 
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = terminate_backend_auth_child_process_tree(&mut child);
     let (state, account_probe_result, capability_probe_result, auth_mode, plan_type) =
         match response {
             Ok((value, capability)) => {
@@ -964,8 +963,7 @@ pub fn run_backend_auth_cli_operation(
             });
         api_key.fill(0);
         if write_result.is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = terminate_backend_auth_child_process_tree(&mut child);
             return complete_backend_auth_cli_operation_with_receipt(
                 &codex_home,
                 &provider,
@@ -1739,14 +1737,32 @@ fn wait_for_backend_auth_child(
                     "backend auth cancel marker does not match the active operation",
                 ));
             }
-            let _ = child.kill();
-            return child.wait().map(|status| (status, true));
+            return terminate_backend_auth_child_process_tree(child).map(|status| (status, true));
         }
         if let Some(status) = child.try_wait()? {
             return Ok((status, false));
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn terminate_backend_auth_child_process_tree(
+    child: &mut std::process::Child,
+) -> io::Result<std::process::ExitStatus> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    child.wait()
 }
 
 fn backend_auth_continuation_file(harness_home: &Path, queue_id: &str) -> PathBuf {
@@ -2516,11 +2532,15 @@ done
                 r#"
 $callFile = '{call_file}'
 $modeFile = '{mode_file}'
+$loggedOutResponse = $null
 if ($args.Count -gt 0 -and $args[0] -eq 'login') {{
     if ($args -contains '--device-auth') {{ $method = 'chatgpt-device-code' }}
     elseif ($args -contains '--with-api-key') {{
         $method = 'api-key-stdin'
-        $null = [Console]::In.ReadToEnd()
+        # The production CLI contract sends exactly one newline-terminated
+        # secret. Read one line so the cmd.exe test wrapper cannot keep its
+        # inherited stdin handle open and prevent EOF forever.
+        $null = [Console]::In.ReadLine()
     }} else {{ $method = 'chatgpt-browser' }}
     Set-Content -LiteralPath $callFile -NoNewline -Value $method
     Set-Content -LiteralPath $modeFile -NoNewline -Value 'ready'
@@ -2542,10 +2562,18 @@ while ($true) {{
         if ($mode -eq 'ready') {{
             [Console]::Out.WriteLine('{{"id":1,"result":{{"account":{{"type":"chatgpt"}},"requiresOpenaiAuth":true,"authMode":"chatgpt","planType":"team"}}}}')
         }} else {{
-            [Console]::Out.WriteLine('{{"id":1,"result":{{"account":null,"requiresOpenaiAuth":true}}}}')
+            # Keep the Windows wrapper alive until model/list is consumed. If
+            # account/read closes the probe first, killing cmd.exe can leave
+            # its PowerShell descendant holding the inherited stdout pipe.
+            $loggedOutResponse = '{{"id":1,"result":{{"account":null,"requiresOpenaiAuth":true}}}}'
         }}
     }} elseif ($msg.id -eq 2) {{
         [Console]::Out.WriteLine('{{"id":2,"result":{{"data":[{{"id":"gpt-fixture"}}],"nextCursor":null}}}}')
+        if ($null -ne $loggedOutResponse) {{
+            [Console]::Out.WriteLine($loggedOutResponse)
+        }}
+        [Console]::Out.Flush()
+        exit 0
     }}
     [Console]::Out.Flush()
 }}
