@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agent Harness Core — An engineering-grade agent harness for long tasks</title>
-<meta name="description" content="A self-hosted Rust agent runtime built for long-horizon tasks: virtual sessions for durable continuity, RLM for bounded deep reasoning, and a receipt for every step. Independently reviewed by a frontier AI; honestly labeled mechanism vs. proven.">
-<meta property="og:title" content="Agent Harness Core — built for long tasks">
-<meta property="og:description" content="Continuity is not intelligence. Long tasks need both — as separate, bounded, receipted engineering layers. A self-hosted Rust agent harness, independently AI-reviewed and honestly scored.">
+<title>Agent Harness Core — Durable long tasks and adaptive skills</title>
+<meta name="description" content="A self-hosted Rust agent runtime for durable long tasks, auditable operations, and evidence-governed adaptive skill intelligence.">
+<meta property="og:title" content="Agent Harness Core — durable tasks, adaptive skills">
+<meta property="og:description" content="Virtual-session continuity, bounded reasoning, and evidence-governed procedural learning as separate, receipted engineering layers.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://phenomenoner.github.io/agent-harness-core/">
 <style>
@@ -50,6 +50,15 @@
   .stat:last-child{border-right:none}
   .stat b{display:block;font-family:var(--mono);font-size:1.25rem;color:var(--amber)}
   .stat span{font-size:.82rem;color:var(--faint)}
+
+  /* explore */
+  .explore-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:38px}
+  .explore-card{display:block;padding:26px;border:1px solid var(--line);border-radius:16px;background:var(--bg2);color:var(--txt);transition:transform .16s ease,border-color .16s ease}
+  .explore-card:hover{transform:translateY(-2px);border-color:var(--amber-dim);text-decoration:none}
+  .explore-card .kicker{font-family:var(--mono);font-size:.74rem;letter-spacing:.12em;text-transform:uppercase;color:var(--amber)}
+  .explore-card h3{margin:10px 0 8px;font-size:1.2rem}
+  .explore-card p{color:var(--dim);font-size:.93rem}
+  .explore-card .arrow{display:block;margin-top:18px;color:var(--amber);font-weight:700}
 
   /* thesis / split */
   .thesis{margin:34px 0;padding:28px 30px;border-left:3px solid var(--amber);background:var(--panel);border-radius:0 12px 12px 0;font-size:1.18rem;font-weight:600;line-height:1.5}
@@ -128,7 +137,7 @@
 
   @media (max-width:760px){
     .split,.qgrid{grid-template-columns:1fr}
-    .proofs,.feat{grid-template-columns:1fr}
+    .proofs,.feat,.explore-grid{grid-template-columns:1fr}
     .tl{grid-template-columns:1fr;gap:4px}
     section{padding:64px 0}
   }
@@ -145,19 +154,48 @@
     <p class="sub">A self-hosted AI agent runtime in Rust that treats long-task survival as an engineering problem. A stable <b>virtual session</b> keeps a task coherent across context compaction, process death, and restarts; deep evidence-work runs as bounded, sandboxed reasoning jobs — and every step writes an auditable receipt. Independently reviewed by a frontier AI, and honestly labeled <span class="mono">mechanism</span> vs. <span class="mono">proven</span> throughout.</p>
     <div class="cta">
       <a class="btn btn-primary" href="https://github.com/phenomenoner/agent-harness-core">★ Star the repo</a>
-      <a class="btn btn-ghost" href="#design">The design ↓</a>
+      <a class="btn btn-ghost" href="#explore">Explore the ideas ↓</a>
+      <a class="btn btn-ghost" href="essay/adaptive-skill-intelligence/">Adaptive skill intelligence →</a>
       <a class="btn btn-ghost" href="essay/long-task-engine/">The long-task engine →</a>
-      <a class="btn btn-ghost" href="#verdict">The AI's verdict ↓</a>
     </div>
     <div class="stats">
       <div class="stat"><b>6</b><span>dependencies, total</span></div>
       <div class="stat"><b>0</b><span>async runtimes</span></div>
-      <div class="stat"><b>500+</b><span>tests, zero model calls</span></div>
+      <div class="stat"><b>1,200+</b><span>tests, zero model calls</span></div>
       <div class="stat"><b>1:1</b><span>steps to receipts</span></div>
       <div class="stat"><b>2</b><span>frontier-AI review rounds</span></div>
     </div>
   </div>
 </header>
+
+<!-- ============ EXPLORE ============ -->
+<section id="explore">
+  <div class="wrap">
+    <div class="eyebrow">Explore the design</div>
+    <h2>Three entry points, one operating philosophy.</h2>
+    <p class="lead">Start with the capability you care about. Each essay separates implemented foundations, design direction, and evidence still required.</p>
+    <div class="explore-grid">
+      <a class="explore-card" href="essay/adaptive-skill-intelligence/">
+        <span class="kicker">New · procedural learning</span>
+        <h3>Adaptive Skill Intelligence</h3>
+        <p>How external guidance and verified task experience become measurable, reusable, and reversible agent capability.</p>
+        <span class="arrow">Read the essay →</span>
+      </a>
+      <a class="explore-card" href="essay/long-task-engine/">
+        <span class="kicker">Architecture · continuity</span>
+        <h3>The Long-Task Engine</h3>
+        <p>Why virtual sessions and bounded reasoning are separate layers—and how exact task identity survives rollover and restart.</p>
+        <span class="arrow">Read the architecture →</span>
+      </a>
+      <a class="explore-card" href="essay/">
+        <span class="kicker">Essay · engineering</span>
+        <h3>Engineering Is No Longer the Moat</h3>
+        <p>The experiment behind the project, the receipts it produced, and the trust questions AI-assisted engineering still has to answer.</p>
+        <span class="arrow">Read the essay →</span>
+      </a>
+    </div>
+  </div>
+</section>
 
 <!-- ============ THE PROBLEM ============ -->
 <section id="problem">
@@ -356,6 +394,7 @@ cargo run -p agent-harness-cli -- enable-check --target-home C:\path\to\.agent-h
 <footer class="site">
   <div class="wrap">
     <div class="links">
+      <a href="essay/adaptive-skill-intelligence/">Adaptive Skill Intelligence</a>
       <a href="essay/long-task-engine/">The Long-Task Engine</a>
       <a href="essay/">The Experiment Essay</a>
       <a href="https://github.com/phenomenoner/agent-harness-core">GitHub</a>
