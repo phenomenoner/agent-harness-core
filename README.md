@@ -7,12 +7,13 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](rust-toolchain.toml)
 [![Edition 2024](https://img.shields.io/badge/edition-2024-red.svg)](Cargo.toml)
-[![Version 0.10.0](https://img.shields.io/badge/version-0.10.0-blue.svg)](crates/agent-harness-core/Cargo.toml)
+[![Version 0.11.0](https://img.shields.io/badge/version-0.11.0-blue.svg)](crates/agent-harness-core/Cargo.toml)
 [![Platform: Windows-first](https://img.shields.io/badge/platform-Windows--first-0078d4.svg)](#faq)
 [![Status: Pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](CHANGELOG.md)
 
 [Quick Start](#quick-start) •
 [Features](#why-agent-harness-core) •
+[Adaptive Skills](docs/adaptive-skill-intelligence.md) •
 [Architecture](#how-it-works) •
 [CLI](#cli-at-a-glance) •
 [Docs](#documentation) •
@@ -55,6 +56,12 @@ Born as a ground-up Rust rebuild of a Docker-based legacy agent gateway ("OpenCl
 | 🪶 **Minimal dependencies** | Six crates: `serde`, `serde_json`, `ureq`, `rusqlite`, `ring`, `base64`. No tokio, no async runtime, no clap. Synchronous Rust you can read in an afternoon and audit forever. |
 | 🔑 **Encrypted secret vault** | Repo-local vault using PBKDF2-HMAC-SHA256 + ChaCha20-Poly1305; `vault-get` reports presence and length, never plaintext. |
 | 🔁 **Legacy migration built in** | Read-only dry-run import plans, conflict policies (skip/overwrite/rename), safe-copy execution that skips raw secrets by default, and cutover readiness gates. |
+
+### Adaptive skill intelligence — design direction
+
+Agent Harness Core is extending skills from matched runbooks into an **evidence-governed procedural learning system**. The target is an agent that combines external guidance with verified task experience, reflects on what worked under which conditions, and accumulates reusable individual capability without turning every transcript or popular workflow into permanent prompt text.
+
+The design uses competence-role retrieval, minimal sufficient disclosure, virtual-session revision manifests, contextual and uncertainty-aware skill beliefs, cost-aware evaluation, and reversible promotion. Existing selection receipts, proposal-mediated mutation, guards, and lifecycle controls are the foundation; outcome-linked learning, consolidation, and progressively autonomous promotion remain a product direction, not a claim that the complete loop is active. Read [Adaptive Skill Intelligence](docs/adaptive-skill-intelligence.md) or the [web essay](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/) for the rationale, architecture, measurement model, and delivery boundary.
 
 ## How It Works
 
@@ -155,10 +162,11 @@ One binary, `agent-harness`, grouped into clear families:
 3. **Fail closed.** No allow-list match, no channel identity binding, no model access. Missing credentials fail at preflight, not mid-turn.
 4. **Small surface, sync Rust.** No async runtime, no macro-heavy frameworks. Boring code that one person can fully audit.
 5. **The model backend is a contractor, not a roommate.** The harness assembles payloads and records outcomes; Codex keeps its own session, tools, and sandbox. App-server protocol errors and failed turns are terminal runtime failures, not empty successful replies.
+6. **Learning is a behavioral deployment.** Skill evidence, proposals, evaluation, promotion, and rollback are distinct. Activity and model self-assessment do not prove that a procedure improved a task.
 
 ## Project Status
 
-Version **0.10.0** is the current checkpoint release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
+Version **0.11.0** is the current checkpoint release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
 
 See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md) for what's done, gated, and next.
 
@@ -166,6 +174,9 @@ See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness
 
 | Document | What's inside |
 |---|---|
+| [Adaptive Skill Intelligence](docs/adaptive-skill-intelligence.md) ([web essay](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/)) | Product direction for turning external knowledge and task experience into measurable, cost-aware, reversible procedural capability. |
+| [Capability Map](docs/agent-harness-feature-parity.html) ([Markdown](docs/agent-harness-feature-parity.md)) | Public source overview separating implemented foundations, evidence boundaries, and design directions across the harness. |
+| [Skill Ecosystem](docs/skill-ecosystem.md) | Current discovery, selection, learning-gate, lifecycle, and compatibility behavior, separated from the adaptive design direction. |
 | [Topology Contract](docs/agent-harness-topology-contract.md) | Identity axes, component ownership, impact matrix, and scenario packs for behavior-changing code reviews. |
 | [Topology Explorer](docs/topology-explorer.html) | Generated interactive browser view of the topology contract, ownership graph, release gates, and open implementation gaps. |
 | [Configuration](docs/configuration.md) | `harness-config.json` reference. |
