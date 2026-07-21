@@ -2,6 +2,21 @@
 
 Agent Harness Core treats skills as runtime state, not static notes. A skill is a directory with `SKILL.md` plus optional `references/`, `templates/`, `scripts/`, and `assets/` support folders.
 
+## Current Foundation And Adaptive Direction
+
+The current source contract provides scoped discovery, deterministic eligibility and selection receipts, bounded prompt delivery, proposal-mediated mutation, guarded apply, reversible lifecycle operations, and checksum-locked packs. Those mechanisms are the auditable foundation for a broader product direction: **Adaptive Skill Intelligence**.
+
+That direction treats a skill as procedural memory that can improve through verified experience. It adds task-local competence roles, minimal sufficient disclosure, stable virtual-session revision manifests, contextual beliefs about applicability, reliability, contribution, and cost, independent cost-aware evaluation, relationship-first consolidation, and progressively authorized promotion and rollback.
+
+The distinction is intentional. Current sections below describe implemented source behavior. [Adaptive Skill Intelligence](adaptive-skill-intelligence.md) describes the target architecture and measurement contract; the [web essay](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/) presents the same direction for a broader audience. Neither is a claim that outcome-linked autonomous evolution is fully implemented or enabled.
+
+| Current foundation | Adaptive direction |
+|---|---|
+| Exact eligibility, lexical/FTS scoring, selection receipts, and bounded delivery | Role-first retrieval with calibrated abstention and adaptive minimal disclosure |
+| Selection, usage, proposal, apply, lifecycle, and pack records | Joined task effects and outcomes with attribution and contextual uncertainty |
+| Proposal-only synthesis by default and guarded explicit apply | Per-task evidence, periodic reflection, independent evaluation, and progressive autonomy |
+| Reversible archive/restore and checksum validation | Versioned topology, conflict resolution, consolidation, promotion, and exact downgrade |
+
 ## Discovery And Selection
 
 Skill discovery reads workspace, managed, project-agent, imported, bundled, agent-created, and pack namespaces. Turn planning resolves the selected agent before building the runtime index: `main` keeps the source home/workspace roots, while a non-main agent uses its own agent directory plus configured or `agents/<agent>/workspace` root. Shared harness/imported namespaces remain available after eligibility filtering. Category folders are supported one level below each root, for example `skills/trading/neoapi-orders/SKILL.md`. Dot directories, including `.archive/`, are excluded from the live index.

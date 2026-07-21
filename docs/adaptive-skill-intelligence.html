@@ -1,0 +1,738 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="How Agent Harness Core turns external knowledge and task experience into evidence-governed, measurable, and reversible procedural capability.">
+  <title>Adaptive Skill Intelligence · Agent Harness Core</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #15221f;
+      --muted: #5c6c67;
+      --paper: #fbfaf5;
+      --panel: #ffffff;
+      --line: #dce4de;
+      --forest: #145b43;
+      --forest-dark: #0b382a;
+      --mint: #dff3e8;
+      --amber: #d6922f;
+      --amber-soft: #fff0d4;
+      --blue: #2e6598;
+      --blue-soft: #e7f1fa;
+      --violet: #6e5494;
+      --shadow: 0 18px 60px rgba(22, 50, 40, 0.10);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% 0%, rgba(214, 146, 47, 0.12), transparent 28rem),
+        radial-gradient(circle at 92% 12%, rgba(20, 91, 67, 0.12), transparent 34rem),
+        var(--paper);
+      font-family: "Segoe UI", "Noto Sans", Arial, sans-serif;
+      line-height: 1.65;
+    }
+
+    a { color: var(--forest); }
+    a:hover { color: var(--forest-dark); }
+
+    .wrap {
+      width: min(1160px, calc(100% - 40px));
+      margin: 0 auto;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 22px 0;
+      font-size: 14px;
+    }
+
+    .brand {
+      color: var(--ink);
+      font-weight: 800;
+      text-decoration: none;
+      letter-spacing: -0.01em;
+    }
+
+    .topnav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+    }
+
+    .topnav a {
+      color: var(--muted);
+      text-decoration: none;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.25fr 0.75fr;
+      gap: 44px;
+      align-items: center;
+      padding: 68px 0 76px;
+    }
+
+    .eyebrow {
+      margin: 0 0 14px;
+      color: var(--forest);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 {
+      line-height: 1.12;
+      letter-spacing: -0.025em;
+    }
+
+    h1 {
+      max-width: 850px;
+      margin: 0;
+      font-size: clamp(44px, 7vw, 78px);
+      font-weight: 820;
+    }
+
+    .hero .lead {
+      max-width: 780px;
+      margin: 24px 0 0;
+      color: #40504b;
+      font-size: clamp(19px, 2.2vw, 25px);
+      line-height: 1.5;
+    }
+
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 26px;
+      padding: 8px 13px;
+      border: 1px solid rgba(20, 91, 67, 0.24);
+      border-radius: 999px;
+      color: var(--forest-dark);
+      background: var(--mint);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .status-chip::before {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--forest);
+      content: "";
+    }
+
+    .capability-orbit {
+      position: relative;
+      min-height: 390px;
+      border: 1px solid rgba(20, 91, 67, 0.16);
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.64);
+      box-shadow: var(--shadow);
+    }
+
+    .orbit-core,
+    .orbit-node {
+      position: absolute;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      border-radius: 50%;
+    }
+
+    .orbit-core {
+      inset: 50% auto auto 50%;
+      width: 154px;
+      height: 154px;
+      padding: 18px;
+      color: #fff;
+      background: var(--forest-dark);
+      transform: translate(-50%, -50%);
+      font-weight: 800;
+      line-height: 1.25;
+    }
+
+    .orbit-node {
+      width: 96px;
+      height: 96px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      background: #fff;
+      font-size: 13px;
+      font-weight: 750;
+      box-shadow: 0 10px 28px rgba(22, 50, 40, 0.09);
+    }
+
+    .orbit-node:nth-of-type(2) { top: 7%; left: 16%; }
+    .orbit-node:nth-of-type(3) { top: 12%; right: 10%; }
+    .orbit-node:nth-of-type(4) { bottom: 10%; right: 8%; }
+    .orbit-node:nth-of-type(5) { bottom: 6%; left: 14%; }
+
+    .status-band {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      overflow: hidden;
+      margin-bottom: 84px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .status-item { padding: 24px; }
+    .status-item + .status-item { border-left: 1px solid var(--line); }
+    .status-item strong { display: block; margin-bottom: 6px; }
+    .status-item span { color: var(--muted); font-size: 14px; }
+
+    section { padding: 74px 0; }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: 0.72fr 1.28fr;
+      gap: 52px;
+      align-items: start;
+      margin-bottom: 38px;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: clamp(32px, 4.6vw, 54px);
+    }
+
+    .section-intro {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 19px;
+    }
+
+    .quote {
+      margin: 32px 0 0;
+      padding: 28px 30px;
+      border-left: 5px solid var(--amber);
+      border-radius: 0 var(--radius) var(--radius) 0;
+      background: var(--amber-soft);
+      font-size: clamp(20px, 2.4vw, 28px);
+      font-weight: 720;
+      line-height: 1.4;
+    }
+
+    .objective {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      gap: 22px;
+      align-items: stretch;
+      margin-top: 30px;
+    }
+
+    .objective-card {
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .objective-card.gain { border-top: 5px solid var(--forest); }
+    .objective-card.cost { border-top: 5px solid var(--amber); }
+    .objective-card h3 { margin: 0 0 14px; font-size: 22px; }
+    .objective-card ul { margin: 0; padding-left: 20px; color: var(--muted); }
+    .operator { display: grid; place-items: center; color: var(--muted); font-size: 34px; }
+
+    .dark-section {
+      color: #f4f8f5;
+      background: var(--forest-dark);
+    }
+
+    .dark-section .eyebrow { color: #97d7ba; }
+    .dark-section .section-intro { color: #c8d8d1; }
+
+    .pipeline {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      margin-top: 40px;
+    }
+
+    .pipeline-step {
+      position: relative;
+      min-height: 190px;
+      padding: 22px;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 15px;
+      background: rgba(255, 255, 255, 0.07);
+    }
+
+    .pipeline-step:not(:last-child)::after {
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      right: -18px;
+      color: #98cbb5;
+      content: "→";
+      font-size: 25px;
+      transform: translateY(-50%);
+    }
+
+    .step-no {
+      display: inline-grid;
+      width: 30px;
+      height: 30px;
+      place-items: center;
+      margin-bottom: 28px;
+      border-radius: 50%;
+      color: var(--forest-dark);
+      background: #a7dfc4;
+      font-size: 13px;
+      font-weight: 900;
+    }
+
+    .pipeline-step h3 { margin: 0 0 10px; font-size: 18px; }
+    .pipeline-step p { margin: 0; color: #c8d8d1; font-size: 14px; }
+
+    .residency-grid,
+    .example-grid,
+    .measure-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-top: 36px;
+    }
+
+    .residency-card,
+    .example-card,
+    .measure-card {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .residency-card .tag,
+    .example-card .tag {
+      display: inline-block;
+      margin-bottom: 22px;
+      padding: 5px 9px;
+      border-radius: 7px;
+      color: var(--forest-dark);
+      background: var(--mint);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .residency-card h3,
+    .example-card h3,
+    .measure-card h3 { margin: 0 0 10px; font-size: 20px; }
+    .residency-card p,
+    .example-card p,
+    .measure-card p { margin: 0; color: var(--muted); font-size: 15px; }
+
+    .loop {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0;
+      overflow: hidden;
+      margin-top: 38px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .loop-step { padding: 28px; }
+    .loop-step + .loop-step { border-left: 1px solid var(--line); }
+    .loop-step b { display: block; margin-bottom: 10px; color: var(--forest); }
+    .loop-step p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    .beliefs {
+      display: grid;
+      grid-template-columns: 0.85fr 1.15fr;
+      gap: 30px;
+      align-items: stretch;
+      margin-top: 36px;
+    }
+
+    .belief-copy,
+    .evaluator-stack {
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .belief-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    .belief-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 11px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .belief-row:last-child { border-bottom: 0; }
+    .belief-row span:last-child { color: var(--muted); text-align: right; }
+
+    .eval-layer {
+      margin: 8px 0;
+      padding: 13px 15px;
+      border-radius: 9px;
+      color: #fff;
+      background: var(--forest);
+    }
+
+    .eval-layer:nth-child(3) { margin-left: 5%; background: #226c56; }
+    .eval-layer:nth-child(4) { margin-left: 10%; background: var(--blue); }
+    .eval-layer:nth-child(5) { margin-left: 15%; background: var(--violet); }
+    .eval-layer:nth-child(6) { margin-left: 20%; background: #7e4a30; }
+
+    .example-grid { grid-template-columns: repeat(3, 1fr); }
+    .example-card { min-height: 270px; }
+    .example-card .tag { background: var(--blue-soft); color: var(--blue); }
+
+    .measure-grid { grid-template-columns: repeat(3, 1fr); }
+    .measure-card { border-top: 4px solid var(--forest); }
+
+    .guardrails {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 22px;
+      margin-top: 34px;
+    }
+
+    .guardrail {
+      padding: 28px;
+      border-radius: var(--radius);
+    }
+
+    .guardrail.yes { background: var(--mint); }
+    .guardrail.no { background: var(--amber-soft); }
+    .guardrail h3 { margin: 0 0 14px; }
+    .guardrail ul { margin: 0; padding-left: 20px; }
+
+    .delivery {
+      counter-reset: delivery;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-top: 36px;
+    }
+
+    .delivery-step {
+      position: relative;
+      min-height: 175px;
+      padding: 28px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .delivery-step::before {
+      counter-increment: delivery;
+      display: block;
+      margin-bottom: 18px;
+      color: var(--amber);
+      content: "0" counter(delivery);
+      font-size: 14px;
+      font-weight: 900;
+      letter-spacing: 0.12em;
+    }
+
+    .delivery-step h3 { margin: 0 0 10px; }
+    .delivery-step p { margin: 0; color: var(--muted); }
+
+    .closing {
+      margin: 76px 0 0;
+      padding: 52px;
+      border-radius: 26px;
+      color: #fff;
+      background: linear-gradient(135deg, var(--forest-dark), var(--forest));
+      box-shadow: var(--shadow);
+    }
+
+    .closing h2 { max-width: 920px; }
+    .closing p { max-width: 850px; margin: 20px 0 0; color: #d6e8df; font-size: 18px; }
+
+    .button {
+      display: inline-block;
+      margin-top: 26px;
+      padding: 11px 16px;
+      border: 1px solid rgba(255, 255, 255, 0.35);
+      border-radius: 9px;
+      color: #fff;
+      text-decoration: none;
+      font-weight: 750;
+    }
+
+    footer {
+      padding: 44px 0 54px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 980px) {
+      .hero { grid-template-columns: 1fr; }
+      .capability-orbit { min-height: 330px; }
+      .pipeline { grid-template-columns: 1fr 1fr; }
+      .pipeline-step:not(:last-child)::after { display: none; }
+      .residency-grid { grid-template-columns: repeat(2, 1fr); }
+      .measure-grid { grid-template-columns: repeat(2, 1fr); }
+      .beliefs { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 720px) {
+      .wrap { width: min(100% - 28px, 1160px); }
+      .topbar, .section-head { display: block; }
+      .topnav { margin-top: 12px; }
+      .hero { padding-top: 42px; }
+      .status-band, .loop, .guardrails, .delivery, .example-grid, .measure-grid { grid-template-columns: 1fr; }
+      .status-item + .status-item, .loop-step + .loop-step { border-top: 1px solid var(--line); border-left: 0; }
+      .objective { grid-template-columns: 1fr; }
+      .operator { transform: rotate(90deg); }
+      .pipeline, .residency-grid { grid-template-columns: 1fr; }
+      .section-head { margin-bottom: 24px; }
+      .section-intro { margin-top: 18px; }
+      .closing { padding: 34px 26px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <nav class="topbar" aria-label="Article navigation">
+      <a class="brand" href="agent-harness-feature-parity.html">Agent Harness Core</a>
+      <div class="topnav">
+        <a href="#architecture">Architecture</a>
+        <a href="#learning">Learning loop</a>
+        <a href="#measurement">Measurement</a>
+        <a href="adaptive-skill-intelligence.md">Markdown source</a>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div>
+        <p class="eyebrow">A core product direction</p>
+        <h1>Adaptive Skill Intelligence</h1>
+        <p class="lead">Turning external knowledge and individual task experience into measurable, reusable, and reversible agent capability.</p>
+        <span class="status-chip">Foundations present · adaptive loop not yet fully enabled</span>
+      </div>
+      <div class="capability-orbit" aria-label="Experience becomes reusable capability">
+        <div class="orbit-core">Compounding<br>procedural<br>capability</div>
+        <div class="orbit-node">External<br>knowledge</div>
+        <div class="orbit-node">Task<br>experience</div>
+        <div class="orbit-node">Reflection<br>&amp; evidence</div>
+        <div class="orbit-node">Reversible<br>skills</div>
+      </div>
+    </header>
+
+    <div class="status-band">
+      <div class="status-item"><strong>Already in the repository</strong><span>Auditable matching, receipts, proposal-mediated mutation, guarded apply, lifecycle tooling, and virtual-session foundations.</span></div>
+      <div class="status-item"><strong>Design direction</strong><span>Role-first retrieval, minimal disclosure, contextual beliefs, cost-aware evaluation, and evidence-driven skill evolution.</span></div>
+      <div class="status-item"><strong>Non-negotiable boundary</strong><span>No claim that broad autonomous self-improvement is currently implemented, activated, or proven in live use.</span></div>
+    </div>
+  </div>
+
+  <main>
+    <section>
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">The human analogy</p>
+            <h2>Experience becomes useful only after reflection</h2>
+          </div>
+          <p class="section-intro">People combine teaching, documentation, demonstrations, and other people's lessons with their own attempts. We retain the procedure that worked, the conditions that mattered, and the warning signs that prevented failure. A skill gives an agent the same kind of reusable procedural asset—without confusing one episode with a universal rule.</p>
+        </div>
+        <div class="quote">The goal is not an agent that rewrites itself after every turn. It is an evidence-governed system that learns the smallest reusable procedure that improves the next comparable task.</div>
+
+        <div class="objective">
+          <div class="objective-card gain">
+            <h3>Expected benefit</h3>
+            <ul>
+              <li>better task outcomes and verifier results</li>
+              <li>fewer corrections and repeated failures</li>
+              <li>faster, more consistent execution</li>
+              <li>capability retained across future tasks</li>
+            </ul>
+          </div>
+          <div class="operator">−</div>
+          <div class="objective-card cost">
+            <h3>Total cost and risk</h3>
+            <ul>
+              <li>context, retrieval, latency, and tool cost</li>
+              <li>irrelevant-procedure interference</li>
+              <li>evaluation and maintenance burden</li>
+              <li>safety, authority, and external-effect risk</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="architecture" class="dark-section">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Role-first architecture</p>
+            <h2>Find less. Help more.</h2>
+          </div>
+          <p class="section-intro">The system does not start by scanning an entire library into the prompt. It asks what competence role is unresolved, applies hard identity and capability boundaries, and discloses only the fragment whose expected marginal value is positive.</p>
+        </div>
+        <div class="pipeline">
+          <div class="pipeline-step"><span class="step-no">1</span><h3>Bound the task</h3><p>Objective, stage, constraints, risk, tools, authority, and available evidence.</p></div>
+          <div class="pipeline-step"><span class="step-no">2</span><h3>Identify roles</h3><p>Diagnosis, planning, domain execution, verification, safety, or delivery.</p></div>
+          <div class="pipeline-step"><span class="step-no">3</span><h3>Filter hard</h3><p>Exact agent, account, channel, user, tool, lifecycle, and permission eligibility.</p></div>
+          <div class="pipeline-step"><span class="step-no">4</span><h3>Compare value</h3><p>Revision-specific utility, cost, uncertainty, freshness, and relationships.</p></div>
+          <div class="pipeline-step"><span class="step-no">5</span><h3>Disclose and stop</h3><p>The smallest sufficient fragment—or no skill when none improves the task.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Residency policy</p>
+            <h2>Availability is not the same as relevance</h2>
+          </div>
+          <p class="section-intro">Competence describes what a procedure can do. Residency describes when it may become model-visible. The two axes are measured independently so frequency cannot quietly turn into permanent prompt residency.</p>
+        </div>
+        <div class="residency-grid">
+          <div class="residency-card"><span class="tag">Always scarce</span><h3>Resident kernel</h3><p>A tiny capsule loaded by default only when broad outcome lift exceeds its repeated context and interference cost.</p></div>
+          <div class="residency-card"><span class="tag">Outside context</span><h3>Priority / predictive</h3><p>Rank metadata or prefetch content when expected latency savings exceed waste. Prefetch is not disclosure or use.</p></div>
+          <div class="residency-card"><span class="tag">Normal path</span><h3>Role on-demand</h3><p>Load the smallest core or reference slice after the current task demonstrates an unresolved competence role.</p></div>
+          <div class="residency-card"><span class="tag">Authority required</span><h3>Explicit / privileged</h3><p>Prediction cannot bypass an explicit invocation, permission, approval, or external-effect boundary.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="learning">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Experience loop</p>
+            <h2>Learn from outcomes, not activity</h2>
+          </div>
+          <p class="section-intro">A skill being surfaced, read, followed, and causally useful are different facts. Agent Harness Core keeps them separate, joins them to effects and outcomes, and preserves uncertainty when several skills contributed.</p>
+        </div>
+        <div class="loop">
+          <div class="loop-step"><b>Observe</b><p>Record candidate, disclosure, material use, test, effect, correction, cost, and terminal outcome.</p></div>
+          <div class="loop-step"><b>Attribute</b><p>Localize evidence to retrieval, role, procedure, composition, capability, or no reusable change.</p></div>
+          <div class="loop-step"><b>Reflect</b><p>Update contextual beliefs per task; periodically review repeated patterns, drift, conflicts, and residual gaps.</p></div>
+          <div class="loop-step"><b>Deploy behavior</b><p>Propose, independently evaluate, shadow, promote narrowly, observe, retain, or roll back.</p></div>
+        </div>
+
+        <div class="beliefs">
+          <div class="belief-copy">
+            <p class="eyebrow">Contextual beliefs</p>
+            <h3>No global “best skill” score</h3>
+            <p>Hierarchical Bayesian updates can share cautious priors across related roles while retaining revision-, context-, backend-, and time-specific uncertainty.</p>
+            <div class="belief-list">
+              <div class="belief-row"><strong>Applicability</strong><span>Should it fill this role here?</span></div>
+              <div class="belief-row"><strong>Reliability</strong><span>Does the procedure work when applicable?</span></div>
+              <div class="belief-row"><strong>Contribution</strong><span>Did it improve the final outcome?</span></div>
+              <div class="belief-row"><strong>Cost</strong><span>What context, latency, tools, and upkeep did it consume?</span></div>
+              <div class="belief-row"><strong>Freshness</strong><span>Does old evidence still match this environment?</span></div>
+            </div>
+          </div>
+          <div class="evaluator-stack">
+            <p class="eyebrow">Cost-aware evidence</p>
+            <h3>Use the least expensive evaluator that is reliable enough</h3>
+            <div class="eval-layer">Deterministic contracts, effects, tests, and invariants</div>
+            <div class="eval-layer">Statistical repetition, calibration, drift, and cost</div>
+            <div class="eval-layer">Bounded lower-cost evaluator model</div>
+            <div class="eval-layer">Stronger specialist for ambiguity or high impact</div>
+            <div class="eval-layer">Operator / high-assurance review for privileged change</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Beyond software</p>
+            <h2>A reusable capability asset for everyday work</h2>
+          </div>
+          <p class="section-intro">External guidance and individual experience can reinforce each other in daily life, interpersonal work, and professional operations—as long as facts, private observations, policy, and reusable procedure remain properly separated.</p>
+        </div>
+        <div class="example-grid">
+          <div class="example-card"><span class="tag">Life</span><h3>Trip preparation</h3><p>Combine public guidance with observed packing mistakes, accessibility needs, timing, and verification results. Current bookings stay task data; only the reusable preparation flow becomes a skill.</p></div>
+          <div class="example-card"><span class="tag">Interpersonal</span><h3>Difficult feedback</h3><p>Use communication frameworks plus accepted revisions and corrections to improve a scoped preparation procedure—without inferring private psychology or universalizing one interaction.</p></div>
+          <div class="example-card"><span class="tag">Work</span><h3>Incident response</h3><p>Join vendor documentation, prior failure modes, recovery evidence, and post-incident review. Environment drift lowers confidence and triggers revalidation instead of replaying an obsolete runbook.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="measurement">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Decision science</p>
+            <h2>Measure capability, not churn</h2>
+          </div>
+          <p class="section-intro">Baselines, task slices, metrics, costs, observation windows, and uncertainty rules are frozen before results are inspected. A lower selection count, a cleaner skill body, or more proposals is not automatically an improvement.</p>
+        </div>
+        <div class="measure-grid">
+          <div class="measure-card"><h3>Outcome</h3><p>Acceptance, verifier pass, corrections, failures, time to terminal, and comparison with no-skill or prior-revision baselines.</p></div>
+          <div class="measure-card"><h3>Coverage &amp; abstention</h3><p>Required-role recall, critical-role coverage, no-skill accuracy, false disclosure, and confidence calibration.</p></div>
+          <div class="measure-card"><h3>Disclosure efficiency</h3><p>Model-visible skill tokens, irrelevant fragments, repeat loads, and verified uplift per 1,000 skill tokens.</p></div>
+          <div class="measure-card"><h3>Total cost</h3><p>Latency, tools, retries, evaluator spend, operator attention, maintenance churn, and opportunity cost.</p></div>
+          <div class="measure-card"><h3>Evolution quality</h3><p>Held-out regression, false promotion, lost coverage, attribution overturn, drift, and rollback success.</p></div>
+          <div class="measure-card"><h3>Hard boundaries</h3><p>Cross-identity exposure, unauthorized effects, policy bypass, secret leakage, and irreversible mutation must remain zero.</p></div>
+        </div>
+
+        <div class="guardrails">
+          <div class="guardrail yes"><h3>Organic growth means</h3><ul><li>versioned procedural assets</li><li>evidence-aware role and residency changes</li><li>several revisions or a new skill when evidence supports them</li><li>independent evaluation and exact rollback</li></ul></div>
+          <div class="guardrail no"><h3>Organic growth does not mean</h3><ul><li>rewriting policy from one successful task</li><li>equating popularity with quality</li><li>merging skills because they look similar</li><li>letting the task model approve its own permanent change</li></ul></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Delivery path</p>
+            <h2>Earn autonomy one boundary at a time</h2>
+          </div>
+          <p class="section-intro">Each expansion of authority is a behavioral deployment with its own evidence. The project moves from observation to narrow promotion only when the affected risk class is independently qualified.</p>
+        </div>
+        <div class="delivery">
+          <div class="delivery-step"><h3>Correct and observe</h3><p>Remove unattributed mutation, compile exact contracts, and compare new policies with no serving-side effects.</p></div>
+          <div class="delivery-step"><h3>Join and evaluate</h3><p>Connect real effects and outcomes, calibrate beliefs and evaluators, and test proposals against frozen held-out cases.</p></div>
+          <div class="delivery-step"><h3>Promote narrowly</h3><p>Activate one reversible low-risk cohort, verify provider-visible outcomes, and widen only with evidence.</p></div>
+        </div>
+
+        <div class="closing">
+          <h2>From a static agent to a system that can accumulate individual capability.</h2>
+          <p>The model remains powerful but interchangeable. Agent Harness Core supplies the durable identity, evidence, decision, and rollback layer that lets experience improve future work without turning learning into an uncontrolled rewrite loop.</p>
+          <a class="button" href="skill-ecosystem.md">Read the current implementation contract</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">Agent Harness Core · Adaptive Skill Intelligence design direction · Updated 2026-07-21</div>
+  </footer>
+</body>
+</html>
