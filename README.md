@@ -17,6 +17,7 @@
 [Architecture](#how-it-works) •
 [CLI](#cli-at-a-glance) •
 [Docs](#documentation) •
+[Website](https://phenomenoner.github.io/agent-harness-core/) •
 [FAQ](#faq)
 
 </div>
@@ -35,6 +36,8 @@ It is **not** another prompt-orchestration library. It is the **operations layer
 - How do I stop a runaway turn? *(`/stop` cancel markers honored by the runtime poll loop)*
 
 Born as a ground-up Rust rebuild of a Docker-based legacy agent gateway ("OpenClaw"), it keeps full import compatibility with that ecosystem — agents, sessions, skills, cron jobs, subagents, and memory snapshots migrate in with dry-run reports and receipts.
+
+Prefer the long-form story? The [project website](https://phenomenoner.github.io/agent-harness-core/) hosts three essays: [Adaptive Skill Intelligence](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/) (skills as evidence-governed rules of thumb), [The Long-Task Engine](https://phenomenoner.github.io/agent-harness-core/essay/long-task-engine/) (virtual sessions and bounded reasoning), and [the experiment essay](https://phenomenoner.github.io/agent-harness-core/essay/) (how this project was built and reviewed).
 
 ## Why Agent Harness Core?
 
@@ -174,6 +177,7 @@ See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness
 
 | Document | What's inside |
 |---|---|
+| [Project Website](https://phenomenoner.github.io/agent-harness-core/) | GitHub Pages home for the project, with long-form essays on [adaptive skill intelligence](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/), [the long-task engine](https://phenomenoner.github.io/agent-harness-core/essay/long-task-engine/), and [the experiment behind the project](https://phenomenoner.github.io/agent-harness-core/essay/). |
 | [Adaptive Skill Intelligence](docs/adaptive-skill-intelligence.md) ([web essay](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/)) | Product direction for turning external knowledge and task experience into measurable, cost-aware, reversible procedural capability. |
 | [Capability Map](docs/agent-harness-feature-parity.html) ([Markdown](docs/agent-harness-feature-parity.md)) | Public source overview separating implemented foundations, evidence boundaries, and design directions across the harness. |
 | [Skill Ecosystem](docs/skill-ecosystem.md) | Current discovery, selection, learning-gate, lifecycle, and compatibility behavior, separated from the adaptive design direction. |
