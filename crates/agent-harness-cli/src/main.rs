@@ -903,10 +903,20 @@ fn run_healthz(args: &[String]) -> Result<(), String> {
 }
 
 fn run_trace(args: &[String]) -> Result<(), String> {
-    let options = SimpleOptions::parse(args, "trace", &["--id"], &[])?;
+    let options = SimpleOptions::parse(args, "trace", &["--queue-id", "--id"], &[])?;
+    let id = match (options.optional("--queue-id"), options.optional("--id")) {
+        (Some(queue_id), None) => queue_id.to_string(),
+        (None, Some(legacy_id)) => legacy_id.to_string(),
+        (Some(_), Some(_)) => {
+            return Err("trace: --queue-id and --id are mutually exclusive".to_string());
+        }
+        (None, None) => {
+            return Err("trace: --queue-id is required (legacy --id is also accepted)".to_string());
+        }
+    };
     let report = trace_harness_event(TraceOptions {
         harness_home: options.target_home.clone(),
-        id: options.required("--id")?,
+        id,
     })
     .map_err(|err| err.to_string())?;
     print_json(&report)
@@ -25514,7 +25524,10 @@ fn print_help() {
     println!("  --live-control-token <token> Token required for live gateway stop/start");
     println!("  --label <name>          Backup label for ops-backup");
     println!("  --summary-only          Print compact ops-backup receipt summary");
-    println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
+    println!(
+        "  --queue-id <id>         Canonical queue selector for trace and runtime queue commands"
+    );
+    println!("  --id <id>               Legacy trace selector; prefer --queue-id");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
     println!("  --codex-exe <path>      Codex executable path for codex-plan/runtime-run-once");
     println!("  --owned-root <path>     Allowed deployment-owned Codex root; repeatable");

@@ -77,7 +77,7 @@ Latest staging evidence:
 | P1.4 Operator Alert Through Outbox | Mechanism implemented; pending live gate | Supervision/dead-letter alert payloads are represented in receipts and current outbox policy remains permission-gated. | Actual Telegram/Discord admin alert receipt from staging. |
 | P1.5 Ordered Shutdown | Mechanism implemented; pending live gate | Existing scoped stop/ops control plus supervision stop-intent model. | Service-wrapper ordered stop transcript. |
 | P1.6 OS Persistence, Scheduled Health, Disk Gate, and `/healthz` | Mechanism implemented; pending live gate | `healthz` CLI/local JSON report with writable state probe. | WinSW/service-wrapper registration, reboot recovery proof, and optional local/admin HTTP endpoint if needed. |
-| P1.7 End-to-End Trace ID and `trace <id>` CLI | Implemented/staging-tested | `trace_harness_event`, `trace` CLI, legacy id chain test. | End-to-end live traceId propagation sample across ingress/runtime/outbox/delivery. |
+| P1.7 End-to-End Trace ID and `trace --queue-id <id>` CLI | Implemented/staging-tested | `trace_harness_event`, canonical `--queue-id` plus legacy `--id` CLI coverage, and terminal-chain tests. | End-to-end live traceId propagation sample across ingress/runtime/outbox/delivery. |
 | P1.8 `supervise deploy` Canary and Rollback | Implemented/staging-tested | `record_supervise_deploy_canary`, `deploy-canary-record` CLI, rollback hash test. | Staging canary drill with candidate binary and optional live-model canary. |
 | P1.9 Metrics and `status --watch` | Mechanism implemented; pending live gate | `collect_harness_metrics`, `metrics` CLI, runtime status counter test. | `status --watch` streaming UI remains pending; metrics snapshot from live soak required. |
 | P2.1 `channel_turn` Lane in Worker Store | Scaffold implemented; pending broader fixtures | SQLite shadow table in `state/workers/worker-store.sqlite`; worker-store direction preserved. | Full execution source cutover to WorkerStore lane after shadow soak. |
@@ -152,7 +152,7 @@ The external comparative review scored Agent Harness Core against OpenClaw and H
 | Error handling and recovery | Conservative fail-stop is predictable but weak for unattended recovery. | Error classification tests, retry/backoff/dead-letter receipts, automatic restart proof, dead-letter user notification samples, trace evidence for timeout/cancel/failure. | P0, P1, T2 |
 | Supervision and operations | No true self-supervising restart path; hidden PowerShell loops are not enough. | `supervise` child receipts, reboot recovery result, kill-loop restart test, crash-loop breaker alert, canary rollback transcript, `/healthz` sample. | P1 |
 | Security | Strong local/no-listener posture, but plaintext secrets and shell/plugin/MCP trust boundaries remain. | Vault migration receipts, adversarial prompt tests, shell escape tests, MCP tool-description pinning tests, trust-boundary doc, dependency audit result. | P6, M3+ |
-| Observability and debuggability | Already strong, but lacks unified trace id and one-command causality reconstruction. | End-to-end `traceId` propagation tests, `trace <id>` samples for normal/cancel/timeout/dead-letter, SLO silent-failure detector examples. | P1.7, P1.9 |
+| Observability and debuggability | Already strong, but lacks unified trace id and one-command causality reconstruction. | End-to-end `traceId` propagation tests, `trace --queue-id <id>` samples for normal/cancel/timeout/dead-letter, SLO silent-failure detector examples. | P1.7, P1.9 |
 | Resource and token efficiency | Good runtime efficiency, but token economics are less mature than Hermes. | Token aggregation reports, >=30% same-session token reduction golden tests, prompt-cache prefix stability assertions, recall/skill ledger evidence. | P4 |
 | Extensibility and ecosystem | Intentionally narrow channels/plugins; cannot match ecosystem breadth. | Native MCP protocol fixtures, per-agent tool allow-list tests, openclaw-mem ContextPack/ingest fixtures, clear non-goal boundaries. | P5.4, M |
 | Testing and quality engineering | Good local tests, but no CI and little crash-interleaving simulation. | Invariants catalog, deterministic simulation seeds, scenario replay fixtures, CI results, real Codex wire fixtures, schema registry checks. | T, P7 |
@@ -163,7 +163,7 @@ Minimum evidence bundle for each phase:
 | Phase | Evidence bundle required before marking complete | Review dimensions expected to improve |
 |---|---|---|
 | P0 | Atomic-write audit, retry/dead-letter fixtures, config validation fixtures, log rotation/compaction sample, queue retry/skip receipts. | Persistence, error recovery, observability, testing |
-| P1 | Kill/restart transcript, reboot or equivalent restart proof, crash-loop alert, `/healthz` JSON sample, `trace <id>` samples, canary rollback proof, metrics snapshot. | Supervision, observability, error recovery, maturity |
+| P1 | Kill/restart transcript, reboot or equivalent restart proof, crash-loop alert, `/healthz` JSON sample, `trace --queue-id <id>` samples, canary rollback proof, metrics snapshot. | Supervision, observability, error recovery, maturity |
 | P2 | Seven-day shadow summary, divergence receipts if any, race tests, performance fixture for large ledgers, backup/compact manifest. | Persistence, concurrency, error recovery, testing |
 | P3 | Scoped `/stop` tests, collect/interrupt tests, burst/admission tests, background registry status sample, long-task heartbeat/blockage receipts. | Concurrency, operations, observability, recovery |
 | P4 | Token reports, golden prompt bundle diffs, >=30% token reduction proof, cache-prefix assertions, recall/skill citation ledger samples. | Token efficiency, observability, testing |
@@ -230,7 +230,7 @@ Implementation steps:
 Acceptance standard:
 
 - Long-running live operation keeps log sizes within configured limits.
-- `trace <id>` still reconstructs complete causality after rotation/compaction.
+- `trace --queue-id <id>` still reconstructs complete causality after rotation/compaction.
 - Rotation writes its own receipt.
 
 ### P0.5 Queue Retry and Skip Commands
@@ -345,14 +345,14 @@ Acceptance standard:
 - Low disk or unwritable state flips readiness to false before data loss.
 - `/healthz` exposes no secrets and is local/admin-gated by default.
 
-### P1.7 End-to-End Trace ID and `trace <id>` CLI
+### P1.7 End-to-End Trace ID and `trace --queue-id <id>` CLI
 
 Implementation steps:
 
 - Generate `traceId` at inbound receipt creation.
 - Propagate `traceId` through channel ingress, queue, prepare, Codex plan/run/complete, outbox, delivery, progress, memory lifecycle, and dead-letter receipts.
 - Backfill trace lookup by queue id/session where legacy receipts lack `traceId`.
-- Add `trace <id>` CLI that reconstructs one message's causality in a single-page output.
+- Add `trace --queue-id <id>` CLI that reconstructs one message's causality in a single-page output.
 
 Acceptance standard:
 
