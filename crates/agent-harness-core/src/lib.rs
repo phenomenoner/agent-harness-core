@@ -9,6 +9,7 @@ pub mod backend_auth;
 pub mod backend_reasoning;
 pub(crate) mod backend_reasoning_execution;
 pub mod background;
+pub mod channel_action;
 pub mod channel_commands;
 pub mod channel_delivery;
 pub(crate) mod channel_delivery_history;
@@ -18,6 +19,7 @@ pub mod channel_ingress;
 pub mod channel_pipeline;
 pub mod channel_runtime;
 pub mod channel_session_key;
+pub mod channel_session_transition;
 pub mod channel_state;
 pub mod child_execution_policy;
 pub mod codex_backend_provenance;
@@ -37,6 +39,7 @@ pub mod dream_director;
 pub mod execution_mode;
 pub mod external_effect;
 pub mod goal_budget;
+pub mod goal_closure;
 pub mod goal_continuation;
 pub mod goal_lineage;
 pub mod goal_transition;
@@ -173,6 +176,12 @@ pub use background::{
     BackgroundTaskStatus, BackgroundTaskUpsertOptions, BackgroundTaskView, list_background_tasks,
     upsert_background_task,
 };
+pub use channel_action::{
+    CHANNEL_APPROVAL_PROMPT_SCHEMA, CHANNEL_INBOUND_ACTION_EVIDENCE_SCHEMA,
+    CHANNEL_INBOUND_ACTION_SCHEMA, ChannelActionError, ChannelApprovalActionV1,
+    ChannelApprovalDecisionV1, ChannelApprovalPromptV1, ChannelInboundActionEvidenceV1,
+    ChannelInboundActionV1, public_approval_action_id, validate_public_approval_action_id,
+};
 pub use channel_commands::{
     ChannelCommand, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, FastCommandMode,
     MAX_THINKING_LEVEL, THINKING_LEVELS, XHIGH_THINKING_LEVEL, normalize_execution_mode,
@@ -204,7 +213,7 @@ pub use channel_identity::{
 };
 pub use channel_ingress::{
     ChannelReceiveOptions, ChannelReceiveReceipt, ChannelReceiveReport, ChannelReceiveStatus,
-    receive_channel_message,
+    HeldChannelMessageReconcileReport, receive_channel_message, reconcile_held_channel_messages,
 };
 pub use channel_pipeline::{
     ChannelRunOnceOptions, ChannelRunOnceReport, ChannelRunOnceStatus, run_channel_once,
@@ -216,14 +225,26 @@ pub use channel_runtime::{
     ChannelStepAction, ChannelStepFile, FastRequestRoutePolicy, build_channel_step,
     fast_request_policy_for_route, write_channel_step,
 };
+pub use channel_session_transition::{
+    CHANNEL_SESSION_TRANSITION_INTENT_SCHEMA, CHANNEL_SESSION_TRANSITION_RECEIPT_SCHEMA,
+    ChannelGoalBoundaryV1, ChannelSessionAdmissionV1, ChannelSessionTransitionCommandV1,
+    ChannelSessionTransitionIntentV1, ChannelSessionTransitionPhaseV1,
+    ChannelSessionTransitionReceiptV1, PrepareChannelSessionTransitionOptionsV1,
+    PreparedChannelSessionTransitionV1, channel_session_transition_admission,
+    channel_session_transition_intents_file, channel_session_transition_receipts_file,
+    prepare_channel_session_transition, record_channel_session_transition_phase,
+};
 pub use channel_state::{
     AgentOverride, AgentOverridesStore, ChannelCommandApplyOptions, ChannelCommandApplyReceipt,
     ChannelCommandApplyReceiptStatus, ChannelCommandApplyReport, ChannelCommandEvent,
     ChannelSessionNote, ChannelSessionState, ChannelSessionStateV2MigrationReport,
-    ChannelSessionStateV2MigrationStatus, ChannelStateLane, agent_overrides_file,
+    ChannelSessionStateV2MigrationStatus, ChannelSessionTransitionReconcileItemV1,
+    ChannelSessionTransitionReconcileReportV1, ChannelSessionTransitionReconcileStatusV1,
+    ChannelStateLane, ReconcileChannelSessionTransitionsOptionsV1, agent_overrides_file,
     apply_channel_command_step, bind_channel_session_state_to_lane_v2, channel_session_state_file,
     channel_session_state_v2_file, migrate_legacy_channel_session_state_to_v2, read_agent_override,
-    read_channel_session_state, read_channel_session_state_v2, write_channel_session_state_v2,
+    read_channel_session_state, read_channel_session_state_v2,
+    reconcile_channel_session_transitions, write_channel_session_state_v2,
 };
 pub use codex_backend_provenance::{
     CODEX_BACKEND_PROVENANCE_SCHEMA, CodexBackendProvenanceProbeOptions,
@@ -327,23 +348,38 @@ pub use external_effect::{
     CONNECTOR_APPROVAL_TOKEN_SCHEMA, ConnectorApprovalModeV1, ConnectorApprovalPolicyV1,
     ConnectorApprovalRuleV1, ConnectorApprovalTokenV1, EXTERNAL_EFFECT_INTENT_SCHEMA,
     EXTERNAL_EFFECT_TRANSITION_SCHEMA, ExternalEffectAdmissionV1, ExternalEffectApprovalDecisionV1,
-    ExternalEffectContinuationV1, ExternalEffectIntentV1, ExternalEffectReadbackAdapter,
-    ExternalEffectReadbackV1, ExternalEffectRequestContextV1, ExternalEffectStateV1,
-    ExternalEffectTransitionV1, GITHUB_ISSUE_READBACK_EVIDENCE_SCHEMA,
-    GithubIssueReadbackAdapterV1, GithubIssueReadbackEvidenceV1, McpElicitationDescriptorV1,
+    ExternalEffectContinuationV1, ExternalEffectExpiryReconcileReportV1,
+    ExternalEffectExpiryReconcileRequestV1, ExternalEffectExpiryResolutionV1,
+    ExternalEffectIntentV1, ExternalEffectReadbackAdapter, ExternalEffectReadbackV1,
+    ExternalEffectRequestContextV1, ExternalEffectStateV1, ExternalEffectTransitionV1,
+    GITHUB_ISSUE_READBACK_EVIDENCE_SCHEMA, GithubIssueReadbackAdapterV1,
+    GithubIssueReadbackEvidenceV1, McpElicitationDescriptorV1,
     PROVIDER_IDEMPOTENCY_READBACK_EVIDENCE_SCHEMA, ProviderIdempotencyReadbackAdapterV1,
     ProviderIdempotencyReadbackEvidenceV1, ProviderIdempotencyReadbackStateV1,
     begin_external_effect_request, ensure_external_effect_continuation,
-    external_effect_idempotency_key, external_effect_mutation_evidence,
+    external_effect_approval_authority_digest, external_effect_idempotency_key,
+    external_effect_mutation_evidence, external_effect_source_session_key_digest,
     external_effect_transition_file, fence_external_effects_for_lane, github_issue_effect_marker,
     load_connector_approval_policy, load_external_effect_intent, parse_mcp_elicitation_descriptor,
-    reconcile_external_effect, resolve_external_effect_approval, transition_external_effect,
+    reconcile_expired_external_effect_approvals, reconcile_external_effect,
+    resolve_external_effect_approval, resolve_external_effect_channel_action,
+    resolve_external_effect_public_channel_action, transition_external_effect,
 };
 pub use goal_budget::{
     GOAL_CAMPAIGN_BUDGET_SCHEMA, GOAL_CAMPAIGN_STATUS_SCHEMA, GoalCampaignBudgetBoundary,
     GoalCampaignBudgetInput, GoalCampaignBudgetReceiptV1, GoalCampaignPolicyV1,
     GoalCampaignStatusReportV1, collect_goal_campaign_status, current_goal_campaign_timeouts,
     evaluate_goal_campaign_budget, goal_campaign_budget_receipts_file, load_goal_campaign_policy,
+};
+pub use goal_closure::{
+    GOAL_CLOSURE_INTENT_SCHEMA, GOAL_CLOSURE_RECEIPT_SCHEMA, GOAL_CLOSURE_RESOLUTION_SCHEMA,
+    GoalClosureAppendDispositionV1, GoalClosureAuthorityV1, GoalClosureDispositionV1,
+    GoalClosureIntentRecordOutcomeV1, GoalClosureIntentV1, GoalClosurePhaseInputV1,
+    GoalClosurePhaseV1, GoalClosureReceiptRecordOutcomeV1, GoalClosureReceiptV1,
+    GoalClosureResolvedTargetV1, GoalClosureResultV1, GoalClosureTargetCandidateV1,
+    GoalClosureTargetResolutionDispositionV1, GoalClosureTargetResolutionV1, GoalClosureTriggerV1,
+    goal_closure_intents_file, goal_closure_receipts_file, goal_closure_receipts_for_id,
+    record_goal_closure_intent, record_goal_closure_phase, resolve_goal_closure_target,
 };
 pub use goal_continuation::{
     GOAL_CONTINUATION_INTENT_SCHEMA, GoalAutonomyActivation, GoalAutonomyMode,
@@ -622,8 +658,9 @@ pub use rich_presentation::{
     validate_rich_message_presentation,
 };
 pub use runtime_pipeline::{
-    RuntimeRunOnceOptions, RuntimeRunOnceReceipt, RuntimeRunOnceReport, RuntimeRunOnceStatus,
-    run_runtime_queue_once,
+    ExternalEffectExpirySettlementReportV1, RuntimeRunOnceOptions, RuntimeRunOnceReceipt,
+    RuntimeRunOnceReport, RuntimeRunOnceStatus, run_runtime_queue_once,
+    settle_expired_external_effect_approval,
 };
 pub use runtime_policy::{
     RuntimeBackoffPolicy, RuntimeBackoffPolicyInspection, RuntimeProviderFallbackRule,
@@ -766,10 +803,11 @@ pub use skills::{
 pub use status::{
     GatewayRestartCompletionStatus, GatewayRestartHeartbeatStatus, GatewayRestartReceiptStatus,
     GatewayRestartServiceStatus, GatewayRestartStatusReport, HarnessChannelStatus,
-    HarnessCronSchedulerStatus, HarnessJsonlStatus, HarnessLearningStatus, HarnessMemoryStatus,
-    HarnessOperationalLogStatus, HarnessOutboxStatus, HarnessPluginStatus,
-    HarnessRuntimeReceiptStatus, HarnessRuntimeStatus, HarnessSkillStatus, HarnessStatusOptions,
-    HarnessStatusReport, collect_gateway_restart_status, collect_harness_status,
+    HarnessCronSchedulerStatus, HarnessGovernedTransitionStatus, HarnessJsonlStatus,
+    HarnessLearningStatus, HarnessMemoryStatus, HarnessOperationalLogStatus, HarnessOutboxStatus,
+    HarnessPluginStatus, HarnessRuntimeReceiptStatus, HarnessRuntimeStatus, HarnessSkillStatus,
+    HarnessStatusOptions, HarnessStatusReport, collect_gateway_restart_status,
+    collect_harness_status,
 };
 pub use subagent_lifecycle::{
     SubagentLifecycleCleanup, SubagentLifecycleCloseOptions, SubagentLifecycleReceipt,

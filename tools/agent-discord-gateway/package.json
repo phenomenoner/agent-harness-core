@@ -3,6 +3,9 @@
   "private": true,
   "type": "module",
   "version": "0.1.0",
+  "scripts": {
+    "test": "node --test interaction.test.mjs"
+  },
   "bin": {
     "agent-discord-gateway": "./index.mjs"
   }

@@ -1,0 +1,20 @@
+{
+  "schema": "agent-harness.acceptance-fixture.channel-command-active-goal-cancel-replay.v1",
+  "providers": ["telegram", "discord"],
+  "cases": [
+    {"name": "stop-active", "command": "stop", "activeGoal": true, "phases": ["intent", "output-fence", "run-cancel", "quiesced", "goal-canceled", "projection-terminal", "lineage-terminal", "reply"]},
+    {"name": "new-active", "command": "new", "activeGoal": true, "phases": ["intent", "target-frozen", "output-fence", "run-cancel", "quiesced", "goal-canceled", "projection-terminal", "lineage-terminal", "old-session-closed", "new-session-active", "reply"]},
+    {"name": "stop-no-active", "command": "stop", "activeGoal": false, "phases": ["intent", "not-applicable", "run-cancel", "reply"]},
+    {"name": "new-no-active", "command": "new", "activeGoal": false, "phases": ["intent", "target-frozen", "not-applicable", "old-session-closed", "new-session-active", "reply"]},
+    {"name": "new-ambiguous", "command": "new", "activeGoal": "ambiguous", "phases": ["intent", "target-frozen", "retry-pending"]},
+    {"name": "duplicate-restart", "command": "new", "activeGoal": true, "restartAfterEachPhase": true},
+    {"name": "message-during-pending-new", "command": "ordinary-message", "transition": "new-pending", "admission": "held"},
+    {"name": "late-final-after-stop", "command": "stop", "event": "assistant-final", "delivery": "fenced"}
+  ],
+  "expected": {
+    "newSessionBeforeGoalTerminal": false,
+    "duplicateTargetSessionCount": 1,
+    "otherControlPlanesCanceled": false,
+    "lateFinalDelivered": false
+  }
+}

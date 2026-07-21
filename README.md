@@ -44,10 +44,10 @@ Prefer the long-form story? The [project website](https://phenomenoner.github.io
 | | What you get |
 |---|---|
 | 🧾 **A receipt for everything** | Every ingress, queue write, model turn, delivery, and retry appends to JSONL ledgers. Reconstruct any incident after the fact — no black boxes. |
-| 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, policy-gated media attachments, referenced-media artifacts, message splitting, edit-in-place progress panels, default-off opt-in final-reply tone, and `/new` `/model` `/think` `/reasoning` `/steer` `/stop` `/status` commands. |
+| 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, policy-gated media attachments, referenced-media artifacts, message splitting, edit-in-place progress panels, guarded connector-approval buttons, default-off opt-in final-reply tone, and `/new` `/model` `/think` `/reasoning` `/steer` `/stop` `/status` commands. |
 | 🔐 **Fail-closed by default** | DMs require explicit admin allow-lists, and ingress must resolve a platform/account/channel identity binding before dispatch. Unknown senders or ambiguous channel bindings never reach the model. |
 | ⚙️ **Durable, bounded work** | SQLite-backed worker dispatch with leases, retry/backoff, stale reaping, watchdogs, and concurrency limits per global / agent / channel / lane. Runtime dispatch classes isolate interactive, cron, worker, and maintenance turns so noisy cron work does not block channel agents. |
-| 🧵 **Long-task continuity** | A turn's session lives inside a stable **virtual session**. Backend-reported context windows are persisted, compact/resume events are correlated to the requesting operation, and safe rollover carries a bounded **working set** (goal, plan refs, decisions, open files, validation, blockers) under the same exact lane. `/new` remains a hard task boundary. |
+| 🧵 **Long-task continuity** | A turn's session lives inside a stable **virtual session**. Backend-reported context windows are persisted, compact/resume events are correlated to the requesting operation, and safe rollover carries a bounded **working set** (goal, plan refs, decisions, open files, validation, blockers) under the same exact lane. `/stop` and `/new` durably bind any active backend goal before cancellation; `/new` holds ordinary ingress until the old boundary is proven closed and one frozen replacement session commits. |
 | 🤖 **Model-agnostic routing** | Codex app-server executes turns; OpenRouter routing switches any conversation to e.g. `anthropic/claude-sonnet-4` with one `/model` command. Provider-specific Codex homes keep OpenRouter config out of the default Codex/OAuth path; secrets are checked at preflight, never written to disk. |
 | 🧭 **Capability-aware reasoning** | The v0.8.0 model catalog resolves the exact provider/model capability surface instead of assuming one global effort list. `/think` and `/reasoning` are aliases for one last-write-wins setting. Exact `max` is the highest currently known legal GPT-5.6 effort; unknown future names are accepted only when that exact route advertises them. Exact `ultra` is filtered and rejected, never advertised or configured as an effort. |
 | 🧩 **Per-agent runtime context** | Every configured agent can use its own OpenClaw-style model and eight-file static prompt inventory, with fallback aliases and deletion tombstones. Canonical prompt manifests are keyed by the exact virtual-session lane and Codex backend generation, while dynamic memory recall remains a separate per-turn context source. |
@@ -74,6 +74,9 @@ flowchart LR
     DC[Discord Gateway / REST] --> IN
     IN[Ingress + fail-closed\nallow-list + identity gate] --> CMD{Command or\nagent turn?}
     CMD -- "/model /status /stop ..." --> ST[Channel state\n+ command reply]
+    TG -.approval callback.-> ACT[Typed channel action\n+ exact authority gate]
+    DC -.component interaction.-> ACT
+    ACT --> ST
     CMD -- ordinary message --> Q[(Durable runtime queue\npending.jsonl + leases)]
     Q --> PB[Prompt bundle\nprompts + skills + memory]
     PB --> CX[Codex app-server\nOpenAI / OpenRouter models]
@@ -87,6 +90,28 @@ flowchart LR
 ```
 
 The harness owns ingress, permissions, queuing, prompt assembly, delivery, long-task continuity, and audit. **Codex owns the model**: system prompt, tool schemas, MCP, sandbox, approvals, and session continuity. That split keeps the harness small, deterministic, and testable — 1,200+ tests run without any model call, using a bundled fake Codex app-server.
+
+### Current source contracts
+
+Channel task boundaries are two-phase and restart-safe. `/stop` and `/new` freeze the old exact
+session, backend generation, source thread, and active goal before writing the run-cancel fence.
+Duplicate commands reuse the same durable effect identity. `/new` freezes one replacement session
+and holds later ordinary messages before model admission until goal closure is proven or exact
+`NotApplicable` evidence exists; close or reconciliation ambiguity leaves the old session
+authoritative. Held messages are replayed in arrival order after the committed boundary.
+
+Connector approval waits use an explicit `ApprovalRequest` message instead of a generic failure.
+Telegram inline keyboards and Discord components contain public, non-bearer action IDs; re-entry
+still passes channel identity, administrator permission, effect generation, exact lane/session,
+authority-digest, expiry, and consume-once checks before the protected capability is resolved.
+Legacy text approval remains readable for capabilities created before the additional authority
+digests, while native callbacks require the complete binding. Waiting parents are parked without a
+lease so later same-lane work can run, and bounded expiry reconciliation settles abandoned waits.
+
+Final delivery and terminal progress are correlated explicitly. Runtime receipts state whether a
+source final is required, explicitly not delivered, or not applicable, and record whether the
+canonical final was appended, already present, or safely reused. Terminal progress does not release
+on another queue or lane's delivery evidence.
 
 ### v0.10.0 continuity and external-effect boundary
 

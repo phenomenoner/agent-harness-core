@@ -219,7 +219,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "8ac0c430a3ce591a1e502feea0d4f316bfd35cc6aaa094fb3c0c249cdfe1ee8f"
+      "sha256": "46b359001fa82a2133a60a1539e56257049242f7a9b6a44271b37b6dac576b43"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -258,27 +258,27 @@
       ]
     },
     {
-      "id": "component-channel-state",
-      "label": "channel_state",
+      "id": "component-channel-state-channel-session-transition",
+      "label": "channel_state / channel_session_transition",
       "group": "component",
       "state": "implemented",
-      "summary": "slash-command state and active session metadata; /think and /reasoning are one control surface",
-      "reads": "channel command input",
-      "writes": "state/channels/\u003cplatform>/\u003cchannel>/\u003cuser>/state.json",
-      "invariants": "I4, I8",
+      "summary": "slash-command state, active session metadata, and two-phase /stop//new boundaries; /think and /reasoning remain one control surface",
+      "reads": "channel command input, exact goal/lineage evidence, transition receipts",
+      "writes": "exact-lane channel state, frozen transition intent, cancel fence, boundary receipt",
+      "invariants": "I4, I8, I17, I36",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
     },
     {
-      "id": "component-channel-ingress-channel-runtime",
-      "label": "channel_ingress / channel_runtime",
+      "id": "component-channel-ingress-channel-runtime-channel-action",
+      "label": "channel_ingress / channel_runtime / channel_action",
       "group": "component",
       "state": "implemented",
-      "summary": "command-vs-agent-turn decision plus exact-lane provider-neutral external-effect approve/deny resolution",
-      "reads": "inbound platform event, identity binding, channel state, protected approval capability",
-      "writes": "runtime queue item, command outbox, or one deterministic effect continuation",
-      "invariants": "I1, I3, I5, I7, I8, I17",
+      "summary": "command-vs-agent-turn decision, pre-admission hold/replay during /new, and provider-neutral typed approval-action resolution",
+      "reads": "inbound platform event or callback, identity binding, channel state, public action id, protected approval capability",
+      "writes": "held-message record, runtime queue item, approval request/command outbox, or one deterministic effect continuation",
+      "invariants": "I1, I3, I5, I7, I8, I14, I17",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -375,14 +375,14 @@
       ]
     },
     {
-      "id": "component-codex-runtime",
-      "label": "codex_runtime",
+      "id": "component-codex-runtime-goal-closure",
+      "label": "codex_runtime / goal_closure",
       "group": "component",
       "state": "implemented",
-      "summary": "app-server protocol, preflight/start/run, prepared work-authority classification, exact-owned productive-evidence tracking, lease-coupled deadline grants, irreversible cause-specific bounded yield, optional-steer provenance, advisory disposition capture, MCP elicitation parking, tool-timeout recovery, interruption evidence, and thread-level web-search mode",
-      "reads": "prompt/config, queue lease guard, task-family budget, connector approval policy, provider capabilities, exact-lane policy",
-      "writes": "primary runtime outcome, bounded secondary diagnostics, run/deadline/lease/steer receipts, bounded protocol failures, advisory disposition/checkpoint, effect state, transcript/completion, and web-search evidence",
-      "invariants": "I2, I3, I5, I6, I7, I10, I13, I19, I31, I37, I38",
+      "summary": "app-server protocol, exact-owned parent-event classification, preflight/start/run, governed original-thread goal closure, prepared work-authority classification, deadline/bounded-yield control, elicitation parking, recovery, and web-search mode",
+      "reads": "prompt/config, queue lease guard, task-family budget, closure intent, connector approval policy, provider capabilities, exact-lane policy",
+      "writes": "primary runtime outcome, quarantined foreign-event evidence, governed terminal projection, closure phase receipts, deadline/steer receipts, effect state, transcript/completion, and web-search evidence",
+      "invariants": "I2, I3, I5, I6, I7, I10, I13, I19, I31, I36, I37, I38",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -392,10 +392,10 @@
       "label": "external_effect",
       "group": "component",
       "state": "implemented",
-      "summary": "exact-lane connector action authority, expiring single-use capabilities, stable opaque idempotency markers/keys, mutation evidence, and readback-before-resubmission reconciliation",
-      "reads": "recognized MCP elicitation descriptor, connector policy, exact source queue/lane, protected token snapshot, exact-bound GitHub marker or provider-idempotency readback evidence",
-      "writes": "append-only effect/transition records, fenced token state, one exact-lane continuation intent, confirmed/absent/unprovable reconciliation",
-      "invariants": "I2, I3, I5, I6, I7, I10, I17, I31",
+      "summary": "exact-lane connector action authority, source-session and full approval-authority binding, expiring single-use capabilities, stable opaque idempotency markers/keys, mutation evidence, and readback-before-resubmission reconciliation",
+      "reads": "recognized MCP elicitation descriptor, connector policy, typed public action, exact source queue/lane/session, protected token snapshot, exact-bound marker or provider-idempotency readback evidence",
+      "writes": "append-only effect/transition records, public-action index, fenced token state, bounded expiry resolution, one exact-lane continuation intent, confirmed/absent/unprovable reconciliation",
+      "invariants": "I2, I3, I5, I6, I7, I10, I14, I17, I31",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -431,9 +431,9 @@
       "label": "runtime_pipeline / task_transition / task_budget",
       "group": "component",
       "state": "implemented",
-      "summary": "run-once orchestration, mutation-aware retry/dead-letter, final-outbox repair, harness-owned task families and primary outcomes, advisory generation-bound disposition, bounded recovery, exact authority revalidation, interruption classification, media resolution, and terminal skill evidence",
-      "reads": "queue item, Codex and lease receipts, exact-lane Goal/OperationPlan/task-family state, budgets, channel state, media policy, prepared virtual evidence",
-      "writes": "exactly one final/continuation/parked outcome, commit-before-enqueue intent, task budget ledger, dead-letter/final outbox, and terminal review",
+      "summary": "run-once orchestration, mutation-aware retry/dead-letter, typed source-final disposition, final-outbox repair, approval parking, harness-owned task families and primary outcomes, bounded recovery, exact authority revalidation, interruption classification, media resolution, and terminal skill evidence",
+      "reads": "queue item, Codex and lease receipts, exact-lane Goal/OperationPlan/task-family state, external-effect authority, budgets, channel state, media policy, prepared virtual evidence",
+      "writes": "exactly one ordinary/campaign final, continuation, parked approval notice, or explicit non-delivery; source-final receipt; task budget; terminal review",
       "invariants": "I2, I3, I5, I7, I8, I9, I10, I13, I17, I22, I31, I35, I37",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -457,10 +457,10 @@
       "label": "progress",
       "group": "component",
       "state": "implemented",
-      "summary": "source-authoritative progress narration delivery, separate from final replies",
-      "reads": "progress events/index, channel policy, watched stop file",
-      "writes": "progress outbox/delivery state, source cursor/cache, surface claims",
-      "invariants": "I2, I4, I9, I17, I25, I27",
+      "summary": "source-authoritative progress narration delivery, separate from final replies, with terminal release bound to the exact source-final expectation",
+      "reads": "progress events/index, runtime receipt, exact-source outbox/delivery state, channel policy, watched stop file",
+      "writes": "progress outbox/delivery state, source cursor/cache, surface claims and fail-closed warnings",
+      "invariants": "I2, I4, I9, I17, I25, I27, I37",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -619,8 +619,8 @@
       "label": "Channel identity, commands, or state",
       "group": "gate",
       "state": "release-gate",
-      "summary": "allow/deny and ambiguous-binding gates; non-main routing; /new, /model, unified /think//reasoning, /stop; agent-scoped state and fresh-task boundaries",
-      "reviewDocs": "docs/trust-boundaries.md, docs/configuration.md, docs/invariants.md, this file",
+      "summary": "allow/deny and ambiguous-binding gates; non-main routing; /new and /stop intent-before-cancel ordering; exact active-goal closure; frozen replacement session; pre-admission hold/FIFO replay; duplicate/restart idempotency; agent-scoped state and fresh-task boundaries",
+      "reviewDocs": "docs/trust-boundaries.md, docs/configuration.md, docs/invariants.md, docs/schema-registry.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -652,7 +652,7 @@
       "label": "Retry, productive deadline/bounded-yield task continuation, MCP elicitation, or external connector effects",
       "group": "gate",
       "state": "release-gate",
-      "summary": "queue-owner renewal before deadline renewal; prepared work authority; scored exact-owned progress; irreversible bounded yield; RPC/prompt provenance; completed-final-only advisory disposition; harness-owned primary outcome, task family, and budget; one child/final/parked surface; restart-safe intent; one elicitation response; approval-token isolation/fencing; readback before ambiguous resubmission",
+      "summary": "queue-owner renewal before deadline renewal; prepared work authority; irreversible bounded yield; exact-owned parent completion; harness-owned primary outcome; one final/child/parked surface; nonblocking needs-user; native approval exact-authority validation; legacy text continuity; bounded expiry/decision race; token isolation/fencing; readback before ambiguous resubmission",
       "reviewDocs": "docs/configuration.md, docs/invariants.md, docs/schema-registry.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -1204,12 +1204,12 @@
     },
     {
       "source": "canon-topology-contract",
-      "target": "component-channel-state",
+      "target": "component-channel-state-channel-session-transition",
       "label": "owns boundary"
     },
     {
       "source": "canon-topology-contract",
-      "target": "component-channel-ingress-channel-runtime",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
       "label": "owns boundary"
     },
     {
@@ -1249,7 +1249,7 @@
     },
     {
       "source": "canon-topology-contract",
-      "target": "component-codex-runtime",
+      "target": "component-codex-runtime-goal-closure",
       "label": "owns boundary"
     },
     {
@@ -1304,7 +1304,7 @@
     },
     {
       "source": "axis-platform",
-      "target": "component-channel-ingress-channel-runtime",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
       "label": "must survive through"
     },
     {
@@ -1334,12 +1334,12 @@
     },
     {
       "source": "axis-accountid",
-      "target": "component-channel-state",
+      "target": "component-channel-state-channel-session-transition",
       "label": "must survive through"
     },
     {
       "source": "axis-accountid",
-      "target": "component-channel-ingress-channel-runtime",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
       "label": "must survive through"
     },
     {
@@ -1359,12 +1359,12 @@
     },
     {
       "source": "axis-channelid",
-      "target": "component-channel-state",
+      "target": "component-channel-state-channel-session-transition",
       "label": "must survive through"
     },
     {
       "source": "axis-channelid",
-      "target": "component-channel-ingress-channel-runtime",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
       "label": "must survive through"
     },
     {
@@ -1389,12 +1389,12 @@
     },
     {
       "source": "axis-userid",
-      "target": "component-channel-state",
+      "target": "component-channel-state-channel-session-transition",
       "label": "must survive through"
     },
     {
       "source": "axis-userid",
-      "target": "component-channel-ingress-channel-runtime",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
       "label": "must survive through"
     },
     {
@@ -1414,7 +1414,12 @@
     },
     {
       "source": "axis-agentid",
-      "target": "component-channel-ingress-channel-runtime",
+      "target": "component-channel-state-channel-session-transition",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
       "label": "must survive through"
     },
     {
@@ -1434,7 +1439,7 @@
     },
     {
       "source": "axis-agentid",
-      "target": "component-codex-runtime",
+      "target": "component-codex-runtime-goal-closure",
       "label": "must survive through"
     },
     {
@@ -1474,12 +1479,12 @@
     },
     {
       "source": "axis-sessionkey",
-      "target": "component-channel-state",
+      "target": "component-channel-state-channel-session-transition",
       "label": "must survive through"
     },
     {
       "source": "axis-sessionkey",
-      "target": "component-channel-ingress-channel-runtime",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
       "label": "must survive through"
     },
     {
@@ -1499,7 +1504,7 @@
     },
     {
       "source": "axis-sessionkey",
-      "target": "component-codex-runtime",
+      "target": "component-codex-runtime-goal-closure",
       "label": "must survive through"
     },
     {
@@ -1579,7 +1584,7 @@
     },
     {
       "source": "axis-sourcequeueid",
-      "target": "component-codex-runtime",
+      "target": "component-codex-runtime-goal-closure",
       "label": "must survive through"
     },
     {
@@ -1628,12 +1633,12 @@
       "label": "changes trigger"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "impact-channel-identity-commands-or-state",
       "label": "changes trigger"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "impact-channel-identity-commands-or-state",
       "label": "changes trigger"
     },
@@ -1648,7 +1653,7 @@
       "label": "reviewed by"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
       "label": "changes trigger"
     },
@@ -1668,7 +1673,7 @@
       "label": "changes trigger"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
       "label": "changes trigger"
     },
@@ -1683,7 +1688,7 @@
       "label": "reviewed by"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "label": "changes trigger"
     },
@@ -1698,7 +1703,7 @@
       "label": "changes trigger"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "label": "changes trigger"
     },
@@ -1783,6 +1788,11 @@
       "label": "reviewed by"
     },
     {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "impact-memory-or-session-history-search",
+      "label": "changes trigger"
+    },
+    {
       "source": "component-codex-web-search",
       "target": "impact-memory-or-session-history-search",
       "label": "changes trigger"
@@ -1823,7 +1833,7 @@
       "label": "tracked in"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-bounded-ledger-maintenance-live-gap",
       "label": "has gap"
     },
@@ -1838,7 +1848,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-bounded-ledger-maintenance-live-gap",
       "label": "has gap"
     },
@@ -1903,12 +1913,12 @@
       "label": "tracked in"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
       "label": "has gap"
     },
@@ -1938,7 +1948,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
       "label": "has gap"
     },
@@ -1968,12 +1978,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
       "label": "has gap"
     },
@@ -1998,7 +2008,7 @@
       "label": "tracked in"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-interrupted-command-observability-live-gap",
       "label": "has gap"
     },
@@ -2018,7 +2028,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-interrupted-command-observability-live-gap",
       "label": "has gap"
     },
@@ -2063,6 +2073,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-per-agent-memory-recall-compartment-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-memory-session-history-retrieval",
       "target": "gap-per-agent-memory-recall-compartment-gap",
       "label": "has gap"
@@ -2078,12 +2093,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-channel-session-history-classification-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-channel-session-history-classification-gap",
       "label": "has gap"
     },
@@ -2133,12 +2148,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-multi-agent-full-matrix-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-multi-agent-full-matrix-gap",
       "label": "has gap"
     },
@@ -2163,7 +2178,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-multi-agent-full-matrix-gap",
       "label": "has gap"
     },
@@ -2203,12 +2218,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
@@ -2228,7 +2243,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
@@ -2263,12 +2278,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-virtual-session-v2-authority-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-virtual-session-v2-authority-gap",
       "label": "has gap"
     },
@@ -2293,7 +2308,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-virtual-session-v2-authority-gap",
       "label": "has gap"
     },
@@ -2323,12 +2338,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-progress-delivery-volume-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-progress-delivery-volume-gap",
       "label": "has gap"
     },
@@ -2388,12 +2403,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-progress-final-surface-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-progress-final-surface-gap",
       "label": "has gap"
     },
@@ -2408,7 +2423,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-progress-final-surface-gap",
       "label": "has gap"
     },
@@ -2438,6 +2453,11 @@
       "label": "tracked in"
     },
     {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-runtime-queue-runtime-worker",
       "target": "gap-tool-use-timeout-recovery-gap",
       "label": "has gap"
@@ -2453,7 +2473,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-tool-use-timeout-recovery-gap",
       "label": "has gap"
     },
@@ -2513,6 +2533,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-external-effect",
       "target": "gap-productive-deadline-live-evidence-gap",
       "label": "has gap"
@@ -2543,12 +2568,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-codex-startup-executable-stability-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-codex-startup-executable-stability-gap",
       "label": "has gap"
     },
@@ -2568,7 +2593,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-codex-startup-executable-stability-gap",
       "label": "has gap"
     },
@@ -2593,12 +2618,12 @@
       "label": "tracked in"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-runtime-terminal-control-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-runtime-terminal-control-gap",
       "label": "has gap"
     },
@@ -2618,7 +2643,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-runtime-terminal-control-gap",
       "label": "has gap"
     },
@@ -2678,12 +2703,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-external-review-loop-resilience-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-external-review-loop-resilience-gap",
       "label": "has gap"
     },
@@ -2703,7 +2728,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-external-review-loop-resilience-gap",
       "label": "has gap"
     },
@@ -2738,7 +2763,7 @@
       "label": "tracked in"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-context-capacity-correlation-gap",
       "label": "has gap"
     },
@@ -2758,7 +2783,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-context-capacity-correlation-gap",
       "label": "has gap"
     },
@@ -2788,7 +2813,7 @@
       "label": "tracked in"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-compact-resume-goal-race-gap",
       "label": "has gap"
     },
@@ -2803,7 +2828,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-compact-resume-goal-race-gap",
       "label": "has gap"
     },
@@ -2833,7 +2858,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-goal-lineage-reconciliation-gap",
       "label": "has gap"
     },
@@ -2853,6 +2878,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-memory-session-history-retrieval",
       "target": "gap-goal-lineage-reconciliation-gap",
       "label": "has gap"
@@ -2868,12 +2898,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-goal-autonomy-activation-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-goal-autonomy-activation-gap",
       "label": "has gap"
     },
@@ -2903,7 +2933,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-goal-autonomy-activation-gap",
       "label": "has gap"
     },
@@ -2943,12 +2973,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
@@ -2978,7 +3008,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
@@ -3013,12 +3043,12 @@
       "label": "tracked in"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-skill-ecosystem-closed-loop-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-skill-ecosystem-closed-loop-gap",
       "label": "has gap"
     },
@@ -3048,7 +3078,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-skill-ecosystem-closed-loop-gap",
       "label": "has gap"
     },
@@ -3073,12 +3103,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-fast",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-fast",
       "label": "has gap"
     },
@@ -3088,7 +3118,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-fast",
       "label": "has gap"
     },
@@ -3123,12 +3153,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-channel-media-delivery-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-channel-media-delivery-gap",
       "label": "has gap"
     },
@@ -3168,12 +3198,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-rich-message-presentation-gap",
       "label": "has gap"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-rich-message-presentation-gap",
       "label": "has gap"
     },
@@ -3198,7 +3228,12 @@
       "label": "tracked in"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-generic-artifact-context-hygiene-gap",
       "label": "has gap"
     },
@@ -3223,7 +3258,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-generic-artifact-context-hygiene-gap",
       "label": "has gap"
     },
@@ -3263,7 +3298,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-image-route-vs-input-classification-gap",
       "label": "has gap"
     },
@@ -3298,7 +3333,7 @@
       "label": "tracked in"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-channel-state-channel-session-transition",
       "target": "gap-supervisor-service-health-precedence-gap",
       "label": "has gap"
     },
@@ -3338,7 +3373,7 @@
       "label": "tracked in"
     },
     {
-      "source": "component-channel-ingress-channel-runtime",
+      "source": "component-channel-ingress-channel-runtime-channel-action",
       "target": "gap-active-runtime-stop-recovery-live-gap",
       "label": "has gap"
     },
@@ -3358,7 +3393,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-codex-runtime",
+      "source": "component-codex-runtime-goal-closure",
       "target": "gap-active-runtime-stop-recovery-live-gap",
       "label": "has gap"
     },
@@ -3376,6 +3411,11 @@
       "source": "gap-scenario-matrix-coverage-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-scenario-matrix-coverage-gap",
+      "label": "has gap"
     },
     {
       "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
@@ -3410,11 +3450,8 @@
         "axis-agentid",
         "axis-sessionkey",
         "component-channel-identity",
-        "component-channel-state",
-        "component-channel-ingress-channel-runtime",
         "component-runtime-queue-runtime-worker",
         "component-prompt-turns",
-        "component-codex-runtime",
         "component-channel-delivery"
       ],
       "steps": [
@@ -3448,7 +3485,6 @@
       "nodes": [
         "axis-agentid",
         "axis-sessionkey",
-        "component-channel-state",
         "component-prompt-turns",
         "component-runtime-queue-runtime-worker",
         "gap-multi-agent-full-matrix-gap",
@@ -3480,7 +3516,6 @@
       "why": "Use this after idle app-server timeouts, excessive progress edits, missing final replies, or compact/retry confusion.",
       "nodes": [
         "component-runtime-queue-runtime-worker",
-        "component-codex-runtime",
         "component-progress",
         "component-channel-delivery",
         "gap-tool-use-timeout-recovery-gap",

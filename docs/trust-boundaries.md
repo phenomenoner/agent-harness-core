@@ -1,6 +1,6 @@
 # Agent Harness Trust Boundaries
 
-Date: 2026-06-17
+Date: 2026-07-21
 
 This document supports P6.5 and the external review security dimension. It names the boundaries that must fail closed or fail open safely before live enablement.
 
@@ -15,6 +15,7 @@ This document supports P6.5 and the external review security dimension. It names
 | Codex app-server/provider process | External execution boundary | Preflight credentials/config, bounded max/idle timeout, cancellation markers, transcript/trajectory receipts. | Codex runtime receipts and preflight receipts. |
 | Shell lane | High-risk local execution | Canonicalize path under allowed roots; future hardening should add command hash pinning and environment scrubbing. | `security-scan`, deterministic shell audit receipts. |
 | Plugin/MCP tools | Semi-trusted external/tool boundary | Explicit allow-list, timeout, per-agent/channel permission, and receipts before real invocation. Tool descriptions are pinned/hash-checked where possible. | `mcp-request`, `tool-pin-check`, plugin sidecar receipts. |
+| Connector approval actions | Untrusted provider callback boundary | Provider payloads contain only public action identifiers. Resolve protected approval authority server-side, bind it to the exact lane, user, concrete session, effect generation, action, and parameter digest, and reject expired, replayed, ambiguous, or mismatched actions before any remote effect. | Typed inbound-action evidence, approval disposition receipts, external-effect transitions. |
 | Memory service / openclaw-mem | Local adapter or external service boundary | ContextPack validation and fail-open degradation. Invalid memory packs must not block normal turns. The active owner remains `snapshot-adapter` until a compatible local in-process or remote endpoint probe, lease heartbeat, shadow parity, trust/scope, rollback proof, and operator promotion gates all pass. | ContextPack fixtures, memory proposal/writeback receipts, owner state, shadow parity receipts, promotion/rollback receipts, trace samples. |
 | Secret vault | Trusted encrypted local store | Store long-lived secrets in repo-local encrypted vault. Never print decrypted secret values in CLI output. | Vault put/get receipts or summaries, migration/rotation receipts. |
 | Public export | Public release boundary | No `.agent-harness`, `.review`, `.debug`, or secret paths. | `public-hygiene` report. |
@@ -31,6 +32,8 @@ This document supports P6.5 and the external review security dimension. It names
 - `handle_mcp_request` implements initialize/list/call with allow-list rejection receipts.
 - `tool_description_hash` and `tool-pin-check` support MCP/tool description pinning.
 - `put_vault_secret` and `get_vault_secret` implement repo-local encrypted vault storage without printing secrets from `vault-get`.
+- Telegram callbacks and Discord component interactions are normalized into a provider-neutral typed action. Public action identifiers are non-bearer references; protected state retains the capability and exact authority binding.
+- Approval waits park without holding a worker lease. Decision/expiry reconciliation is monotonic, so only one terminal outcome can authorize or deny the exact effect generation.
 
 ## Remaining Hardening Gates
 

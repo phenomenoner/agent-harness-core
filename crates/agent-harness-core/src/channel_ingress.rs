@@ -75,6 +75,7 @@ pub struct ChannelReceiveReport {
 pub enum ChannelReceiveStatus {
     CommandApplied,
     AgentTurnQueued,
+    SessionTransitionPending,
     ErrorReplied,
     DuplicateSuppressed,
     Skipped,
@@ -119,6 +120,43 @@ struct IngressClaimRecord {
     queue_id: Option<String>,
 }
 
+const HELD_CHANNEL_MESSAGE_SCHEMA: &str = "agent-harness.held-channel-message.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HeldChannelMessageV1 {
+    schema: String,
+    held_id: String,
+    source_home: PathBuf,
+    source_workspace: PathBuf,
+    runtime_workspace: Option<PathBuf>,
+    platform: String,
+    account_id: Option<String>,
+    channel_id: String,
+    user_id: String,
+    agent_id: Option<String>,
+    old_session_key: String,
+    message: String,
+    inbound_context: Option<String>,
+    inbound_media_artifacts: Vec<InboundMediaArtifact>,
+    inbound_event_kind: Option<String>,
+    inbound_event_id: Option<String>,
+    inbound_canonical_id: Option<String>,
+    skill_limit: usize,
+    received_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeldChannelMessageReconcileReport {
+    pub scanned: usize,
+    pub replayed: usize,
+    pub still_held: usize,
+    pub failed: usize,
+    pub queue_ids: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<ChannelReceiveReport> {
     let channel_state_dir = options.harness_home.join("state").join("channels");
     let outbox_file = channel_state_dir.join("outbox.jsonl");
@@ -136,6 +174,27 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
         .filter(|value| !value.is_empty())
         .unwrap_or("default")
         .to_string();
+    let mut held_input = HeldChannelMessageV1 {
+        schema: HELD_CHANNEL_MESSAGE_SCHEMA.to_string(),
+        held_id: String::new(),
+        source_home: options.source.home.clone(),
+        source_workspace: options.source.workspace.clone(),
+        runtime_workspace: options.runtime_workspace.clone(),
+        platform: options.platform.clone(),
+        account_id: Some(account_id.clone()),
+        channel_id: options.channel_id.clone(),
+        user_id: options.user_id.clone(),
+        agent_id: options.agent_id.clone(),
+        old_session_key: options.session_key.clone().unwrap_or_default(),
+        message: options.message.clone(),
+        inbound_context: options.inbound_context.clone(),
+        inbound_media_artifacts: options.inbound_media_artifacts.clone(),
+        inbound_event_kind: options.inbound_event_kind.clone(),
+        inbound_event_id: options.inbound_event_id.clone(),
+        inbound_canonical_id: None,
+        skill_limit: options.skill_limit,
+        received_at_ms: options.now_ms,
+    };
     let turn = build_turn_plan_for_account(
         &options.source,
         &registry,
@@ -170,6 +229,85 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
         options.inbound_event_kind.as_deref(),
         options.inbound_event_id.as_deref(),
     );
+    if step.action == ChannelStepAction::EnqueueAgentTurn
+        && let Some(agent) = turn.agent.as_ref()
+    {
+        let lane = crate::ChannelStateLane::new(
+            &options.platform,
+            Some(account_id.as_str()),
+            &options.channel_id,
+            &options.user_id,
+            &agent.id,
+        )?;
+        if crate::channel_session_transition_admission(
+            &options.harness_home,
+            &lane.exact_lane_digest(),
+            &step.session_key,
+        )? == crate::ChannelSessionAdmissionV1::HoldPendingNew
+        {
+            held_input.agent_id = Some(agent.id.clone());
+            held_input.old_session_key = step.session_key.clone();
+            held_input.inbound_canonical_id = inbound_canonical_id.clone();
+            held_input.held_id = held_channel_message_id(&held_input);
+            persist_held_channel_message_once(&options.harness_home, &held_input)?;
+            let reason =
+                "message durably held while the current /new session transition is pending"
+                    .to_string();
+            let receipt = ChannelReceiveReceipt {
+                status: ChannelReceiveStatus::SessionTransitionPending,
+                platform: options.platform.clone(),
+                account_id: Some(account_id.clone()),
+                channel_id: options.channel_id.clone(),
+                user_id: options.user_id.clone(),
+                session_key: step.session_key.clone(),
+                queue_id: None,
+                inbound_canonical_id: inbound_canonical_id.clone(),
+                duplicate_sibling_of: None,
+                outbound_count: 0,
+                reason: reason.clone(),
+            };
+            append_json_line(&receipts_file, &receipt)?;
+            append_harness_log(
+                &options.harness_home,
+                &HarnessLogEvent::new(
+                    options.now_ms,
+                    HarnessLogLevel::Info,
+                    "channel",
+                    "channel.receive.session-transition-pending",
+                    reason,
+                )
+                .session_key(Some(step.session_key.clone()))
+                .agent_id(Some(agent.id.clone()))
+                .channel(
+                    options.platform.clone(),
+                    options.channel_id.clone(),
+                    options.user_id.clone(),
+                ),
+            )?;
+            return Ok(ChannelReceiveReport {
+                schema: CHANNEL_RECEIVE_SCHEMA,
+                harness_home: options.harness_home,
+                platform: options.platform,
+                account_id: Some(account_id),
+                channel_id: options.channel_id,
+                user_id: options.user_id,
+                session_key: step.session_key,
+                status: ChannelReceiveStatus::SessionTransitionPending,
+                step_action: step.action,
+                command_name,
+                queue_id: None,
+                inbound_canonical_id,
+                duplicate_sibling_of: None,
+                outbox_file,
+                receipts_file,
+                command_apply: None,
+                queue_enqueue: None,
+                outbound_messages: Vec::new(),
+                receipt,
+                warnings,
+            });
+        }
+    }
     let mut claim_file = None;
     if let (Some(canonical_id), Some(event_kind), Some(event_id)) = (
         inbound_canonical_id.as_deref(),
@@ -402,9 +540,9 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
         &HarnessLogEvent::new(
             options.now_ms,
             match status {
-                ChannelReceiveStatus::CommandApplied | ChannelReceiveStatus::AgentTurnQueued => {
-                    HarnessLogLevel::Info
-                }
+                ChannelReceiveStatus::CommandApplied
+                | ChannelReceiveStatus::AgentTurnQueued
+                | ChannelReceiveStatus::SessionTransitionPending => HarnessLogLevel::Info,
                 ChannelReceiveStatus::DuplicateSuppressed => HarnessLogLevel::Info,
                 ChannelReceiveStatus::ErrorReplied => HarnessLogLevel::Warn,
                 ChannelReceiveStatus::Skipped => HarnessLogLevel::Debug,
@@ -487,6 +625,214 @@ fn with_account_id(
 
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
     crate::append_jsonl_value(path, value)
+}
+
+const MAX_HELD_CHANNEL_MESSAGES_PER_RECONCILE: usize = 128;
+
+fn held_channel_messages_dir(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("channels")
+        .join("held-session-transition-messages")
+}
+
+fn held_channel_message_id(record: &HeldChannelMessageV1) -> String {
+    let identity = record.inbound_canonical_id.clone().unwrap_or_else(|| {
+        format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            record.platform,
+            record.account_id.as_deref().unwrap_or("default"),
+            record.channel_id,
+            record.user_id,
+            record.received_at_ms,
+            record.message
+        )
+    });
+    format!("held:{}", fnv1a_64_hex(&identity))
+}
+
+fn held_channel_message_file(harness_home: &Path, held_id: &str) -> PathBuf {
+    held_channel_messages_dir(harness_home).join(format!("{}.json", fnv1a_64_hex(held_id)))
+}
+
+fn persist_held_channel_message_once(
+    harness_home: &Path,
+    record: &HeldChannelMessageV1,
+) -> io::Result<()> {
+    if record.schema != HELD_CHANNEL_MESSAGE_SCHEMA
+        || record.held_id != held_channel_message_id(record)
+        || record.old_session_key.trim().is_empty()
+        || record.agent_id.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "held channel message identity is incomplete",
+        ));
+    }
+    fs::create_dir_all(held_channel_messages_dir(harness_home))?;
+    let file = held_channel_message_file(harness_home, &record.held_id);
+    if file.exists() {
+        let existing: HeldChannelMessageV1 =
+            serde_json::from_slice(&fs::read(&file)?).map_err(io::Error::other)?;
+        // A provider retry can carry a later local receive timestamp. The
+        // canonical provider identity owns this held row, so retain the first
+        // durable payload instead of treating that timestamp drift as a
+        // collision. Every behavior-bearing field must still match.
+        if existing.schema != record.schema
+            || existing.held_id != record.held_id
+            || existing.source_home != record.source_home
+            || existing.source_workspace != record.source_workspace
+            || existing.runtime_workspace != record.runtime_workspace
+            || existing.platform != record.platform
+            || existing.account_id != record.account_id
+            || existing.channel_id != record.channel_id
+            || existing.user_id != record.user_id
+            || existing.agent_id != record.agent_id
+            || existing.old_session_key != record.old_session_key
+            || existing.message != record.message
+            || existing.inbound_context != record.inbound_context
+            || existing.inbound_media_artifacts != record.inbound_media_artifacts
+            || existing.inbound_event_kind != record.inbound_event_kind
+            || existing.inbound_event_id != record.inbound_event_id
+            || existing.inbound_canonical_id != record.inbound_canonical_id
+            || existing.skill_limit != record.skill_limit
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "held channel message identity collision",
+            ));
+        }
+        return Ok(());
+    }
+    crate::write_json_atomic(&file, record)
+}
+
+pub fn reconcile_held_channel_messages(
+    harness_home: &Path,
+    max_rows: usize,
+    now_ms: i64,
+) -> io::Result<HeldChannelMessageReconcileReport> {
+    if max_rows == 0 || max_rows > MAX_HELD_CHANNEL_MESSAGES_PER_RECONCILE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "held channel message reconcile row cap is outside policy",
+        ));
+    }
+    let dir = held_channel_messages_dir(harness_home);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(HeldChannelMessageReconcileReport {
+                scanned: 0,
+                replayed: 0,
+                still_held: 0,
+                failed: 0,
+                queue_ids: Vec::new(),
+                warnings: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let bytes = fs::read(entry.path())?;
+        let record: HeldChannelMessageV1 =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        if record.schema != HELD_CHANNEL_MESSAGE_SCHEMA
+            || record.held_id != held_channel_message_id(&record)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "held channel message failed schema or identity validation",
+            ));
+        }
+        records.push((record, entry.path()));
+    }
+    records.sort_by(|left, right| {
+        left.0
+            .received_at_ms
+            .cmp(&right.0.received_at_ms)
+            .then_with(|| left.0.held_id.cmp(&right.0.held_id))
+    });
+    records.truncate(max_rows);
+
+    let mut report = HeldChannelMessageReconcileReport {
+        scanned: records.len(),
+        replayed: 0,
+        still_held: 0,
+        failed: 0,
+        queue_ids: Vec::new(),
+        warnings: Vec::new(),
+    };
+    for (record, file) in records {
+        let Some(agent_id) = record.agent_id.as_deref() else {
+            report.failed += 1;
+            report
+                .warnings
+                .push(format!("held message {} has no agent", record.held_id));
+            continue;
+        };
+        let lane = crate::ChannelStateLane::new(
+            &record.platform,
+            record.account_id.as_deref(),
+            &record.channel_id,
+            &record.user_id,
+            agent_id,
+        )?;
+        if crate::channel_session_transition_admission(
+            harness_home,
+            &lane.exact_lane_digest(),
+            &record.old_session_key,
+        )? == crate::ChannelSessionAdmissionV1::HoldPendingNew
+        {
+            report.still_held += 1;
+            continue;
+        }
+        let source = AgentSource::with_workspace(&record.source_home, &record.source_workspace);
+        let skill_index = crate::build_source_skill_index(&source)?;
+        match receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: record.runtime_workspace.clone(),
+            harness_home: harness_home.to_path_buf(),
+            skill_index,
+            platform: record.platform.clone(),
+            account_id: record.account_id.clone(),
+            channel_id: record.channel_id.clone(),
+            user_id: record.user_id.clone(),
+            agent_id: record.agent_id.clone(),
+            session_key: None,
+            message: record.message.clone(),
+            inbound_context: record.inbound_context.clone(),
+            inbound_media_artifacts: record.inbound_media_artifacts.clone(),
+            inbound_event_kind: record.inbound_event_kind.clone(),
+            inbound_event_id: record.inbound_event_id.clone(),
+            skill_limit: record.skill_limit,
+            now_ms: now_ms.max(record.received_at_ms),
+        }) {
+            Ok(receive) if receive.status == ChannelReceiveStatus::SessionTransitionPending => {
+                report.still_held += 1;
+            }
+            Ok(receive) => {
+                if let Some(queue_id) = receive.queue_id {
+                    report.queue_ids.push(queue_id);
+                }
+                fs::remove_file(&file)?;
+                report.replayed += 1;
+            }
+            Err(error) => {
+                report.failed += 1;
+                report.warnings.push(format!(
+                    "held message {} replay failed: {error}",
+                    record.held_id
+                ));
+            }
+        }
+    }
+    Ok(report)
 }
 
 fn inbound_canonical_id(
@@ -1340,6 +1686,132 @@ mod tests {
         .lines()
         .count();
         assert_eq!(queue_lines, 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_new_holds_provider_messages_once_and_replays_them_fifo() {
+        let root = temp_root("pending_new_holds_provider_messages_once_and_replays_them_fifo");
+        let source = write_receive_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let registry = load_agent_registry(&source).unwrap();
+        let planned = build_turn_plan_for_account(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "discord".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                text: "held first".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: Some("discord:dm-42:user-7:main".to_string()),
+                skill_limit: 3,
+            },
+            Some("discord-main".to_string()),
+        )
+        .unwrap();
+        let old_session_key = planned.session_key.clone();
+        let lane =
+            ChannelStateLane::new("discord", Some("discord-main"), "dm-42", "user-7", "main")
+                .unwrap();
+        let transition = crate::prepare_channel_session_transition(
+            crate::PrepareChannelSessionTransitionOptionsV1 {
+                harness_home: harness_home.clone(),
+                command: crate::ChannelSessionTransitionCommandV1::New,
+                lane_digest: lane.exact_lane_digest(),
+                old_session_key: old_session_key.clone(),
+                proposed_new_session_key: Some(format!("{old_session_key}:new")),
+                topic: None,
+                reason: Some("test pending boundary".to_string()),
+                now_ms: 900,
+            },
+        )
+        .unwrap();
+
+        let receive = |event_id: &str, message: &str, now_ms: i64| {
+            receive_channel_message(ChannelReceiveOptions {
+                source: source.clone(),
+                runtime_workspace: None,
+                harness_home: harness_home.clone(),
+                skill_index: skills.clone(),
+                platform: "discord".to_string(),
+                account_id: Some("discord-main".to_string()),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                agent_id: Some("main".to_string()),
+                session_key: Some(old_session_key.clone()),
+                message: message.to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                inbound_event_kind: Some("message".to_string()),
+                inbound_event_id: Some(event_id.to_string()),
+                skill_limit: 3,
+                now_ms,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            receive("provider-held-1", "held first", 1_000).status,
+            ChannelReceiveStatus::SessionTransitionPending
+        );
+        assert_eq!(
+            receive("provider-held-2", "held second", 1_001).status,
+            ChannelReceiveStatus::SessionTransitionPending
+        );
+        // Provider retry owns the same held row even though its local receive
+        // timestamp is different.
+        assert_eq!(
+            receive("provider-held-1", "held first", 1_100).status,
+            ChannelReceiveStatus::SessionTransitionPending
+        );
+        assert_eq!(
+            fs::read_dir(held_channel_messages_dir(&harness_home))
+                .unwrap()
+                .count(),
+            2
+        );
+        assert!(
+            !harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl")
+                .exists()
+        );
+
+        crate::record_channel_session_transition_phase(
+            &harness_home,
+            &transition.intent,
+            crate::ChannelSessionTransitionPhaseV1::BoundaryCommitted,
+            "session state boundary committed",
+            1_200,
+        )
+        .unwrap();
+        let replay = reconcile_held_channel_messages(&harness_home, 8, 1_300).unwrap();
+        assert_eq!(replay.scanned, 2);
+        assert_eq!(replay.replayed, 2);
+        assert_eq!(replay.still_held, 0);
+        assert_eq!(replay.failed, 0);
+        assert_eq!(replay.queue_ids.len(), 2);
+        assert_eq!(
+            fs::read_dir(held_channel_messages_dir(&harness_home))
+                .unwrap()
+                .count(),
+            0
+        );
+        let queued = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(queued.find("held first").unwrap() < queued.find("held second").unwrap());
 
         let _ = fs::remove_dir_all(root);
     }

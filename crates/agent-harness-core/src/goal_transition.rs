@@ -36,6 +36,18 @@ pub enum GoalTransitionAuthority {
     Invalid,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GoalTransitionRelation {
+    CurrentGoalSlice,
+    AuthorizedCampaignContinuation,
+    FreshUnrelatedTurn,
+    HistoricalState,
+    #[default]
+    #[serde(other)]
+    Unproven,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GoalTransitionDecision {
@@ -56,6 +68,7 @@ pub enum GoalTransitionDecision {
 #[serde(rename_all = "kebab-case")]
 pub enum GoalTransitionSurface {
     CampaignFinal,
+    OrdinaryFinal,
     ProgressOnly,
     TerminalNotice,
     FailureNotice,
@@ -80,6 +93,7 @@ pub struct GoalTransitionInput {
     pub source_slice_generation: u64,
     pub decision_generation: u64,
     pub authority: GoalTransitionAuthority,
+    pub relation: GoalTransitionRelation,
     pub retryable_failure: bool,
     pub context_rollover_required: bool,
     pub budget_exhausted: bool,
@@ -108,6 +122,8 @@ pub struct GoalTransitionReceiptV1 {
     pub source_slice_generation: u64,
     pub decision_generation: u64,
     pub authority: GoalTransitionAuthority,
+    #[serde(default)]
+    pub relation: GoalTransitionRelation,
     pub decision: GoalTransitionDecision,
     pub surface: GoalTransitionSurface,
     pub schedule_continuation: bool,
@@ -131,10 +147,17 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
         .as_deref()
         .map(normalize_status)
         .unwrap_or_default();
-    let active_goal = matches!(
+    let goal_status_is_active = matches!(
         normalized_goal_status.as_str(),
         "active" | "running" | "inprogress"
     );
+    let campaign_authorized = input.authority == GoalTransitionAuthority::Ready
+        && matches!(
+            input.relation,
+            GoalTransitionRelation::CurrentGoalSlice
+                | GoalTransitionRelation::AuthorizedCampaignContinuation
+        );
+    let active_goal = goal_status_is_active && campaign_authorized;
     let (decision, surface, schedule_continuation, terminal, reason) = if matches!(
         input.event,
         GoalTransitionEventKind::NewerSteer | GoalTransitionEventKind::OlderCompletion
@@ -169,10 +192,12 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             "backend auth is not ready; defer without a normal-channel credential or final surface"
                 .to_string(),
         )
-    } else if matches!(
-        normalized_goal_status.as_str(),
-        "completed" | "complete" | "succeeded" | "achieved"
-    ) {
+    } else if campaign_authorized
+        && matches!(
+            normalized_goal_status.as_str(),
+            "completed" | "complete" | "succeeded" | "achieved"
+        )
+    {
         (
             GoalTransitionDecision::Complete,
             GoalTransitionSurface::CampaignFinal,
@@ -180,7 +205,7 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status is complete".to_string(),
         )
-    } else if matches!(normalized_goal_status.as_str(), "paused" | "pause") {
+    } else if campaign_authorized && matches!(normalized_goal_status.as_str(), "paused" | "pause") {
         (
             GoalTransitionDecision::Pause,
             GoalTransitionSurface::TerminalNotice,
@@ -188,10 +213,12 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status is paused".to_string(),
         )
-    } else if matches!(
-        normalized_goal_status.as_str(),
-        "stopped" | "stop" | "canceled" | "cancelled"
-    ) {
+    } else if campaign_authorized
+        && matches!(
+            normalized_goal_status.as_str(),
+            "stopped" | "stop" | "canceled" | "cancelled"
+        )
+    {
         (
             GoalTransitionDecision::Stop,
             GoalTransitionSurface::TerminalNotice,
@@ -199,10 +226,12 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status is stopped".to_string(),
         )
-    } else if matches!(
-        normalized_goal_status.as_str(),
-        "needsuser" | "needsinput" | "needsapproval"
-    ) {
+    } else if campaign_authorized
+        && matches!(
+            normalized_goal_status.as_str(),
+            "needsuser" | "needsinput" | "needsapproval"
+        )
+    {
         (
             GoalTransitionDecision::NeedsUser,
             GoalTransitionSurface::TerminalNotice,
@@ -210,10 +239,12 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status requires user input or authority".to_string(),
         )
-    } else if matches!(
-        normalized_goal_status.as_str(),
-        "needsauthority" | "needsauthorization" | "needsauthorisation"
-    ) {
+    } else if campaign_authorized
+        && matches!(
+            normalized_goal_status.as_str(),
+            "needsauthority" | "needsauthorization" | "needsauthorisation"
+        )
+    {
         (
             GoalTransitionDecision::NeedsAuthority,
             GoalTransitionSurface::TerminalNotice,
@@ -221,10 +252,12 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status requires additional authority".to_string(),
         )
-    } else if matches!(
-        normalized_goal_status.as_str(),
-        "needsoperatorauth" | "operatorauthrequired" | "authenticationrequired"
-    ) {
+    } else if campaign_authorized
+        && matches!(
+            normalized_goal_status.as_str(),
+            "needsoperatorauth" | "operatorauthrequired" | "authenticationrequired"
+        )
+    {
         (
             GoalTransitionDecision::NeedsOperatorAuth,
             GoalTransitionSurface::TerminalNotice,
@@ -232,7 +265,7 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status requires operator authentication".to_string(),
         )
-    } else if active_goal && input.authority != GoalTransitionAuthority::Ready {
+    } else if goal_status_is_active && !campaign_authorized {
         (
             GoalTransitionDecision::NeedsAuthority,
             GoalTransitionSurface::ProgressOnly,
@@ -295,7 +328,7 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             GoalTransitionEventKind::NormalCompletion
             | GoalTransitionEventKind::DrainCompletion => (
                 GoalTransitionDecision::Complete,
-                GoalTransitionSurface::CampaignFinal,
+                GoalTransitionSurface::OrdinaryFinal,
                 false,
                 true,
                 "completed non-goal turn owns its normal final surface".to_string(),
@@ -305,7 +338,7 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             {
                 (
                     GoalTransitionDecision::Complete,
-                    GoalTransitionSurface::CampaignFinal,
+                    GoalTransitionSurface::OrdinaryFinal,
                     false,
                     true,
                     "restart reconciliation recovered an already completed non-goal turn"
@@ -369,6 +402,7 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
         source_slice_generation: input.source_slice_generation,
         decision_generation: input.decision_generation,
         authority: input.authority,
+        relation: input.relation,
         decision,
         surface,
         schedule_continuation,
@@ -501,6 +535,22 @@ mod tests {
         assert!(!missing.schedule_continuation);
     }
 
+    #[test]
+    fn historical_completed_goal_does_not_authorize_campaign_final() {
+        let historical = evaluate_goal_transition(GoalTransitionInput {
+            authority: GoalTransitionAuthority::Missing,
+            relation: GoalTransitionRelation::HistoricalState,
+            ..input(
+                GoalTransitionEventKind::NormalCompletion,
+                Some("completed"),
+                false,
+            )
+        });
+
+        assert_ne!(historical.surface, GoalTransitionSurface::CampaignFinal);
+        assert!(!historical.allow_campaign_final);
+    }
+
     fn input(
         event: GoalTransitionEventKind,
         goal_status: Option<&str>,
@@ -523,6 +573,7 @@ mod tests {
             source_slice_generation: 1,
             decision_generation: 1,
             authority: GoalTransitionAuthority::Ready,
+            relation: GoalTransitionRelation::CurrentGoalSlice,
             retryable_failure,
             context_rollover_required: false,
             budget_exhausted: false,

@@ -1,0 +1,27 @@
+{
+  "schema": "agent-harness.acceptance-fixture.fresh-turn-after-goal-final-replay.v1",
+  "authority": {
+    "laneDigest": "lane-synthetic",
+    "virtualSessionId": "virtual-session-synthetic",
+    "campaignFamilyId": "campaign-a"
+  },
+  "events": [
+    {"seq": 1, "kind": "queue-started", "queueId": "queue-a", "turnRelation": "current-owned-turn"},
+    {"seq": 2, "kind": "goal-updated", "queueId": "queue-a", "goalId": "goal-a", "status": "completed", "observationPhase": "owned-turn"},
+    {"seq": 3, "kind": "final-appended", "queueId": "queue-a", "messageId": "message-a", "disposition": "campaign-appended"},
+    {"seq": 4, "kind": "provider-delivered", "queueId": "queue-a", "deliveryId": "delivery-a"},
+    {"seq": 5, "kind": "queue-started", "queueId": "queue-b", "turnRelation": "fresh-unrelated-turn"},
+    {"seq": 6, "kind": "goal-updated", "queueId": "queue-b", "goalId": "goal-a", "status": "completed", "observationPhase": "resume-settle"},
+    {"seq": 7, "kind": "assistant-final", "queueId": "queue-b", "itemId": "final-b"},
+    {"seq": 8, "kind": "final-appended", "queueId": "queue-b", "messageId": "message-b", "disposition": "ordinary-appended"},
+    {"seq": 9, "kind": "provider-delivered", "queueId": "queue-b", "deliveryId": "delivery-b"},
+    {"seq": 10, "kind": "campaign-replay", "queueId": "queue-a", "messageId": "message-a"}
+  ],
+  "expected": {
+    "queueAFinalCount": 1,
+    "queueBFinalCount": 1,
+    "queueBReusesQueueAText": false,
+    "queueBProgressRequiresDeliveryId": "delivery-b",
+    "campaignReplayAddsFinal": false
+  }
+}

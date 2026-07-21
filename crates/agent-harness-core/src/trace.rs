@@ -38,6 +38,12 @@ pub struct TraceRecord {
     pub queue_id: Option<String>,
     pub status: Option<String>,
     pub event: Option<String>,
+    pub source_queue_id: Option<String>,
+    pub delivery_id: Option<String>,
+    pub source_final_expectation: Option<String>,
+    pub final_outbox_disposition: Option<String>,
+    pub authority_digest: Option<String>,
+    pub phase: Option<String>,
     pub summary: String,
 }
 
@@ -71,6 +77,12 @@ pub fn trace_harness_event(options: TraceOptions) -> io::Result<TraceReport> {
                     queue_id: Some(historical.queue_id),
                     status: Some(historical.status),
                     event: Some("runtime-receipt-history".to_string()),
+                    source_queue_id: None,
+                    delivery_id: None,
+                    source_final_expectation: None,
+                    final_outbox_disposition: None,
+                    authority_digest: None,
+                    phase: None,
                     summary: summary.chars().take(240).collect(),
                 });
             }
@@ -103,6 +115,7 @@ pub fn trace_harness_event(options: TraceOptions) -> io::Result<TraceReport> {
                     | "skipped"
                     | "canceled"
                     | "suppressed"
+                    | "external-effect-denied"
             )
         })
     });
@@ -161,6 +174,10 @@ fn trace_sources(harness_home: &std::path::Path) -> Vec<PathBuf> {
         queue.join("run-once-receipts.jsonl"),
         queue.join("dead-letter-receipts.jsonl"),
         queue.join("progress-events.jsonl"),
+        state.join("goal-closure").join("receipts.jsonl"),
+        state
+            .join("channel-session-transitions")
+            .join("receipts.jsonl"),
         state.join("logs").join("harness.jsonl"),
     ]
 }
@@ -186,6 +203,18 @@ fn read_matching_records(path: &PathBuf, id: &str) -> io::Result<Vec<TraceRecord
             queue_id: string_path(&value, &["queueId", "queue_id"]),
             status: string_path(&value, &["status"]),
             event: string_path(&value, &["event"]),
+            source_queue_id: string_path(&value, &["sourceQueueId", "source_queue_id"]),
+            delivery_id: string_path(&value, &["deliveryId", "delivery_id"]),
+            source_final_expectation: string_path(
+                &value,
+                &["sourceFinalExpectation", "source_final_expectation"],
+            ),
+            final_outbox_disposition: string_path(
+                &value,
+                &["finalOutboxDisposition", "final_outbox_disposition"],
+            ),
+            authority_digest: string_path(&value, &["authorityDigest", "authority_digest"]),
+            phase: string_path(&value, &["phase"]),
             summary: summarize_record(&value),
         });
     }
@@ -293,6 +322,60 @@ mod tests {
         assert_eq!(report.records.len(), 1);
         assert!(report.terminal);
         assert!(report.diagnostics.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trace_exposes_typed_final_and_closure_authority_without_payload_text() {
+        let root = temp_root("trace_exposes_typed_final_and_closure_authority");
+        let harness_home = root.join(".agent-harness");
+        let queue = harness_home.join("state").join("runtime-queue");
+        let closures = harness_home.join("state").join("goal-closure");
+        fs::create_dir_all(&queue).unwrap();
+        fs::create_dir_all(&closures).unwrap();
+        fs::write(
+            queue.join("run-once-receipts.jsonl"),
+            r#"{"queueId":"q-final","sourceQueueId":"q-final","deliveryId":"delivery:v2:abc","status":"completed","sourceFinalExpectation":"required","finalOutboxDisposition":"appended"}"#,
+        )
+        .unwrap();
+        fs::write(
+            closures.join("receipts.jsonl"),
+            r#"{"closureId":"closure-q-final","queueId":"q-final","authorityDigest":"sha256:authority","phase":"terminal-converged","status":"completed"}"#,
+        )
+        .unwrap();
+
+        let report = trace_harness_event(TraceOptions {
+            harness_home,
+            id: "q-final".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(report.records.len(), 2, "{report:#?}");
+        let final_record = report
+            .records
+            .iter()
+            .find(|record| record.delivery_id.is_some())
+            .unwrap();
+        assert_eq!(final_record.source_queue_id.as_deref(), Some("q-final"));
+        assert_eq!(
+            final_record.source_final_expectation.as_deref(),
+            Some("required")
+        );
+        assert_eq!(
+            final_record.final_outbox_disposition.as_deref(),
+            Some("appended")
+        );
+        let closure = report
+            .records
+            .iter()
+            .find(|record| record.phase.is_some())
+            .unwrap();
+        assert_eq!(
+            closure.authority_digest.as_deref(),
+            Some("sha256:authority")
+        );
+        assert_eq!(closure.phase.as_deref(), Some("terminal-converged"));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -4,12 +4,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 const PROBE_SCHEMA = "agent-harness.discord-gateway-probe.v1";
 const RECEIPT_SCHEMA = "agent-harness.discord-gateway-probe-receipt.v1";
 const DISCORD_GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const DEFAULT_DISCORD_INTENTS = (1 << 0) | (1 << 9) | (1 << 12);
+const DISCORD_COMPONENT_ACTION_SCHEMA = "agent-harness.discord-component-action.v1";
+const DISCORD_CUSTOM_ID_MAX_BYTES = 100;
+const PUBLIC_APPROVAL_ACTION_ID_PATTERN = /^ahpa1_[0-9a-f]{32}$/;
 
 function parseArgs(argv) {
   const args = {
@@ -302,6 +306,31 @@ function identifyPayload(token, intents) {
 
 async function handleInteractionCreate(args, payload) {
   const interaction = payload.d ?? {};
+  if (interaction.type === 3) {
+    const normalized = normalizeDiscordComponentAction(payload);
+    if (!normalized.ok) {
+      const ackStatus = await acknowledgeInteraction(
+        interaction,
+        "This approval control is invalid or no longer supported.",
+      );
+      return {
+        ackStatus,
+        routed: false,
+        status: 0,
+        reason: normalized.reason,
+      };
+    }
+
+    const ackStatus = await acknowledgeInteraction(interaction);
+    const result = runHarnessForEvent(args, normalized.envelope);
+    return {
+      ackStatus,
+      routed: true,
+      status: result.status,
+      reason: "Discord component routed as typed channel action",
+    };
+  }
+
   const content = interactionToMessageText(interaction);
   const userId = interactionUserId(interaction);
   const channelId = interaction.channel_id;
@@ -647,10 +676,7 @@ async function acknowledgeInteraction(interaction, content) {
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          type: 4,
-          data: { content },
-        }),
+        body: JSON.stringify(interactionAcknowledgementPayload(interaction, content)),
       },
     );
     return response.ok ? "sent" : `failed-${response.status}`;
@@ -659,16 +685,83 @@ async function acknowledgeInteraction(interaction, content) {
   }
 }
 
+export function interactionAcknowledgementPayload(interaction, content) {
+  if (interaction?.type === 3 && content === undefined) {
+    return { type: 6 };
+  }
+  return {
+    type: 4,
+    data: {
+      content,
+      ...(interaction?.type === 3 ? { flags: 64 } : {}),
+    },
+  };
+}
+
 function interactionUserId(interaction) {
   return interaction?.user?.id ?? interaction?.member?.user?.id ?? null;
 }
 
-function interactionToMessageText(interaction) {
+export function interactionToMessageText(interaction) {
   if (interaction?.type !== 2 || !interaction?.data?.name) {
     return null;
   }
   const args = interactionOptionsToText(interaction.data.options ?? []);
   return args ? `/${interaction.data.name} ${args}` : `/${interaction.data.name}`;
+}
+
+export function normalizeDiscordComponentAction(payload) {
+  const interaction = payload?.d;
+  if (!interaction || interaction.type !== 3) {
+    return { ok: false, reason: "not a Discord component interaction" };
+  }
+  if (interaction.data?.component_type !== 2) {
+    return { ok: false, reason: "unsupported Discord component type" };
+  }
+
+  const customId = interaction.data?.custom_id;
+  if (typeof customId !== "string") {
+    return { ok: false, reason: "missing Discord component custom ID" };
+  }
+  if (Buffer.byteLength(customId, "utf8") > DISCORD_CUSTOM_ID_MAX_BYTES) {
+    return { ok: false, reason: "Discord component custom ID exceeds 100 bytes" };
+  }
+  if (!PUBLIC_APPROVAL_ACTION_ID_PATTERN.test(customId)) {
+    return { ok: false, reason: "unrecognized Discord approval action ID" };
+  }
+
+  const providerEventId = requiredInteractionString(interaction.id);
+  const providerMessageId = requiredInteractionString(interaction.message?.id);
+  const channelId = requiredInteractionString(interaction.channel_id);
+  const userId = requiredInteractionString(interactionUserId(interaction));
+  if (!providerEventId || !providerMessageId || !channelId || !userId) {
+    return { ok: false, reason: "incomplete Discord component authority envelope" };
+  }
+
+  return {
+    ok: true,
+    envelope: {
+      t: "INTERACTION_CREATE",
+      ...(typeof payload.s === "number" ? { s: payload.s } : {}),
+      d: {
+        schema: DISCORD_COMPONENT_ACTION_SCHEMA,
+        kind: "component-action",
+        provider: "discord",
+        interaction_type: 3,
+        component_type: 2,
+        provider_event_id: providerEventId,
+        provider_message_id: providerMessageId,
+        channel_id: channelId,
+        guild_id: requiredInteractionString(interaction.guild_id),
+        user_id: userId,
+        public_action_id: customId,
+      },
+    },
+  };
+}
+
+function requiredInteractionString(value) {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function interactionOptionsToText(options) {
@@ -794,7 +887,10 @@ async function main() {
   await runGateway(args);
 }
 
-main().catch((error) => {
-  console.error(error.message);
-  process.exit(2);
-});
+const entryPoint = process.argv[1];
+if (entryPoint && import.meta.url === pathToFileURL(path.resolve(entryPoint)).href) {
+  main().catch((error) => {
+    console.error(error.message);
+    process.exit(2);
+  });
+}

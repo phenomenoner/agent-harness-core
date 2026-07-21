@@ -26,15 +26,16 @@ use crate::goal_continuation::{
 };
 use crate::goal_lineage::{
     GoalLineageDisposition, GoalLineageDoctorOptions, GoalLineageDoctorStatus, GoalProjectionHint,
-    latest_goal_projection_for_queue, run_goal_lineage_doctor,
+    GoalProjectionTurnRelationV1, latest_goal_projection_for_queue, run_goal_lineage_doctor,
 };
 use crate::goal_transition::{
     GoalTransitionAuthority, GoalTransitionDecision, GoalTransitionEventKind, GoalTransitionInput,
-    GoalTransitionReceiptV1, GoalTransitionSurface, evaluate_goal_transition,
-    record_goal_transition,
+    GoalTransitionReceiptV1, GoalTransitionRelation, GoalTransitionSurface,
+    evaluate_goal_transition, record_goal_transition,
 };
 use crate::rich_presentation::{
-    RichMessagePresentation, rich_presentation_from_plain_final_with_attachment_count,
+    RichMessagePresentation, RichPresentationAction, RichPresentationActionKind,
+    rich_presentation_from_plain_final_with_attachment_count,
 };
 use crate::runtime_worker::{
     QueueTerminalControl, record_terminal_control_suppression, refresh_runtime_queue_state_index,
@@ -43,11 +44,11 @@ use crate::runtime_worker::{
 };
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
-    AssistantNarrationConfig, AssistantNarrationMode, ChannelDeliveryIntent,
-    ChannelDeliveryIntentKind, ChannelOutboundAttachment, ChannelOutboundAttachmentKind,
-    ChannelOutboundMessage, ChannelOutboundMessageKind, CodexRuntimePlan, CodexRuntimePlanOptions,
-    CodexRuntimePlanReport, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions,
-    CodexRuntimeRunReport, CodexRuntimeRunStatus, ContextRolloverMode,
+    AssistantNarrationConfig, AssistantNarrationMode, ChannelApprovalPromptV1,
+    ChannelDeliveryIntent, ChannelDeliveryIntentKind, ChannelOutboundAttachment,
+    ChannelOutboundAttachmentKind, ChannelOutboundMessage, ChannelOutboundMessageKind,
+    CodexRuntimePlan, CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimeReceiptStatus,
+    CodexRuntimeRunOptions, CodexRuntimeRunReport, CodexRuntimeRunStatus, ContextRolloverMode,
     ContextRolloverPreparedRequeueReport, ContextRolloverRequeuePreparedOptions, HarnessLogEvent,
     HarnessLogLevel, InboundMediaArtifact, MediaDeliveryVerdict, MemoryLifecycleTurnOptions,
     PromptAssemblyOptions, ResponseToneConfig, ResponseToneContext, RuntimeContinuationMetadata,
@@ -270,7 +271,49 @@ pub struct RuntimeRunOnceReceipt {
     pub suppressed_run_once_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prepared_execution_terminalization_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_final_expectation: Option<SourceFinalExpectationV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_outbox_disposition: Option<FinalOutboxDispositionV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_source_queue_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_delivery_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_final_lane_digest: Option<String>,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceFinalExpectationV1 {
+    Required,
+    ExplicitNonDelivery,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FinalOutboxDispositionV1 {
+    Appended,
+    AlreadyPresent,
+    ReusedCanonicalCampaign,
+    ExplicitNonDelivery,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalOutboxOutcome {
+    outbox_file: PathBuf,
+    disposition: FinalOutboxDispositionV1,
+    canonical_source_queue_id: Option<String>,
+    delivery_id: Option<String>,
+}
+
+impl FinalOutboxOutcome {
+    fn appended(&self) -> bool {
+        self.disposition == FinalOutboxDispositionV1::Appended
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -295,6 +338,180 @@ pub enum RuntimeRunOnceStatus {
     DeadLetter,
     FailedTerminal,
     Canceled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalEffectExpirySettlementReportV1 {
+    pub effect_id: String,
+    pub source_queue_id: String,
+    pub resolution_id: String,
+    pub notice_id: String,
+    pub notice_delivery_id: Option<String>,
+    pub notice_appended: bool,
+    pub queue_terminal_receipt_appended: bool,
+    pub progress_terminal_appended: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalEffectExpiryQueueTerminalReceiptV1 {
+    event_key: String,
+    queue_id: Option<String>,
+    status: RuntimeRunOnceStatus,
+    runtime_class: Option<String>,
+    origin: Option<String>,
+    reason: String,
+    effect_id: String,
+    approval_generation: u64,
+    resolution_id: String,
+    notice_id: String,
+    final_outbox_disposition: FinalOutboxDispositionV1,
+}
+
+/// Completes the user-visible side of one already-durable approval expiry.
+/// The deterministic notice delivery and progress identities make restart
+/// replay safe; the run-once terminal receipt is appended once by event key.
+pub fn settle_expired_external_effect_approval(
+    harness_home: &Path,
+    resolution: &crate::ExternalEffectExpiryResolutionV1,
+    now_ms: i64,
+) -> io::Result<ExternalEffectExpirySettlementReportV1> {
+    let intent = crate::load_external_effect_intent(harness_home, &resolution.effect_id)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "expired effect was not found"))?;
+    if intent.state != crate::ExternalEffectStateV1::Denied
+        || intent.approval_generation != resolution.approval_generation
+        || intent.expiry_resolution_id.as_deref() != Some(resolution.resolution_id.as_str())
+        || intent.expiry_notice_id.as_deref() != Some(resolution.notice_id.as_str())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expired effect settlement authority does not match protected terminal state",
+        ));
+    }
+    let mut warnings = Vec::new();
+    let context = find_queue_channel_context(harness_home, &intent.source_queue_id, &mut warnings)?;
+    let mut notice_delivery_id = None;
+    let mut notice_appended = false;
+    let mut progress_terminal_appended = false;
+    let mut final_outbox_disposition = FinalOutboxDispositionV1::ExplicitNonDelivery;
+    if let Some(context) = context.as_ref() {
+        let suffix = resolution
+            .notice_id
+            .strip_prefix("ahen1_")
+            .filter(|value| value.len() == 64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid expiry notice identity")
+            })?;
+        let delivery_id = format!("delivery:v2:{}", &suffix[..32]);
+        let mut message = ChannelOutboundMessage {
+            platform: context.platform.clone(),
+            account_id: context.account_id.clone(),
+            channel_id: context.channel_id.clone(),
+            user_id: context.user_id.clone(),
+            session_key: context.session_key.clone(),
+            delivery_id: Some(delivery_id.clone()),
+            kind: ChannelOutboundMessageKind::AgentReply,
+            source_queue_id: Some(intent.source_queue_id.clone()),
+            source_completion_file: None,
+            text: "Connector approval expired. The protected action was denied and will not be retried.".to_string(),
+            presentation: None,
+            delivery_intent: delivery_intent_from_inbound_context(
+                &context.platform,
+                &context.channel_id,
+                context.inbound_context.as_deref(),
+            ),
+            attachments: Vec::new(),
+        };
+        let outbox = append_channel_outbox_message(harness_home, &mut message)?;
+        notice_appended = matches!(
+            outbox.outcome,
+            crate::ChannelOutboxAppendOutcome::Appended
+                | crate::ChannelOutboxAppendOutcome::AppendedIndexDeferred
+        );
+        final_outbox_disposition = if notice_appended {
+            FinalOutboxDispositionV1::Appended
+        } else {
+            FinalOutboxDispositionV1::AlreadyPresent
+        };
+        if let Some(warning) = outbox.index_warning {
+            warnings.push(warning);
+        }
+        notice_delivery_id = Some(outbox.delivery_id);
+
+        let progress_id = format!("pe2-{}", &suffix[..32]);
+        let events_file = crate::agent_progress_events_file(harness_home);
+        let progress_already_present = fs::read_to_string(&events_file)
+            .ok()
+            .is_some_and(|text| text.contains(&format!("\"eventId\":\"{progress_id}\"")));
+        if !progress_already_present {
+            let progress_context = AgentProgressContext {
+                queue_id: intent.source_queue_id.clone(),
+                agent_id: Some(context.agent_id.clone()),
+                account_id: context.account_id.clone(),
+                thread_id: None,
+                session_key: context.session_key.clone(),
+                platform: context.platform.clone(),
+                channel_id: context.channel_id.clone(),
+                user_id: context.user_id.clone(),
+            };
+            let mut event = AgentProgressEvent::new(
+                &progress_context,
+                AgentProgressKind::Runtime,
+                "approval-expired",
+                "connector approval expired and the protected action was denied",
+                AgentProgressStatus::Failed,
+                now_ms,
+            )
+            .source("external-effect-expiry-reconciler");
+            event.event_id = Some(progress_id);
+            append_agent_progress_event(harness_home, &event)?;
+            progress_terminal_appended = true;
+        }
+    } else {
+        warnings.push(format!(
+            "expiry notice for queue {} has no channel context",
+            intent.source_queue_id
+        ));
+    }
+
+    let receipt = ExternalEffectExpiryQueueTerminalReceiptV1 {
+        event_key: format!("{}:queue-terminal", resolution.resolution_id),
+        queue_id: Some(intent.source_queue_id.clone()),
+        status: RuntimeRunOnceStatus::ExternalEffectDenied,
+        runtime_class: Some("interactive".to_string()),
+        origin: Some("external-effect-expiry-reconciler".to_string()),
+        reason: "connector approval expired and was denied".to_string(),
+        effect_id: intent.effect_id.clone(),
+        approval_generation: intent.approval_generation,
+        resolution_id: resolution.resolution_id.clone(),
+        notice_id: resolution.notice_id.clone(),
+        final_outbox_disposition,
+    };
+    let receipt_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("run-once-receipts.jsonl");
+    let queue_terminal_receipt_appended =
+        crate::append_jsonl_value_once_by_event_key(&receipt_file, &receipt)?;
+    if queue_terminal_receipt_appended {
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        let _ =
+            crate::runtime_worker::refresh_runtime_queue_state_index(&queue_dir, &mut warnings)?;
+    }
+
+    Ok(ExternalEffectExpirySettlementReportV1 {
+        effect_id: intent.effect_id,
+        source_queue_id: intent.source_queue_id,
+        resolution_id: resolution.resolution_id.clone(),
+        notice_id: resolution.notice_id.clone(),
+        notice_delivery_id,
+        notice_appended,
+        queue_terminal_receipt_appended,
+        progress_terminal_appended,
+        warnings,
+    })
 }
 
 impl RuntimeRunOnceStatus {
@@ -546,6 +763,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             terminal_control_source: None,
             suppressed_run_once_reason: None,
             prepared_execution_terminalization_reason: None,
+            source_final_expectation: Some(SourceFinalExpectationV1::NotApplicable),
+            final_outbox_disposition: Some(FinalOutboxDispositionV1::NotApplicable),
+            canonical_source_queue_id: None,
+            final_delivery_id: None,
+            source_final_lane_digest: None,
             reason: "runtime queue lease lock is busy; retrying later".to_string(),
         };
         append_runtime_run_once_log(
@@ -610,6 +832,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             terminal_control_source: prepare.receipt.terminal_control_source.clone(),
             suppressed_run_once_reason: prepare.receipt.suppressed_run_once_reason.clone(),
             prepared_execution_terminalization_reason: None,
+            source_final_expectation: Some(SourceFinalExpectationV1::NotApplicable),
+            final_outbox_disposition: Some(FinalOutboxDispositionV1::NotApplicable),
+            canonical_source_queue_id: None,
+            final_delivery_id: None,
+            source_final_lane_digest: None,
             reason: if requested_specific_queue {
                 if prepare.receipt.terminal_control_matched == Some(true) {
                     prepare.receipt.reason.clone()
@@ -726,6 +953,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 terminal_control_source: Some(control.source.as_str().to_string()),
                 suppressed_run_once_reason: Some("terminal-control-present".to_string()),
                 prepared_execution_terminalization_reason: None,
+                source_final_expectation: Some(SourceFinalExpectationV1::NotApplicable),
+                final_outbox_disposition: Some(FinalOutboxDispositionV1::NotApplicable),
+                canonical_source_queue_id: None,
+                final_delivery_id: None,
+                source_final_lane_digest: None,
                 reason: format!(
                     "runtime queue item suppressed before no-prepared execution fallback because terminal control is present: {}: {}",
                     control.source.as_str(),
@@ -823,6 +1055,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             terminal_control_source: None,
             suppressed_run_once_reason: None,
             prepared_execution_terminalization_reason: terminalization_reason.clone(),
+            source_final_expectation: Some(SourceFinalExpectationV1::NotApplicable),
+            final_outbox_disposition: Some(FinalOutboxDispositionV1::NotApplicable),
+            canonical_source_queue_id: None,
+            final_delivery_id: None,
+            source_final_lane_digest: None,
             reason: terminalization_reason
                 .clone()
                 .unwrap_or_else(|| "no prepared runtime execution is available to run".to_string()),
@@ -1019,6 +1256,10 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     }
     let mut outbox_file = None;
     let mut outbound_message = None;
+    let mut final_outbox_disposition = FinalOutboxDispositionV1::NotApplicable;
+    let mut canonical_source_queue_id = None;
+    let mut final_delivery_id = None;
+    let mut stale_session_explicit_non_delivery = false;
     let mut child_queue_id = None;
     let mut child_session_key = None;
     let goal_authority = establish_runtime_goal_authority_before_outbox(
@@ -1490,7 +1731,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     ),
                     attachments: Vec::new(),
                 };
-                let (file, appended) = append_goal_terminal_outbound_message_once(
+                let outcome = append_goal_terminal_outbound_message_once(
                     &options.harness_home,
                     run.receipt.execution_dir.as_deref(),
                     run.receipt.completion_file.as_deref(),
@@ -1498,7 +1739,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     &mut message,
                     &mut warnings,
                 )?;
-                outbox_file = Some(file);
+                let appended = outcome.appended();
+                outbox_file = Some(outcome.outbox_file.clone());
+                final_outbox_disposition = outcome.disposition;
+                canonical_source_queue_id = outcome.canonical_source_queue_id;
+                final_delivery_id = outcome.delivery_id;
                 if appended {
                     outbound_message = Some(message);
                 }
@@ -1549,24 +1794,30 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     ),
                     attachments: Vec::new(),
                 };
-                let (file, appended) = append_final_outbound_message_once(
+                let outcome = append_final_outbound_message_once(
                     &options.harness_home,
                     run.receipt.execution_dir.as_deref(),
                     run.receipt.completion_file.as_deref(),
                     &mut message,
                     &mut warnings,
                 )?;
-                outbox_file = Some(file);
+                let appended = outcome.appended();
+                outbox_file = Some(outcome.outbox_file.clone());
+                final_outbox_disposition = outcome.disposition;
+                canonical_source_queue_id = outcome.canonical_source_queue_id;
+                final_delivery_id = outcome.delivery_id;
                 if appended {
                     outbound_message = Some(message);
                 }
             }
         }
     } else if run.receipt.status == CodexRuntimeRunStatus::Completed
-        && (!goal_transition.allow_campaign_final
-            || task_drain_evaluation
-                .as_ref()
-                .is_some_and(|evaluation| !evaluation.allow_logical_final))
+        && (!matches!(
+            goal_transition.surface,
+            GoalTransitionSurface::CampaignFinal | GoalTransitionSurface::OrdinaryFinal
+        ) || task_drain_evaluation
+            .as_ref()
+            .is_some_and(|evaluation| !evaluation.allow_logical_final))
     {
         warnings.push(format!(
             "completed slice final outbox suppressed by unified goal transition {:?}: {}",
@@ -1654,6 +1905,15 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                     terminal_control_source: None,
                                     suppressed_run_once_reason: None,
                                     prepared_execution_terminalization_reason: None,
+                                    source_final_expectation: Some(
+                                        SourceFinalExpectationV1::ExplicitNonDelivery,
+                                    ),
+                                    final_outbox_disposition: Some(
+                                        FinalOutboxDispositionV1::ExplicitNonDelivery,
+                                    ),
+                                    canonical_source_queue_id: None,
+                                    final_delivery_id: None,
+                                    source_final_lane_digest: None,
                                     reason: format!(
                                         "final outbox suppressed: completed response classified as {:?} with disposition {:?}",
                                         input_kind, decision.disposition
@@ -1752,26 +2012,31 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                     ),
                                     attachments,
                                 };
-                                let (file, appended) =
-                                    if goal_transition.campaign_family_id.is_some() {
-                                        append_goal_terminal_outbound_message_once(
-                                            &options.harness_home,
-                                            run.receipt.execution_dir.as_deref(),
-                                            run.receipt.completion_file.as_deref(),
-                                            &goal_transition,
-                                            &mut message,
-                                            &mut warnings,
-                                        )?
-                                    } else {
-                                        append_final_outbound_message_once(
-                                            &options.harness_home,
-                                            run.receipt.execution_dir.as_deref(),
-                                            run.receipt.completion_file.as_deref(),
-                                            &mut message,
-                                            &mut warnings,
-                                        )?
-                                    };
-                                outbox_file = Some(file);
+                                let outcome = if goal_transition.surface
+                                    == GoalTransitionSurface::CampaignFinal
+                                {
+                                    append_goal_terminal_outbound_message_once(
+                                        &options.harness_home,
+                                        run.receipt.execution_dir.as_deref(),
+                                        run.receipt.completion_file.as_deref(),
+                                        &goal_transition,
+                                        &mut message,
+                                        &mut warnings,
+                                    )?
+                                } else {
+                                    append_final_outbound_message_once(
+                                        &options.harness_home,
+                                        run.receipt.execution_dir.as_deref(),
+                                        run.receipt.completion_file.as_deref(),
+                                        &mut message,
+                                        &mut warnings,
+                                    )?
+                                };
+                                let appended = outcome.appended();
+                                outbox_file = Some(outcome.outbox_file.clone());
+                                final_outbox_disposition = outcome.disposition;
+                                canonical_source_queue_id = outcome.canonical_source_queue_id;
+                                final_delivery_id = outcome.delivery_id;
                                 if appended {
                                     if let Some(codex_plan) = plan.plan.as_ref() {
                                         match record_memory_lifecycle_turn(
@@ -1819,6 +2084,15 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 terminal_control_source: None,
                                 suppressed_run_once_reason: None,
                                 prepared_execution_terminalization_reason: None,
+                                source_final_expectation: Some(
+                                    SourceFinalExpectationV1::ExplicitNonDelivery,
+                                ),
+                                final_outbox_disposition: Some(
+                                    FinalOutboxDispositionV1::ExplicitNonDelivery,
+                                ),
+                                canonical_source_queue_id: None,
+                                final_delivery_id: None,
+                                source_final_lane_digest: None,
                                 reason: run.receipt.reason.clone(),
                             };
                             append_runtime_run_once_log(
@@ -1897,6 +2171,39 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     input_kind, decision.disposition
                 ));
             } else {
+                let approval_presentation = if status == RuntimeRunOnceStatus::NeedsUser {
+                    run.receipt
+                        .external_effect
+                        .as_ref()
+                        .filter(|intent| {
+                            !intent.source_session_key_digest.is_empty()
+                                && !intent.approval_authority_digest.is_empty()
+                        })
+                        .map(approval_request_presentation)
+                        .transpose()?
+                } else {
+                    None
+                };
+                let (message_kind, message_text, presentation) =
+                    if let Some((text, presentation)) = approval_presentation {
+                        (
+                            ChannelOutboundMessageKind::ApprovalRequest,
+                            text,
+                            Some(presentation),
+                        )
+                    } else {
+                        (
+                            decision
+                                .outbound_kind
+                                .unwrap_or(ChannelOutboundMessageKind::ErrorReply),
+                            runtime_failure_reply_text(
+                                status,
+                                &runtime_failure_reply_reason(&run.receipt, &receipt_reason),
+                                run.receipt.queue_id.as_deref(),
+                            ),
+                            None,
+                        )
+                    };
                 let mut message = ChannelOutboundMessage {
                     platform: context.platform.clone(),
                     account_id: context.account_id.clone(),
@@ -1904,17 +2211,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     user_id: context.user_id.clone(),
                     session_key: context.session_key.clone(),
                     delivery_id: None,
-                    kind: decision
-                        .outbound_kind
-                        .unwrap_or(ChannelOutboundMessageKind::ErrorReply),
+                    kind: message_kind,
                     source_queue_id: run.receipt.queue_id.clone(),
                     source_completion_file: run.receipt.completion_file.clone(),
-                    text: runtime_failure_reply_text(
-                        status,
-                        &runtime_failure_reply_reason(&run.receipt, &receipt_reason),
-                        run.receipt.queue_id.as_deref(),
-                    ),
-                    presentation: None,
+                    text: message_text,
+                    presentation,
                     delivery_intent: delivery_intent_from_inbound_context(
                         &context.platform,
                         &context.channel_id,
@@ -1922,19 +2223,24 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     ),
                     attachments: Vec::new(),
                 };
-                let (file, appended) = append_final_outbound_message_once(
+                let outcome = append_final_outbound_message_once(
                     &options.harness_home,
                     run.receipt.execution_dir.as_deref(),
                     run.receipt.completion_file.as_deref(),
                     &mut message,
                     &mut warnings,
                 )?;
-                outbox_file = Some(file);
+                let appended = outcome.appended();
+                outbox_file = Some(outcome.outbox_file.clone());
+                final_outbox_disposition = outcome.disposition;
+                canonical_source_queue_id = outcome.canonical_source_queue_id;
+                final_delivery_id = outcome.delivery_id;
                 if appended {
                     outbound_message = Some(message);
                 }
             }
         } else {
+            stale_session_explicit_non_delivery = true;
             let receipt = RuntimeRunOnceReceipt {
                 queue_id: run.receipt.queue_id.clone(),
                 status,
@@ -1959,6 +2265,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 terminal_control_source: None,
                 suppressed_run_once_reason: None,
                 prepared_execution_terminalization_reason: None,
+                source_final_expectation: Some(SourceFinalExpectationV1::ExplicitNonDelivery),
+                final_outbox_disposition: Some(FinalOutboxDispositionV1::ExplicitNonDelivery),
+                canonical_source_queue_id: None,
+                final_delivery_id: None,
+                source_final_lane_digest: None,
                 reason: receipt_reason.clone(),
             };
             append_runtime_run_once_log(
@@ -2081,14 +2392,18 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 ),
                 attachments: Vec::new(),
             };
-            let (file, appended) = append_final_outbound_message_once(
+            let outcome = append_final_outbound_message_once(
                 &options.harness_home,
                 run.receipt.execution_dir.as_deref(),
                 run.receipt.completion_file.as_deref(),
                 &mut message,
                 &mut warnings,
             )?;
-            outbox_file = Some(file);
+            let appended = outcome.appended();
+            outbox_file = Some(outcome.outbox_file.clone());
+            final_outbox_disposition = outcome.disposition;
+            canonical_source_queue_id = outcome.canonical_source_queue_id;
+            final_delivery_id = outcome.delivery_id;
             if appended {
                 outbound_message = Some(message);
             }
@@ -2142,6 +2457,42 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             _ => None,
         }
     };
+    let source_final_expectation = if stale_session_explicit_non_delivery {
+        final_outbox_disposition = FinalOutboxDispositionV1::ExplicitNonDelivery;
+        SourceFinalExpectationV1::ExplicitNonDelivery
+    } else if receipt_status == RuntimeRunOnceStatus::Completed
+        && matches!(
+            goal_transition.surface,
+            GoalTransitionSurface::CampaignFinal | GoalTransitionSurface::OrdinaryFinal
+        )
+    {
+        if matches!(
+            final_outbox_disposition,
+            FinalOutboxDispositionV1::Appended
+                | FinalOutboxDispositionV1::AlreadyPresent
+                | FinalOutboxDispositionV1::ReusedCanonicalCampaign
+        ) {
+            SourceFinalExpectationV1::Required
+        } else {
+            final_outbox_disposition = FinalOutboxDispositionV1::ExplicitNonDelivery;
+            SourceFinalExpectationV1::ExplicitNonDelivery
+        }
+    } else {
+        SourceFinalExpectationV1::NotApplicable
+    };
+    let source_final_lane_digest = progress_context.as_ref().and_then(|context| {
+        context.agent_id.as_deref().and_then(|agent_id| {
+            ChannelStateLane::new(
+                &context.platform,
+                context.account_id.as_deref(),
+                &context.channel_id,
+                &context.user_id,
+                agent_id,
+            )
+            .ok()
+            .map(|lane| lane.exact_lane_digest())
+        })
+    });
     let receipt = RuntimeRunOnceReceipt {
         queue_id: run.receipt.queue_id.clone(),
         status: receipt_status,
@@ -2166,6 +2517,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         terminal_control_source: None,
         suppressed_run_once_reason: None,
         prepared_execution_terminalization_reason: None,
+        source_final_expectation: Some(source_final_expectation),
+        final_outbox_disposition: Some(final_outbox_disposition),
+        canonical_source_queue_id,
+        final_delivery_id,
+        source_final_lane_digest,
         reason: receipt_reason,
     };
     if matches!(
@@ -2766,6 +3122,56 @@ fn runtime_failure_reply_text(
         status,
         truncate_for_channel(reason, 360)
     )
+}
+
+fn approval_request_presentation(
+    intent: &crate::ExternalEffectIntentV1,
+) -> io::Result<(String, RichMessagePresentation)> {
+    let token = intent.approval_token.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "approval-required external effect is missing protected token metadata",
+        )
+    })?;
+    let prompt = ChannelApprovalPromptV1::new(
+        intent.effect_id.clone(),
+        intent.approval_generation,
+        intent.source_session_key_digest.clone(),
+        intent.approval_authority_digest.clone(),
+        intent.action_summary.clone(),
+        token.expires_at_ms,
+    )
+    .map_err(io::Error::other)?;
+    let approve = prompt
+        .actions
+        .iter()
+        .find(|action| action.decision == crate::ChannelApprovalDecisionV1::Approve)
+        .ok_or_else(|| io::Error::other("approval prompt has no approve action"))?;
+    let deny = prompt
+        .actions
+        .iter()
+        .find(|action| action.decision == crate::ChannelApprovalDecisionV1::Deny)
+        .ok_or_else(|| io::Error::other("approval prompt has no deny action"))?;
+    let text = format!(
+        "Approval required: {}\n\nApprove: /approve {}\nDeny: /deny {}\nExpires at: {}",
+        prompt.action_summary,
+        approve.public_action_id,
+        deny.public_action_id,
+        prompt.expires_at_ms
+    );
+    let mut presentation = rich_presentation_from_plain_final_with_attachment_count(&text, 0)
+        .ok_or_else(|| io::Error::other("approval prompt could not be rendered"))?;
+    presentation.actions = prompt
+        .actions
+        .into_iter()
+        .map(|action| RichPresentationAction {
+            id: action.public_action_id,
+            label: action.label,
+            kind: RichPresentationActionKind::Callback,
+            url: None,
+        })
+        .collect();
+    Ok((text, presentation))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3914,8 +4320,18 @@ fn evaluate_runtime_goal_transition(
                 GoalLineageDoctorStatus::Ready => selected
                     .as_ref()
                     .map(|lineage| match lineage.disposition {
-                        GoalLineageDisposition::Runnable | GoalLineageDisposition::Inactive => {
+                        GoalLineageDisposition::Runnable | GoalLineageDisposition::Inactive
+                            if lineage.source_final_eligible
+                                && matches!(
+                                    lineage.turn_relation,
+                                    GoalProjectionTurnRelationV1::CurrentOwnedTurn
+                                        | GoalProjectionTurnRelationV1::ExplicitCampaignContinuation
+                                ) =>
+                        {
                             GoalTransitionAuthority::Ready
+                        }
+                        GoalLineageDisposition::Runnable | GoalLineageDisposition::Inactive => {
+                            GoalTransitionAuthority::Missing
                         }
                         GoalLineageDisposition::StaleGeneration => GoalTransitionAuthority::Stale,
                         GoalLineageDisposition::MissingAuthority => {
@@ -3947,6 +4363,37 @@ fn evaluate_runtime_goal_transition(
     } else {
         classify_goal_transition_event(run, receipt_status)
     };
+    let relation = selected
+        .as_ref()
+        .map(|lineage| match lineage.turn_relation {
+            GoalProjectionTurnRelationV1::CurrentOwnedTurn => {
+                GoalTransitionRelation::CurrentGoalSlice
+            }
+            GoalProjectionTurnRelationV1::ExplicitCampaignContinuation => {
+                GoalTransitionRelation::AuthorizedCampaignContinuation
+            }
+            GoalProjectionTurnRelationV1::HistoricalThreadState
+            | GoalProjectionTurnRelationV1::AuthoritativeGoalClosure => {
+                GoalTransitionRelation::HistoricalState
+            }
+            GoalProjectionTurnRelationV1::Uncorrelated => GoalTransitionRelation::Unproven,
+        })
+        .or_else(|| {
+            hint.map(|projection| match projection.turn_relation {
+                GoalProjectionTurnRelationV1::CurrentOwnedTurn => {
+                    GoalTransitionRelation::CurrentGoalSlice
+                }
+                GoalProjectionTurnRelationV1::ExplicitCampaignContinuation => {
+                    GoalTransitionRelation::AuthorizedCampaignContinuation
+                }
+                GoalProjectionTurnRelationV1::HistoricalThreadState
+                | GoalProjectionTurnRelationV1::AuthoritativeGoalClosure => {
+                    GoalTransitionRelation::HistoricalState
+                }
+                GoalProjectionTurnRelationV1::Uncorrelated => GoalTransitionRelation::Unproven,
+            })
+        })
+        .unwrap_or(GoalTransitionRelation::FreshUnrelatedTurn);
     let goal_status = selected
         .as_ref()
         .map(|lineage| lineage.goal_status.clone())
@@ -4070,6 +4517,7 @@ fn evaluate_runtime_goal_transition(
         source_slice_generation,
         decision_generation,
         authority,
+        relation,
         retryable_failure: receipt_status == RuntimeRunOnceStatus::RetryPending,
         context_rollover_required: context_recovery_indicates_interrupted_long_task(run)
             || context_recovery_indicates_polluted_thread(run.receipt.context_recovery.as_ref()),
@@ -5565,7 +6013,7 @@ fn append_final_outbound_message_once(
     completion_file: Option<&Path>,
     message: &mut ChannelOutboundMessage,
     warnings: &mut Vec<String>,
-) -> io::Result<(PathBuf, bool)> {
+) -> io::Result<FinalOutboxOutcome> {
     let _lock = acquire_final_outbox_lock(execution_dir, warnings)?;
     if let Some(receipt) = read_final_outbox_receipt(execution_dir, warnings)? {
         if final_outbox_receipt_matches(&receipt, message, completion_file) {
@@ -5573,7 +6021,12 @@ fn append_final_outbound_message_once(
                 "runtime final outbox already enqueued for queue {}; skipping duplicate append",
                 receipt.queue_id.as_deref().unwrap_or("-")
             ));
-            return Ok((receipt.outbox_file, false));
+            return Ok(FinalOutboxOutcome {
+                outbox_file: receipt.outbox_file,
+                disposition: FinalOutboxDispositionV1::AlreadyPresent,
+                canonical_source_queue_id: receipt.queue_id,
+                delivery_id: message.delivery_id.clone(),
+            });
         }
         warnings.push(format!(
             "runtime final outbox receipt did not match queue/completion {}; falling back to outbox scan",
@@ -5595,7 +6048,12 @@ fn append_final_outbound_message_once(
             "runtime final outbox already present for queue {}; recorded marker without duplicate append",
             message.source_queue_id.as_deref().unwrap_or("-")
         ));
-        return Ok((outbox_file, false));
+        return Ok(FinalOutboxOutcome {
+            outbox_file,
+            disposition: FinalOutboxDispositionV1::AlreadyPresent,
+            canonical_source_queue_id: message.source_queue_id.clone(),
+            delivery_id: message.delivery_id.clone(),
+        });
     }
 
     let (outbox_file, appended) = append_outbound_message(harness_home, message, warnings)?;
@@ -5608,7 +6066,16 @@ fn append_final_outbound_message_once(
             warnings,
         )?;
     }
-    Ok((outbox_file, appended))
+    Ok(FinalOutboxOutcome {
+        outbox_file,
+        disposition: if appended {
+            FinalOutboxDispositionV1::Appended
+        } else {
+            FinalOutboxDispositionV1::AlreadyPresent
+        },
+        canonical_source_queue_id: message.source_queue_id.clone(),
+        delivery_id: message.delivery_id.clone(),
+    })
 }
 
 fn append_goal_terminal_outbound_message_once(
@@ -5618,11 +6085,12 @@ fn append_goal_terminal_outbound_message_once(
     transition: &GoalTransitionReceiptV1,
     message: &mut ChannelOutboundMessage,
     warnings: &mut Vec<String>,
-) -> io::Result<(PathBuf, bool)> {
+) -> io::Result<FinalOutboxOutcome> {
     let (terminal_key, delivery_id) = goal_terminal_outbox_identity(transition)?;
     let receipt_file = goal_terminal_outbox_receipts_file(harness_home);
     let _lock = acquire_goal_terminal_outbox_lock(harness_home, &terminal_key, warnings)?;
     let existing = read_latest_goal_terminal_outbox_receipt(&receipt_file, &terminal_key)?;
+    let requested_source_queue_id = message.source_queue_id.clone();
     let mut canonical = if let Some(existing) = existing.as_ref() {
         if existing.delivery_id != delivery_id {
             return Err(io::Error::new(
@@ -5634,6 +6102,15 @@ fn append_goal_terminal_outbound_message_once(
             ));
         }
         if &existing.message != message {
+            let different_source = existing.source_queue_id != message.source_queue_id;
+            if different_source
+                && transition.relation != GoalTransitionRelation::AuthorizedCampaignContinuation
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "foreign campaign terminal reuse lacks an authorized continuation relation",
+                ));
+            }
             warnings.push(format!(
                 "goal terminal {} already committed by queue {}; reusing the canonical campaign surface",
                 terminal_key,
@@ -5671,10 +6148,10 @@ fn append_goal_terminal_outbound_message_once(
         committed.message
     };
 
-    if let Some(existing) = existing
+    if let Some(existing) = existing.as_ref()
         && existing.state == GoalTerminalOutboxState::Appended
     {
-        let outbox_file = existing.outbox_file.ok_or_else(|| {
+        let outbox_file = existing.outbox_file.clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "appended goal terminal receipt is missing its outbox file",
@@ -5685,10 +6162,19 @@ fn append_goal_terminal_outbound_message_once(
             "goal terminal {} was already appended; suppressing duplicate campaign surface",
             terminal_key
         ));
-        return Ok((outbox_file, false));
+        return Ok(FinalOutboxOutcome {
+            outbox_file,
+            disposition: if existing.source_queue_id != requested_source_queue_id {
+                FinalOutboxDispositionV1::ReusedCanonicalCampaign
+            } else {
+                FinalOutboxDispositionV1::AlreadyPresent
+            },
+            canonical_source_queue_id: existing.source_queue_id.clone(),
+            delivery_id: Some(existing.delivery_id.clone()),
+        });
     }
 
-    let (outbox_file, appended) = append_final_outbound_message_once(
+    let mut outcome = append_final_outbound_message_once(
         harness_home,
         execution_dir,
         completion_file,
@@ -5698,7 +6184,7 @@ fn append_goal_terminal_outbound_message_once(
     let appended_receipt = GoalTerminalOutboxReceiptV1 {
         schema: GOAL_TERMINAL_OUTBOX_SCHEMA.to_string(),
         terminal_key,
-        delivery_id,
+        delivery_id: delivery_id.clone(),
         campaign_family_id: transition
             .campaign_family_id
             .clone()
@@ -5716,12 +6202,22 @@ fn append_goal_terminal_outbound_message_once(
         source_queue_id: canonical.source_queue_id.clone(),
         message: canonical.clone(),
         state: GoalTerminalOutboxState::Appended,
-        outbox_file: Some(outbox_file.clone()),
+        outbox_file: Some(outcome.outbox_file.clone()),
         recorded_at_ms: current_log_time_ms()?,
     };
     append_json_line(&receipt_file, &appended_receipt)?;
     *message = canonical;
-    Ok((outbox_file, appended))
+    if existing
+        .as_ref()
+        .is_some_and(|receipt| receipt.source_queue_id != requested_source_queue_id)
+    {
+        outcome.disposition = FinalOutboxDispositionV1::ReusedCanonicalCampaign;
+        outcome.canonical_source_queue_id = existing
+            .as_ref()
+            .and_then(|receipt| receipt.source_queue_id.clone());
+    }
+    outcome.delivery_id = Some(delivery_id);
+    Ok(outcome)
 }
 
 fn goal_terminal_outbox_identity(
@@ -6159,13 +6655,13 @@ mod tests {
     }
 
     #[test]
-    fn goal_terminal_outbox_is_exactly_once_across_source_queues() {
+    fn authorized_campaign_replay_reuses_one_canonical_terminal() {
         let root = temp_root("goal_terminal_outbox_is_exactly_once_across_source_queues");
         let harness_home = root.join(".agent-harness");
         let transition = test_goal_terminal_transition(GoalTransitionDecision::Complete);
         let mut first = test_goal_terminal_message("queue-goal-1", "Authoritative final.");
         let mut warnings = Vec::new();
-        let (outbox_file, appended) = append_goal_terminal_outbound_message_once(
+        let outcome = append_goal_terminal_outbound_message_once(
             &harness_home,
             None,
             None,
@@ -6174,7 +6670,7 @@ mod tests {
             &mut warnings,
         )
         .unwrap();
-        assert!(appended);
+        assert!(outcome.appended());
         assert!(
             first
                 .delivery_id
@@ -6183,24 +6679,67 @@ mod tests {
         );
 
         let mut replay = test_goal_terminal_message("queue-goal-2", "Late duplicate final.");
-        let (_, replay_appended) = append_goal_terminal_outbound_message_once(
+        let mut replay_transition = transition.clone();
+        replay_transition.relation = GoalTransitionRelation::AuthorizedCampaignContinuation;
+        let replay_outcome = append_goal_terminal_outbound_message_once(
             &harness_home,
             None,
             None,
-            &transition,
+            &replay_transition,
             &mut replay,
             &mut warnings,
         )
         .unwrap();
-        assert!(!replay_appended);
+        assert_eq!(
+            replay_outcome.disposition,
+            FinalOutboxDispositionV1::ReusedCanonicalCampaign
+        );
         assert_eq!(replay.source_queue_id.as_deref(), Some("queue-goal-1"));
         assert_eq!(replay.text, "Authoritative final.");
-        assert_eq!(fs::read_to_string(outbox_file).unwrap().lines().count(), 1);
+        assert_eq!(
+            fs::read_to_string(outcome.outbox_file)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
         let receipts =
             fs::read_to_string(goal_terminal_outbox_receipts_file(&harness_home)).unwrap();
         assert_eq!(receipts.lines().count(), 2);
         assert!(receipts.contains(r#""state":"committed""#));
         assert!(receipts.contains(r#""state":"appended""#));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fresh_queue_rejects_foreign_campaign_terminal_reuse() {
+        let root = temp_root("fresh_queue_rejects_foreign_campaign_terminal_reuse");
+        let harness_home = root.join(".agent-harness");
+        let transition = test_goal_terminal_transition(GoalTransitionDecision::Complete);
+        let mut first = test_goal_terminal_message("queue-goal-a", "Canonical final.");
+        append_goal_terminal_outbound_message_once(
+            &harness_home,
+            None,
+            None,
+            &transition,
+            &mut first,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut foreign = test_goal_terminal_message("queue-fresh-b", "Fresh queue final.");
+        let error = append_goal_terminal_outbound_message_once(
+            &harness_home,
+            None,
+            None,
+            &transition,
+            &mut foreign,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(foreign.source_queue_id.as_deref(), Some("queue-fresh-b"));
+        assert_eq!(foreign.text, "Fresh queue final.");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6240,6 +6779,7 @@ mod tests {
             source_slice_generation: 2,
             decision_generation: 1,
             authority: GoalTransitionAuthority::Ready,
+            relation: crate::goal_transition::GoalTransitionRelation::CurrentGoalSlice,
             decision,
             surface: GoalTransitionSurface::CampaignFinal,
             schedule_continuation: false,
@@ -8084,7 +8624,10 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: receive.queue_id,
             codex_executable: Some(fake_partial_final_bounded_yield_codex_executable(&root)),
-            timeout_ms: 4_000,
+            // Leave enough wall-clock budget for a cold PowerShell app-server
+            // process to complete the JSON-RPC handshake before exercising the
+            // bounded-yield timeout path itself.
+            timeout_ms: 10_000,
             idle_timeout_ms: 10_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
@@ -8110,6 +8653,112 @@ mod tests {
                 .drain_disposition_error
                 .as_deref(),
             Some("multiple-or-unbalanced-disposition-markers")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_external_effect_settlement_is_source_correlated_and_exactly_once() {
+        let _guard = env_lock();
+        let root = temp_root("expired-external-effect-settlement");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: Some("acct-expiry".to_string()),
+            channel_id: "dm-expiry".to_string(),
+            user_id: "user-expiry".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "request one protected connector action".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: Some("provider-expiry-1".to_string()),
+            skill_limit: 3,
+            now_ms: 10,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.unwrap();
+        let admission = crate::begin_external_effect_request(
+            &harness_home,
+            &crate::ExternalEffectRequestContextV1 {
+                exact_lane_digest: format!("sha256:{}", "1".repeat(64)),
+                logical_lineage_id: "virtual-session-expiry".to_string(),
+                source_queue_id: queue_id.clone(),
+                source_session_key_digest: format!("sha256:{}", "2".repeat(64)),
+                approval_authority_digest: format!("sha256:{}", "3".repeat(64)),
+            },
+            &crate::McpElicitationDescriptorV1 {
+                connector: "github".to_string(),
+                action: "create_issue".to_string(),
+                params_digest: format!("sha256:{}", "4".repeat(64)),
+                action_summary: "github/create_issue: create a tracked issue".to_string(),
+                mode: "form".to_string(),
+            },
+            &crate::ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap();
+        let intent = match admission {
+            crate::ExternalEffectAdmissionV1::NeedsUser { intent, .. } => intent,
+            other => panic!("unexpected external-effect admission {other:?}"),
+        };
+        let snapshot = harness_home
+            .join("state")
+            .join("external-effects")
+            .join("latest")
+            .join(format!("{}.json", intent.effect_id));
+        let mut value: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+        value["approvalToken"]["expiresAtMs"] = Value::from(100);
+        fs::write(&snapshot, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let reconcile = crate::reconcile_expired_external_effect_approvals(
+            &harness_home,
+            &crate::ExternalEffectExpiryReconcileRequestV1 {
+                now_ms: 100,
+                max_rows: 1,
+                after_effect_id: None,
+            },
+        )
+        .unwrap();
+        let resolution = reconcile.resolutions.first().unwrap();
+
+        let first =
+            settle_expired_external_effect_approval(&harness_home, resolution, 100).unwrap();
+        let replay =
+            settle_expired_external_effect_approval(&harness_home, resolution, 101).unwrap();
+        assert_eq!(first.source_queue_id, queue_id);
+        assert!(first.notice_appended);
+        assert!(first.queue_terminal_receipt_appended);
+        assert!(first.progress_terminal_appended);
+        assert!(!replay.notice_appended);
+        assert!(!replay.queue_terminal_receipt_appended);
+        assert!(!replay.progress_terminal_appended);
+        let outbox = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(outbox.lines().count(), 1);
+        let run_receipts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("run-once-receipts.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(
+            run_receipts
+                .lines()
+                .filter(|line| line.contains(&resolution.resolution_id))
+                .count(),
+            1
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -11952,13 +12601,23 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Suppressed);
+        assert_eq!(report.receipt.terminal_control_matched, Some(true));
+        assert_eq!(
+            report.receipt.terminal_control_source.as_deref(),
+            Some("scoped-stop")
+        );
+        assert_eq!(
+            report.receipt.suppressed_run_once_reason.as_deref(),
+            Some("terminal-control-present")
+        );
+        assert!(report.run.is_none());
         assert!(report.outbound_message.is_none());
         assert!(
             report
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("stale session"))
+                .any(|warning| warning.contains("terminal control scoped-stop"))
         );
         let outbox = fs::read_to_string(
             harness_home
@@ -12923,8 +13582,9 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-pipeline"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
-        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"Pipeline fake reply."}}')
-        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-pipeline","status":"completed"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-pipeline","turn":{"id":"turn-pipeline","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"threadId":"thread-pipeline","turnId":"turn-pipeline","itemId":"msg-pipeline","delta":"Pipeline fake reply."}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-pipeline","turn":{"id":"turn-pipeline","status":"completed"}}}')
         [Console]::Out.Flush()
         break
     }
@@ -12961,7 +13621,7 @@ while ($true) {
     } elseif ($msg.method -eq 'turn/start') {
         [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-active-goal","turn":{"id":"turn-active-goal","kind":"regular"}}}')
         [Console]::Out.WriteLine('{"method":"thread/goal/updated","params":{"threadId":"thread-active-goal","turnId":"turn-active-goal","goal":{"id":"goal-active","objective":"finish the durable campaign","status":"active","completionCriteria":["T3 replay passes"]}}}')
-        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"Slice checkpoint only."}}')
+        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"threadId":"thread-active-goal","turnId":"turn-active-goal","itemId":"msg-active-goal","delta":"Slice checkpoint only."}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-active-goal","turn":{"id":"turn-active-goal","status":"completed"}}}')
         [Console]::Out.Flush()
         break
@@ -13298,7 +13958,7 @@ while ($true) {{
     }} elseif ($msg.method -eq 'turn/start') {{
         [Console]::Out.WriteLine('{{"method":"turn/started","params":{{"threadId":"thread-terminal-goal","turn":{{"id":"turn-terminal-goal","kind":"regular"}}}}}}')
         [Console]::Out.WriteLine('{{"method":"thread/goal/updated","params":{{"threadId":"thread-terminal-goal","turnId":"turn-terminal-goal","goal":{{"id":"goal-terminal","objective":"finish the durable campaign","status":{status},"completionCriteria":["T3 replay passes"]}}}}}}')
-        [Console]::Out.WriteLine('{{"method":"item/agentMessage/delta","params":{{"delta":{assistant_text}}}}}')
+        [Console]::Out.WriteLine('{{"method":"item/agentMessage/delta","params":{{"threadId":"thread-terminal-goal","turnId":"turn-terminal-goal","itemId":"msg-terminal-goal","delta":{assistant_text}}}}}')
         [Console]::Out.WriteLine('{{"method":"turn/completed","params":{{"threadId":"thread-terminal-goal","turn":{{"id":"turn-terminal-goal","status":"completed"}}}}}}')
         [Console]::Out.Flush()
         break
@@ -13422,13 +14082,14 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-media-final"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-media-final","turn":{"id":"turn-media-final","kind":"regular"}}}')
         $delta = "Here is the file.`nMEDIA:$media`nDone."
         $event = @{
             method = 'item/agentMessage/delta'
-            params = @{ delta = $delta }
+            params = @{ threadId = 'thread-media-final'; turnId = 'turn-media-final'; itemId = 'msg-media-final'; delta = $delta }
         } | ConvertTo-Json -Compress
         [Console]::Out.WriteLine($event)
-        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-media-final","status":"completed"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-media-final","turn":{"id":"turn-media-final","status":"completed"}}}')
         [Console]::Out.Flush()
         break
     }
@@ -13582,8 +14243,9 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-read-only-review-final"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
-        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"Read-only inspection only. No files changed, no tests run.\n\n- Final/outbox authority seam: runtime_pipeline owns final decisions.\n- Dirty Worktree Risks: implementation still needs to continue."}}')
-        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-read-only-review-final","status":"completed"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-read-only-review-final","turn":{"id":"turn-read-only-review-final","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"threadId":"thread-read-only-review-final","turnId":"turn-read-only-review-final","itemId":"msg-read-only-review-final","delta":"Read-only inspection only. No files changed, no tests run.\n\n- Final/outbox authority seam: runtime_pipeline owns final decisions.\n- Dirty Worktree Risks: implementation still needs to continue."}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-read-only-review-final","turn":{"id":"turn-read-only-review-final","status":"completed"}}}')
         [Console]::Out.Flush()
         break
     }
@@ -13739,8 +14401,9 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-pipeline"}}}'
             ;;
         *'"method":"turn/start"'*)
-            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Pipeline fake reply."}}'
-            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-pipeline","status":"completed"}}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-pipeline","turn":{"id":"turn-pipeline","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-pipeline","turnId":"turn-pipeline","itemId":"msg-pipeline","delta":"Pipeline fake reply."}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-pipeline","turn":{"id":"turn-pipeline","status":"completed"}}}'
             exit 0
             ;;
     esac
@@ -13775,7 +14438,7 @@ while IFS= read -r line; do
         *'"method":"turn/start"'*)
             printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-active-goal","turn":{"id":"turn-active-goal","kind":"regular"}}}'
             printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-active-goal","turnId":"turn-active-goal","goal":{"id":"goal-active","objective":"finish the durable campaign","status":"active","completionCriteria":["T3 replay passes"]}}}'
-            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Slice checkpoint only."}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-active-goal","turnId":"turn-active-goal","itemId":"msg-active-goal","delta":"Slice checkpoint only."}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-active-goal","turn":{"id":"turn-active-goal","status":"completed"}}}'
             exit 0
             ;;
@@ -13867,7 +14530,7 @@ while IFS= read -r line; do
         *'"method":"turn/start"'*)
             printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"thread-terminal-goal","turn":{{"id":"turn-terminal-goal","kind":"regular"}}}}}}'
             printf '%s\n' '{{"method":"thread/goal/updated","params":{{"threadId":"thread-terminal-goal","turnId":"turn-terminal-goal","goal":{{"id":"goal-terminal","objective":"finish the durable campaign","status":{status},"completionCriteria":["T3 replay passes"]}}}}}}'
-            printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"delta":{assistant_text}}}}}'
+            printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"threadId":"thread-terminal-goal","turnId":"turn-terminal-goal","itemId":"msg-terminal-goal","delta":{assistant_text}}}}}'
             printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-terminal-goal","turn":{{"id":"turn-terminal-goal","status":"completed"}}}}}}'
             exit 0
             ;;
@@ -13908,8 +14571,9 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-media-final"}}}'
             ;;
         *'"method":"turn/start"'*)
-            printf '%s\n' "{\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"Here is the file.\\nMEDIA:$media\\nDone.\"}}"
-            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-media-final","status":"completed"}}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-media-final","turn":{"id":"turn-media-final","kind":"regular"}}}'
+            printf '%s\n' "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-media-final\",\"turnId\":\"turn-media-final\",\"itemId\":\"msg-media-final\",\"delta\":\"Here is the file.\\nMEDIA:$media\\nDone.\"}}"
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-media-final","turn":{"id":"turn-media-final","status":"completed"}}}'
             exit 0
             ;;
     esac
@@ -14087,8 +14751,9 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-read-only-review-final"}}}'
             ;;
         *'"method":"turn/start"'*)
-            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Read-only inspection only. No files changed, no tests run.\n\n- Final/outbox authority seam: runtime_pipeline owns final decisions.\n- Dirty Worktree Risks: implementation still needs to continue."}}'
-            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-read-only-review-final","status":"completed"}}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-read-only-review-final","turn":{"id":"turn-read-only-review-final","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-read-only-review-final","turnId":"turn-read-only-review-final","itemId":"msg-read-only-review-final","delta":"Read-only inspection only. No files changed, no tests run.\n\n- Final/outbox authority seam: runtime_pipeline owns final decisions.\n- Dirty Worktree Risks: implementation still needs to continue."}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-read-only-review-final","turn":{"id":"turn-read-only-review-final","status":"completed"}}}'
             exit 0
             ;;
     esac

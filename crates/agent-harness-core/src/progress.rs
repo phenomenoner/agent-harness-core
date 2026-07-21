@@ -2763,6 +2763,91 @@ fn final_source_delivery_is_still_pending(
     event: &AgentProgressEvent,
     warnings: &mut Vec<String>,
 ) -> io::Result<bool> {
+    let receipts_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("run-once-receipts.jsonl");
+    let expected_lane_digest = event.agent_id.as_deref().and_then(|agent_id| {
+        crate::channel_state::ChannelStateLane::new(
+            &event.platform,
+            event.account_id.as_deref(),
+            &event.channel_id,
+            &event.user_id,
+            agent_id,
+        )
+        .ok()
+        .map(|lane| lane.exact_lane_digest())
+    });
+    let receipt_bytes = match fs::read(&receipts_file) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            warnings.push(format!(
+                "source-final expectation is missing for terminal queue {queue_id}; holding progress"
+            ));
+            return Ok(true);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut latest_receipt = None;
+    for (index, line) in receipt_bytes.split(|byte| *byte == b'\n').enumerate() {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        match serde_json::from_slice::<Value>(line) {
+            Ok(value) if value.get("queueId").and_then(Value::as_str) == Some(queue_id) => {
+                latest_receipt = Some(value);
+            }
+            Ok(_) => {}
+            Err(error) => warnings.push(format!(
+                "runtime receipt line {} is corrupt while resolving source-final expectation: {error}",
+                index + 1
+            )),
+        }
+    }
+    let Some(receipt) = latest_receipt else {
+        warnings.push(format!(
+            "source-final expectation has no runtime receipt for terminal queue {queue_id}; holding progress"
+        ));
+        return Ok(true);
+    };
+    let Some(expectation) = receipt
+        .get("sourceFinalExpectation")
+        .and_then(Value::as_str)
+    else {
+        warnings.push(format!(
+            "legacy-expectation: runtime receipt for queue {queue_id} predates source-final evidence; preserving legacy progress release"
+        ));
+        return Ok(false);
+    };
+    if expectation == "not-applicable" {
+        return Ok(false);
+    }
+    let recorded_lane_digest = receipt.get("sourceFinalLaneDigest").and_then(Value::as_str);
+    if recorded_lane_digest.is_none() || recorded_lane_digest != expected_lane_digest.as_deref() {
+        warnings.push(format!(
+            "source-final expectation lane evidence is missing or mismatched for terminal queue {queue_id}; holding progress"
+        ));
+        return Ok(true);
+    }
+    if expectation == "explicit-non-delivery" {
+        if receipt
+            .get("finalOutboxDisposition")
+            .and_then(Value::as_str)
+            == Some("explicit-non-delivery")
+        {
+            return Ok(false);
+        }
+        warnings.push(format!(
+            "source-final explicit non-delivery evidence is incomplete for terminal queue {queue_id}; holding progress"
+        ));
+        return Ok(true);
+    }
+    if expectation != "required" {
+        warnings.push(format!(
+            "source-final expectation `{expectation}` is unknown for terminal queue {queue_id}; holding progress"
+        ));
+        return Ok(true);
+    }
     let channel_dir = harness_home.join("state").join("channels");
     let deliveries =
         crate::channel_delivery_index::channel_delivery_states_for_source_queue_in_lane(
@@ -2779,6 +2864,9 @@ fn final_source_delivery_is_still_pending(
     // rich presentation with a fallback).  Keep the terminal progress surface
     // behind every source-owned final delivery, rather than treating a single
     // completed row as permission to overtake another pending row.
+    if deliveries.is_empty() {
+        return Ok(true);
+    }
     Ok(deliveries.iter().any(|delivery| {
         !matches!(
             delivery.terminal_status.or(delivery.last_status),
@@ -3737,6 +3825,116 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    fn write_source_final_expectation(
+        harness_home: &Path,
+        context: &AgentProgressContext,
+        expectation: &str,
+        disposition: &str,
+    ) {
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("run-once-receipts.jsonl");
+        fs::create_dir_all(receipts_file.parent().unwrap()).unwrap();
+        let lane_digest = crate::channel_state::ChannelStateLane::new(
+            &context.platform,
+            context.account_id.as_deref(),
+            &context.channel_id,
+            &context.user_id,
+            context.agent_id.as_deref().unwrap(),
+        )
+        .unwrap()
+        .exact_lane_digest();
+        fs::write(
+            receipts_file,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "queueId": context.queue_id,
+                    "status": "completed",
+                    "sourceFinalExpectation": expectation,
+                    "finalOutboxDisposition": disposition,
+                    "sourceFinalLaneDigest": lane_digest,
+                })
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_legacy_source_final_receipt(harness_home: &Path, context: &AgentProgressContext) {
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("run-once-receipts.jsonl");
+        fs::create_dir_all(receipts_file.parent().unwrap()).unwrap();
+        fs::write(
+            receipts_file,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "queueId": context.queue_id,
+                    "status": "completed",
+                })
+            ),
+        )
+        .unwrap();
+    }
+
+    fn record_delivered_source_final(harness_home: &Path, context: &AgentProgressContext) {
+        let channels_dir = harness_home.join("state").join("channels");
+        fs::create_dir_all(&channels_dir).unwrap();
+        crate::append_jsonl_value(
+            &channels_dir.join("outbox.jsonl"),
+            &crate::ChannelOutboundMessage {
+                platform: context.platform.clone(),
+                account_id: context.account_id.clone(),
+                channel_id: context.channel_id.clone(),
+                user_id: context.user_id.clone(),
+                session_key: context.session_key.clone(),
+                delivery_id: None,
+                kind: crate::ChannelOutboundMessageKind::AgentReply,
+                source_queue_id: Some(context.queue_id.clone()),
+                source_completion_file: None,
+                presentation: None,
+                text: "source final".to_string(),
+                delivery_intent: None,
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+        let plan = crate::plan_channel_outbox(crate::ChannelOutboxPlanOptions {
+            harness_home: harness_home.to_path_buf(),
+            platform: Some(context.platform.clone()),
+            limit: 10,
+        })
+        .unwrap();
+        let delivery_id = plan
+            .pending
+            .iter()
+            .find(|pending| {
+                pending.message.source_queue_id.as_deref() == Some(context.queue_id.as_str())
+            })
+            .expect("source final should receive a canonical delivery id")
+            .delivery_id
+            .clone();
+        crate::record_channel_delivery(crate::ChannelDeliveryRecordOptions {
+            harness_home: harness_home.to_path_buf(),
+            delivery_id: delivery_id.clone(),
+            status: crate::ChannelDeliveryStatus::Delivered,
+            platform: context.platform.clone(),
+            account_id: context.account_id.clone(),
+            channel_id: context.channel_id.clone(),
+            user_id: context.user_id.clone(),
+            session_key: context.session_key.clone(),
+            provider_message_id: Some(format!("provider-{delivery_id}")),
+            error: None,
+            now_ms: 5_000,
+            rendered_units: Vec::new(),
+            presentation: None,
+        })
+        .unwrap();
+    }
+
     #[test]
     fn queued_ingress_event_never_renders_working() {
         let event = AgentProgressEvent::new(
@@ -4690,6 +4888,7 @@ mod tests {
             ),
         )
         .unwrap();
+        write_legacy_source_final_receipt(&harness_home, &context);
         let terminal = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
             harness_home: harness_home.clone(),
             platform: Some("telegram".to_string()),
@@ -5167,6 +5366,7 @@ mod tests {
                 ),
             )
             .unwrap();
+            write_legacy_source_final_receipt(&harness_home, &context);
             let terminal = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
                 harness_home: harness_home.clone(),
                 platform: Some(platform.to_string()),
@@ -5462,6 +5662,12 @@ mod tests {
         let root = temp_root("terminal_progress_state_is_monotonic_after_late_events");
         let harness_home = root.join(".agent-harness");
         let context = context();
+        write_source_final_expectation(
+            &harness_home,
+            &context,
+            "explicit-non-delivery",
+            "explicit-non-delivery",
+        );
         append_agent_progress_event(
             &harness_home,
             &AgentProgressEvent::new(
@@ -5681,6 +5887,7 @@ mod tests {
             ),
         )
         .unwrap();
+        write_legacy_source_final_receipt(&harness_home, &context);
 
         let first = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
             harness_home: harness_home.clone(),
@@ -5817,6 +6024,7 @@ mod tests {
             ),
         )
         .unwrap();
+        write_legacy_source_final_receipt(&harness_home, &context);
 
         let terminal = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
             harness_home: harness_home.clone(),
@@ -5951,6 +6159,7 @@ mod tests {
             .unwrap();
         }
 
+        write_source_final_expectation(&harness_home, &context, "required", "appended");
         append_agent_progress_event(
             &harness_home,
             &AgentProgressEvent::new(
@@ -6051,6 +6260,132 @@ mod tests {
                 .any(|pending| { pending.message_kind == AgentProgressDeliveryMessageKind::Body })
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_progress_waits_when_required_source_final_is_missing() {
+        let root = temp_root("terminal_progress_waits_when_required_source_final_is_missing");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        write_source_final_expectation(&harness_home, &context, "required", "appended");
+        let event = AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::Runtime,
+            "run",
+            "completed",
+            AgentProgressStatus::Completed,
+            3000,
+        );
+        let mut warnings = Vec::new();
+
+        assert!(
+            final_source_delivery_is_still_pending(
+                &harness_home,
+                &context.queue_id,
+                &event,
+                &mut warnings,
+            )
+            .unwrap()
+        );
+        assert!(warnings.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_progress_accepts_explicit_typed_non_delivery() {
+        let root = temp_root("terminal_progress_accepts_explicit_typed_non_delivery");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        write_source_final_expectation(
+            &harness_home,
+            &context,
+            "explicit-non-delivery",
+            "explicit-non-delivery",
+        );
+        let event = AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::Runtime,
+            "run",
+            "completed",
+            AgentProgressStatus::Completed,
+            3000,
+        );
+        let mut warnings = Vec::new();
+
+        assert!(
+            !final_source_delivery_is_still_pending(
+                &harness_home,
+                &context.queue_id,
+                &event,
+                &mut warnings,
+            )
+            .unwrap()
+        );
+        assert!(warnings.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_progress_releases_legacy_receipt_with_warning() {
+        let root = temp_root("terminal_progress_releases_legacy_receipt_with_warning");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        write_legacy_source_final_receipt(&harness_home, &context);
+        let event = AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::Runtime,
+            "run",
+            "completed",
+            AgentProgressStatus::Completed,
+            3000,
+        );
+        let mut warnings = Vec::new();
+
+        assert!(
+            !final_source_delivery_is_still_pending(
+                &harness_home,
+                &context.queue_id,
+                &event,
+                &mut warnings,
+            )
+            .unwrap()
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("legacy-expectation"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn other_queue_or_lane_delivery_does_not_release_terminal_progress() {
+        let root = temp_root("other_queue_or_lane_delivery_does_not_release_terminal_progress");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        write_source_final_expectation(&harness_home, &context, "required", "appended");
+        let mut foreign = context.clone();
+        foreign.queue_id = "queue-foreign".to_string();
+        foreign.channel_id = "channel-foreign".to_string();
+        record_delivered_source_final(&harness_home, &foreign);
+        let event = AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::Runtime,
+            "run",
+            "completed",
+            AgentProgressStatus::Completed,
+            3000,
+        );
+        let mut warnings = Vec::new();
+
+        assert!(
+            final_source_delivery_is_still_pending(
+                &harness_home,
+                &context.queue_id,
+                &event,
+                &mut warnings,
+            )
+            .unwrap()
+        );
+        assert!(warnings.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6692,6 +7027,7 @@ mod tests {
             now_ms: 3000,
         })
         .unwrap();
+        write_legacy_source_final_receipt(&harness_home, &context);
 
         let close = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
             harness_home: harness_home.clone(),
@@ -7304,6 +7640,7 @@ mod tests {
             ),
         )
         .unwrap();
+        write_legacy_source_final_receipt(&harness_home, &context);
 
         let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
             harness_home: harness_home.clone(),

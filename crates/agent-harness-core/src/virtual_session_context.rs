@@ -873,6 +873,7 @@ fn outbound_message_kind_label(kind: &crate::ChannelOutboundMessageKind) -> &'st
     match kind {
         crate::ChannelOutboundMessageKind::CommandReply => "command-reply",
         crate::ChannelOutboundMessageKind::AgentReply => "agent-reply",
+        crate::ChannelOutboundMessageKind::ApprovalRequest => "approval-request",
         crate::ChannelOutboundMessageKind::ErrorReply => "error-reply",
     }
 }

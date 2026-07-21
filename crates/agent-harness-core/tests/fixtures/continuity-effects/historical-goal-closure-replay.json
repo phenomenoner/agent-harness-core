@@ -1,0 +1,47 @@
+{
+  "schema": "agent-harness.acceptance-fixture.historical-goal-closure-replay.v1",
+  "authority": {
+    "platform": "telegram",
+    "accountId": "account-synthetic",
+    "channelId": "channel-synthetic",
+    "userId": "user-synthetic",
+    "agentId": "main",
+    "sessionKeyDigest": "session-digest-synthetic",
+    "virtualSessionId": "virtual-session-synthetic",
+    "backendGeneration": "generation-1",
+    "sourceThreadId": "thread-original",
+    "goalId": "goal-historical",
+    "goalGeneration": "goal-generation-1",
+    "projectionChecksum": "projection-checksum-1"
+  },
+  "phases": [
+    {"seq": 1, "phase": "intent-persisted"},
+    {"seq": 2, "phase": "backend-goal-update-requested", "threadId": "thread-original", "disposition": "canceled"},
+    {"seq": 3, "phase": "backend-goal-update-observed", "threadId": "thread-original", "goalStatus": "canceled"},
+    {"seq": 4, "phase": "terminal-projection-appended", "sourceFinalEligible": false},
+    {"seq": 5, "phase": "lineage-reconciled", "runnableLineages": 0},
+    {"seq": 6, "phase": "completed"}
+  ],
+  "rejections": [
+    "zero-match",
+    "multi-match",
+    "wrong-platform",
+    "wrong-account",
+    "wrong-channel",
+    "wrong-user",
+    "wrong-agent",
+    "wrong-session",
+    "wrong-thread",
+    "wrong-generation",
+    "stale-checksum",
+    "fresh-thread-attempt"
+  ],
+  "expected": {
+    "backendUpdateCount": 1,
+    "terminalProjectionCount": 1,
+    "completionReceiptCount": 1,
+    "newBindingCount": 0,
+    "channelFinalCount": 0,
+    "runnableLineages": 0
+  }
+}

@@ -41,6 +41,12 @@ use crate::external_effect::{
     ExternalEffectStateV1, begin_external_effect_request, load_connector_approval_policy,
     parse_mcp_elicitation_descriptor, transition_external_effect,
 };
+use crate::goal_closure::{
+    GoalClosureDispositionV1, GoalClosureIntentV1, GoalClosurePhaseInputV1, GoalClosurePhaseV1,
+    GoalClosureResultV1, GoalClosureTargetResolutionDispositionV1, GoalClosureTargetResolutionV1,
+    goal_closure_receipts_for_id, record_goal_closure_intent, record_goal_closure_phase,
+};
+use crate::goal_lineage::{GoalProjectionObservationPhaseV1, GoalProjectionTurnRelationV1};
 use crate::runtime_execution_receipt_index::latest_prepared_execution_dir_from_index;
 use crate::virtual_session_runtime_index::latest_codex_runtime_usage as latest_codex_runtime_usage_from_index;
 use crate::{
@@ -272,9 +278,9 @@ fn resolve_productive_deadline_config(
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum OwnedCodexEventsRolloutMode {
-    #[default]
     Off,
     Shadow,
+    #[default]
     Authoritative,
 }
 
@@ -286,30 +292,31 @@ fn owned_codex_events_rollout_mode(
         .into_iter()
         .find(|path| path.is_file())
     else {
-        return OwnedCodexEventsRolloutMode::Off;
+        return OwnedCodexEventsRolloutMode::Authoritative;
     };
     let Ok(text) = fs::read_to_string(config_file) else {
-        return OwnedCodexEventsRolloutMode::Off;
+        return OwnedCodexEventsRolloutMode::Authoritative;
     };
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return OwnedCodexEventsRolloutMode::Off;
+        return OwnedCodexEventsRolloutMode::Authoritative;
     };
     let Some(feature) = value
         .pointer("/orchestration/features/ownedCodexEventsV2")
         .and_then(Value::as_object)
     else {
-        return OwnedCodexEventsRolloutMode::Off;
+        return OwnedCodexEventsRolloutMode::Authoritative;
     };
     let mode = match feature.get("mode").and_then(Value::as_str).map(str::trim) {
+        Some("off") => OwnedCodexEventsRolloutMode::Off,
         Some("shadow") => OwnedCodexEventsRolloutMode::Shadow,
         Some("authoritative") => OwnedCodexEventsRolloutMode::Authoritative,
-        _ => OwnedCodexEventsRolloutMode::Off,
+        _ => OwnedCodexEventsRolloutMode::Authoritative,
     };
     let Some(cohort) = feature.get("enabledAgentIds") else {
         return mode;
     };
     let Some(cohort) = cohort.as_array() else {
-        return OwnedCodexEventsRolloutMode::Off;
+        return OwnedCodexEventsRolloutMode::Authoritative;
     };
     let enabled = cohort.iter().filter_map(Value::as_str).any(|candidate| {
         let candidate = candidate.trim();
@@ -1161,6 +1168,12 @@ struct CodexGoalProjectionV1 {
     backend_context_generation: Option<String>,
     objective: String,
     status: String,
+    #[serde(default)]
+    observation_phase: GoalProjectionObservationPhaseV1,
+    #[serde(default)]
+    turn_relation: GoalProjectionTurnRelationV1,
+    #[serde(default)]
+    source_final_eligible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token_budget: Option<u64>,
     #[serde(default)]
@@ -1184,6 +1197,8 @@ struct CodexGoalProjectionObserver {
     lane_digest: Option<String>,
     backend_context_generation: Option<String>,
     current_thread_id: Option<String>,
+    observation_phase: GoalProjectionObservationPhaseV1,
+    owned_turn_id: Option<String>,
     latest_by_thread: BTreeMap<String, CodexGoalProjectionV1>,
 }
 
@@ -1217,12 +1232,93 @@ impl CodexGoalProjectionObserver {
             lane_digest: plan.prompt_authority.lane_digest.clone(),
             backend_context_generation: plan.prompt_authority.backend_context_generation.clone(),
             current_thread_id: plan.invocation.thread_id.clone(),
+            observation_phase: GoalProjectionObservationPhaseV1::LegacyUnknown,
+            owned_turn_id: None,
+            latest_by_thread,
+        })
+    }
+
+    fn for_governed_closure(harness_home: &Path, intent: &GoalClosureIntentV1) -> io::Result<Self> {
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        let mut matching = Vec::new();
+        if receipts_file.is_file() {
+            for (index, line) in fs::read_to_string(&receipts_file)?.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let projection =
+                    serde_json::from_str::<CodexGoalProjectionV1>(line).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid goal projection at {}:{}: {error}",
+                                receipts_file.display(),
+                                index + 1
+                            ),
+                        )
+                    })?;
+                let goal_matches = projection.goal_reference == intent.goal_identity
+                    || projection.backend_goal_ref.as_deref()
+                        == Some(intent.goal_identity.as_str())
+                    || projection.goal_checksum == intent.goal_identity;
+                if projection.schema == CODEX_GOAL_PROJECTION_SCHEMA
+                    && projection.session_key == intent.authority.concrete_session_key
+                    && projection.lane_digest.as_deref()
+                        == Some(intent.authority.lane_digest.as_str())
+                    && projection.backend_context_generation.as_deref()
+                        == Some(intent.authority.backend_context_generation.as_str())
+                    && projection.source_thread_id == intent.authority.source_thread_id
+                    && projection.projection_checksum
+                        == intent
+                            .expected_projection_checksum
+                            .as_deref()
+                            .unwrap_or_default()
+                    && goal_matches
+                {
+                    matching.push(projection);
+                }
+            }
+        }
+        if matching.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "governed closure requires one exact prior projection; found {}",
+                    matching.len()
+                ),
+            ));
+        }
+        let prior = matching.pop().expect("exact projection count checked");
+        let queue_id = prior.queue_id.clone();
+        let mut latest_by_thread = BTreeMap::new();
+        latest_by_thread.insert(prior.source_thread_id.clone(), prior);
+        Ok(Self {
+            receipts_file,
+            queue_id,
+            session_key: intent.authority.concrete_session_key.clone(),
+            lane_digest: Some(intent.authority.lane_digest.clone()),
+            backend_context_generation: Some(intent.authority.backend_context_generation.clone()),
+            current_thread_id: Some(intent.authority.source_thread_id.clone()),
+            observation_phase: GoalProjectionObservationPhaseV1::GovernedClosure,
+            owned_turn_id: None,
             latest_by_thread,
         })
     }
 
     fn set_current_thread(&mut self, thread_id: &str) {
         self.current_thread_id = Some(thread_id.to_string());
+    }
+
+    fn set_observation_context(
+        &mut self,
+        phase: GoalProjectionObservationPhaseV1,
+        owned_turn_id: Option<&str>,
+    ) {
+        self.observation_phase = phase;
+        self.owned_turn_id = owned_turn_id.map(ToString::to_string);
     }
 
     fn has_active_goal(&self) -> bool {
@@ -1257,6 +1353,747 @@ impl CodexGoalProjectionObserver {
         self.latest_by_thread.insert(thread_id, projection);
         Ok(true)
     }
+
+    fn latest_for_thread(&self, thread_id: &str) -> Option<&CodexGoalProjectionV1> {
+        self.latest_by_thread.get(thread_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexGoalClosureExecutionOptions {
+    pub harness_home: PathBuf,
+    pub intent: GoalClosureIntentV1,
+    pub resolution: GoalClosureTargetResolutionV1,
+    pub executable: PathBuf,
+    pub arguments: Vec<String>,
+    pub working_directory: PathBuf,
+    pub codex_home: Option<PathBuf>,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexGoalClosureExecutionStatus {
+    Completed,
+    Replayed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexGoalClosureExecutionReport {
+    pub status: CodexGoalClosureExecutionStatus,
+    pub closure_id: String,
+    pub authority_digest: String,
+    pub target_digest: String,
+    pub projection_checksum: String,
+    pub lineage_checksum: String,
+    pub phases: Vec<GoalClosurePhaseV1>,
+    pub backend_mutation_sent: bool,
+    pub source_final_eligible: bool,
+}
+
+struct CodexGoalClosureMaintenanceResult {
+    projection_checksum: String,
+    backend_result_digest: Option<String>,
+    backend_mutation_sent: bool,
+}
+
+pub fn execute_codex_goal_closure(
+    options: CodexGoalClosureExecutionOptions,
+) -> io::Result<CodexGoalClosureExecutionReport> {
+    options.intent.validate()?;
+    let target = options.resolution.target.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "goal closure execution requires an exact resolved target",
+        )
+    })?;
+    if options.resolution.disposition != GoalClosureTargetResolutionDispositionV1::Exact
+        || options.resolution.closure_id != options.intent.closure_id
+        || options.resolution.authority_digest != options.intent.authority_digest
+        || target.authority != options.intent.authority
+        || target.goal_identity != options.intent.goal_identity
+        || target.goal_generation != options.intent.goal_generation
+        || Some(target.projection_checksum.as_str())
+            != options.intent.expected_projection_checksum.as_deref()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "goal closure resolution does not exactly match the validated intent",
+        ));
+    }
+    if options.timeout_ms == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "goal closure maintenance timeout must be positive",
+        ));
+    }
+
+    let mut receipts =
+        goal_closure_receipts_for_id(&options.harness_home, &options.intent.closure_id)?;
+    if receipts
+        .last()
+        .is_some_and(|receipt| receipt.phase == GoalClosurePhaseV1::Completed)
+    {
+        let completed = receipts.last().expect("completed receipt checked");
+        return Ok(CodexGoalClosureExecutionReport {
+            status: CodexGoalClosureExecutionStatus::Replayed,
+            closure_id: options.intent.closure_id,
+            authority_digest: completed.authority_digest.clone(),
+            target_digest: completed.target_digest.clone(),
+            projection_checksum: completed.projection_checksum.clone().unwrap_or_default(),
+            lineage_checksum: completed.lineage_checksum.clone().unwrap_or_default(),
+            phases: receipts.iter().map(|receipt| receipt.phase).collect(),
+            backend_mutation_sent: false,
+            source_final_eligible: false,
+        });
+    }
+
+    // The caller's resolution is an optimistic snapshot. Re-read the durable
+    // projection at the core boundary so stale CLI or reconciler evidence
+    // cannot record an intent, let alone reach the backend. A fully completed
+    // closure above replays from its terminal receipt and needs no active goal.
+    let _ = revalidate_goal_closure_projection_authority(&options)?;
+    record_goal_closure_intent(&options.harness_home, &options.intent)?;
+    receipts = goal_closure_receipts_for_id(&options.harness_home, &options.intent.closure_id)?;
+    if receipts.is_empty() {
+        record_goal_closure_phase(
+            &options.harness_home,
+            &options.intent,
+            GoalClosurePhaseV1::IntentRecorded,
+            GoalClosurePhaseInputV1 {
+                result: GoalClosureResultV1::Pending,
+                projection_checksum: None,
+                lineage_checksum: None,
+                result_evidence_digest: None,
+                recorded_at_ms: current_log_time_ms()?,
+            },
+        )?;
+        receipts = goal_closure_receipts_for_id(&options.harness_home, &options.intent.closure_id)?;
+    }
+    let backend_recorded = receipts
+        .iter()
+        .any(|receipt| receipt.phase == GoalClosurePhaseV1::BackendResultRecorded);
+    let projection_recorded = receipts
+        .iter()
+        .find(|receipt| receipt.phase == GoalClosurePhaseV1::TerminalProjectionRecorded)
+        .and_then(|receipt| receipt.projection_checksum.clone());
+    let durable_projection = if projection_recorded.is_none() && backend_recorded {
+        find_durable_governed_closure_projection(&options)?
+    } else {
+        None
+    };
+    let maintenance =
+        if let Some(projection_checksum) = projection_recorded.clone().or(durable_projection) {
+            CodexGoalClosureMaintenanceResult {
+                projection_checksum,
+                backend_result_digest: None,
+                backend_mutation_sent: false,
+            }
+        } else {
+            run_codex_goal_closure_maintenance(&options, backend_recorded)?
+        };
+    if !backend_recorded {
+        record_goal_closure_phase(
+            &options.harness_home,
+            &options.intent,
+            GoalClosurePhaseV1::BackendResultRecorded,
+            GoalClosurePhaseInputV1 {
+                result: GoalClosureResultV1::Succeeded,
+                projection_checksum: None,
+                lineage_checksum: None,
+                result_evidence_digest: maintenance.backend_result_digest.clone(),
+                recorded_at_ms: current_log_time_ms()?,
+            },
+        )?;
+    }
+    if projection_recorded.is_none() {
+        record_goal_closure_phase(
+            &options.harness_home,
+            &options.intent,
+            GoalClosurePhaseV1::TerminalProjectionRecorded,
+            GoalClosurePhaseInputV1 {
+                result: GoalClosureResultV1::Succeeded,
+                projection_checksum: Some(maintenance.projection_checksum.clone()),
+                lineage_checksum: None,
+                result_evidence_digest: None,
+                recorded_at_ms: current_log_time_ms()?,
+            },
+        )?;
+    }
+
+    receipts = goal_closure_receipts_for_id(&options.harness_home, &options.intent.closure_id)?;
+    let lineage_recorded = receipts
+        .iter()
+        .find(|receipt| receipt.phase == GoalClosurePhaseV1::LineageReconciled)
+        .and_then(|receipt| receipt.lineage_checksum.clone());
+    let lineage_checksum = match lineage_recorded {
+        Some(checksum) => checksum,
+        None => {
+            let checksum = reconcile_closed_goal_lineage(&options)?;
+            record_goal_closure_phase(
+                &options.harness_home,
+                &options.intent,
+                GoalClosurePhaseV1::LineageReconciled,
+                GoalClosurePhaseInputV1 {
+                    result: GoalClosureResultV1::Succeeded,
+                    projection_checksum: Some(maintenance.projection_checksum.clone()),
+                    lineage_checksum: Some(checksum.clone()),
+                    result_evidence_digest: None,
+                    recorded_at_ms: current_log_time_ms()?,
+                },
+            )?;
+            checksum
+        }
+    };
+    receipts = goal_closure_receipts_for_id(&options.harness_home, &options.intent.closure_id)?;
+    if !receipts
+        .iter()
+        .any(|receipt| receipt.phase == GoalClosurePhaseV1::Completed)
+    {
+        record_goal_closure_phase(
+            &options.harness_home,
+            &options.intent,
+            GoalClosurePhaseV1::Completed,
+            GoalClosurePhaseInputV1 {
+                result: GoalClosureResultV1::Succeeded,
+                projection_checksum: Some(maintenance.projection_checksum.clone()),
+                lineage_checksum: Some(lineage_checksum.clone()),
+                result_evidence_digest: None,
+                recorded_at_ms: current_log_time_ms()?,
+            },
+        )?;
+    }
+    receipts = goal_closure_receipts_for_id(&options.harness_home, &options.intent.closure_id)?;
+    let completed = receipts.last().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "goal closure completed without a durable receipt",
+        )
+    })?;
+    Ok(CodexGoalClosureExecutionReport {
+        status: CodexGoalClosureExecutionStatus::Completed,
+        closure_id: options.intent.closure_id,
+        authority_digest: completed.authority_digest.clone(),
+        target_digest: completed.target_digest.clone(),
+        projection_checksum: maintenance.projection_checksum,
+        lineage_checksum,
+        phases: receipts.iter().map(|receipt| receipt.phase).collect(),
+        backend_mutation_sent: maintenance.backend_mutation_sent,
+        source_final_eligible: false,
+    })
+}
+
+fn find_durable_governed_closure_projection(
+    options: &CodexGoalClosureExecutionOptions,
+) -> io::Result<Option<String>> {
+    let file = options
+        .harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-goal-projection-receipts.jsonl");
+    if !file.is_file() {
+        return Ok(None);
+    }
+    let expected_status = match options.intent.disposition {
+        GoalClosureDispositionV1::Completed => "completed",
+        GoalClosureDispositionV1::Canceled => "canceled",
+        GoalClosureDispositionV1::Unknown => return Ok(None),
+    };
+    let mut latest = None::<CodexGoalProjectionV1>;
+    for (index, line) in fs::read_to_string(&file)?.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let projection = serde_json::from_str::<CodexGoalProjectionV1>(line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid goal projection at {}:{}: {error}",
+                    file.display(),
+                    index + 1
+                ),
+            )
+        })?;
+        let goal_matches = projection.goal_reference == options.intent.goal_identity
+            || projection.backend_goal_ref.as_deref()
+                == Some(options.intent.goal_identity.as_str())
+            || projection.goal_checksum == options.intent.goal_identity;
+        if projection.session_key == options.intent.authority.concrete_session_key
+            && projection.lane_digest.as_deref()
+                == Some(options.intent.authority.lane_digest.as_str())
+            && projection.backend_context_generation.as_deref()
+                == Some(options.intent.authority.backend_context_generation.as_str())
+            && projection.source_thread_id == options.intent.authority.source_thread_id
+            && projection.observation_phase == GoalProjectionObservationPhaseV1::GovernedClosure
+            && projection.turn_relation == GoalProjectionTurnRelationV1::AuthoritativeGoalClosure
+            && !projection.source_final_eligible
+            && projection.status.eq_ignore_ascii_case(expected_status)
+            && goal_matches
+            && latest.as_ref().is_none_or(|current| {
+                (projection.observed_at_ms, projection.observation_order)
+                    > (current.observed_at_ms, current.observation_order)
+            })
+        {
+            latest = Some(projection);
+        }
+    }
+    Ok(latest.map(|projection| projection.projection_checksum))
+}
+
+fn revalidate_goal_closure_projection_authority(
+    options: &CodexGoalClosureExecutionOptions,
+) -> io::Result<CodexGoalProjectionV1> {
+    let file = options
+        .harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-goal-projection-receipts.jsonl");
+    let mut latest = None::<CodexGoalProjectionV1>;
+    if file.is_file() {
+        for (index, line) in fs::read_to_string(&file)?.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let projection =
+                serde_json::from_str::<CodexGoalProjectionV1>(line).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid goal projection at {}:{}: {error}",
+                            file.display(),
+                            index + 1
+                        ),
+                    )
+                })?;
+            if projection.schema == CODEX_GOAL_PROJECTION_SCHEMA
+                && projection.session_key == options.intent.authority.concrete_session_key
+                && projection.lane_digest.as_deref()
+                    == Some(options.intent.authority.lane_digest.as_str())
+                && projection.backend_context_generation.as_deref()
+                    == Some(options.intent.authority.backend_context_generation.as_str())
+                && projection.source_thread_id == options.intent.authority.source_thread_id
+                && latest.as_ref().is_none_or(|current| {
+                    (projection.observed_at_ms, projection.observation_order)
+                        > (current.observed_at_ms, current.observation_order)
+                })
+            {
+                latest = Some(projection);
+            }
+        }
+    }
+    let latest = latest.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "goal closure authority projection is no longer available",
+        )
+    })?;
+    let goal_matches = latest.goal_reference == options.intent.goal_identity
+        || latest.backend_goal_ref.as_deref() == Some(options.intent.goal_identity.as_str())
+        || latest.goal_checksum == options.intent.goal_identity;
+    if !latest.projection_complete
+        || !latest.status.eq_ignore_ascii_case("active")
+        || !goal_matches
+        || Some(latest.projection_checksum.as_str())
+            != options.intent.expected_projection_checksum.as_deref()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "goal closure authority changed after target resolution",
+        ));
+    }
+    Ok(latest)
+}
+
+fn run_codex_goal_closure_maintenance(
+    options: &CodexGoalClosureExecutionOptions,
+    backend_recorded: bool,
+) -> io::Result<CodexGoalClosureMaintenanceResult> {
+    let mut observer =
+        CodexGoalProjectionObserver::for_governed_closure(&options.harness_home, &options.intent)?;
+    observer.set_observation_context(GoalProjectionObservationPhaseV1::GovernedClosure, None);
+    let execution_dir = options
+        .harness_home
+        .join("state")
+        .join("goal-closure")
+        .join("executions")
+        .join(normalize_key_part(&options.intent.closure_id));
+    fs::create_dir_all(&execution_dir)?;
+    let stdout_log = execution_dir.join("codex-maintenance-stdout.jsonl");
+    let mut command = Command::new(&options.executable);
+    command
+        .args(&options.arguments)
+        .current_dir(&options.working_directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(codex_home) = options.codex_home.as_ref() {
+        command.env("CODEX_HOME", codex_home);
+    }
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("goal closure child stdout was not piped"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("goal closure child stdin was not piped"))?;
+    let (line_rx, mut reader_handle) = spawn_stdout_reader(stdout, stdout_log);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(options.timeout_ms))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "closure timeout overflow"))?;
+    let execution_result = (|| -> io::Result<CodexGoalClosureMaintenanceResult> {
+        write_json_rpc(
+            &mut stdin,
+            &json!({
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "agent_harness_goal_closure",
+                        "title": "Agent Harness Goal Closure",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": { "experimentalApi": true }
+                }
+            }),
+        )?;
+        let _ = wait_for_goal_closure_rpc(&line_rx, deadline, 0, None)?;
+        write_json_rpc(
+            &mut stdin,
+            &json!({ "method": "initialized", "params": {} }),
+        )?;
+        write_json_rpc(
+            &mut stdin,
+            &json!({
+                "id": 1,
+                "method": "thread/resume",
+                "params": { "threadId": options.intent.authority.source_thread_id }
+            }),
+        )?;
+        let mut buffered_goal_updates = Vec::new();
+        let resume =
+            wait_for_goal_closure_rpc(&line_rx, deadline, 1, Some(&mut buffered_goal_updates))?;
+        let resumed_thread = first_string_pointer(
+            &resume,
+            &["/result/thread/id", "/result/threadId", "/result/id"],
+        )
+        .ok_or_else(|| io::Error::other("thread/resume omitted the resumed thread ID"))?;
+        if resumed_thread != options.intent.authority.source_thread_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "thread/resume returned a different thread than the governed closure target",
+            ));
+        }
+
+        let expected_status = match options.intent.disposition {
+            GoalClosureDispositionV1::Completed => "completed",
+            GoalClosureDispositionV1::Canceled => "canceled",
+            GoalClosureDispositionV1::Unknown => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unknown goal closure disposition cannot reach the backend",
+                ));
+            }
+        };
+        for update in &buffered_goal_updates {
+            validate_goal_closure_update_identity(update, &options.intent)?;
+        }
+        let recovered_terminal = buffered_goal_updates.iter().find(|value| {
+            first_string_pointer(value, &["/params/goal/status", "/params/status"])
+                .is_some_and(|status| status.eq_ignore_ascii_case(expected_status))
+        });
+        let mut backend_result_digest = recovered_terminal
+            .map(|value| serde_json::to_vec(value).map(|bytes| sha256_prefixed(&bytes)))
+            .transpose()
+            .map_err(io::Error::other)?;
+        let backend_mutation_sent = !backend_recorded && recovered_terminal.is_none();
+        if backend_mutation_sent {
+            // Resume is deliberately read-only. Revalidate immediately after it
+            // and use that fresh projection for the only mutating RPC.
+            let prior = revalidate_goal_closure_projection_authority(options)?;
+            write_json_rpc(
+                &mut stdin,
+                &json!({
+                    "id": 2,
+                    "method": "thread/goal/set",
+                    "params": {
+                        "threadId": options.intent.authority.source_thread_id,
+                        "goalId": options.intent.goal_identity,
+                        "objective": prior.objective,
+                        "status": expected_status,
+                        "tokenBudget": prior.token_budget,
+                        "completionCriteria": prior.completion_criteria
+                    }
+                }),
+            )?;
+            let response =
+                wait_for_goal_closure_rpc(&line_rx, deadline, 2, Some(&mut buffered_goal_updates))?;
+            backend_result_digest = Some(sha256_prefixed(
+                &serde_json::to_vec(&response).map_err(io::Error::other)?,
+            ));
+        }
+        if !backend_recorded {
+            record_goal_closure_phase(
+                &options.harness_home,
+                &options.intent,
+                GoalClosurePhaseV1::BackendResultRecorded,
+                GoalClosurePhaseInputV1 {
+                    result: GoalClosureResultV1::Succeeded,
+                    projection_checksum: None,
+                    lineage_checksum: None,
+                    result_evidence_digest: backend_result_digest.clone(),
+                    recorded_at_ms: current_log_time_ms()?,
+                },
+            )?;
+        }
+
+        let goal_event = wait_for_matching_goal_closure_update(
+            &line_rx,
+            deadline,
+            &options.intent,
+            expected_status,
+            buffered_goal_updates,
+        )?;
+        observer.observe(&goal_event, 1)?;
+        let projection = observer
+            .latest_for_thread(&options.intent.authority.source_thread_id)
+            .ok_or_else(|| io::Error::other("governed closure projection was not durable"))?;
+        if projection.observation_phase != GoalProjectionObservationPhaseV1::GovernedClosure
+            || projection.turn_relation != GoalProjectionTurnRelationV1::AuthoritativeGoalClosure
+            || projection.source_final_eligible
+            || !projection.status.eq_ignore_ascii_case(expected_status)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "terminal goal update did not produce an authoritative non-final closure projection",
+            ));
+        }
+        Ok(CodexGoalClosureMaintenanceResult {
+            projection_checksum: projection.projection_checksum.clone(),
+            backend_result_digest,
+            backend_mutation_sent,
+        })
+    })();
+    drop(stdin);
+    let mut cleanup_warnings = Vec::new();
+    finish_codex_child_and_stdout_reader(
+        &mut child,
+        &mut reader_handle,
+        &mut cleanup_warnings,
+        "governed goal closure maintenance",
+    );
+    execution_result
+}
+
+fn wait_for_goal_closure_rpc(
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    deadline: Instant,
+    request_id: i64,
+    mut goal_updates: Option<&mut Vec<Value>>,
+) -> io::Result<Value> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for goal closure app-server response",
+            ));
+        }
+        let line = match line_rx.recv_timeout(remaining) {
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => return Err(io::Error::other(error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for goal closure app-server response",
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "goal closure app-server stdout closed before its response",
+                ));
+            }
+        };
+        let value: Value = serde_json::from_str(&line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("goal closure app-server emitted invalid JSON: {error}"),
+            )
+        })?;
+        reject_goal_closure_unsafe_event(&value)?;
+        if matches!(json_method(&value), Some("thread/goal/updated")) {
+            if let Some(goal_updates) = goal_updates.as_deref_mut() {
+                goal_updates.push(value);
+            }
+            continue;
+        }
+        if json_id(&value) == Some(request_id) {
+            if let Some(error) = protocol_error(&value) {
+                return Err(io::Error::other(error));
+            }
+            return Ok(value);
+        }
+    }
+}
+
+fn wait_for_matching_goal_closure_update(
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    deadline: Instant,
+    intent: &GoalClosureIntentV1,
+    expected_status: &str,
+    mut buffered: Vec<Value>,
+) -> io::Result<Value> {
+    loop {
+        let value = if buffered.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for the terminal governed goal update",
+                ));
+            }
+            let line = match line_rx.recv_timeout(remaining) {
+                Ok(Ok(line)) => line,
+                Ok(Err(error)) => return Err(io::Error::other(error)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the terminal governed goal update",
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "goal closure app-server closed before the terminal goal update",
+                    ));
+                }
+            };
+            serde_json::from_str(&line).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("goal closure app-server emitted invalid JSON: {error}"),
+                )
+            })?
+        } else {
+            buffered.remove(0)
+        };
+        reject_goal_closure_unsafe_event(&value)?;
+        if !matches!(json_method(&value), Some("thread/goal/updated")) {
+            continue;
+        }
+        validate_goal_closure_update_identity(&value, intent)?;
+        let status = first_string_pointer(&value, &["/params/goal/status", "/params/status"]);
+        if status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case(expected_status))
+        {
+            return Ok(value);
+        }
+    }
+}
+
+fn validate_goal_closure_update_identity(
+    value: &Value,
+    intent: &GoalClosureIntentV1,
+) -> io::Result<()> {
+    let thread_id = extract_thread_id(value).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "governed goal update omitted its source thread",
+        )
+    })?;
+    let goal_id = first_string_pointer(
+        value,
+        &["/params/goal/id", "/params/goal/goalId", "/params/goalId"],
+    );
+    if thread_id != intent.authority.source_thread_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "governed goal update crossed the resolved source-thread boundary",
+        ));
+    }
+    if goal_id.as_deref() != Some(intent.goal_identity.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "governed goal update crossed the resolved goal-identity boundary",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_goal_closure_unsafe_event(value: &Value) -> io::Result<()> {
+    let Some(method) = json_method(value) else {
+        return Ok(());
+    };
+    let forbidden = method.starts_with("turn/")
+        || method.starts_with("item/")
+        || method.contains("approval")
+        || method.contains("elicitation")
+        || method.contains("tool")
+        || json_id(value).is_some();
+    if forbidden {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("governed goal closure rejected unsafe app-server event {method}"),
+        ));
+    }
+    Ok(())
+}
+
+fn reconcile_closed_goal_lineage(options: &CodexGoalClosureExecutionOptions) -> io::Result<String> {
+    let report = crate::goal_lineage::run_goal_lineage_doctor(
+        crate::goal_lineage::GoalLineageDoctorOptions {
+            harness_home: options.harness_home.clone(),
+            lane_digest: Some(options.intent.authority.lane_digest.clone()),
+            virtual_session_id: Some(options.intent.authority.virtual_session_id.clone()),
+        },
+    )?;
+    let expected_status = match options.intent.disposition {
+        GoalClosureDispositionV1::Completed => "completed",
+        GoalClosureDispositionV1::Canceled => "canceled",
+        GoalClosureDispositionV1::Unknown => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown closure disposition cannot be reconciled",
+            ));
+        }
+    };
+    let matching = report
+        .lineages
+        .iter()
+        .filter(|lineage| {
+            lineage.source_session_key == options.intent.authority.concrete_session_key
+                && lineage.virtual_session_id.as_deref()
+                    == Some(options.intent.authority.virtual_session_id.as_str())
+                && lineage.lane_digest.as_deref()
+                    == Some(options.intent.authority.lane_digest.as_str())
+                && lineage.backend_context_generation.as_deref()
+                    == Some(options.intent.authority.backend_context_generation.as_str())
+                && lineage.source_thread_id == options.intent.authority.source_thread_id
+                && (lineage.goal_reference == options.intent.goal_identity
+                    || lineage.backend_goal_ref.as_deref()
+                        == Some(options.intent.goal_identity.as_str())
+                    || lineage.goal_checksum == options.intent.goal_identity)
+        })
+        .collect::<Vec<_>>();
+    let closure_lineage = matching.iter().any(|lineage| {
+        lineage.observation_phase == GoalProjectionObservationPhaseV1::GovernedClosure
+            && lineage.turn_relation == GoalProjectionTurnRelationV1::AuthoritativeGoalClosure
+            && !lineage.source_final_eligible
+            && !lineage.runnable
+            && lineage.goal_status.eq_ignore_ascii_case(expected_status)
+    });
+    if matching.is_empty() || !closure_lineage || matching.iter().any(|lineage| lineage.runnable) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "goal closure lineage reconciliation did not prove zero exact runnable lineages",
+        ));
+    }
+    let bytes = serde_json::to_vec(&matching).map_err(io::Error::other)?;
+    Ok(sha256_prefixed(&bytes))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3126,7 +3963,25 @@ fn recover_completed_codex_run_from_stdout_log(
     let mut completed = false;
     let mut terminal_error = None;
     let mut terminal_failure_reason = None;
-    let mut thread_id = plan.invocation.thread_id.clone();
+    let recovery_binding = read_json_file_as::<CodexActiveTurnBindingRecord>(
+        &codex_active_turn_binding_file(harness_home, &plan.session_key),
+    )
+    .ok();
+    let mut thread_id = recovery_binding
+        .as_ref()
+        .map(|binding| binding.thread_id.clone())
+        .or_else(|| plan.invocation.thread_id.clone());
+    let mut owned_turn_id = recovery_binding
+        .as_ref()
+        .and_then(|binding| binding.active_turn_id.clone());
+    let mut owned_item_ids = Vec::new();
+    let mut divergent_event_count = 0usize;
+    if let Some(observer) = state.goal_projection_observer.as_mut() {
+        observer.set_observation_context(
+            GoalProjectionObservationPhaseV1::StdoutRecovery,
+            owned_turn_id.as_deref(),
+        );
+    }
 
     for line in reader.lines() {
         let line = line?;
@@ -3134,10 +3989,62 @@ fn recover_completed_codex_run_from_stdout_log(
         state.event_count = event_count;
         match serde_json::from_str::<Value>(&line) {
             Ok(value) => {
-                record_protocol_usage_event(&value, &mut state);
-                if let Some(extracted_thread_id) = extract_thread_id(&value) {
-                    thread_id = Some(extracted_thread_id);
+                if json_id(&value) == Some(1)
+                    && let Some(extracted_thread_id) = extract_thread_id(&value)
+                {
+                    match thread_id.as_deref() {
+                        Some(expected_thread_id) if expected_thread_id != extracted_thread_id => {
+                            state.warnings.push(format!(
+                                "stdout recovery quarantined mismatched thread/start response: expectedThreadId={}; observedThreadId={}",
+                                bounded_codex_scope(Some(expected_thread_id)),
+                                bounded_codex_scope(Some(&extracted_thread_id))
+                            ));
+                            continue;
+                        }
+                        None => thread_id = Some(extracted_thread_id),
+                        Some(_) => {}
+                    }
                 }
+                let Some(expected_thread_id) = thread_id.as_deref() else {
+                    if json_id(&value).is_none() {
+                        state.warnings.push(format!(
+                            "stdout recovery quarantined unowned Codex event before parent thread binding: method={}",
+                            bounded_codex_scope(json_method(&value))
+                        ));
+                    }
+                    continue;
+                };
+                let scope = CodexEventScope::from_json(&value);
+                if let Err(reason) = classify_owned_codex_event(
+                    expected_thread_id,
+                    &mut owned_turn_id,
+                    &mut owned_item_ids,
+                    &value,
+                    &scope,
+                ) {
+                    divergent_event_count = divergent_event_count.saturating_add(1);
+                    if divergent_event_count <= CODEX_FOREIGN_EVENT_WARNING_LIMIT {
+                        state.warnings.push(format!(
+                            "stdout recovery quarantined foreign Codex event: reason={reason}; method={}; threadId={}; turnId={}",
+                            bounded_codex_scope(json_method(&value)),
+                            bounded_codex_scope(scope.thread_id.as_deref()),
+                            bounded_codex_scope(scope.turn_id.as_deref())
+                        ));
+                    } else if divergent_event_count == CODEX_FOREIGN_EVENT_WARNING_LIMIT + 1 {
+                        state.warnings.push(format!(
+                            "additional stdout recovery ownership divergence metadata omitted after {} events",
+                            CODEX_FOREIGN_EVENT_WARNING_LIMIT
+                        ));
+                    }
+                    continue;
+                }
+                if let Some(observer) = state.goal_projection_observer.as_mut() {
+                    observer.set_observation_context(
+                        GoalProjectionObservationPhaseV1::StdoutRecovery,
+                        owned_turn_id.as_deref(),
+                    );
+                }
+                record_protocol_usage_event(&value, &mut state);
                 if let Some(error) = protocol_error(&value) {
                     terminal_error = Some(error);
                 }
@@ -8931,7 +9838,7 @@ impl CodexProtocolState {
             );
             if let Some(first) = self.denied_approval_requests.first() {
                 notice.push_str(" First cancelled request: ");
-                notice.push_str(first);
+                notice.push_str(&redact_approval_capabilities(first));
                 notice.push('.');
             }
             notice.push_str(
@@ -8943,17 +9850,16 @@ impl CodexProtocolState {
             let disposition = if effect.state == ExternalEffectStateV1::Denied {
                 format!(
                     "[Harness safety] Connector action denied: {}. Effect {} is terminal for approval generation {}.",
-                    effect.action_summary, effect.effect_id, effect.approval_generation
+                    redact_approval_capabilities(&effect.action_summary),
+                    effect.effect_id,
+                    effect.approval_generation
                 )
             } else {
-                let token = effect
-                    .approval_token
-                    .as_ref()
-                    .map(|token| token.token.as_str())
-                    .unwrap_or("unavailable");
                 format!(
-                    "[Harness approval required] {}. Approve or deny this exact action with token {}. Effect {}; generation {}. The connector mutation is parked and will not be replayed by generic timeout recovery.",
-                    effect.action_summary, token, effect.effect_id, effect.approval_generation
+                    "[Harness approval required] {}. Approve or deny this exact action through the protected exact-lane approval flow; raw capability text is intentionally omitted. Effect {}; generation {}. The connector mutation is parked and will not be replayed by generic timeout recovery.",
+                    redact_approval_capabilities(&effect.action_summary),
+                    effect.effect_id,
+                    effect.approval_generation
                 )
             };
             notices.push(disposition);
@@ -9694,9 +10600,74 @@ enum ProtocolWait {
     },
 }
 
+fn redact_approval_capabilities(text: &str) -> String {
+    fn redact_matches(
+        text: &str,
+        marker: &str,
+        replacement: &str,
+        is_value_char: impl Fn(char) -> bool,
+    ) -> String {
+        let mut output = String::with_capacity(text.len());
+        let mut cursor = 0;
+        while let Some(relative_start) = text[cursor..].find(marker) {
+            let start = cursor + relative_start;
+            output.push_str(&text[cursor..start]);
+            output.push_str(replacement);
+            let value_start = start + marker.len();
+            let mut end = value_start;
+            for (offset, ch) in text[value_start..].char_indices() {
+                if !is_value_char(ch) {
+                    break;
+                }
+                end = value_start + offset + ch.len_utf8();
+            }
+            cursor = end;
+        }
+        output.push_str(&text[cursor..]);
+        output
+    }
+
+    let without_named_token = redact_matches(
+        text,
+        "approvalToken=",
+        "approval-capability=[redacted]",
+        |ch| !ch.is_whitespace() && !matches!(ch, ';' | ',' | ']' | '}'),
+    );
+    redact_matches(
+        &without_named_token,
+        "ahx1_",
+        "[approval-capability-redacted]",
+        |ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'),
+    )
+}
+
+fn external_effect_wait_reason(effect: &ExternalEffectIntentV1) -> String {
+    let mut reason = format!(
+        "{}; actionSummary={}; effectId={}; approvalGeneration={}; approvalState=protected",
+        redact_approval_capabilities(
+            effect
+                .reason
+                .as_deref()
+                .unwrap_or("connector action is waiting for explicit authority"),
+        ),
+        redact_approval_capabilities(&effect.action_summary),
+        effect.effect_id,
+        effect.approval_generation,
+    );
+    if let Some(token_digest) = effect
+        .approval_token
+        .as_ref()
+        .map(|token| token.token_digest.as_str())
+    {
+        reason.push_str("; approvalCapabilityDigest=");
+        reason.push_str(token_digest);
+    }
+    reason
+}
+
 fn external_effect_protocol_wait(state: &CodexProtocolState) -> Option<ProtocolWait> {
     if let Some(reason) = state.external_effect_protocol_failure.clone() {
-        return Some(ProtocolWait::Failed(reason));
+        return Some(ProtocolWait::Failed(redact_approval_capabilities(&reason)));
     }
     let effect = state.parked_external_effect.as_ref()?;
     let disposition = if effect.state == ExternalEffectStateV1::Denied {
@@ -9704,22 +10675,7 @@ fn external_effect_protocol_wait(state: &CodexProtocolState) -> Option<ProtocolW
     } else {
         "needs-user"
     };
-    let token = effect
-        .approval_token
-        .as_ref()
-        .map(|token| token.token.as_str())
-        .unwrap_or("none");
-    let reason = format!(
-        "{}; actionSummary={}; effectId={}; approvalGeneration={}; approvalToken={}",
-        effect
-            .reason
-            .as_deref()
-            .unwrap_or("connector action is waiting for explicit authority"),
-        effect.action_summary,
-        effect.effect_id,
-        effect.approval_generation,
-        token,
-    );
+    let reason = external_effect_wait_reason(effect);
     Some(ProtocolWait::Canceled(format!(
         "external-effect-parked:{disposition}:{reason}"
     )))
@@ -9804,6 +10760,66 @@ fn is_child_turn_started(value: &Value) -> bool {
                 .replace(['-', '_', ' '], "")
         })
         .is_some_and(|kind| matches!(kind.as_str(), "subagent" | "child"))
+}
+
+fn classify_owned_codex_event(
+    expected_thread_id: &str,
+    owned_turn_id: &mut Option<String>,
+    owned_item_ids: &mut Vec<String>,
+    value: &Value,
+    scope: &CodexEventScope,
+) -> Result<(), &'static str> {
+    if json_id(value).is_some() {
+        return Ok(());
+    }
+    if scope
+        .thread_id
+        .as_deref()
+        .is_some_and(|thread_id| thread_id != expected_thread_id)
+    {
+        return Err("thread-mismatch");
+    }
+    if let Some(turn_id) = scope.turn_id.as_deref() {
+        match owned_turn_id.as_deref() {
+            Some(owned_turn_id) if owned_turn_id != turn_id => {
+                return Err("turn-mismatch");
+            }
+            Some(_) => remember_owned_codex_item(owned_item_ids, scope.item_id.as_deref()),
+            None if is_regular_turn_started(value)
+                && scope.thread_id.as_deref() == Some(expected_thread_id) =>
+            {
+                *owned_turn_id = Some(turn_id.to_string());
+                remember_owned_codex_item(owned_item_ids, scope.item_id.as_deref());
+            }
+            None if is_child_turn_started(value) => {
+                return Err("child-turn-start-before-owner");
+            }
+            None => return Err("owner-turn-unbound"),
+        }
+    } else if extract_agent_delta(value).is_some() {
+        if scope
+            .item_id
+            .as_deref()
+            .is_some_and(|item_id| owned_item_ids.iter().any(|owned| owned == item_id))
+        {
+            return Ok(());
+        }
+        return Err("uncorrelated-id-less-agent-delta");
+    }
+    Ok(())
+}
+
+fn remember_owned_codex_item(owned_item_ids: &mut Vec<String>, item_id: Option<&str>) {
+    let Some(item_id) = item_id.map(str::trim).filter(|item_id| !item_id.is_empty()) else {
+        return;
+    };
+    if owned_item_ids.iter().any(|owned| owned == item_id) {
+        return;
+    }
+    if owned_item_ids.len() >= CODEX_OWNED_ITEM_ID_LIMIT {
+        owned_item_ids.remove(0);
+    }
+    owned_item_ids.push(item_id.to_string());
 }
 
 fn bounded_codex_scope(value: Option<&str>) -> String {
@@ -9990,60 +11006,22 @@ impl CodexTurnSteerBridge {
     }
 
     fn owns_event(&mut self, value: &Value, state: &mut CodexProtocolState) -> io::Result<bool> {
-        if json_id(value).is_some() {
-            return Ok(true);
-        }
-        if self.rollout_mode == OwnedCodexEventsRolloutMode::Off {
-            return Ok(true);
-        }
-
         let scope = CodexEventScope::from_json(value);
         let method = json_method(value).unwrap_or("<unknown>");
-        if scope
-            .thread_id
-            .as_deref()
-            .is_some_and(|thread_id| thread_id != self.binding.thread_id)
-        {
-            return Ok(self.divergent_event(state, method, &scope, "thread-mismatch"));
+        let previous_owned_turn_id = self.owned_turn_id.clone();
+        if let Err(reason) = classify_owned_codex_event(
+            &self.binding.thread_id,
+            &mut self.owned_turn_id,
+            &mut self.owned_item_ids,
+            value,
+            &scope,
+        ) {
+            return Ok(self.divergent_event(state, method, &scope, reason));
         }
-
-        if let Some(turn_id) = scope.turn_id.as_deref() {
-            match self.owned_turn_id.as_deref() {
-                Some(owned_turn_id) if owned_turn_id != turn_id => {
-                    return Ok(self.divergent_event(state, method, &scope, "turn-mismatch"));
-                }
-                Some(_) => self.remember_owned_item(scope.item_id.as_deref()),
-                None if is_regular_turn_started(value)
-                    && scope.thread_id.as_deref() == Some(self.binding.thread_id.as_str()) =>
-                {
-                    self.bind_owned_turn(turn_id.to_string())?;
-                }
-                None if is_child_turn_started(value) => {
-                    return Ok(self.divergent_event(
-                        state,
-                        method,
-                        &scope,
-                        "child-turn-start-before-owner",
-                    ));
-                }
-                None => {
-                    return Ok(self.divergent_event(state, method, &scope, "owner-turn-unbound"));
-                }
-            }
-        } else if extract_agent_delta(value).is_some() {
-            if scope
-                .item_id
-                .as_deref()
-                .is_some_and(|item_id| self.owned_item_ids.iter().any(|owned| owned == item_id))
-            {
-                return Ok(true);
-            }
-            return Ok(self.divergent_event(
-                state,
-                method,
-                &scope,
-                "uncorrelated-id-less-agent-delta",
-            ));
+        if previous_owned_turn_id != self.owned_turn_id
+            && let Some(turn_id) = self.owned_turn_id.clone()
+        {
+            self.set_active_turn_id(turn_id)?;
         }
 
         Ok(true)
@@ -10061,7 +11039,9 @@ impl CodexTurnSteerBridge {
             let prefix = match self.rollout_mode {
                 OwnedCodexEventsRolloutMode::Shadow => "ownedCodexEventsV2 shadow divergence",
                 OwnedCodexEventsRolloutMode::Authoritative => "quarantined foreign Codex event",
-                OwnedCodexEventsRolloutMode::Off => return true,
+                OwnedCodexEventsRolloutMode::Off => {
+                    "quarantined foreign Codex event (diagnostics off)"
+                }
             };
             state.warnings.push(format!(
                 "{prefix}: reason={reason}; method={}; threadId={}; turnId={}",
@@ -10075,7 +11055,7 @@ impl CodexTurnSteerBridge {
                 CODEX_FOREIGN_EVENT_WARNING_LIMIT
             ));
         }
-        self.rollout_mode != OwnedCodexEventsRolloutMode::Authoritative
+        false
     }
 
     fn bind_owned_turn(&mut self, turn_id: String) -> io::Result<()> {
@@ -10089,23 +11069,17 @@ impl CodexTurnSteerBridge {
         if self.owned_turn_id.is_none() {
             self.owned_turn_id = Some(turn_id.clone());
         }
-        if self.rollout_mode == OwnedCodexEventsRolloutMode::Authoritative {
-            self.set_active_turn_id(turn_id)?;
-        }
+        self.set_active_turn_id(turn_id)?;
         Ok(())
     }
 
-    fn remember_owned_item(&mut self, item_id: Option<&str>) {
-        let Some(item_id) = item_id.map(str::trim).filter(|item_id| !item_id.is_empty()) else {
-            return;
-        };
-        if self.owned_item_ids.iter().any(|owned| owned == item_id) {
-            return;
+    fn sync_goal_projection_observation_context(&self, state: &mut CodexProtocolState) {
+        if let Some(observer) = state.goal_projection_observer.as_mut() {
+            observer.set_observation_context(
+                GoalProjectionObservationPhaseV1::OwnedTurn,
+                self.owned_turn_id.as_deref(),
+            );
         }
-        if self.owned_item_ids.len() >= CODEX_OWNED_ITEM_ID_LIMIT {
-            self.owned_item_ids.remove(0);
-        }
-        self.owned_item_ids.push(item_id.to_string());
     }
 
     fn observe_json(
@@ -10122,12 +11096,10 @@ impl CodexTurnSteerBridge {
                 || (is_regular_turn_started(value)
                     && extract_thread_id(value).as_deref()
                         == Some(self.binding.thread_id.as_str()));
-            if self.rollout_mode != OwnedCodexEventsRolloutMode::Off && trusted_owner_event {
+            if trusted_owner_event {
                 self.bind_owned_turn(turn_id.clone())?;
             }
-            if self.rollout_mode != OwnedCodexEventsRolloutMode::Authoritative
-                || trusted_owner_event
-            {
+            if trusted_owner_event {
                 self.set_active_turn_id(turn_id)?;
             }
         }
@@ -10499,12 +11471,11 @@ impl CodexTurnSteerBridge {
     }
 
     fn set_active_turn_id(&mut self, turn_id: String) -> io::Result<()> {
-        if self.rollout_mode == OwnedCodexEventsRolloutMode::Authoritative
-            && self
-                .binding
-                .active_turn_id
-                .as_deref()
-                .is_some_and(|active_turn_id| active_turn_id != turn_id)
+        if self
+            .binding
+            .active_turn_id
+            .as_deref()
+            .is_some_and(|active_turn_id| active_turn_id != turn_id)
         {
             return Ok(());
         }
@@ -11086,7 +12057,7 @@ fn wait_for_thread_start(
                 emit_codex_progress(progress, &value, state);
                 if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
                     if let Some(reason) = state.external_effect_protocol_failure.clone() {
-                        return Ok(ProtocolWait::Failed(reason));
+                        return Ok(ProtocolWait::Failed(redact_approval_capabilities(&reason)));
                     }
                     if let Some(effect) = state.parked_external_effect.as_ref() {
                         let disposition = if effect.state == ExternalEffectStateV1::Denied {
@@ -11094,22 +12065,7 @@ fn wait_for_thread_start(
                         } else {
                             "needs-user"
                         };
-                        let token = effect
-                            .approval_token
-                            .as_ref()
-                            .map(|token| token.token.as_str())
-                            .unwrap_or("none");
-                        let reason = format!(
-                            "{}; actionSummary={}; effectId={}; approvalGeneration={}; approvalToken={}",
-                            effect
-                                .reason
-                                .as_deref()
-                                .unwrap_or("connector action is waiting for explicit authority"),
-                            effect.action_summary,
-                            effect.effect_id,
-                            effect.approval_generation,
-                            token,
-                        );
+                        let reason = external_effect_wait_reason(effect);
                         return Ok(ProtocolWait::Canceled(format!(
                             "external-effect-parked:{disposition}:{reason}"
                         )));
@@ -11165,6 +12121,9 @@ fn settle_resumed_thread(
     cancel_check: Option<&RuntimeCancelCheck>,
     narration_config: &AssistantNarrationConfig,
 ) -> io::Result<CodexResumeSettleRun> {
+    if let Some(observer) = state.goal_projection_observer.as_mut() {
+        observer.set_observation_context(GoalProjectionObservationPhaseV1::ResumeSettle, None);
+    }
     let started = Instant::now();
     let started_at_ms = current_log_time_ms()?;
     let starting_event_count = state.event_count;
@@ -11371,19 +12330,40 @@ fn goal_projection_from_event(
         codex_goal_checksum(&objective, &status, token_budget, &completion_criteria)?;
     let projection_complete = !objective.is_empty()
         && !matches!(status.trim().to_ascii_lowercase().as_str(), "" | "unknown");
+    let source_turn_id = extract_turn_id(value)
+        .or_else(|| prior.and_then(|projection| projection.source_turn_id.clone()));
+    let (turn_relation, source_final_eligible) = match observer.observation_phase {
+        GoalProjectionObservationPhaseV1::ResumeSettle => {
+            (GoalProjectionTurnRelationV1::HistoricalThreadState, false)
+        }
+        GoalProjectionObservationPhaseV1::GovernedClosure => (
+            GoalProjectionTurnRelationV1::AuthoritativeGoalClosure,
+            false,
+        ),
+        GoalProjectionObservationPhaseV1::OwnedTurn
+        | GoalProjectionObservationPhaseV1::StdoutRecovery
+            if observer.owned_turn_id.as_deref() == source_turn_id.as_deref()
+                && source_turn_id.is_some() =>
+        {
+            (GoalProjectionTurnRelationV1::CurrentOwnedTurn, true)
+        }
+        _ => (GoalProjectionTurnRelationV1::Uncorrelated, false),
+    };
     Ok(Some(CodexGoalProjectionV1 {
         schema: CODEX_GOAL_PROJECTION_SCHEMA.to_string(),
         queue_id: observer.queue_id.clone(),
         session_key: observer.session_key.clone(),
         source_thread_id: expected_thread_id.to_string(),
-        source_turn_id: extract_turn_id(value)
-            .or_else(|| prior.and_then(|projection| projection.source_turn_id.clone())),
+        source_turn_id,
         goal_reference,
         backend_goal_ref,
         lane_digest: observer.lane_digest.clone(),
         backend_context_generation: observer.backend_context_generation.clone(),
         objective,
         status,
+        observation_phase: observer.observation_phase,
+        turn_relation,
+        source_final_eligible,
         token_budget,
         completion_criteria,
         goal_checksum,
@@ -11452,6 +12432,9 @@ fn rehydrate_goal_on_thread(
     cancel_check: Option<&RuntimeCancelCheck>,
     narration_config: &AssistantNarrationConfig,
 ) -> io::Result<CodexGoalRehydrationRun> {
+    if let Some(observer) = state.goal_projection_observer.as_mut() {
+        observer.set_observation_context(GoalProjectionObservationPhaseV1::GoalRehydration, None);
+    }
     let receipts_file = harness_home
         .join("state")
         .join("runtime-queue")
@@ -11727,6 +12710,10 @@ fn run_official_context_compact(
     request_id: i64,
     authority: CodexCompactAttemptAuthority,
 ) -> io::Result<ProtocolWait> {
+    if let Some(observer) = state.goal_projection_observer.as_mut() {
+        observer
+            .set_observation_context(GoalProjectionObservationPhaseV1::CompactMaintenance, None);
+    }
     let requested_at_ms = current_log_time_ms()?;
     let mut receipt = CodexCompactAttemptReceipt {
         schema: CODEX_COMPACT_ATTEMPT_SCHEMA,
@@ -12254,6 +13241,9 @@ fn wait_for_turn_completed(
                 {
                     continue;
                 }
+                if let Some(bridge) = steer_bridge.as_deref() {
+                    bridge.sync_goal_projection_observation_context(state);
+                }
                 record_protocol_usage_event(&value, state);
                 timeouts.observe_owned_event(&value, Instant::now());
 
@@ -12628,12 +13618,26 @@ fn codex_external_effect_runtime_context(
         .as_deref()
         .unwrap_or(&plan.session_key);
     let source_queue = plan.queue_id.as_deref().unwrap_or("unattributed-queue");
+    let exact_lane_digest = lane.exact_lane_digest();
+    let logical_lineage_id = sha256_prefixed(lineage_source.as_bytes());
+    let source_queue_id = source_queue.to_string();
+    let source_session_key_digest =
+        crate::external_effect::external_effect_source_session_key_digest(&plan.session_key)?;
+    let approval_authority_digest =
+        crate::external_effect::external_effect_approval_authority_digest(
+            &exact_lane_digest,
+            &source_session_key_digest,
+            &logical_lineage_id,
+            &source_queue_id,
+        )?;
     Ok(Some(CodexExternalEffectRuntimeContext {
         harness_home: harness_home.to_path_buf(),
         request: ExternalEffectRequestContextV1 {
-            exact_lane_digest: lane.exact_lane_digest(),
-            logical_lineage_id: sha256_prefixed(lineage_source.as_bytes()),
-            source_queue_id: source_queue.to_string(),
+            exact_lane_digest,
+            logical_lineage_id,
+            source_queue_id,
+            source_session_key_digest,
+            approval_authority_digest,
         },
         policy: load_connector_approval_policy(harness_home)?,
     }))
@@ -15878,6 +16882,9 @@ fn normalize_key_part(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::goal_closure::{
+        GoalClosureAuthorityV1, GoalClosureTargetCandidateV1, resolve_goal_closure_target,
+    };
     use crate::{
         ContextVirtualSessionRecord, InboundMediaModelAttachmentStatus, PromptAssemblyOptions,
         RuntimeQueueEnqueueOptions, RuntimeQueuePrepareOptions, TurnPlanInput, build_channel_step,
@@ -15889,6 +16896,333 @@ mod tests {
         runtime_worker::release_runtime_queue_lease,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn goal_history_close_updates_original_thread_without_rebinding() {
+        let root = temp_root("goal_history_close_updates_original_thread_without_rebinding");
+        let (options, capture) = goal_closure_execution_fixture(&root, false);
+        let harness_home = options.harness_home.clone();
+        let intent = options.intent.clone();
+        let first = execute_codex_goal_closure(options.clone()).unwrap();
+        assert_eq!(first.status, CodexGoalClosureExecutionStatus::Completed);
+        assert!(first.backend_mutation_sent);
+        assert!(!first.source_final_eligible);
+        assert_eq!(
+            first.phases,
+            vec![
+                GoalClosurePhaseV1::IntentRecorded,
+                GoalClosurePhaseV1::BackendResultRecorded,
+                GoalClosurePhaseV1::TerminalProjectionRecorded,
+                GoalClosurePhaseV1::LineageReconciled,
+                GoalClosurePhaseV1::Completed,
+            ]
+        );
+        let input = fs::read_to_string(&capture).unwrap();
+        assert!(input.contains(r#""method":"thread/resume""#));
+        assert!(input.contains(r#""threadId":"thread-original""#));
+        assert!(input.contains(r#""method":"thread/goal/set""#));
+        assert!(input.contains(r#""goalId":"goal-original""#));
+        assert!(!input.contains(r#""method":"thread/start""#));
+        assert!(!input.contains(r#""method":"turn/start""#));
+
+        let projection_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("codex-goal-projection-receipts.jsonl"),
+        )
+        .unwrap();
+        let terminal: CodexGoalProjectionV1 =
+            serde_json::from_str(projection_text.lines().last().unwrap()).unwrap();
+        assert_eq!(terminal.source_thread_id, "thread-original");
+        assert_eq!(
+            terminal.observation_phase,
+            GoalProjectionObservationPhaseV1::GovernedClosure
+        );
+        assert_eq!(
+            terminal.turn_relation,
+            GoalProjectionTurnRelationV1::AuthoritativeGoalClosure
+        );
+        assert!(!terminal.source_final_eligible);
+        assert_eq!(terminal.status, "completed");
+
+        let before_replay = fs::read(&capture).unwrap();
+        let replay = execute_codex_goal_closure(options).unwrap();
+        assert_eq!(replay.status, CodexGoalClosureExecutionStatus::Replayed);
+        assert!(!replay.backend_mutation_sent);
+        assert_eq!(fs::read(&capture).unwrap(), before_replay);
+        assert_eq!(
+            goal_closure_receipts_for_id(&harness_home, &intent.closure_id)
+                .unwrap()
+                .len(),
+            5
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn goal_history_close_core_rejects_latest_projection_drift_before_backend_mutation() {
+        let root = temp_root(
+            "goal_history_close_core_rejects_latest_projection_drift_before_backend_mutation",
+        );
+        let (options, capture) = goal_closure_execution_fixture(&root, false);
+        let projection_file = options
+            .harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        let text = fs::read_to_string(&projection_file).unwrap();
+        let mut changed: CodexGoalProjectionV1 =
+            serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        changed.observed_at_ms += 1;
+        changed.observation_order += 1;
+        changed.projection_checksum = "sha256:changed-after-dry-run".to_string();
+        append_json_line(&projection_file, &changed).unwrap();
+
+        let error = execute_codex_goal_closure(options.clone()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("changed after target resolution")
+        );
+        assert!(
+            !capture.exists(),
+            "stale authority must not spawn the backend"
+        );
+        assert!(
+            goal_closure_receipts_for_id(&options.harness_home, &options.intent.closure_id)
+                .unwrap()
+                .is_empty(),
+            "stale authority must not record a closure intent phase"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn historical_goal_close_never_owns_channel_final_or_tool_boundary() {
+        let root = temp_root("historical_goal_close_never_owns_channel_final_or_tool_boundary");
+        let (options, capture) = goal_closure_execution_fixture(&root, true);
+        let harness_home = options.harness_home.clone();
+        let closure_id = options.intent.closure_id.clone();
+        let error = execute_codex_goal_closure(options).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("turn/started"));
+        let input = fs::read_to_string(capture).unwrap();
+        assert!(input.contains(r#""method":"thread/resume""#));
+        assert!(!input.contains(r#""method":"thread/goal/set""#));
+        assert_eq!(
+            goal_closure_receipts_for_id(&harness_home, &closure_id)
+                .unwrap()
+                .iter()
+                .map(|receipt| receipt.phase)
+                .collect::<Vec<_>>(),
+            vec![GoalClosurePhaseV1::IntentRecorded]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn goal_closure_execution_fixture(
+        root: &Path,
+        unsafe_turn: bool,
+    ) -> (CodexGoalClosureExecutionOptions, PathBuf) {
+        let harness_home = root.join("harness-home");
+        let projection_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        let authority_file = harness_home
+            .join("state")
+            .join("context-rollover")
+            .join("virtual-session-authority-receipts.jsonl");
+        let objective = "Close the historical goal through its original thread.";
+        let projection_checksum = codex_goal_checksum(objective, "active", None, &[]).unwrap();
+        let goal_checksum = codex_goal_checksum(objective, "active", None, &[]).unwrap();
+        append_json_line(
+            &authority_file,
+            &json!({
+                "schema": "agent-harness.virtual-session-authority.v1",
+                "queueId": "queue-original",
+                "virtualSessionId": "virtual-original",
+                "workingSessionKey": "session-original",
+                "laneDigest": "lane-original",
+                "backendContextGeneration": "backend-original",
+                "workingSetFile": "opaque-working-set-ref",
+                "status": "authoritative-v2",
+                "reason": "goal closure fake-server fixture",
+                "updatedAtMs": 10
+            }),
+        )
+        .unwrap();
+        append_json_line(
+            &projection_file,
+            &json!({
+                "schema": CODEX_GOAL_PROJECTION_SCHEMA,
+                "queueId": "queue-original",
+                "sessionKey": "session-original",
+                "sourceThreadId": "thread-original",
+                "goalReference": "goal-original",
+                "backendGoalRef": "goal-original",
+                "laneDigest": "lane-original",
+                "backendContextGeneration": "backend-original",
+                "objective": objective,
+                "status": "active",
+                "observationPhase": "owned-turn",
+                "turnRelation": "current-owned-turn",
+                "sourceFinalEligible": true,
+                "tokenBudget": null,
+                "completionCriteria": [],
+                "goalChecksum": goal_checksum,
+                "completionCriteriaChecksum": sha256_prefixed(b"[]"),
+                "projectionChecksum": projection_checksum,
+                "projectionComplete": true,
+                "observationOrder": 7,
+                "observedAtMs": 11
+            }),
+        )
+        .unwrap();
+        let authority = GoalClosureAuthorityV1 {
+            lane_digest: "lane-original".to_string(),
+            concrete_session_key: "session-original".to_string(),
+            virtual_session_id: "virtual-original".to_string(),
+            backend_context_generation: "backend-original".to_string(),
+            source_thread_id: "thread-original".to_string(),
+        };
+        let intent = GoalClosureIntentV1::new(
+            crate::goal_closure::GoalClosureTriggerV1::OperatorHistorical,
+            GoalClosureDispositionV1::Completed,
+            authority.clone(),
+            "goal-original",
+            "goal-generation-original",
+            Some(projection_checksum.clone()),
+            "operator-effect-original",
+            "operator confirmed historical completion",
+        )
+        .unwrap();
+        let resolution = resolve_goal_closure_target(
+            &intent,
+            &[GoalClosureTargetCandidateV1 {
+                authority,
+                goal_identity: "goal-original".to_string(),
+                goal_generation: "goal-generation-original".to_string(),
+                projection_checksum,
+                active: true,
+                original_binding: true,
+                latest_authoritative_projection: true,
+                latest_authoritative_lineage: true,
+            }],
+        );
+        let (executable, arguments, capture) =
+            goal_closure_fake_app_server_command(root, unsafe_turn);
+        (
+            CodexGoalClosureExecutionOptions {
+                harness_home,
+                intent,
+                resolution,
+                executable,
+                arguments,
+                working_directory: root.to_path_buf(),
+                codex_home: None,
+                timeout_ms: 10_000,
+            },
+            capture,
+        )
+    }
+
+    #[cfg(windows)]
+    fn goal_closure_fake_app_server_command(
+        root: &Path,
+        unsafe_turn: bool,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("goal-closure-fake-app-server.ps1");
+        let capture = root.join("goal-closure-fake-input.jsonl");
+        let source = r#"
+$capture = Join-Path $PSScriptRoot 'goal-closure-fake-input.jsonl'
+$unsafeTurn = __UNSAFE__
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    Add-Content -LiteralPath $capture -Value $line
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/resume') {
+        if ($unsafeTurn) {
+            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-original","turn":{"id":"turn-forbidden","kind":"regular"}}}')
+            [Console]::Out.Flush()
+        }
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-original"}}}')
+        [Console]::Out.WriteLine('{"method":"thread/goal/updated","params":{"threadId":"thread-original","goal":{"id":"goal-original","objective":"Close the historical goal through its original thread.","status":"active"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/goal/set') {
+        [Console]::Out.WriteLine('{"id":2,"result":{"goal":{"id":"goal-original","status":"completed"}}}')
+        [Console]::Out.WriteLine('{"method":"thread/goal/updated","params":{"threadId":"thread-original","goal":{"id":"goal-original","objective":"Close the historical goal through its original thread.","status":"completed"}}}')
+        [Console]::Out.Flush()
+    }
+}
+"#
+        .replace("__UNSAFE__", if unsafe_turn { "$true" } else { "$false" });
+        fs::write(&script, source).unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+            capture,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn goal_closure_fake_app_server_command(
+        root: &Path,
+        unsafe_turn: bool,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("goal-closure-fake-app-server.sh");
+        let capture = root.join("goal-closure-fake-input.jsonl");
+        let source = r#"
+capture="$(dirname "$0")/goal-closure-fake-input.jsonl"
+unsafe_turn=__UNSAFE__
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$capture"
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/resume"'*)
+            if [ "$unsafe_turn" = true ]; then
+                printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-original","turn":{"id":"turn-forbidden","kind":"regular"}}}'
+            fi
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-original"}}}'
+            printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-original","goal":{"id":"goal-original","objective":"Close the historical goal through its original thread.","status":"active"}}}'
+            ;;
+        *'"method":"thread/goal/set"'*)
+            printf '%s\n' '{"id":2,"result":{"goal":{"id":"goal-original","status":"completed"}}}'
+            printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-original","goal":{"id":"goal-original","objective":"Close the historical goal through its original thread.","status":"completed"}}}'
+            ;;
+    esac
+done
+"#
+        .replace("__UNSAFE__", if unsafe_turn { "true" } else { "false" });
+        fs::write(&script, source).unwrap();
+        make_executable(&script);
+        (
+            PathBuf::from("sh"),
+            vec![script.display().to_string()],
+            capture,
+        )
+    }
 
     #[test]
     fn server_overloaded_metadata_survives_protocol_parsing() {
@@ -17964,7 +19298,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
-        assert_eq!(report.receipt.event_count, 5);
+        assert_eq!(report.receipt.event_count, 6);
         assert_eq!(
             report
                 .receipt
@@ -18501,10 +19835,8 @@ mod tests {
     }
 
     #[test]
-    fn run_codex_runtime_owned_events_default_off_preserves_legacy_child_authority() {
-        let root = temp_root(
-            "run_codex_runtime_owned_events_default_off_preserves_legacy_child_authority",
-        );
+    fn effective_parent_completion_ignores_interleaved_subagent_final() {
+        let root = temp_root("effective_parent_completion_ignores_interleaved_subagent_final");
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
         enqueue_and_prepare(&source, &harness_home);
@@ -18536,15 +19868,15 @@ mod tests {
                 .usage
                 .as_ref()
                 .and_then(|usage| usage.total_tokens),
-            Some(999),
-            "default-off must retain the pre-rollout authority decision"
+            Some(42),
+            "the safe effective default must retain parent-owned usage"
         );
         assert!(
             report
                 .warnings
                 .iter()
-                .all(|warning| !warning.contains("foreign Codex event")),
-            "off mode must not emit ownership divergence warnings: {:?}",
+                .any(|warning| warning.contains("quarantined foreign Codex event")),
+            "the safe effective default must record bounded quarantine evidence: {:?}",
             report.warnings
         );
         let transcript = fs::read_to_string(
@@ -18557,7 +19889,9 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(transcript.contains("CROSS THREAD CHILD TEXT"));
+        assert!(transcript.contains("Exact parent final."));
+        assert!(!transcript.contains("CHILD FINAL MUST BE QUARANTINED"));
+        assert!(!transcript.contains("CROSS THREAD CHILD TEXT"));
         let binding: Value = serde_json::from_slice(
             &fs::read(codex_active_turn_binding_file(
                 &harness_home,
@@ -18566,15 +19900,15 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(binding["activeTurnId"], "turn-child");
+        assert_eq!(binding["activeTurnId"], "turn-parent");
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn run_codex_runtime_owned_events_shadow_observes_without_changing_legacy_authority() {
+    fn run_codex_runtime_owned_events_shadow_keeps_parent_completion_authoritative() {
         let root = temp_root(
-            "run_codex_runtime_owned_events_shadow_observes_without_changing_legacy_authority",
+            "run_codex_runtime_owned_events_shadow_keeps_parent_completion_authoritative",
         );
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -18608,8 +19942,8 @@ mod tests {
                 .usage
                 .as_ref()
                 .and_then(|usage| usage.total_tokens),
-            Some(999),
-            "shadow mode must observe only and retain legacy authority"
+            Some(42),
+            "shadow diagnostics must not grant child completion authority"
         );
         assert!(
             report
@@ -18637,7 +19971,9 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(transcript.contains("CROSS THREAD CHILD TEXT"));
+        assert!(transcript.contains("Exact parent final."));
+        assert!(!transcript.contains("CHILD FINAL MUST BE QUARANTINED"));
+        assert!(!transcript.contains("CROSS THREAD CHILD TEXT"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -18921,9 +20257,9 @@ mod tests {
     }
 
     #[test]
-    fn run_codex_runtime_owned_events_agent_cohort_keeps_other_agents_on_legacy_path() {
+    fn run_codex_runtime_owned_events_agent_cohort_never_restores_foreign_completion_authority() {
         let root = temp_root(
-            "run_codex_runtime_owned_events_agent_cohort_keeps_other_agents_on_legacy_path",
+            "run_codex_runtime_owned_events_agent_cohort_never_restores_foreign_completion_authority",
         );
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -18957,8 +20293,8 @@ mod tests {
                 .usage
                 .as_ref()
                 .and_then(|usage| usage.total_tokens),
-            Some(999),
-            "main is outside the enabled cohort and must retain the legacy authority path"
+            Some(42),
+            "cohort exclusion may reduce diagnostics but cannot grant child completion authority"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -19640,7 +20976,8 @@ mod tests {
         fs::write(
             execution_dir.join("codex-runtime-run.stdout.jsonl"),
             r#"{"id":1,"result":{"thread":{"id":"thread-recovered"}}}
-{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-recovered","text":"Recovered final reply.","phase":"final_answer"},"threadId":"thread-recovered","completedAtMs":1234}}
+{"method":"turn/started","params":{"threadId":"thread-recovered","turn":{"id":"turn-recovered","kind":"regular"}}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-recovered","text":"Recovered final reply.","phase":"final_answer"},"threadId":"thread-recovered","turnId":"turn-recovered","completedAtMs":1234}}
 {"method":"turn/completed","params":{"threadId":"thread-recovered","turn":{"id":"turn-recovered","status":"completed","usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}}}
 "#,
         )
@@ -19658,7 +20995,7 @@ mod tests {
 
         assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
         assert!(report.receipt.reason.contains("recovered completed"));
-        assert_eq!(report.receipt.event_count, 3);
+        assert_eq!(report.receipt.event_count, 4);
         assert_eq!(
             report
                 .receipt
@@ -19693,8 +21030,9 @@ mod tests {
         fs::write(
             execution_dir.join("codex-runtime-run.stdout.jsonl"),
             r#"{"id":1,"result":{"thread":{"id":"thread-narration-only"}}}
-{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-progress-1","text":"I will generate six separate images.","phase":"commentary"},"threadId":"thread-narration-only","completedAtMs":1234}}
-{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-progress-2","text":"Six images are generated; checking local receipts.","phase":"commentary"},"threadId":"thread-narration-only","completedAtMs":1235}}
+{"method":"turn/started","params":{"threadId":"thread-narration-only","turn":{"id":"turn-narration-only","kind":"regular"}}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-progress-1","text":"I will generate six separate images.","phase":"commentary"},"threadId":"thread-narration-only","turnId":"turn-narration-only","completedAtMs":1234}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-progress-2","text":"Six images are generated; checking local receipts.","phase":"commentary"},"threadId":"thread-narration-only","turnId":"turn-narration-only","completedAtMs":1235}}
 {"method":"turn/completed","params":{"threadId":"thread-narration-only","turn":{"id":"turn-narration-only","status":"completed","usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}}}
 "#,
         )
@@ -19724,6 +21062,51 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("progress-panel narration was not used"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stdout_recovery_ignores_foreign_subagent_final() {
+        let root = temp_root("stdout_recovery_ignores_foreign_subagent_final");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let execution_dir = plan_report.execution_dir.as_ref().unwrap();
+        fs::write(
+            execution_dir.join("codex-runtime-run.stdout.jsonl"),
+            r#"{"id":1,"result":{"thread":{"id":"thread-test"}}}
+{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-parent","kind":"regular"}}}
+{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-child","kind":"subAgent"}}}
+{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-child","item":{"type":"agentMessage","id":"child-final","text":"RECOVERED CHILD FINAL MUST BE QUARANTINED","phase":"final_answer"}}}
+{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-child","status":"completed","usage":{"inputTokens":900,"outputTokens":99,"totalTokens":999}}}}
+"#,
+        )
+        .unwrap();
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(
+            report.completion.is_none(),
+            "foreign child completion must not manufacture a recovered parent completion"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -20324,6 +21707,8 @@ mod tests {
                 lane_digest: Some("lane-goal".to_string()),
                 backend_context_generation: Some("generation-goal".to_string()),
                 current_thread_id: Some("thread-goal".to_string()),
+                observation_phase: GoalProjectionObservationPhaseV1::OwnedTurn,
+                owned_turn_id: Some("turn-goal-1".to_string()),
                 latest_by_thread: BTreeMap::new(),
             }),
             ..CodexProtocolState::default()
@@ -20394,6 +21779,118 @@ mod tests {
         assert_eq!(projections[2].source_thread_id, "thread-without-prior");
         assert!(!projections[2].projection_complete);
         assert!(projections[2].projection_reason.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn goal_projection_observer_marks_resume_settle_as_historical() {
+        let root = temp_root("goal-projection-resume-settle-historical");
+        let receipts_file = root
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        let mut state = CodexProtocolState {
+            goal_projection_observer: Some(CodexGoalProjectionObserver {
+                receipts_file: receipts_file.clone(),
+                queue_id: Some("queue-fresh".to_string()),
+                session_key: "session-goal".to_string(),
+                lane_digest: Some("lane-goal".to_string()),
+                backend_context_generation: Some("generation-goal".to_string()),
+                current_thread_id: Some("thread-goal".to_string()),
+                observation_phase: GoalProjectionObservationPhaseV1::ResumeSettle,
+                owned_turn_id: None,
+                latest_by_thread: BTreeMap::new(),
+            }),
+            ..CodexProtocolState::default()
+        };
+        state.event_count = 1;
+        record_protocol_usage_event(
+            &json!({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-goal",
+                    "turnId": "turn-historical",
+                    "goal": {
+                        "id": "backend-goal-1",
+                        "objective": "completed historical campaign",
+                        "status": "completed"
+                    }
+                }
+            }),
+            &mut state,
+        );
+
+        let projection: CodexGoalProjectionV1 = serde_json::from_str(
+            fs::read_to_string(&receipts_file)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            projection.observation_phase,
+            GoalProjectionObservationPhaseV1::ResumeSettle
+        );
+        assert_eq!(
+            projection.turn_relation,
+            GoalProjectionTurnRelationV1::HistoricalThreadState
+        );
+        assert!(!projection.source_final_eligible);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn goal_projection_observer_marks_exact_owned_turn_as_current() {
+        let root = temp_root("goal-projection-owned-turn-current");
+        let receipts_file = root
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        let mut state = CodexProtocolState {
+            goal_projection_observer: Some(CodexGoalProjectionObserver {
+                receipts_file: receipts_file.clone(),
+                queue_id: Some("queue-owned".to_string()),
+                session_key: "session-goal".to_string(),
+                lane_digest: Some("lane-goal".to_string()),
+                backend_context_generation: Some("generation-goal".to_string()),
+                current_thread_id: Some("thread-goal".to_string()),
+                observation_phase: GoalProjectionObservationPhaseV1::OwnedTurn,
+                owned_turn_id: Some("turn-owned".to_string()),
+                latest_by_thread: BTreeMap::new(),
+            }),
+            ..CodexProtocolState::default()
+        };
+        state.event_count = 1;
+        record_protocol_usage_event(
+            &json!({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-goal",
+                    "turnId": "turn-owned",
+                    "goal": {
+                        "id": "backend-goal-1",
+                        "objective": "finish current campaign",
+                        "status": "completed"
+                    }
+                }
+            }),
+            &mut state,
+        );
+
+        let projection: CodexGoalProjectionV1 = serde_json::from_str(
+            fs::read_to_string(&receipts_file)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            projection.turn_relation,
+            GoalProjectionTurnRelationV1::CurrentOwnedTurn
+        );
+        assert!(projection.source_final_eligible);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -20692,8 +22189,11 @@ mod tests {
             harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
-            idle_timeout_ms: 10_000,
+            // This fixture launches Windows PowerShell after the serial suite has
+            // exercised many child processes; leave enough absolute budget for a
+            // cold process start before testing the compact-before-turn behavior.
+            timeout_ms: if cfg!(windows) { 30_000 } else { 10_000 },
+            idle_timeout_ms: if cfg!(windows) { 30_000 } else { 10_000 },
             progress_context: None,
         })
         .unwrap();
@@ -21808,6 +23308,8 @@ mod tests {
                 exact_lane_digest: format!("sha256:{}", "1".repeat(64)),
                 logical_lineage_id: format!("sha256:{}", "2".repeat(64)),
                 source_queue_id: format!("sha256:{}", "3".repeat(64)),
+                source_session_key_digest: format!("sha256:{}", "4".repeat(64)),
+                approval_authority_digest: format!("sha256:{}", "5".repeat(64)),
             },
             policy: crate::ConnectorApprovalPolicyV1::default(),
         });
@@ -21841,12 +23343,24 @@ mod tests {
         assert_eq!(response["result"]["content"], Value::Null);
         let parked = state.parked_external_effect.as_ref().unwrap();
         assert_eq!(parked.state, ExternalEffectStateV1::ApprovalRequired);
-        assert!(parked.approval_token.is_some());
-        assert!(
-            state
-                .assistant_message_with_harness_notices()
-                .contains("generic timeout recovery")
-        );
+        let raw_token = parked
+            .approval_token
+            .as_ref()
+            .map(|token| token.token.clone())
+            .unwrap();
+        let notice = state.assistant_message_with_harness_notices();
+        assert!(notice.contains("generic timeout recovery"));
+        assert!(notice.contains("protected exact-lane approval flow"));
+        assert!(!notice.contains(&raw_token));
+        assert!(!notice.contains("ahx1_"));
+        assert!(!notice.contains("approvalToken="));
+        let wait_reason = match external_effect_protocol_wait(&state).unwrap() {
+            ProtocolWait::Canceled(reason) => reason,
+            _ => panic!("parked external effect must cancel the protocol wait"),
+        };
+        assert!(!wait_reason.contains(&raw_token));
+        assert!(!wait_reason.contains("ahx1_"));
+        assert!(!wait_reason.contains("approvalToken="));
         assert!(state.external_effect_protocol_failure.is_none());
         let transitions =
             fs::read_to_string(crate::external_effect_transition_file(&harness_home)).unwrap();
@@ -21892,6 +23406,21 @@ mod tests {
             .as_ref()
             .map(|token| token.token.clone())
             .unwrap();
+        let serialized_receipt = serde_json::to_string(&first.receipt).unwrap();
+        assert!(!first.receipt.reason.contains(&token));
+        assert!(!first.receipt.reason.contains("ahx1_"));
+        assert!(!first.receipt.reason.contains("approvalToken="));
+        assert!(!serialized_receipt.contains(&token));
+        assert!(!serialized_receipt.contains("ahx1_"));
+        assert!(!serialized_receipt.contains("approvalToken="));
+        let persisted_run = fs::read_to_string(first.run_file.as_ref().unwrap()).unwrap();
+        assert!(!persisted_run.contains(&token));
+        assert!(!persisted_run.contains("ahx1_"));
+        assert!(!persisted_run.contains("approvalToken="));
+        let persisted_receipts = fs::read_to_string(&first.receipts_file).unwrap();
+        assert!(!persisted_receipts.contains(&token));
+        assert!(!persisted_receipts.contains("ahx1_"));
+        assert!(!persisted_receipts.contains("approvalToken="));
         let lane_digest = parked.exact_lane_digest.clone();
         let effect_id = parked.effect_id.clone();
         let responses = fs::read_to_string(root.join("mcp-app-server-responses.jsonl")).unwrap();
@@ -21949,6 +23478,8 @@ mod tests {
             exact_lane_digest: format!("sha256:{}", "4".repeat(64)),
             logical_lineage_id: format!("sha256:{}", "5".repeat(64)),
             source_queue_id: format!("sha256:{}", "6".repeat(64)),
+            source_session_key_digest: format!("sha256:{}", "7".repeat(64)),
+            approval_authority_digest: format!("sha256:{}", "8".repeat(64)),
         };
         let runtime_context = CodexExternalEffectRuntimeContext {
             harness_home: harness_home.clone(),
@@ -22720,11 +24251,12 @@ while ($true) {
         }
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}')
         if (Test-Path -LiteralPath $webSearchEvent) {
             [Console]::Out.WriteLine('{"method":"item/started","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"web-test","type":"webSearch","query":"private fixture query","action":{"type":"search","query":"private fixture query","queries":["private fixture query"]}}}}')
         }
-        [Console]::Out.WriteLine(('{"method":"item/agentMessage/delta","params":{"delta":"Fake assistant reply. method=' + $threadMethod + '"}}'))
-        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
+        [Console]::Out.WriteLine(('{"method":"item/agentMessage/delta","params":{"threadId":"thread-test","turnId":"turn-test","itemId":"msg-test","delta":"Fake assistant reply. method=' + $threadMethod + '"}}'))
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
         [Console]::Out.Flush()
         break
     }
@@ -23007,6 +24539,7 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}')
         [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Final before notLoaded terminal.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[],"itemsView":"notLoaded"}}}')
         [Console]::Out.Flush()
@@ -23072,7 +24605,7 @@ while ($true) {{
             $steerId = [int]$steer.id
         }} catch {{}}
         [Console]::Out.WriteLine(('{{"id":' + $steerId + ',"result":{{"turnId":"turn-test"}}}}'))
-        [Console]::Out.WriteLine('{{"method":"item/agentMessage/delta","params":{{"delta":"Steered reply."}}}}')
+        [Console]::Out.WriteLine('{{"method":"item/agentMessage/delta","params":{{"threadId":"thread-test","turnId":"turn-test","itemId":"msg-test","delta":"Steered reply."}}}}')
         [Console]::Out.WriteLine('{{"method":"turn/completed","params":{{"threadId":"thread-test","turn":{{"id":"turn-test","status":"completed","usage":{{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}}}}}')
         [Console]::Out.Flush()
         break
@@ -23125,14 +24658,16 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
-        Start-Sleep -Milliseconds 2500
-        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"Slow "}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}')
         [Console]::Out.Flush()
         Start-Sleep -Milliseconds 2500
-        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"stream reply."}}')
+        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"threadId":"thread-test","turnId":"turn-test","itemId":"msg-test","delta":"Slow "}}')
         [Console]::Out.Flush()
         Start-Sleep -Milliseconds 2500
-        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed"}}}')
+        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"threadId":"thread-test","turnId":"turn-test","itemId":"msg-test","delta":"stream reply."}}')
+        [Console]::Out.Flush()
+        Start-Sleep -Milliseconds 2500
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}')
         [Console]::Out.Flush()
         break
     }
@@ -23283,7 +24818,8 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
-        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"stdout holder reply","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"stdout holder reply","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}')
         [Console]::Out.Flush()
         $holder = Join-Path $PSScriptRoot 'stdout-holder.ps1'
@@ -23339,6 +24875,7 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-failed","kind":"regular"}}}')
         [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"Missing environment variable: `OPENROUTER_API_KEY`.","codexErrorInfo":"other","additionalDetails":null},"willRetry":false,"threadId":"thread-test","turnId":"turn-failed"}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"Missing environment variable: `OPENROUTER_API_KEY`."}}}}')
         [Console]::Out.Flush()
@@ -23479,8 +25016,10 @@ while ($true) {
         [Console]::Out.WriteLine($updated)
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
-        $item = @{ method = 'item/completed'; params = @{ item = @{ type = 'agentMessage'; id = 'msg-test'; text = 'Reordered compact reply.'; phase = 'final_answer' }; threadId = $thread } } | ConvertTo-Json -Compress -Depth 8
+        $started = @{ method = 'turn/started'; params = @{ threadId = $thread; turn = @{ id = 'turn-test'; kind = 'regular' } } } | ConvertTo-Json -Compress -Depth 8
+        $item = @{ method = 'item/completed'; params = @{ item = @{ type = 'agentMessage'; id = 'msg-test'; text = 'Reordered compact reply.'; phase = 'final_answer' }; threadId = $thread; turnId = 'turn-test' } } | ConvertTo-Json -Compress -Depth 8
         $completed = @{ method = 'turn/completed'; params = @{ threadId = $thread; turn = @{ id = 'turn-test'; status = 'completed' } } } | ConvertTo-Json -Compress -Depth 8
+        [Console]::Out.WriteLine($started)
         [Console]::Out.WriteLine($item)
         [Console]::Out.WriteLine($completed)
         [Console]::Out.Flush()
@@ -23541,7 +25080,8 @@ while ($true) {
         [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
-        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Compacted reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Compacted reply.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
         [Console]::Out.Flush()
         break
@@ -23608,11 +25148,13 @@ while ($true) {
     } elseif ($msg.method -eq 'turn/start') {
         if ((Test-Path -LiteralPath $resumed) -and !(Test-Path -LiteralPath $first)) {
             Set-Content -LiteralPath $first -Value 'failed'
+            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-bloated","turn":{"id":"turn-failed","kind":"regular"}}}')
             [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"},"willRetry":true,"threadId":"thread-bloated","turnId":"turn-failed"}}')
             [Console]::Out.Flush()
             break
         }
-        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-fresh","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-fresh","turn":{"id":"turn-fresh","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-fresh","turnId":"turn-fresh","completedAtMs":1234}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-fresh","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}')
         [Console]::Out.Flush()
         break
@@ -23684,6 +25226,7 @@ while ($true) {
             [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-before-user","status":"completed","items":[],"itemsView":"notLoaded"}}}')
             $compactBoundarySent = $true
         }
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}')
         [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Reply after compact turn boundary.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
         [Console]::Out.Flush()
@@ -23733,6 +25276,7 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[]}}}')
         [Console]::Out.Flush()
         break
@@ -23779,6 +25323,7 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}')
         [Console]::Out.WriteLine('{"id":77,"method":"item/commandExecution/requestApproval","params":{}}')
         [Console]::Out.Flush()
         $null = [Console]::In.ReadLine()
@@ -23851,7 +25396,8 @@ while ($true) {
             break
         }
     } elseif ($msg.method -eq 'turn/start') {
-        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-fresh","completedAtMs":1234}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}')
         [Console]::Out.Flush()
         break
@@ -23914,12 +25460,14 @@ while ($true) {
     } elseif ($msg.method -eq 'turn/start') {
         if (!(Test-Path -LiteralPath $marker)) {
             Set-Content -LiteralPath $marker -Value 'failed'
+            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-failed","kind":"regular"}}}')
             [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"ContextWindowExceeded: ran out of room in the model context window."},"threadId":"thread-test","turnId":"turn-failed"}}')
             [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"ContextWindowExceeded: ran out of room in the model context window."}}}}')
             [Console]::Out.Flush()
             break
         }
-        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Recovered after compact.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Recovered after compact.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":20,"outputTokens":8,"totalTokens":28}}}}')
         [Console]::Out.Flush()
         break
@@ -23982,12 +25530,14 @@ while ($true) {
     } elseif ($msg.method -eq 'turn/start') {
         if (!(Test-Path -LiteralPath $first)) {
             Set-Content -LiteralPath $first -Value 'failed'
+            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-failed","kind":"regular"}}}')
             [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"ContextWindowExceeded: ran out of room in the model context window."},"threadId":"thread-test","turnId":"turn-failed"}}')
             [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"ContextWindowExceeded: ran out of room in the model context window."}}}}')
             [Console]::Out.Flush()
             break
         }
-        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-fresh","completedAtMs":1234}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}')
         [Console]::Out.Flush()
         break
@@ -24207,6 +25757,7 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
         *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}'
             printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Final before notLoaded terminal.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[],"itemsView":"notLoaded"}}}'
             exit 0
@@ -24246,7 +25797,7 @@ while IFS= read -r line; do
             steer_id=$(printf '%s' "$steer_line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
             if [ -z "$steer_id" ]; then steer_id=10000; fi
             printf '%s\n' '{{"id":'"$steer_id"',"result":{{"turnId":"turn-test"}}}}'
-            printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"delta":"Steered reply."}}}}'
+            printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"threadId":"thread-test","turnId":"turn-test","itemId":"msg-test","delta":"Steered reply."}}}}'
             printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-test","turn":{{"id":"turn-test","status":"completed","usage":{{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}}}}}'
             exit 0
             ;;
@@ -24277,12 +25828,13 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
         *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}'
             sleep 2.5
-            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Slow "}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-test","turnId":"turn-test","itemId":"msg-test","delta":"Slow "}}'
             sleep 2.5
-            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"stream reply."}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-test","turnId":"turn-test","itemId":"msg-test","delta":"stream reply."}}'
             sleep 2.5
-            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}'
             break
             ;;
     esac
@@ -24312,7 +25864,8 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
         *'"method":"turn/start"'*)
-            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"stdout holder reply","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"stdout holder reply","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}'
             sleep 5 &
             exit 0
@@ -24344,6 +25897,7 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
         *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-failed","kind":"regular"}}}'
             printf '%s\n' '{"method":"error","params":{"error":{"message":"Missing environment variable: `OPENROUTER_API_KEY`.","codexErrorInfo":"other","additionalDetails":null},"willRetry":false,"threadId":"thread-test","turnId":"turn-failed"}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"Missing environment variable: `OPENROUTER_API_KEY`."}}}}'
             exit 0
@@ -24451,7 +26005,8 @@ while IFS= read -r line; do
             printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-fresh","goal":{"objective":"Preserve the sanitized campaign goal across rollover.","status":"active","tokenBudget":10000,"completionCriteria":["verified rollover"]}}}'
             ;;
         *'"method":"turn/start"'*)
-            printf '%s\n' "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg-test\",\"text\":\"Reordered compact reply.\",\"phase\":\"final_answer\"},\"threadId\":\"$thread\"}}"
+            printf '%s\n' "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"$thread\",\"turn\":{\"id\":\"turn-test\",\"kind\":\"regular\"}}}"
+            printf '%s\n' "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg-test\",\"text\":\"Reordered compact reply.\",\"phase\":\"final_answer\"},\"threadId\":\"$thread\",\"turnId\":\"turn-test\"}}"
             printf '%s\n' "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"$thread\",\"turn\":{\"id\":\"turn-test\",\"status\":\"completed\"}}}"
             exit 0
             ;;
@@ -24492,7 +26047,8 @@ while IFS= read -r line; do
             printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
             ;;
         *'"method":"turn/start"'*)
-            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Compacted reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Compacted reply.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
             exit 0
             ;;
@@ -24547,10 +26103,12 @@ while IFS= read -r line; do
         *'"method":"turn/start"'*)
             if [ -f "$resumed" ] && [ ! -f "$first" ]; then
                 printf failed > "$first"
+                printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-bloated","turn":{"id":"turn-failed","kind":"regular"}}}'
                 printf '%s\n' '{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"},"willRetry":true,"threadId":"thread-bloated","turnId":"turn-failed"}}'
                 exit 0
             fi
-            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-fresh","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-fresh","turn":{"id":"turn-fresh","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-fresh","turnId":"turn-fresh","completedAtMs":1234}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-fresh","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}'
             exit 0
             ;;
@@ -24607,6 +26165,7 @@ while IFS= read -r line; do
                 printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-before-user","status":"completed","items":[],"itemsView":"notLoaded"}}}'
                 compact_boundary_sent=1
             fi
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}'
             printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Reply after compact turn boundary.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
             exit 0
@@ -24646,6 +26205,7 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
         *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[]}}}'
             exit 0
             ;;
@@ -24679,6 +26239,7 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
         *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}'
             printf '%s\n' '{"id":77,"method":"item/commandExecution/requestApproval","params":{}}'
             IFS= read -r _approval_response || true
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[]}}}'
@@ -24742,7 +26303,8 @@ while IFS= read -r line; do
             esac
             ;;
         *'"method":"turn/start"'*)
-            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-fresh","completedAtMs":1234}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}'
             exit 0
             ;;
@@ -24792,11 +26354,13 @@ while IFS= read -r line; do
         *'"method":"turn/start"'*)
             if [ ! -f "$marker" ]; then
                 printf failed > "$marker"
+                printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-failed","kind":"regular"}}}'
                 printf '%s\n' '{"method":"error","params":{"error":{"message":"ContextWindowExceeded: ran out of room in the model context window."},"threadId":"thread-test","turnId":"turn-failed"}}'
                 printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"ContextWindowExceeded: ran out of room in the model context window."}}}}'
                 exit 0
             fi
-            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Recovered after compact.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Recovered after compact.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":20,"outputTokens":8,"totalTokens":28}}}}'
             exit 0
             ;;
@@ -24845,11 +26409,13 @@ while IFS= read -r line; do
         *'"method":"turn/start"'*)
             if [ ! -f "$first" ]; then
                 printf failed > "$first"
+                printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-failed","kind":"regular"}}}'
                 printf '%s\n' '{"method":"error","params":{"error":{"message":"ContextWindowExceeded: ran out of room in the model context window."},"threadId":"thread-test","turnId":"turn-failed"}}'
                 printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"ContextWindowExceeded: ran out of room in the model context window."}}}}'
                 exit 0
             fi
-            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-fresh","completedAtMs":1234}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}'
             exit 0
             ;;

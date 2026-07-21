@@ -42,6 +42,32 @@ pub enum GoalLineageDisposition {
     InvalidIdentity,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GoalProjectionObservationPhaseV1 {
+    ResumeSettle,
+    OwnedTurn,
+    GoalRehydration,
+    CompactMaintenance,
+    StdoutRecovery,
+    GovernedClosure,
+    #[default]
+    #[serde(other)]
+    LegacyUnknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GoalProjectionTurnRelationV1 {
+    CurrentOwnedTurn,
+    ExplicitCampaignContinuation,
+    HistoricalThreadState,
+    AuthoritativeGoalClosure,
+    #[default]
+    #[serde(other)]
+    Uncorrelated,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalLineageV1 {
@@ -63,6 +89,12 @@ pub struct GoalLineageV1 {
     pub goal_checksum: String,
     pub projection_checksum: String,
     pub goal_status: String,
+    #[serde(default)]
+    pub observation_phase: GoalProjectionObservationPhaseV1,
+    #[serde(default)]
+    pub turn_relation: GoalProjectionTurnRelationV1,
+    #[serde(default)]
+    pub source_final_eligible: bool,
     pub observation_order: u64,
     pub observed_at_ms: i64,
     pub authority_observed_at_ms: Option<i64>,
@@ -138,6 +170,9 @@ pub struct GoalProjectionHint {
     pub lane_digest: Option<String>,
     pub backend_context_generation: Option<String>,
     pub status: String,
+    pub observation_phase: GoalProjectionObservationPhaseV1,
+    pub turn_relation: GoalProjectionTurnRelationV1,
+    pub source_final_eligible: bool,
     pub goal_checksum: String,
     pub projection_checksum: String,
     pub projection_complete: bool,
@@ -164,6 +199,12 @@ struct GoalProjectionReceipt {
     backend_context_generation: Option<String>,
     objective: String,
     status: String,
+    #[serde(default)]
+    observation_phase: GoalProjectionObservationPhaseV1,
+    #[serde(default)]
+    turn_relation: GoalProjectionTurnRelationV1,
+    #[serde(default)]
+    source_final_eligible: bool,
     goal_checksum: String,
     projection_checksum: String,
     #[serde(default = "goal_projection_complete_default")]
@@ -229,6 +270,13 @@ pub fn latest_goal_projection_for_queue(
             lane_digest: projection.lane_digest,
             backend_context_generation: projection.backend_context_generation,
             status: projection.status,
+            observation_phase: projection.observation_phase,
+            turn_relation: projection.turn_relation,
+            source_final_eligible: projection_source_final_is_eligible(
+                projection.source_final_eligible,
+                projection.observation_phase,
+                projection.turn_relation,
+            ),
             goal_checksum: projection.goal_checksum,
             projection_checksum: projection.projection_checksum,
             projection_complete: projection.projection_complete,
@@ -280,11 +328,15 @@ pub fn run_goal_lineage_doctor(
                 .backend_context_generation
                 .as_deref()
                 .unwrap_or_default(),
-            projection.backend_goal_ref.as_deref().unwrap_or_default()
+            projection_goal_identity(projection)
         );
         let replace = latest_projections.get(&key).is_none_or(|current| {
-            (projection.observed_at_ms, projection.observation_order)
-                >= (current.observed_at_ms, current.observation_order)
+            let current_is_closure = is_authoritative_terminal_closure(current);
+            let incoming_is_closure = is_authoritative_terminal_closure(projection);
+            (incoming_is_closure && !current_is_closure)
+                || (incoming_is_closure == current_is_closure
+                    && (projection.observed_at_ms, projection.observation_order)
+                        >= (current.observed_at_ms, current.observation_order))
         });
         if replace {
             latest_projections.insert(key, projection.clone());
@@ -312,11 +364,11 @@ pub fn run_goal_lineage_doctor(
             "objectiveChecksum": objective_checksum,
         });
         let campaign_family_id = checksum_json(&family_payload)?;
-        let goal_reference = if projection.goal_reference.trim().is_empty() {
-            projection.goal_checksum.clone()
-        } else {
-            projection.goal_reference.clone()
-        };
+        // Use the same durable identity for both projection selection and the
+        // emitted lineage. Newer receipts carry `backendGoalRef` without the
+        // legacy `goalReference` field, so falling straight back to the
+        // checksum would make an otherwise runnable goal appear unrelated.
+        let goal_reference = projection_goal_identity(&projection).to_string();
         let lineage_payload = serde_json::json!({
             "campaignFamilyId": campaign_family_id,
             "backendContextGeneration": projection.backend_context_generation,
@@ -378,6 +430,13 @@ pub fn run_goal_lineage_doctor(
             goal_checksum: projection.goal_checksum,
             projection_checksum: projection.projection_checksum,
             goal_status: projection.status,
+            observation_phase: projection.observation_phase,
+            turn_relation: projection.turn_relation,
+            source_final_eligible: projection_source_final_is_eligible(
+                projection.source_final_eligible,
+                projection.observation_phase,
+                projection.turn_relation,
+            ),
             observation_order: projection.observation_order,
             observed_at_ms: projection.observed_at_ms,
             authority_observed_at_ms: authority.map(|value| value.updated_at_ms),
@@ -777,6 +836,39 @@ fn goal_projection_complete_default() -> bool {
     true
 }
 
+fn projection_goal_identity(projection: &GoalProjectionReceipt) -> &str {
+    projection
+        .backend_goal_ref
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            (!projection.goal_reference.trim().is_empty())
+                .then_some(projection.goal_reference.as_str())
+        })
+        .unwrap_or(projection.goal_checksum.as_str())
+}
+
+fn is_authoritative_terminal_closure(projection: &GoalProjectionReceipt) -> bool {
+    projection.observation_phase == GoalProjectionObservationPhaseV1::GovernedClosure
+        && projection.turn_relation == GoalProjectionTurnRelationV1::AuthoritativeGoalClosure
+        && !projection.source_final_eligible
+        && !is_active_status(&projection.status)
+}
+
+fn projection_source_final_is_eligible(
+    claimed_eligible: bool,
+    observation_phase: GoalProjectionObservationPhaseV1,
+    turn_relation: GoalProjectionTurnRelationV1,
+) -> bool {
+    claimed_eligible
+        && observation_phase != GoalProjectionObservationPhaseV1::LegacyUnknown
+        && matches!(
+            turn_relation,
+            GoalProjectionTurnRelationV1::CurrentOwnedTurn
+                | GoalProjectionTurnRelationV1::ExplicitCampaignContinuation
+        )
+}
+
 fn checksum_json(value: &impl Serialize) -> io::Result<String> {
     let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
     let hash = digest::digest(&digest::SHA256, &bytes);
@@ -1077,6 +1169,221 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn projection_reader_preserves_provenance_and_fails_closed_for_legacy_or_unknown_rows() {
+        let root = temp_root("projection_reader_preserves_provenance");
+        let home = root.join(".agent-harness");
+        let projection_file = home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        let base = |queue: &str| {
+            json!({
+                "schema": GOAL_PROJECTION_SCHEMA,
+                "queueId": queue,
+                "sessionKey": "session",
+                "sourceThreadId": "thread",
+                "sourceTurnId": "turn",
+                "goalReference": "goal-ref",
+                "backendGoalRef": "backend-goal-ref",
+                "laneDigest": "lane",
+                "backendContextGeneration": "generation",
+                "objective": "ship the integrated campaign",
+                "status": "active",
+                "goalChecksum": "goal-checksum",
+                "projectionChecksum": "projection-checksum",
+                "projectionComplete": true,
+                "observationOrder": 1,
+                "observedAtMs": 10
+            })
+        };
+        let mut current = base("queue-current");
+        current["observationPhase"] = json!("owned-turn");
+        current["turnRelation"] = json!("current-owned-turn");
+        current["sourceFinalEligible"] = json!(true);
+        append_jsonl_value(&projection_file, &current).unwrap();
+        append_jsonl_value(&projection_file, &base("queue-legacy")).unwrap();
+        let mut unknown = base("queue-unknown");
+        unknown["observationPhase"] = json!("future-maintenance-phase");
+        unknown["turnRelation"] = json!("future-turn-relation");
+        unknown["sourceFinalEligible"] = json!(true);
+        append_jsonl_value(&projection_file, &unknown).unwrap();
+
+        let current = latest_goal_projection_for_queue(&home, "queue-current")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.observation_phase,
+            GoalProjectionObservationPhaseV1::OwnedTurn
+        );
+        assert_eq!(
+            current.turn_relation,
+            GoalProjectionTurnRelationV1::CurrentOwnedTurn
+        );
+        assert!(current.source_final_eligible);
+
+        let legacy = latest_goal_projection_for_queue(&home, "queue-legacy")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            legacy.observation_phase,
+            GoalProjectionObservationPhaseV1::LegacyUnknown
+        );
+        assert_eq!(
+            legacy.turn_relation,
+            GoalProjectionTurnRelationV1::Uncorrelated
+        );
+        assert!(!legacy.source_final_eligible);
+
+        let unknown = latest_goal_projection_for_queue(&home, "queue-unknown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unknown.observation_phase,
+            GoalProjectionObservationPhaseV1::LegacyUnknown
+        );
+        assert_eq!(
+            unknown.turn_relation,
+            GoalProjectionTurnRelationV1::Uncorrelated
+        );
+        assert!(
+            !unknown.source_final_eligible,
+            "unknown provenance must override a claimed eligibility bit"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn late_active_projection_cannot_reopen_closed_generation() {
+        let root = temp_root("terminal_closure_precedence");
+        let home = root.join("home");
+        let projection_file = home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        let authority_file = home
+            .join("state")
+            .join("context-rollover")
+            .join("virtual-session-authority-receipts.jsonl");
+        write_authority(&authority_file, "queue", "session", "lane", "gen", 1);
+
+        let projection = |goal_ref: &str,
+                          status: &str,
+                          phase: &str,
+                          relation: &str,
+                          eligible: bool,
+                          order: u64,
+                          at: i64| {
+            json!({
+                "schema": GOAL_PROJECTION_SCHEMA,
+                "queueId": "queue",
+                "sessionKey": "session",
+                "sourceThreadId": "thread",
+                "sourceTurnId": "turn",
+                "backendGoalRef": goal_ref,
+                "laneDigest": "lane",
+                "backendContextGeneration": "gen",
+                "objective": "ship the integrated campaign",
+                "status": status,
+                "observationPhase": phase,
+                "turnRelation": relation,
+                "sourceFinalEligible": eligible,
+                "goalChecksum": format!("checksum-{goal_ref}"),
+                "projectionChecksum": format!("projection-{order}"),
+                "projectionComplete": true,
+                "observationOrder": order,
+                "observedAtMs": at
+            })
+        };
+        append_jsonl_value(
+            &projection_file,
+            &projection(
+                "goal-1",
+                "active",
+                "owned-turn",
+                "current-owned-turn",
+                true,
+                1,
+                10,
+            ),
+        )
+        .unwrap();
+        append_jsonl_value(
+            &projection_file,
+            &projection(
+                "goal-1",
+                "completed",
+                "governed-closure",
+                "authoritative-goal-closure",
+                false,
+                2,
+                20,
+            ),
+        )
+        .unwrap();
+        append_jsonl_value(
+            &projection_file,
+            &projection(
+                "goal-1",
+                "active",
+                "owned-turn",
+                "current-owned-turn",
+                true,
+                3,
+                30,
+            ),
+        )
+        .unwrap();
+
+        let closed = run_goal_lineage_doctor(GoalLineageDoctorOptions {
+            harness_home: home.clone(),
+            lane_digest: None,
+            virtual_session_id: None,
+        })
+        .unwrap();
+        assert_eq!(closed.lineages.len(), 1);
+        assert_eq!(closed.lineages[0].goal_status, "completed");
+        assert_eq!(
+            closed.lineages[0].observation_phase,
+            GoalProjectionObservationPhaseV1::GovernedClosure
+        );
+        assert!(!closed.lineages[0].runnable);
+
+        append_jsonl_value(
+            &projection_file,
+            &projection(
+                "goal-2",
+                "active",
+                "owned-turn",
+                "current-owned-turn",
+                true,
+                4,
+                40,
+            ),
+        )
+        .unwrap();
+        let next_goal = run_goal_lineage_doctor(GoalLineageDoctorOptions {
+            harness_home: home.clone(),
+            lane_digest: None,
+            virtual_session_id: None,
+        })
+        .unwrap();
+        assert_eq!(next_goal.lineages.len(), 2);
+        assert_eq!(
+            next_goal.lineages.iter().filter(|row| row.runnable).count(),
+            1
+        );
+        assert!(
+            next_goal
+                .lineages
+                .iter()
+                .any(|row| row.goal_reference == "goal-2" && row.runnable),
+            "new goal lineage should remain runnable: {:#?}",
+            next_goal.lineages
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn write_projection(path: &Path, queue: &str, thread: &str, generation: &str, at: i64) {
         append_jsonl_value(
             path,
@@ -1091,6 +1398,9 @@ mod tests {
                 "backendContextGeneration": generation,
                 "objective": "ship the integrated campaign",
                 "status": "active",
+                "observationPhase": "owned-turn",
+                "turnRelation": "current-owned-turn",
+                "sourceFinalEligible": true,
                 "goalChecksum": "goal-checksum",
                 "projectionChecksum": "projection-checksum",
                 "observationOrder": 1,

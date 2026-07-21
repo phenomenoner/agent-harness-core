@@ -94,8 +94,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I8",
-            statement: "agent identity and /new task boundaries are routing boundaries across channel state, session freshness, prompt, skill source/eligibility/usage priors, runtime, outbox, delivery, and memory namespaces",
-            owner: "channel_state/runtime_pipeline/prompt/turns/skills/skill_usage/memory",
+            statement: "agent identity and /new task boundaries are routing and admission boundaries; /new freezes one target session, holds ordinary ingress until governed closure is proven and the boundary commits, then replays held work FIFO without inheriting the previous task",
+            owner: "channel_state/channel_session_transition/channel_ingress/runtime_pipeline/prompt/turns/skills/memory",
         },
         InvariantEntry {
             id: "I9",
@@ -124,8 +124,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I14",
-            statement: "rich outbound presentation is rendered by provider adapters only from a trusted semantic payload with proven complete canonical text coverage; otherwise provider-safe canonical fallback occurs before any rich unit, fullTextPreserved=true requires all required ordered text units to be accepted, and media units retain attachment-kind accounting",
-            owner: "runtime_pipeline/channel_delivery/progress/media/trace",
+            statement: "rich outbound presentation is rendered only from validated semantic payloads with loss-aware canonical text coverage; callback actions require one typed approve/deny pair of public non-bearer ids and re-enter through identity, authority, expiry, and consume-once gates without becoming model-authored text",
+            owner: "runtime_pipeline/channel_delivery/channel_action/channel_ingress/progress/media/trace",
         },
         InvariantEntry {
             id: "I15",
@@ -139,8 +139,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I17",
-            statement: "durable control artifacts are authoritative before runtime execution, retry eligibility, task/effect continuation, progress delivery, restart consumption, and sender-class cron notification; stop/newer steer/expiry fence connector capabilities and exact task authority is revalidated before child admission",
-            owner: "runtime_worker/runtime_pipeline/runtime_queue/progress/channel_runtime/task_transition/external_effect/dream_director/cron_scheduler/deterministic_cron",
+            statement: "durable control artifacts are authoritative before ingress admission, runtime execution, retry or continuation, progress delivery, restart consumption, and notification; transition holds, parked waits, expiry, stop, skip, and quarantine are checked before acting and every suppression, settlement, or replay is idempotently receipted",
+            owner: "channel_ingress/channel_session_transition/runtime_worker/runtime_pipeline/runtime_queue/progress/channel_runtime/task_transition/external_effect/dream_director/cron_scheduler/deterministic_cron",
         },
         InvariantEntry {
             id: "I18",
@@ -209,8 +209,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I31",
-            statement: "the exact Codex 0.144.5 JSON-RPC surface is fixture-locked for initialization, thread and turn lifecycle, token/context accounting, goals, compact, auth, capabilities, web-search items, MCP elicitation responses, and error/null behavior; upstream completion without exact correlation cannot close compact, task/goal transition, or external mutation",
-            owner: "codex_protocol_compat/codex_runtime/context_rollover/coordinator_resume/goal/task_transition/external_effect",
+            statement: "the exact Codex 0.144.5 JSON-RPC surface is fixture-locked for initialization, thread start/resume, turn lifecycle, token/context accounting, goal state/update, compact, account, capability, web-search, MCP, and error/null behavior; completion affects a parent, compact, or closure only after exact operation and thread/turn/item ownership",
+            owner: "codex_protocol_compat/codex_runtime/context_rollover/coordinator_resume/goal_closure/task_transition/external_effect",
         },
         InvariantEntry {
             id: "I32",
@@ -234,13 +234,13 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I36",
-            statement: "active backend goal rows are projected through exact-v2 lane, virtual-session, backend-generation, source thread/turn, goal-reference, checksum, and observation-order identity; one campaign has at most one runnable lineage, and duplicate/stale/orphan rows become non-runnable only through validated append-only supersession, never deletion or wrong-lane substitution",
-            owner: "goal_lineage/codex_runtime/context_rollover/runtime_pipeline",
+            statement: "backend goal rows carry exact-v2 lane, virtual session, backend generation, source thread/turn, goal identity/checksum, observation phase, turn relation, eligibility, and order; only current-owned or explicit-continuation observations authorize source finals, while governed original-thread closure records terminal projection before lineage and outranks late active rows",
+            owner: "goal_lineage/goal_closure/codex_runtime/context_rollover/runtime_pipeline",
         },
         InvariantEntry {
             id: "I37",
-            statement: "every goal or typed deadline-drain task completion passes transition authority before final-outbox selection; a harness-owned ordinary task family and generation-bound disposition select exactly one final, continuation child, parked notice, or one bounded observation-only recovery child; authorized work commits one deterministic exact-lane intent before enqueue, reconciles restart/replay to one child, keeps campaign/task/recovery generations separate, and acknowledges only after child lease ownership",
-            owner: "goal_transition/task_transition/goal_continuation/runtime_pipeline/context_rollover/runtime_worker",
+            statement: "every goal, ordinary task, bounded-yield completion, and needs-user wait passes typed transition authority before final or progress selection; each terminal receipt states its source-final expectation and outbox disposition, parked approval is lease-free, and continuations commit before enqueue then acknowledge only after child lease ownership",
+            owner: "goal_transition/task_transition/goal_continuation/runtime_pipeline/context_rollover/runtime_worker/progress/external_effect",
         },
         InvariantEntry {
             id: "I38",
@@ -496,6 +496,46 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.task-transition.v1",
             owner_module: "task_transition/runtime_pipeline",
             compatibility: "additive drain evaluation embedded in runtime receipts; exact-lane authority snapshot and breaker disposition are immutable for one source completion",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-closure-intent.v1",
+            owner_module: "goal_closure/codex_runtime",
+            compatibility: "append-once protected authority for one original-thread closure; closure id, exact lane, concrete session, virtual session, goal identity, generation, and disposition are immutable",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-closure-resolution.v1",
+            owner_module: "goal_closure",
+            compatibility: "deterministic fail-closed target resolution; zero or multiple exact authority matches remain non-mutating",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-closure-receipt.v1",
+            owner_module: "goal_closure/codex_runtime",
+            compatibility: "append-once causal phases for backend result, projection, lineage reconciliation, and terminal convergence; additive diagnostics only",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.channel-session-transition-intent.v1",
+            owner_module: "channel_session_transition/channel_state",
+            compatibility: "protected exact-lane two-phase /stop and /new intent; old and frozen-new sessions plus optional closure authority are immutable across replay",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.channel-session-transition-receipt.v1",
+            owner_module: "channel_session_transition/channel_state",
+            compatibility: "append-once transition phases; BoundaryCommitted is the only admission-release authority",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.channel-approval-prompt.v1",
+            owner_module: "channel_action/runtime_pipeline",
+            compatibility: "provider-neutral approval presentation contains safe public action ids and bounded summaries, never bearer capabilities",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.channel-inbound-action.v1",
+            owner_module: "channel_action/channel_runtime",
+            compatibility: "typed provider action ingress is exact-lane, generation, session, and approval-authority bound before model admission",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.channel-inbound-action-evidence.v1",
+            owner_module: "channel_action/channel_runtime",
+            compatibility: "sanitized action receipts expose digests and dispositions only; raw callback and bearer token material is non-serializable",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.external-effect-intent.v1",
@@ -1043,6 +1083,31 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
 pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
     vec![
         ScenarioMatrixEntry {
+            id: "parent-subagent-completion-ownership",
+            title: "Parent-owned completion across delegated event streams",
+            changed_areas: vec![
+                "Codex event ownership",
+                "stdout recovery",
+                "coordinator completion",
+                "final outbox",
+            ],
+            required_invariants: vec!["I2", "I3", "I7", "I23", "I24", "I37"],
+            required_evidence: vec![
+                "live stream and stdout recovery apply the same parent thread and turn authority",
+                "foreign child finals remain internal worker evidence and cannot terminate the parent",
+                "the authoritative parent final appears exactly once in transcript and source-correlated outbox",
+                "a coordinator-capable runtime cannot report ready with fail-open completion ownership",
+            ],
+            runnable_tests: vec![
+                "codex_runtime::tests::effective_parent_completion_ignores_interleaved_subagent_final",
+                "codex_runtime::tests::run_codex_runtime_codex_owned_turn_ignores_child_final_and_completion",
+                "codex_runtime::tests::stdout_recovery_ignores_foreign_subagent_final",
+                "continuity_effect_acceptance::parent_completion_fixture_covers_live_recovery_and_two_children",
+                "continuity_interactions_goal::child_final_during_stop_is_internal_and_cannot_reopen_closed_goal",
+            ],
+            promotion_gate: "Replay interleaved parent and two-child events through both live and stdout-recovery paths, then prove one parent-owned final and no child-owned terminalization.",
+        },
+        ScenarioMatrixEntry {
             id: "agent-boundary",
             title: "Agent boundary and task freshness",
             changed_areas: vec![
@@ -1061,6 +1126,9 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             runnable_tests: vec![
                 "runtime_pipeline::tests::channel_session_freshness_does_not_cross_suppress_other_agent",
                 "prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context",
+                "continuity_interactions_actions::waiting_approval_parent_new_session_restart_admits_post_commit_message",
+                "continuity_interactions_goal::current_queue_runs_while_old_session_historical_closure_is_pending",
+                "continuity_interactions_goal::committed_new_boundary_resolves_required_final_hold_with_typed_non_delivery",
             ],
             promotion_gate: "Run the agent-boundary scenario pack from docs/agent-harness-topology-contract.md for channel/runtime/session changes.",
         },
@@ -1128,6 +1196,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "runtime_pipeline::tests::untargeted_terminal_control_suppression_appends_progress_with_queue_id",
                 "progress::tests::terminal_control_marker_suppresses_cached_nonterminal_ghost_queue",
                 "runtime_pipeline::tests::e2e_1_ghost_queue_replay_from_sanitized_fixture",
+                "continuity_interactions_actions::waiting_approval_parent_stopped_across_restart_is_terminal_exactly_once",
             ],
             promotion_gate: "Run the focused T1-T6/P5 regression pack plus the checked-in E2E-1 sanitized ghost replay and a live or candidate-home replay of a terminal-controlled pending queue; promotion requires exactly one suppression receipt, one final terminal progress surface, no later status edits, and no recurring no-prepared-execution churn.",
         },
@@ -1336,6 +1405,11 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "external_effect::tests::connector_specific_readback_adapters_are_exactly_bound_and_fail_closed",
                 "external_effect::tests::stop_or_expiry_fences_pending_capabilities_without_cross_lane_effects",
                 "progress::tests::telegram_and_discord_waiting_for_approval_stays_distinct_from_other_lifecycles",
+                "continuity_interactions_actions::waiting_approval_parent_stopped_across_restart_is_terminal_exactly_once",
+                "continuity_interactions_actions::waiting_approval_parent_new_session_restart_admits_post_commit_message",
+                "continuity_interactions_actions::approved_before_new_session_restart_is_voided_once_without_continuation",
+                "continuity_interactions_actions::expiry_reconciler_and_native_callback_race_consumes_decision_once_after_restart",
+                "continuity_interactions_goal::legacy_state_is_readable_without_fabricating_completion_or_native_authority",
             ],
             promotion_gate: "Run the exact 0.144.5 fixture plus the fake MCP server park/approve/submit/confirm replay, channel token isolation matrix, readback ambiguity matrix, and provider progress renderers; live connector mutation requires an explicitly authorized bounded smoke and readback receipt.",
         },
@@ -1439,6 +1513,8 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "progress::tests::progress_delivery_does_not_fresh_send_historical_event_without_existing_surface",
                 "agent-harness-cli::tests::progress_delivery_stop_releases_unattempted_surface_claims_before_provider_io",
                 "codex_runtime::tests::run_codex_runtime_rejects_stdout_recovery_narration_without_final_answer",
+                "continuity_interactions_goal::committed_new_boundary_resolves_required_final_hold_with_typed_non_delivery",
+                "continuity_interactions_goal::legacy_state_is_readable_without_fabricating_completion_or_native_authority",
             ],
             promotion_gate: "Replay Telegram and Discord long-running turns through progress caps, recovery, final outbox, terminal convergence, source-index contention, historical-cache recovery, and a watched progress-owner stop.",
         },

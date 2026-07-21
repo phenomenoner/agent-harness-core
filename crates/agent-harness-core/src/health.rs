@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::{HarnessStatusOptions, SkillDoctorStatus, SkillDoctorSummary, collect_harness_status};
+use crate::{
+    HarnessGovernedTransitionStatus, HarnessStatusOptions, SkillDoctorStatus, SkillDoctorSummary,
+    collect_harness_status,
+};
 
 const HEALTHZ_SCHEMA: &str = "agent-harness.healthz.v1";
 
@@ -25,6 +28,8 @@ pub struct HealthzReport {
     pub live: bool,
     pub readiness_ready: bool,
     pub queue: HealthzQueue,
+    pub goal_closures: HarnessGovernedTransitionStatus,
+    pub session_transitions: HarnessGovernedTransitionStatus,
     pub outbox: HealthzOutbox,
     pub loops: Vec<HealthzLoop>,
     pub supervisor_services: Vec<HealthzSupervisorService>,
@@ -38,6 +43,7 @@ pub struct HealthzReport {
 pub struct HealthzQueue {
     pub queued: usize,
     pub open: usize,
+    pub waiting: usize,
     pub prepared: usize,
     pub completed: usize,
 }
@@ -256,6 +262,29 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
             "runtime-loop is not ready; channel ingress may queue without replies".to_string(),
         );
     }
+    for (label, transition) in [
+        ("goal closure", &status.runtime.goal_closures),
+        (
+            "channel session transition",
+            &status.runtime.session_transitions,
+        ),
+    ] {
+        if transition.failed > 0 {
+            warnings.push(format!(
+                "{label} reconciliation has {} retry-pending or failed item(s)",
+                transition.failed
+            ));
+        }
+        if transition
+            .oldest_pending_age_ms
+            .is_some_and(|age_ms| age_ms > options.loop_stale_ms)
+        {
+            warnings.push(format!(
+                "{label} reconciliation has pending work older than {} ms",
+                options.loop_stale_ms
+            ));
+        }
+    }
     let skills_ready = status.skills.status != SkillDoctorStatus::Error;
     if !skills_ready {
         warnings.push("skill doctor is not ready; autonomous skill apply is blocked".to_string());
@@ -285,9 +314,12 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
         queue: HealthzQueue {
             queued: status.runtime.queued_items,
             open: status.runtime.open_items,
+            waiting: status.runtime.waiting_items,
             prepared: status.runtime.prepared_items,
             completed: status.runtime.completed_items,
         },
+        goal_closures: status.runtime.goal_closures.clone(),
+        session_transitions: status.runtime.session_transitions.clone(),
         outbox: HealthzOutbox {
             pending: status.channels.outbox.all.pending,
             retryable: status.channels.outbox.all.failed_retryable,

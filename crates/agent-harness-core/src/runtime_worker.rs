@@ -54,7 +54,7 @@ const RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA: &str =
     "agent-harness.runtime-queue-lease-observation.v1";
 const RUNTIME_QUEUE_LEASE_RENEWAL_SCHEMA: &str = "agent-harness.runtime-queue-lease-renewal.v1";
 const RUNTIME_QUEUE_STATE_INDEX_SCHEMA: &str = "agent-harness.runtime-queue-state-index.v1";
-const RUNTIME_QUEUE_STATE_INDEX_REVISION: u32 = 4;
+const RUNTIME_QUEUE_STATE_INDEX_REVISION: u32 = 5;
 const RUNTIME_QUEUE_RECEIPT_COMPACTION_SCHEMA: &str =
     "agent-harness.runtime-queue-receipt-compaction.v1";
 const RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA: &str =
@@ -594,11 +594,19 @@ impl RuntimeQueueLeaseGuard {
                 warnings.join("; ")
             )));
         }
+        let index = refresh_runtime_queue_state_index(&queue_dir, &mut warnings)?;
+        if !warnings.is_empty() {
+            return Err(io::Error::other(format!(
+                "pending exact-lane work could not be proven: {}",
+                warnings.join("; ")
+            )));
+        }
+        let parked_run_ids = parked_run_once_ids_from_index(&index);
         for value in values {
             let Ok(item) = parse_pending_item(&value) else {
                 continue;
             };
-            if item.queue_id == self.queue_id {
+            if item.queue_id == self.queue_id || parked_run_ids.contains(&item.queue_id) {
                 continue;
             }
             let Some(class_config) = default_runtime_class_config_for_item(&item) else {
@@ -787,6 +795,7 @@ pub fn prepare_runtime_queue_item(
     }
     let retry_pending_run_ids = retry_pending_run_once_ids_from_index(&run_once_index);
     let auth_deferred_run_ids = auth_deferred_run_once_ids_from_index(&run_once_index);
+    let parked_run_ids = parked_run_once_ids_from_index(&run_once_index);
     let lock_runtime_class = select_lock_runtime_class(
         options.queue_id.as_deref(),
         &preliminary_pending_items,
@@ -841,6 +850,7 @@ pub fn prepare_runtime_queue_item(
         now_ms,
         &terminal_run_ids,
         &retry_pending_run_ids,
+        &parked_run_ids,
         Some(&execution_receipts_file),
         &mut warnings,
     )?;
@@ -1000,6 +1010,45 @@ pub fn prepare_runtime_queue_item(
             suppressed_run_once_reason: None,
             reason: "requested runtime queue item is waiting for operator authentication"
                 .to_string(),
+        };
+        append_json_line(&execution_receipts_file, &receipt)?;
+        return Ok(RuntimeQueuePrepareReport {
+            schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+            harness_home: options.harness_home,
+            queue_file,
+            execution_receipts_file,
+            item: None,
+            receipt,
+            warnings,
+        });
+    }
+    if let Some(requested_queue_id) = options.queue_id.as_deref()
+        && parked_run_ids.contains(requested_queue_id)
+    {
+        write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+        let pending = pending_by_id
+            .get(requested_queue_id)
+            .or_else(|| preliminary_pending_by_id.get(requested_queue_id));
+        let receipt = RuntimeExecutionReceipt {
+            queue_id: Some(requested_queue_id.to_string()),
+            status: RuntimeExecutionReceiptStatus::NoPendingItem,
+            channel_lane: None,
+            runtime_class: pending.map(|item| item.runtime_class.clone()),
+            origin: pending.map(|item| item.origin.clone()),
+            cron_run_id: pending.and_then(|item| item.cron_run_id.clone()),
+            scheduled_for_ms: pending.and_then(|item| item.scheduled_for_ms),
+            execution_dir: None,
+            prompt_bundle_json: None,
+            prompt_markdown: None,
+            runtime_workspace: None,
+            inbound_media_artifacts: Vec::new(),
+            continuation: pending
+                .map(|item| item.continuation.clone())
+                .unwrap_or_else(RuntimeContinuationMetadata::legacy),
+            terminal_control_matched: None,
+            terminal_control_source: None,
+            suppressed_run_once_reason: None,
+            reason: "requested runtime queue item is parked waiting for user input".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
         return Ok(RuntimeQueuePrepareReport {
@@ -1207,6 +1256,7 @@ pub fn prepare_runtime_queue_item(
                 &pending_items,
                 pending,
                 &terminal_run_ids,
+                &parked_run_ids,
                 &load_runtime_dispatch_config(&options.harness_home)?,
             ) {
                 let receipt = RuntimeExecutionReceipt {
@@ -1306,6 +1356,7 @@ pub fn prepare_runtime_queue_item(
         for (queue_id, prepared) in prepared_receipts.iter().filter(|(queue_id, _)| {
             !terminal_run_ids.contains(*queue_id)
                 && !auth_deferred_run_ids.contains(*queue_id)
+                && !parked_run_ids.contains(*queue_id)
                 && !lease_state.leases.contains_key(*queue_id)
         }) {
             if let Some(pending) = pending_by_id.get(queue_id) {
@@ -1361,6 +1412,7 @@ pub fn prepare_runtime_queue_item(
                         &pending_items,
                         pending,
                         &terminal_run_ids,
+                        &parked_run_ids,
                         &load_runtime_dispatch_config(&options.harness_home)?,
                     ) {
                         warnings.push(format!(
@@ -1444,6 +1496,7 @@ pub fn prepare_runtime_queue_item(
         &prepared_ids,
         &terminal_run_ids,
         &auth_deferred_run_ids,
+        &parked_run_ids,
         &run_once_index,
         &lease_state,
         &lock_runtime_class,
@@ -2030,6 +2083,7 @@ pub fn inspect_runtime_queue_capacity(
     }
     let retry_pending_run_ids = retry_pending_run_once_ids_from_index(&run_once_index);
     let auth_deferred_run_ids = auth_deferred_run_once_ids_from_index(&run_once_index);
+    let parked_run_ids = parked_run_once_ids_from_index(&run_once_index);
     let pending_items = read_pending_items(&queue_file, &mut warnings)?;
     let pending_by_id = pending_items
         .iter()
@@ -2069,6 +2123,7 @@ pub fn inspect_runtime_queue_capacity(
             now_ms,
             &terminal_run_ids,
             &retry_pending_run_ids,
+            &parked_run_ids,
             Some(&execution_receipts_file),
             &mut warnings,
         )?;
@@ -2082,6 +2137,7 @@ pub fn inspect_runtime_queue_capacity(
             .filter(|queue_id| {
                 !terminal_run_ids.contains(*queue_id)
                     && !auth_deferred_run_ids.contains(*queue_id)
+                    && !parked_run_ids.contains(*queue_id)
                     && !lease_state.leases.contains_key(*queue_id)
             })
             .cloned()
@@ -2093,9 +2149,13 @@ pub fn inspect_runtime_queue_capacity(
             if pending.runtime_class != runtime_class {
                 continue;
             }
-            if let Some(blocker) =
-                same_session_fifo_blocker(&pending_items, pending, &terminal_run_ids, &config)
-            {
+            if let Some(blocker) = same_session_fifo_blocker(
+                &pending_items,
+                pending,
+                &terminal_run_ids,
+                &parked_run_ids,
+                &config,
+            ) {
                 warnings.push(format!(
                     "prepared runtime queue item `{queue_id}` blocked by {blocker}; capacity excludes it"
                 ));
@@ -2131,6 +2191,7 @@ pub fn inspect_runtime_queue_capacity(
             if prepared_ids.contains(&pending.queue_id)
                 || terminal_run_ids.contains(&pending.queue_id)
                 || auth_deferred_run_ids.contains(&pending.queue_id)
+                || parked_run_ids.contains(&pending.queue_id)
                 || simulated.leases.contains_key(&pending.queue_id)
             {
                 continue;
@@ -2144,9 +2205,13 @@ pub fn inspect_runtime_queue_capacity(
                 ));
                 continue;
             }
-            if let Some(blocker) =
-                same_session_fifo_blocker(&pending_items, pending, &terminal_run_ids, &config)
-            {
+            if let Some(blocker) = same_session_fifo_blocker(
+                &pending_items,
+                pending,
+                &terminal_run_ids,
+                &parked_run_ids,
+                &config,
+            ) {
                 warnings.push(format!(
                     "runtime queue item `{}` blocked by {}; capacity excludes it",
                     pending.queue_id, blocker
@@ -2797,6 +2862,7 @@ fn purge_runtime_queue_leases(
     now_ms: i64,
     terminal_run_ids: &HashSet<String>,
     retry_pending_run_ids: &HashSet<String>,
+    parked_run_ids: &HashSet<String>,
     receipts_file: Option<&Path>,
     warnings: &mut Vec<String>,
 ) -> io::Result<()> {
@@ -2805,6 +2871,7 @@ fn purge_runtime_queue_leases(
     for (queue_id, lease) in &state.leases {
         if terminal_run_ids.contains(queue_id)
             || retry_pending_run_ids.contains(queue_id)
+            || parked_run_ids.contains(queue_id)
             || lease.lease_expires_at_ms <= now_ms
         {
             remove_silently.push(queue_id.clone());
@@ -6127,6 +6194,7 @@ fn same_session_fifo_blocker(
     pending_items: &[PendingQueueItem],
     item: &PendingQueueItem,
     terminal_run_ids: &HashSet<String>,
+    parked_run_ids: &HashSet<String>,
     config: &RuntimeDispatchConfig,
 ) -> Option<String> {
     let class_config = config.classes.get(&item.runtime_class)?;
@@ -6138,6 +6206,7 @@ fn same_session_fifo_blocker(
         .iter()
         .filter(|candidate| candidate.queue_id != item.queue_id)
         .filter(|candidate| !terminal_run_ids.contains(&candidate.queue_id))
+        .filter(|candidate| !parked_run_ids.contains(&candidate.queue_id))
         .filter(|candidate| {
             candidate.created_at_ms < item.created_at_ms
                 || (candidate.created_at_ms == item.created_at_ms
@@ -6197,6 +6266,7 @@ fn select_pending_item(
     prepared_ids: &HashSet<String>,
     terminal_run_ids: &HashSet<String>,
     auth_deferred_run_ids: &HashSet<String>,
+    parked_run_ids: &HashSet<String>,
     run_once_index: &RuntimeQueueStateIndex,
     lease_state: &RuntimeQueueLeaseState,
     runtime_class: &str,
@@ -6273,6 +6343,13 @@ fn select_pending_item(
             ));
             continue;
         }
+        if parked_run_ids.contains(&item.queue_id) {
+            warnings.push(format!(
+                "runtime queue item `{}` is parked waiting for user input; skipping until it is resolved",
+                item.queue_id
+            ));
+            continue;
+        }
         if let Some(blocker) =
             retry_schedule_dispatch_blocker(run_once_index, &item.queue_id, now_ms)
         {
@@ -6304,9 +6381,13 @@ fn select_pending_item(
             ));
             continue;
         }
-        if let Some(blocker) =
-            same_session_fifo_blocker(&pending_items, item, terminal_run_ids, &config)
-        {
+        if let Some(blocker) = same_session_fifo_blocker(
+            &pending_items,
+            item,
+            terminal_run_ids,
+            parked_run_ids,
+            &config,
+        ) {
             warnings.push(format!(
                 "runtime queue item `{}` blocked by {}; skipping",
                 item.queue_id, blocker
@@ -6661,6 +6742,8 @@ pub fn resolve_runtime_queue_typing_context_nonblocking(
         .collect::<BTreeSet<_>>();
     let terminal_ids =
         resolve_runtime_queue_terminal_ids_nonblocking(harness_home, &candidate_queue_ids)?;
+    let parked_ids =
+        resolve_runtime_queue_parked_ids_nonblocking(harness_home, &candidate_queue_ids)?;
     for value in pending_values {
         let queue_id = string_field(&value, &["queueId", "queue_id"]);
         if let Some(requested_queue_id) = requested_queue_id
@@ -6670,6 +6753,7 @@ pub fn resolve_runtime_queue_typing_context_nonblocking(
         }
         if string_field(&value, &["status"]) != Some("queued")
             || queue_id.is_some_and(|queue_id| terminal_ids.contains(queue_id))
+            || queue_id.is_some_and(|queue_id| parked_ids.contains(queue_id))
         {
             continue;
         }
@@ -6689,6 +6773,25 @@ pub fn resolve_runtime_queue_typing_context_nonblocking(
         }));
     }
     Ok(None)
+}
+
+fn resolve_runtime_queue_parked_ids_nonblocking(
+    harness_home: &Path,
+    candidate_queue_ids: &BTreeSet<String>,
+) -> io::Result<BTreeSet<String>> {
+    if candidate_queue_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let index = match refresh_runtime_queue_state_index_nonblocking(&queue_dir, &mut Vec::new()) {
+        Ok(index) => index,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(parked_run_once_ids_from_index(&index)
+        .into_iter()
+        .filter(|queue_id| candidate_queue_ids.contains(queue_id))
+        .collect())
 }
 
 /// Returns the latest hot-ledger receipt materialized for one exact queue ID.
@@ -6802,6 +6905,7 @@ pub(crate) fn runtime_queue_prior_failure_count_from_index(
                         && status != "completed"
                         && status != "no-work"
                         && status != "auth-deferred"
+                        && status != "needs-user"
                 })
                 .fold(0usize, |count, (_, status_count)| {
                     count.saturating_add(*status_count)
@@ -6830,6 +6934,16 @@ fn auth_deferred_run_once_ids_from_index(index: &RuntimeQueueStateIndex) -> Hash
         .collect()
 }
 
+pub(crate) fn parked_run_once_ids_from_index(index: &RuntimeQueueStateIndex) -> HashSet<String> {
+    index
+        .queues
+        .iter()
+        .filter_map(|(queue_id, entry)| {
+            (entry.latest_status.as_deref() == Some("needs-user")).then_some(queue_id.clone())
+        })
+        .collect()
+}
+
 fn is_terminal_run_once_status(status: &str) -> bool {
     matches!(
         status,
@@ -6840,6 +6954,7 @@ fn is_terminal_run_once_status(status: &str) -> bool {
             | "skipped"
             | "dead-letter"
             | "suppressed"
+            | "external-effect-denied"
     )
 }
 
@@ -10528,6 +10643,7 @@ mod tests {
             2_000,
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
             Some(&receipts_file),
             &mut warnings,
         )
@@ -12006,6 +12122,7 @@ mod tests {
         let lease_state = RuntimeQueueLeaseState::default();
         let terminal_ids = HashSet::new();
         let auth_deferred_ids = HashSet::new();
+        let parked_ids = HashSet::new();
         let run_once_index = RuntimeQueueStateIndex::default();
         let mut prepared_ids = HashSet::new();
         let mut warnings = Vec::new();
@@ -12016,6 +12133,7 @@ mod tests {
             &prepared_ids,
             &terminal_ids,
             &auth_deferred_ids,
+            &parked_ids,
             &run_once_index,
             &lease_state,
             "cron",
@@ -12035,6 +12153,7 @@ mod tests {
             &prepared_ids,
             &terminal_ids,
             &auth_deferred_ids,
+            &parked_ids,
             &run_once_index,
             &lease_state,
             "cron",
@@ -12092,6 +12211,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
             &restarted,
             &RuntimeQueueLeaseState::default(),
             "cron",
@@ -12107,6 +12227,7 @@ mod tests {
         let selected_after_backoff = select_pending_item(
             pending,
             None,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
@@ -12494,6 +12615,212 @@ mod tests {
         assert_eq!(
             after_terminal.receipt.status,
             RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn needs_user_parent_is_parked_without_blocking_later_turn() {
+        let root = temp_root("needs_user_parent_is_parked_without_blocking_later_turn");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn_with_text(&source, &harness_home, "first turn", 1_000);
+        enqueue_fixture_turn_with_text(&source, &harness_home, "later turn", 1_001);
+
+        let queue_dir = queue_dir(&harness_home);
+        let mut warnings = Vec::new();
+        let pending = read_pending_items(&queue_dir.join("pending.jsonl"), &mut warnings).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].session_key, pending[1].session_key);
+        let parent_queue_id = pending[0].queue_id.clone();
+        let later_queue_id = pending[1].queue_id.clone();
+
+        let first = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(parent_queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            first.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        let leases_before =
+            read_runtime_queue_leases(&queue_dir, "interactive", &mut Vec::new()).unwrap();
+        assert!(leases_before.leases.contains_key(&parent_queue_id));
+
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-run-once.v1",
+                "queueId": parent_queue_id.clone(),
+                "status": "needs-user",
+                "reason": "approval decision required"
+            }),
+        )
+        .unwrap();
+
+        let parked_prepare = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(parent_queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert!(parked_prepare.item.is_none());
+        assert_eq!(
+            parked_prepare.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert!(parked_prepare.receipt.reason.contains("parked waiting"));
+        assert!(
+            resolve_runtime_queue_typing_context_nonblocking(&harness_home, Some(&parent_queue_id))
+                .unwrap()
+                .is_none(),
+            "parked work must not emit a provider typing indicator"
+        );
+
+        let capacity = inspect_runtime_queue_capacity(RuntimeQueueCapacityOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+        assert_eq!(capacity.claimable_queue_ids, vec![later_queue_id.clone()]);
+        assert_eq!(capacity.claimable_items, 1);
+        let leases_after =
+            read_runtime_queue_leases(&queue_dir, "interactive", &mut Vec::new()).unwrap();
+        assert!(
+            !leases_after.leases.contains_key(&parent_queue_id),
+            "parked parent must be lease-free"
+        );
+
+        let resumed = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            resumed.receipt.queue_id.as_deref(),
+            Some(later_queue_id.as_str())
+        );
+        assert_eq!(
+            resumed.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+
+        let pending_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
+        assert!(
+            pending_text.contains(&parent_queue_id),
+            "parked parent must remain durable for later resolution"
+        );
+        fs::remove_file(runtime_queue_state_index_file(&queue_dir)).unwrap();
+        let rebuilt = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        assert_eq!(
+            rebuilt.queues[&parent_queue_id].latest_status.as_deref(),
+            Some("needs-user")
+        );
+        assert_eq!(
+            runtime_queue_prior_failure_count_from_index(&rebuilt, &parent_queue_id),
+            0,
+            "waiting for user input must not consume retry budget"
+        );
+
+        enqueue_fixture_turn_with_text(&source, &harness_home, "third turn", 1_002);
+        let active_fifo_capacity = inspect_runtime_queue_capacity(RuntimeQueueCapacityOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+        assert_eq!(active_fifo_capacity.claimable_items, 0);
+        assert!(active_fifo_capacity.claimable_queue_ids.is_empty());
+
+        release_runtime_queue_lease(&harness_home, &later_queue_id).unwrap();
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-run-once.v1",
+                "queueId": later_queue_id.clone(),
+                "status": "completed",
+                "reason": "later turn completed"
+            }),
+        )
+        .unwrap();
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-run-once.v1",
+                "queueId": parent_queue_id.clone(),
+                "status": "retry-pending",
+                "reason": "user supplied the required decision"
+            }),
+        )
+        .unwrap();
+        let resolved_capacity = inspect_runtime_queue_capacity(RuntimeQueueCapacityOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            resolved_capacity.claimable_queue_ids,
+            vec![parent_queue_id.clone()],
+            "a later durable resolution must make the parked parent runnable again"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn external_effect_denied_is_terminal() {
+        let root = temp_root("external_effect_denied_is_terminal");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn_with_text(&source, &harness_home, "denied effect", 1_000);
+
+        let queue_dir = queue_dir(&harness_home);
+        let pending =
+            read_pending_items(&queue_dir.join("pending.jsonl"), &mut Vec::new()).unwrap();
+        let queue_id = pending[0].queue_id.clone();
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-run-once.v1",
+                "queueId": queue_id.clone(),
+                "status": "external-effect-denied",
+                "reason": "operator denied protected action"
+            }),
+        )
+        .unwrap();
+
+        write_json_atomic(
+            &runtime_queue_state_index_file(&queue_dir),
+            &serde_json::json!({
+                "schema": runtime_queue_state_index_schema(),
+                "revision": 4,
+                "queues": {
+                    queue_id.clone(): {
+                        "latestStatus": "external-effect-denied",
+                        "terminalRunOnceEver": false,
+                        "terminalEver": false
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let index = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        assert_eq!(index.revision, RUNTIME_QUEUE_STATE_INDEX_REVISION);
+        assert!(index.queues[&queue_id].terminal_run_once_ever);
+        let control = resolve_queue_terminal_control_from_index(
+            &queue_dir,
+            &queue_id,
+            Some(&pending[0].session_key),
+            index.queues.get(&queue_id),
+        )
+        .unwrap();
+        let QueueTerminalControl::Terminal(control) = control else {
+            panic!("external-effect-denied must produce terminal control");
+        };
+        assert_eq!(
+            control.terminal_status.as_deref(),
+            Some("external-effect-denied")
         );
 
         let _ = fs::remove_dir_all(root);

@@ -17,7 +17,10 @@ use crate::memory::{
 };
 use crate::memory_owner::{MemoryOwnerState, read_memory_owner_state_or_default};
 use crate::runtime_receipt_history::find_runtime_queue_terminal_history;
-use crate::runtime_worker::{refresh_runtime_queue_state_index, terminal_run_once_ids_from_index};
+use crate::runtime_worker::{
+    parked_run_once_ids_from_index, refresh_runtime_queue_state_index,
+    terminal_run_once_ids_from_index,
+};
 use crate::skill_apply::skill_apply_receipts_file;
 use crate::skill_doctor::skill_doctor_receipts_file;
 use crate::skill_learning::skill_proposals_file;
@@ -67,6 +70,7 @@ pub struct HarnessRuntimeStatus {
     pub prepared_items: usize,
     pub completed_items: usize,
     pub open_items: usize,
+    pub waiting_items: usize,
     pub cron_queued_items: usize,
     pub cron_open_items: usize,
     pub queued_by_runtime_class: BTreeMap<String, usize>,
@@ -84,6 +88,20 @@ pub struct HarnessRuntimeStatus {
     pub codex_launch_receipts: HarnessJsonlStatus,
     pub control_receipts: HarnessJsonlStatus,
     pub dead_letter_receipts: HarnessJsonlStatus,
+    pub goal_closures: HarnessGovernedTransitionStatus,
+    pub session_transitions: HarnessGovernedTransitionStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessGovernedTransitionStatus {
+    pub intents: usize,
+    pub pending: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub latest_phase: Option<String>,
+    pub oldest_pending_age_ms: Option<i64>,
+    pub invalid_lines: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1578,6 +1596,7 @@ fn runtime_status(
     // turn into apparent current work.
     let hot_index = refresh_runtime_queue_state_index(&queue_dir, warnings)?;
     let mut terminal_run_ids = terminal_run_once_ids_from_index(&hot_index);
+    let parked_run_ids = parked_run_once_ids_from_index(&hot_index);
     for terminal in find_runtime_queue_terminal_history(&queue_dir, &pending.queue_ids)? {
         terminal_run_ids.insert(terminal.queue_id);
     }
@@ -1597,7 +1616,7 @@ fn runtime_status(
     let mut open_by_origin = BTreeMap::new();
     let mut cron_open_items = 0;
     for item in &pending.items {
-        if terminal_run_ids.contains(&item.queue_id) {
+        if terminal_run_ids.contains(&item.queue_id) || parked_run_ids.contains(&item.queue_id) {
             continue;
         }
         *open_by_runtime_class
@@ -1617,6 +1636,11 @@ fn runtime_status(
         prepared_items: pending.queue_ids.intersection(&prepared_ids).count(),
         completed_items: pending.queue_ids.intersection(&completed_ids).count(),
         open_items,
+        waiting_items: pending
+            .queue_ids
+            .iter()
+            .filter(|queue_id| parked_run_ids.contains(*queue_id))
+            .count(),
         cron_queued_items: pending.cron_queued_items,
         cron_open_items,
         queued_by_runtime_class: pending.queued_by_runtime_class,
@@ -1638,7 +1662,122 @@ fn runtime_status(
         codex_launch_receipts: jsonl_status(queue_dir.join("codex-runtime-launch-receipts.jsonl"))?,
         control_receipts: jsonl_status(queue_dir.join("control-receipts.jsonl"))?,
         dead_letter_receipts: jsonl_status(queue_dir.join("dead-letter-receipts.jsonl"))?,
+        goal_closures: governed_transition_status(
+            &harness_home
+                .join("state")
+                .join("goal-closure")
+                .join("protected-intents.jsonl"),
+            &harness_home
+                .join("state")
+                .join("goal-closure")
+                .join("receipts.jsonl"),
+            "closureId",
+            "requestedAtMs",
+            &["completed"],
+            &["failed"],
+        )?,
+        session_transitions: governed_transition_status(
+            &harness_home
+                .join("state")
+                .join("channel-session-transitions")
+                .join("protected-intents.jsonl"),
+            &harness_home
+                .join("state")
+                .join("channel-session-transitions")
+                .join("receipts.jsonl"),
+            "transitionId",
+            "requestedAtMs",
+            &["boundary-committed"],
+            &["retry-pending"],
+        )?,
     })
+}
+
+fn governed_transition_status(
+    intents_file: &Path,
+    receipts_file: &Path,
+    id_key: &str,
+    requested_at_key: &str,
+    completed_phases: &[&str],
+    failed_phases: &[&str],
+) -> io::Result<HarnessGovernedTransitionStatus> {
+    let mut report = HarnessGovernedTransitionStatus::default();
+    let mut intents = BTreeMap::<String, Option<i64>>::new();
+    if intents_file.is_file() {
+        for line in fs::read_to_string(intents_file)?.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                report.invalid_lines += 1;
+                continue;
+            };
+            let Some(id) = value.get(id_key).and_then(Value::as_str) else {
+                report.invalid_lines += 1;
+                continue;
+            };
+            intents.insert(
+                id.to_string(),
+                value.get(requested_at_key).and_then(Value::as_i64),
+            );
+        }
+    }
+    let mut latest_state_by_id = BTreeMap::<String, (String, bool)>::new();
+    let mut earliest_receipt_at_by_id = BTreeMap::<String, i64>::new();
+    if receipts_file.is_file() {
+        for line in fs::read_to_string(receipts_file)?.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                report.invalid_lines += 1;
+                continue;
+            };
+            let (Some(id), Some(phase)) = (
+                value.get(id_key).and_then(Value::as_str),
+                value.get("phase").and_then(Value::as_str),
+            ) else {
+                report.invalid_lines += 1;
+                continue;
+            };
+            let failed_result = value
+                .get("result")
+                .and_then(Value::as_str)
+                .is_some_and(|result| result.eq_ignore_ascii_case("failed"));
+            latest_state_by_id.insert(id.to_string(), (phase.to_string(), failed_result));
+            if let Some(recorded_at_ms) = value.get("recordedAtMs").and_then(Value::as_i64) {
+                earliest_receipt_at_by_id
+                    .entry(id.to_string())
+                    .and_modify(|current| *current = (*current).min(recorded_at_ms))
+                    .or_insert(recorded_at_ms);
+            }
+            report.latest_phase = Some(phase.to_string());
+        }
+    }
+    report.intents = intents.len();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default();
+    for (id, requested_at_ms) in intents {
+        let latest_state = latest_state_by_id.get(&id);
+        let latest_phase = latest_state.map(|(phase, _)| phase.as_str());
+        if latest_phase.is_some_and(|phase| completed_phases.contains(&phase)) {
+            report.completed += 1;
+            continue;
+        }
+        report.pending += 1;
+        if latest_phase.is_some_and(|phase| failed_phases.contains(&phase))
+            || latest_state.is_some_and(|(_, failed_result)| *failed_result)
+        {
+            report.failed += 1;
+        }
+        if let Some(requested_at_ms) =
+            requested_at_ms.or_else(|| earliest_receipt_at_by_id.get(&id).copied())
+        {
+            let age_ms = now_ms.saturating_sub(requested_at_ms).max(0);
+            report.oldest_pending_age_ms = Some(
+                report
+                    .oldest_pending_age_ms
+                    .map_or(age_ms, |current| current.max(age_ms)),
+            );
+        }
+    }
+    Ok(report)
 }
 
 fn channel_status(
@@ -4150,6 +4289,109 @@ mod tests {
             "cold history must not replace current-ledger telemetry"
         );
         assert_eq!(report.run_once_receipts.lines, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_separates_waiting_from_open_and_terminal() {
+        let root = temp_root("status_separates_waiting_from_open_and_terminal");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            [
+                r#"{"queueId":"queue-waiting","status":"queued","runtimeClass":"interactive","origin":"channel"}"#,
+                r#"{"queueId":"queue-open","status":"queued","runtimeClass":"interactive","origin":"channel"}"#,
+                r#"{"queueId":"queue-terminal","status":"queued","runtimeClass":"interactive","origin":"channel"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            [
+                r#"{"queueId":"queue-waiting","status":"needs-user","reason":"approval decision required"}"#,
+                r#"{"queueId":"queue-terminal","status":"completed","reason":"done"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let report = runtime_status(&harness_home, &mut Vec::new()).unwrap();
+
+        assert_eq!(report.queued_items, 3);
+        assert_eq!(report.waiting_items, 1);
+        assert_eq!(report.open_items, 1);
+        assert_eq!(report.open_by_runtime_class.get("interactive"), Some(&1));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_summarizes_governed_transition_phases_without_raw_authority() {
+        let root = temp_root("status_summarizes_governed_transition_phases");
+        let state = root.join(".agent-harness").join("state");
+        let closures = state.join("goal-closure");
+        let transitions = state.join("channel-session-transitions");
+        fs::create_dir_all(&closures).unwrap();
+        fs::create_dir_all(&transitions).unwrap();
+        fs::write(
+            closures.join("protected-intents.jsonl"),
+            concat!(
+                "{\"closureId\":\"closure-1\",\"authority\":{\"sourceThreadId\":\"private-thread\"}}\n",
+                "{\"closureId\":\"closure-2\",\"authority\":{\"sourceThreadId\":\"private-thread-2\"}}"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            closures.join("receipts.jsonl"),
+            concat!(
+                "{\"closureId\":\"closure-1\",\"phase\":\"completed\",\"result\":\"succeeded\",\"authorityDigest\":\"sha256:closure\",\"recordedAtMs\":1000}\n",
+                "{\"closureId\":\"closure-2\",\"phase\":\"backend-result-recorded\",\"result\":\"failed\",\"authorityDigest\":\"sha256:closure-2\",\"recordedAtMs\":2000}"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            transitions.join("protected-intents.jsonl"),
+            r#"{"transitionId":"transition-1","requestedAtMs":1000,"oldSessionKey":"private-session"}"#,
+        )
+        .unwrap();
+        fs::write(
+            transitions.join("receipts.jsonl"),
+            r#"{"transitionId":"transition-1","phase":"retry-pending","laneDigest":"sha256:lane"}"#,
+        )
+        .unwrap();
+
+        let closure = governed_transition_status(
+            &closures.join("protected-intents.jsonl"),
+            &closures.join("receipts.jsonl"),
+            "closureId",
+            "requestedAtMs",
+            &["completed"],
+            &["failed"],
+        )
+        .unwrap();
+        let transition = governed_transition_status(
+            &transitions.join("protected-intents.jsonl"),
+            &transitions.join("receipts.jsonl"),
+            "transitionId",
+            "requestedAtMs",
+            &["boundary-committed"],
+            &["retry-pending"],
+        )
+        .unwrap();
+
+        assert_eq!(closure.completed, 1);
+        assert_eq!(closure.pending, 1);
+        assert_eq!(closure.failed, 1);
+        assert!(closure.oldest_pending_age_ms.is_some());
+        assert_eq!(transition.pending, 1);
+        assert_eq!(transition.failed, 1);
+        let serialized = serde_json::to_string(&transition).unwrap();
+        assert!(!serialized.contains("private-session"));
+        assert!(!serialized.contains("private-thread"));
+
         let _ = fs::remove_dir_all(root);
     }
 

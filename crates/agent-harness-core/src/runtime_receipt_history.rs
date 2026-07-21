@@ -926,6 +926,7 @@ fn is_terminal_run_once_status(status: &str) -> bool {
             | "skipped"
             | "dead-letter"
             | "suppressed"
+            | "external-effect-denied"
     )
 }
 
@@ -1052,6 +1053,42 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn external_effect_denied_survives_terminal_history_compaction() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-harness-runtime-effect-denied-history-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let original = br#"{"schema":"agent-harness.runtime-run-once.v1","queueId":"turn:denied","traceId":"trace:denied","sessionKey":"session:denied","status":"external-effect-denied","reason":"approval denied","completedAtMs":42}
+"#;
+        let staged = stage_runtime_queue_receipt_history(
+            &queue_dir,
+            "effect-denied-transaction",
+            original,
+            b"",
+            &HashSet::new(),
+            100,
+        )
+        .unwrap();
+        commit_runtime_queue_receipt_history(&staged, 101).unwrap();
+
+        let records = find_runtime_queue_terminal_history(
+            &queue_dir,
+            &BTreeSet::from(["turn:denied".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "external-effect-denied");
+        assert_eq!(records[0].reason.as_deref(), Some("approval denied"));
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn continuation_disposition_and_link_survive_compaction() {

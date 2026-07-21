@@ -12,12 +12,13 @@ use crate::backend_reasoning::{
 };
 use crate::execution_mode::{ExecutionModePolicyV1, ExecutionModePreference};
 use crate::{
-    AgentRegistry, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, ExternalEffectApprovalDecisionV1,
-    ExternalEffectContinuationV1, ExternalEffectIntentV1, FastCommandMode,
-    GatewayRestartStatusReport, InboundMediaArtifact, RichMessagePresentation, THINKING_LEVELS,
-    TurnDispatch, TurnPlan, XHIGH_THINKING_LEVEL, collect_gateway_restart_status,
-    ensure_external_effect_continuation, inspect_codex_approval_policy, inspect_codex_sandbox,
-    inspect_codex_sandbox_policy, resolve_external_effect_approval,
+    AgentRegistry, ChannelApprovalDecisionV1, ChannelCommandIntent, DEFAULT_THINKING_LEVEL,
+    ExternalEffectApprovalDecisionV1, ExternalEffectContinuationV1, ExternalEffectIntentV1,
+    FastCommandMode, GatewayRestartStatusReport, InboundMediaArtifact, RichMessagePresentation,
+    THINKING_LEVELS, TurnDispatch, TurnPlan, XHIGH_THINKING_LEVEL, collect_gateway_restart_status,
+    ensure_external_effect_continuation, external_effect_source_session_key_digest,
+    inspect_codex_approval_policy, inspect_codex_sandbox, inspect_codex_sandbox_policy,
+    resolve_external_effect_approval, resolve_external_effect_public_channel_action,
 };
 
 const CHANNEL_STEP_SCHEMA: &str = "agent-harness.channel-step.v1";
@@ -407,6 +408,7 @@ pub enum ChannelOutboundAttachmentKind {
 pub enum ChannelOutboundMessageKind {
     CommandReply,
     AgentReply,
+    ApprovalRequest,
     ErrorReply,
 }
 
@@ -601,12 +603,15 @@ fn external_effect_approval_effect(
     };
     let Some(token) = token.filter(|value| {
         let mut parts = value.split_whitespace();
-        parts.next().is_some_and(|part| part.starts_with("ahx1_")) && parts.next().is_none()
+        parts
+            .next()
+            .is_some_and(|part| part.starts_with("ahx1_") || part.starts_with("ahpa1_"))
+            && parts.next().is_none()
     }) else {
         return failure(
             "invalid-token",
             format!(
-                "/{} requires exactly one connector action token beginning with `ahx1_`",
+                "/{} requires exactly one connector action reference beginning with `ahpa1_` (or a legacy `ahx1_` token)",
                 if approve { "approve" } else { "deny" }
             ),
         );
@@ -638,12 +643,29 @@ fn external_effect_approval_effect(
     } else {
         ExternalEffectApprovalDecisionV1::Deny
     };
-    let intent = match resolve_external_effect_approval(
-        harness_home,
-        &token,
-        &lane.exact_lane_digest(),
-        decision,
-    ) {
+    let resolved = if token.starts_with("ahpa1_") {
+        let source_session_key_digest =
+            match external_effect_source_session_key_digest(&turn.session_key) {
+                Ok(digest) => digest,
+                Err(error) => return failure("invalid-session", error.to_string()),
+            };
+        resolve_external_effect_public_channel_action(
+            harness_home,
+            &format!("text-command:{token}"),
+            None,
+            &token,
+            &lane.exact_lane_digest(),
+            &source_session_key_digest,
+            Some(if approve {
+                ChannelApprovalDecisionV1::Approve
+            } else {
+                ChannelApprovalDecisionV1::Deny
+            }),
+        )
+    } else {
+        resolve_external_effect_approval(harness_home, &token, &lane.exact_lane_digest(), decision)
+    };
+    let intent = match resolved {
         Ok(intent) => intent,
         Err(error) => {
             warnings.push(format!("external-effect approval failed closed: {error}"));
@@ -2841,6 +2863,8 @@ mod tests {
             exact_lane_digest: lane.exact_lane_digest(),
             logical_lineage_id: "lineage-1".to_string(),
             source_queue_id: "queue-approval-source".to_string(),
+            source_session_key_digest: format!("sha256:{}", "1".repeat(64)),
+            approval_authority_digest: format!("sha256:{}", "2".repeat(64)),
         };
         let session_key = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
             "discord:dm#42:user#7:main",

@@ -1,0 +1,55 @@
+{
+  "schema": "agent-harness.acceptance-fixture.approval-waiting-channel-actions-replay.v1",
+  "authority": {
+    "platforms": ["telegram", "discord"],
+    "accountId": "account-synthetic",
+    "channelId": "channel-synthetic",
+    "userId": "user-synthetic",
+    "agentId": "main",
+    "sessionKeyDigest": "session-digest-synthetic",
+    "virtualSessionId": "virtual-session-synthetic",
+    "backendGeneration": "generation-1",
+    "effectId": "effect-1",
+    "approvalGeneration": 1,
+    "paramsDigest": "params-digest-synthetic",
+    "tokenDigest": "token-digest-synthetic"
+  },
+  "events": [
+    {"seq": 1, "kind": "mcp-elicitation"},
+    {"seq": 2, "kind": "approval-intent-persisted"},
+    {"seq": 3, "kind": "queue-needs-user", "leaseOwned": false, "runnable": false},
+    {"seq": 4, "kind": "approval-prompt-appended"},
+    {"seq": 5, "kind": "later-same-session-queue", "admission": "runnable"},
+    {"seq": 6, "kind": "typed-channel-action", "decision": "approved", "startsModelTurn": false},
+    {"seq": 7, "kind": "decision-persisted"},
+    {"seq": 8, "kind": "continuation-enqueued"},
+    {"seq": 9, "kind": "effect-confirmed"}
+  ],
+  "variants": [
+    "deny",
+    "wrong-platform",
+    "wrong-account",
+    "wrong-channel",
+    "wrong-user",
+    "wrong-agent",
+    "wrong-session",
+    "wrong-generation",
+    "wrong-effect",
+    "stale-approval-generation",
+    "expired",
+    "same-decision-replay",
+    "opposite-decision-replay",
+    "restart-before-prompt",
+    "restart-after-decision-before-continuation",
+    "restart-after-continuation-before-reply"
+  ],
+  "expected": {
+    "waitingLeaseCount": 0,
+    "laterQueueRuns": true,
+    "modelTurnFromActionCount": 0,
+    "decisionCount": 1,
+    "continuationCount": 1,
+    "effectCount": 1,
+    "rawTokenInDurableEvidence": false
+  }
+}

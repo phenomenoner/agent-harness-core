@@ -1,0 +1,32 @@
+{
+  "schema": "agent-harness.acceptance-fixture.parent-subagent-completion-ownership-replay.v1",
+  "authority": {
+    "parentThreadId": "thread-parent",
+    "parentTurnId": "turn-parent",
+    "sourceQueueId": "queue-parent",
+    "rolloutModes": ["off", "shadow", "authoritative"]
+  },
+  "events": [
+    {"seq": 1, "path": "live", "method": "turn/started", "threadId": "thread-parent", "turnId": "turn-parent", "turnKind": "regular"},
+    {"seq": 2, "path": "live", "method": "item/completed", "threadId": "thread-parent", "turnId": "turn-parent", "itemId": "parent-commentary", "phase": "commentary"},
+    {"seq": 3, "path": "live", "method": "turn/started", "threadId": "thread-child-a", "turnId": "turn-child-a", "turnKind": "subAgent"},
+    {"seq": 4, "path": "live", "method": "turn/started", "threadId": "thread-child-b", "turnId": "turn-child-b", "turnKind": "subAgent"},
+    {"seq": 5, "path": "live", "method": "item/completed", "threadId": "thread-child-a", "turnId": "turn-child-a", "itemId": "child-a-tool", "phase": "tool"},
+    {"seq": 6, "path": "live", "method": "item/completed", "threadId": "thread-child-a", "turnId": "turn-child-a", "itemId": "child-a-final", "phase": "final_answer"},
+    {"seq": 7, "path": "live", "method": "turn/completed", "threadId": "thread-child-a", "turnId": "turn-child-a", "status": "completed"},
+    {"seq": 8, "path": "live", "method": "turn/completed", "threadId": "thread-child-b", "turnId": "turn-child-b", "status": "failed"},
+    {"seq": 9, "path": "live", "method": "item/completed", "threadId": "thread-parent", "turnId": "turn-parent", "itemId": "parent-final", "phase": "final_answer"},
+    {"seq": 10, "path": "live", "method": "turn/completed", "threadId": "thread-parent", "turnId": "turn-parent", "status": "completed"},
+    {"seq": 11, "path": "stdout-recovery", "method": "item/completed", "threadId": "thread-child-a", "turnId": "turn-child-a", "itemId": "child-a-final", "phase": "final_answer"},
+    {"seq": 12, "path": "stdout-recovery", "method": "turn/completed", "threadId": "thread-child-a", "turnId": "turn-child-a", "status": "completed"},
+    {"seq": 13, "path": "stdout-recovery", "method": "item/completed", "threadId": "thread-parent", "turnId": "turn-parent", "itemId": "parent-final", "phase": "final_answer"},
+    {"seq": 14, "path": "stdout-recovery", "method": "turn/completed", "threadId": "thread-parent", "turnId": "turn-parent", "status": "completed"}
+  ],
+  "expected": {
+    "parentCompletionCount": 1,
+    "parentFinalItemId": "parent-final",
+    "childResultEnvelopeCount": 2,
+    "foreignFinalCanCompleteParent": false,
+    "liveAndRecoveryConverge": true
+  }
+}

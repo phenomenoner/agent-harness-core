@@ -538,12 +538,25 @@ effect generation. The two approval modes park the turn promptly, emit a distinc
 platform/account/channel/user/agent lane, action, parameter digest, and effect generation.
 Protected live-control actions remain denied even if a rule would otherwise allow approval.
 
-The provider-neutral channel commands are `/approve <ahx1_...>` and `/deny <ahx1_...>`. They are
-command-only replies and never enqueue a new model request directly. A valid approval commits one
-exact-lane continuation; repeating the same decision reuses the same child. Wrong-lane, expired,
-opposite-decision, stopped, superseded, or digest-mismatched capabilities fail closed. Raw bearer
-tokens are stored only in the protected latest-state snapshot and are excluded from generic
-receipts, command effects, public serialization, and logs.
+Telegram and Discord can present native approval controls. Their callback/component payloads carry
+only a short-lived public action identifier; they never carry the bearer capability. Provider
+callbacks and Discord component interactions are converted into the same provider-neutral typed
+action before authorization. The runtime then resolves that public identifier against protected
+state and requires an exact match for platform, account, channel, user, agent, concrete session,
+effect generation, action, and parameter digest.
+
+The compatibility commands `/approve <ahx1_...>` and `/deny <ahx1_...>` remain accepted for clients
+that cannot render native controls. Native actions and compatibility commands are control-only
+inputs and never enqueue a new model request directly. A valid approval commits one exact-lane
+continuation; repeating the same decision reuses the same child. Wrong-lane, expired,
+opposite-decision, stopped, superseded, or digest-mismatched actions fail closed. Raw bearer tokens
+are stored only in protected latest-state snapshots and are excluded from provider payloads,
+generic receipts, command effects, public serialization, and logs.
+
+An approval wait is a durable parked state rather than a running lease. It blocks later work only
+on the same exact lane and does not consume worker capacity while waiting. Expiry reconciliation
+has a bounded winner: either a valid decision commits first or expiry terminalizes the generation;
+the losing path cannot revive or duplicate the effect.
 
 If a process stops after the initial `Requested` snapshot but before the approval disposition is
 durable, restart re-applies the same connector policy under the stable effect id and creates one

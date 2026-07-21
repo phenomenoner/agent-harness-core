@@ -57,6 +57,7 @@ pub enum ChannelRunOnceStatus {
     CommandHandled,
     AgentTurnCompleted,
     AgentTurnQueued,
+    SessionTransitionPending,
     ErrorReplied,
     Skipped,
 }
@@ -118,6 +119,9 @@ pub fn run_channel_once(options: ChannelRunOnceOptions) -> io::Result<ChannelRun
                 ChannelRunOnceStatus::AgentTurnQueued
             }
         }
+        ChannelReceiveStatus::SessionTransitionPending => {
+            ChannelRunOnceStatus::SessionTransitionPending
+        }
         ChannelReceiveStatus::ErrorReplied => ChannelRunOnceStatus::ErrorReplied,
         ChannelReceiveStatus::DuplicateSuppressed => ChannelRunOnceStatus::Skipped,
         ChannelReceiveStatus::Skipped => ChannelRunOnceStatus::Skipped,
@@ -129,7 +133,8 @@ pub fn run_channel_once(options: ChannelRunOnceOptions) -> io::Result<ChannelRun
             match status {
                 ChannelRunOnceStatus::CommandHandled
                 | ChannelRunOnceStatus::AgentTurnCompleted
-                | ChannelRunOnceStatus::AgentTurnQueued => HarnessLogLevel::Info,
+                | ChannelRunOnceStatus::AgentTurnQueued
+                | ChannelRunOnceStatus::SessionTransitionPending => HarnessLogLevel::Info,
                 ChannelRunOnceStatus::ErrorReplied => HarnessLogLevel::Warn,
                 ChannelRunOnceStatus::Skipped => HarnessLogLevel::Debug,
             },
@@ -601,8 +606,9 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-channel"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
-        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"Channel fake reply."}}')
-        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-channel","status":"completed"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-channel","turn":{"id":"turn-channel","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"threadId":"thread-channel","turnId":"turn-channel","itemId":"msg-channel","delta":"Channel fake reply."}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-channel","turn":{"id":"turn-channel","status":"completed"}}}')
         [Console]::Out.Flush()
         break
     }
@@ -637,8 +643,9 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-channel"}}}'
             ;;
         *'"method":"turn/start"'*)
-            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Channel fake reply."}}'
-            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-channel","status":"completed"}}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-channel","turn":{"id":"turn-channel","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-channel","turnId":"turn-channel","itemId":"msg-channel","delta":"Channel fake reply."}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-channel","turn":{"id":"turn-channel","status":"completed"}}}'
             exit 0
             ;;
     esac

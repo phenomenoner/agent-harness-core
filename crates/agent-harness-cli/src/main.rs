@@ -34,15 +34,15 @@ use agent_harness_core::{
     ChannelIdentityLookup, ChannelIdentityResolutionStatus, ChannelOutboundAttachment,
     ChannelOutboundAttachmentKind, ChannelOutboundMessage, ChannelOutboundMessageKind,
     ChannelOutboxPlanOptions, ChannelOutboxPlanReport, ChannelReceiveOptions, ChannelReceiveReport,
-    ChannelRunOnceOptions, ChannelRunOnceReport, ChannelStep, CodexBackendProvenanceProbeOptions,
-    CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions,
-    CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions, CodexRuntimePlanReport,
-    CodexRuntimePreflightOptions, CodexRuntimePreflightReport, CodexRuntimeRunOptions,
-    CodexRuntimeRunReport, ConflictPolicy, ContextPackParseOptions,
-    ContextRolloverRequeuePreparedOptions, ControlledCoordinatorSmokeChildV1,
-    ControlledCoordinatorSmokeLaneV1, ControlledCoordinatorSmokeOptionsV1,
-    CreateOperationPlanOptions, CreateOperationPlanOptionsV2, CronRunControlAction,
-    CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
+    ChannelRunOnceOptions, ChannelRunOnceReport, ChannelStateLane, ChannelStep,
+    CodexBackendProvenanceProbeOptions, CodexRuntimeCompletionOptions,
+    CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport,
+    CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightOptions,
+    CodexRuntimePreflightReport, CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy,
+    ContextPackParseOptions, ContextRolloverRequeuePreparedOptions,
+    ControlledCoordinatorSmokeChildV1, ControlledCoordinatorSmokeLaneV1,
+    ControlledCoordinatorSmokeOptionsV1, CreateOperationPlanOptions, CreateOperationPlanOptionsV2,
+    CronRunControlAction, CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
     CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DEFAULT_DREAM_DIRECTOR_MAX_CHARS,
     DEFAULT_DREAM_DIRECTOR_SOURCE_MAX_AGE_HOURS, DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM,
     DEFAULT_MEMORY_BACKFILL_BATCH_SIZE, DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
@@ -50,26 +50,29 @@ use agent_harness_core::{
     DEFAULT_MEMORY_BACKFILL_RETRY_CAP, DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION,
     DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS, DeterministicCronPlan, DeterministicCronPlanInput,
     DeterministicCronWorkerEnqueueOptions, DreamDirectorSendOptions, DriftCheckOptions,
-    DryRunImportOptions, ExecuteImportOptions, GoalLineageDoctorOptions, GoalLineageDoctorStatus,
-    GoalLineageSupersessionOptions, HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions,
-    HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport, HealthzOptions,
-    ImportPhaseStatus, ImportReport, InboundMediaArtifact, InboundMediaDownloadStatus,
-    InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, LearningProposalOptions,
-    LedgerMaintenanceRunOptions, LiveControlAction, McpRequestOptions, MemoryCanvasWorkerOptions,
-    MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions,
-    MemoryCredentialsExportReport, MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions,
-    MemoryEmbeddingBackfillReport, MemoryHookAdapterOptions, MemoryHookKind,
-    MemoryOwnerEndpointProbeOptions, MemoryOwnerEnsureOptions, MemoryOwnerHeartbeatOptions,
-    MemoryOwnerPromotionOptions, MemoryOwnerRecoveryOptions, MemoryOwnerShadowKind,
-    MemoryOwnerShadowOptions, MemoryOwnerTrustScopeOptions, MemorySearchOptions,
-    MemorySearchReport, MemoryVectorRecallOptions, MemoryVectorRecallReport,
-    MemoryVectorRecallStatus, NativeCronPlan, NativeCronPlanInput, NativeCronWorkerEnqueueOptions,
-    OpenClawMemLocalOwnerPrepareOptions, OpenClawMemReadPathSmokeOptions,
-    OpenClawMemServiceProposeOptions, OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus,
-    OpenClawMemServiceStatusOptions, OpenClawMemServiceStoreOptions, OperationPlanAddItemOptions,
-    OperationPlanBlockOptions, OperationPlanCommentOptions, OperationPlanCompleteOptions,
-    OperationPlanDelegateItemOptions, OperationPlanItemStatus,
-    OperationPlanPromoteDependenciesOptions, OperationPlanShowOptions,
+    DryRunImportOptions, ExecuteImportOptions, ExternalEffectExpiryReconcileRequestV1,
+    ExternalEffectStateV1, GoalClosureAuthorityV1, GoalClosureDispositionV1, GoalClosureIntentV1,
+    GoalClosureTargetCandidateV1, GoalClosureTargetResolutionDispositionV1,
+    GoalClosureTargetResolutionV1, GoalClosureTriggerV1, GoalLineageDisposition,
+    GoalLineageDoctorOptions, GoalLineageDoctorStatus, GoalLineageSupersessionOptions,
+    HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions, HarnessMetricsOptions,
+    HarnessStatusOptions, HarnessStatusReport, HealthzOptions, ImportPhaseStatus, ImportReport,
+    InboundMediaArtifact, InboundMediaDownloadStatus, InboundMediaModelAttachmentStatus,
+    InboundMediaSelectedVariant, LearningProposalOptions, LedgerMaintenanceRunOptions,
+    LiveControlAction, McpRequestOptions, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
+    MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions, MemoryCredentialsExportReport,
+    MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions, MemoryEmbeddingBackfillReport,
+    MemoryHookAdapterOptions, MemoryHookKind, MemoryOwnerEndpointProbeOptions,
+    MemoryOwnerEnsureOptions, MemoryOwnerHeartbeatOptions, MemoryOwnerPromotionOptions,
+    MemoryOwnerRecoveryOptions, MemoryOwnerShadowKind, MemoryOwnerShadowOptions,
+    MemoryOwnerTrustScopeOptions, MemorySearchOptions, MemorySearchReport,
+    MemoryVectorRecallOptions, MemoryVectorRecallReport, MemoryVectorRecallStatus, NativeCronPlan,
+    NativeCronPlanInput, NativeCronWorkerEnqueueOptions, OpenClawMemLocalOwnerPrepareOptions,
+    OpenClawMemReadPathSmokeOptions, OpenClawMemServiceProposeOptions,
+    OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus, OpenClawMemServiceStatusOptions,
+    OpenClawMemServiceStoreOptions, OperationPlanAddItemOptions, OperationPlanBlockOptions,
+    OperationPlanCommentOptions, OperationPlanCompleteOptions, OperationPlanDelegateItemOptions,
+    OperationPlanItemStatus, OperationPlanPromoteDependenciesOptions, OperationPlanShowOptions,
     OperationPlanUpdateItemOptions, OpsBackupOptions, OpsControlAction, OpsControlOptions,
     OpsCutoverApplyOptions, OpsCutoverApproveOptions, OpsCutoverReceiptOptions,
     OpsCutoverRequestOptions, OpsCutoverStatusOptions, PlainFinalPresentationAssessment,
@@ -114,9 +117,10 @@ use agent_harness_core::{
     delegate_operation_plan_item, doctor_backend_auth, enqueue_channel_step,
     enqueue_controlled_coordinator_smoke, enqueue_deterministic_cron_workers,
     enqueue_native_cron_workers, enqueue_subagent_workers, enqueue_worker_job,
-    ensure_memory_owner_state, evaluate_admission, evaluate_prompt_reduction,
-    evaluate_supervisor_children, execute_import, export_harness_registry_files,
-    export_memory_credentials, export_skill_pack, get_vault_secret, handle_mcp_request,
+    ensure_external_effect_continuation, ensure_memory_owner_state, evaluate_admission,
+    evaluate_prompt_reduction, evaluate_supervisor_children, execute_import,
+    export_harness_registry_files, export_memory_credentials, export_skill_pack,
+    external_effect_source_session_key_digest, get_vault_secret, handle_mcp_request,
     import_skill_pack, inspect_openclaw_mem_service, inspect_runtime_queue_capacity,
     invariant_catalog, inventory, latest_agent_progress_event_identity_for_queue,
     lint_cron_scheduler, lint_skill_file, list_background_tasks, list_cron_runs,
@@ -127,7 +131,9 @@ use agent_harness_core::{
     preflight_codex_runtime, prepare_openclaw_mem_local_owner, prepare_runtime_queue_item,
     probe_backend_account, probe_codex_backend_provenance, probe_codex_runtime_launch,
     promote_operation_plan_items_from_dependencies, propose_openclaw_mem_service_memory,
-    put_vault_secret, reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
+    put_vault_secret, read_channel_session_state_v2, reap_stale_worker_jobs,
+    recall_openclaw_mem_service, receive_channel_message, reconcile_channel_session_transitions,
+    reconcile_expired_external_effect_approvals, reconcile_held_channel_messages,
     reconcile_supervisor_inventory, record_agent_progress_delivery_with_context,
     record_channel_delivery, record_channel_delivery_for_source_queue, record_channel_turn_shadow,
     record_codex_runtime_completion, record_memory_owner_endpoint_probe,
@@ -139,6 +145,7 @@ use agent_harness_core::{
     release_checklist, remove_skill_pack, render_rich_presentation_batch_for_discord,
     render_rich_presentation_batch_for_telegram, request_backend_auth_cancel,
     request_memory_owner_promotion, requeue_prepared_context_rollover, resolve_channel_identity,
+    resolve_external_effect_public_channel_action, resolve_goal_closure_target,
     resolve_or_create_provider_codex_home, resolve_queue_terminal_control_nonblocking,
     resolve_runtime_queue_typing_context_nonblocking, resolve_virtual_session_working_context,
     restore_skill_from_archive, rotate_harness_log_if_needed, run_backend_auth_cli_operation,
@@ -150,7 +157,8 @@ use agent_harness_core::{
     runtime_worker::reconcile_runtime_queue_leases_for_generation,
     scan_security_boundaries, scenario_matrix_catalog, schema_registry_entries,
     search_imported_memory, search_imported_vector_memory, select_skills, set_skill_pin,
-    show_operation_plan, show_subagent_lifecycle, skill_curator_receipts_dir,
+    settle_expired_external_effect_approval, show_operation_plan, show_subagent_lifecycle,
+    skill_curator_receipts_dir,
     skill_replay::{load_skill_replay_corpus, report_current_policy_baseline},
     store_openclaw_mem_service_memory, subagent_lifecycle_receipts_file,
     subagent_lifecycle_snapshot_file, sync_builtin_harness_skills, synthesize_skill,
@@ -167,6 +175,10 @@ const DEFAULT_CODEX_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 const DEFAULT_RUNTIME_SAFE_MODE_RESTART_MS: u64 = 60_000;
 const DEFAULT_RUNTIME_ACTIVE_TASK_SHUTDOWN_GRACE_MS: u64 = 15_000;
 const DEFAULT_RUNTIME_CONTROL_POLL_MS: u64 = 1_000;
+const DEFAULT_EXTERNAL_EFFECT_EXPIRY_RECONCILE_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_EXTERNAL_EFFECT_EXPIRY_RECONCILE_ROWS: usize = 32;
+const DEFAULT_HELD_CHANNEL_MESSAGE_RECONCILE_ROWS: usize = 32;
+const DEFAULT_CHANNEL_SESSION_TRANSITION_RECONCILE_ROWS: usize = 8;
 const DISCORD_ATTACHMENT_TEXT_EXTRACT_MAX_BYTES: usize = 16 * 1024;
 const DISCORD_ATTACHMENT_DOWNLOAD_MAX_BYTES: usize =
     DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM as usize;
@@ -222,6 +234,7 @@ fn main() {
         "invariants" => run_invariants(&rest),
         "goal-lineage-doctor" => run_goal_lineage_doctor_cli(&rest),
         "goal-lineage-supersede" => run_goal_lineage_supersede_cli(&rest),
+        "goal-history-close" => run_goal_history_close_cli(&rest),
         "goal-campaign-status" => run_goal_campaign_status_cli(&rest),
         "scenario-matrix" => run_scenario_matrix(&rest),
         "schema-registry" => run_schema_registry(&rest),
@@ -2626,6 +2639,397 @@ fn run_goal_lineage_doctor_cli(args: &[String]) -> Result<(), String> {
         Err("goal-lineage-doctor found unresolved or unsafe active goal rows".to_string())
     } else {
         Ok(())
+    }
+}
+
+const GOAL_HISTORY_CLOSE_REPORT_SCHEMA: &str = "agent-harness.goal-history-close-report.v1";
+
+#[derive(Debug, Clone)]
+struct GoalHistoryCloseCliArgs {
+    harness_home: PathBuf,
+    lane: ChannelStateLane,
+    concrete_session_key: String,
+    source_thread_id: String,
+    virtual_session_id: Option<String>,
+    backend_generation: Option<String>,
+    goal_identity: Option<String>,
+    goal_generation: Option<String>,
+    disposition: GoalClosureDispositionV1,
+    reason: String,
+    expected_projection_checksum: String,
+    caller_effect_identity: String,
+    apply: bool,
+    expected_authority_digest: Option<String>,
+    expected_intent_checksum: Option<String>,
+    codex_executable: Option<PathBuf>,
+    codex_arguments: Vec<String>,
+    working_directory: PathBuf,
+    codex_home: Option<PathBuf>,
+    timeout_ms: u64,
+}
+
+#[derive(Debug)]
+struct GoalHistoryClosePrepared {
+    intent: GoalClosureIntentV1,
+    resolution: GoalClosureTargetResolutionV1,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoalHistoryCloseApplyGuard {
+    expected_authority_digest: String,
+    expected_intent_checksum: String,
+    expected_projection_checksum: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoalHistoryCloseReport {
+    schema: &'static str,
+    mode: &'static str,
+    read_only: bool,
+    safe_to_apply: bool,
+    closure_id: String,
+    authority_digest: String,
+    intent_checksum: String,
+    projection_checksum: String,
+    resolution: GoalClosureTargetResolutionDispositionV1,
+    candidate_count: usize,
+    reason: String,
+    apply_guard: GoalHistoryCloseApplyGuard,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution: Option<agent_harness_core::codex_runtime::CodexGoalClosureExecutionReport>,
+}
+
+fn run_goal_history_close_cli(args: &[String]) -> Result<(), String> {
+    let parsed = parse_goal_history_close_args(args)?;
+    let prepared = prepare_goal_history_close(&parsed)?;
+    let mut report = goal_history_close_report(&parsed, &prepared, None);
+    if !parsed.apply {
+        let safe = report.safe_to_apply;
+        print_json(&report)?;
+        return if safe {
+            Ok(())
+        } else {
+            Err("goal-history-close dry-run did not resolve one exact authority".to_string())
+        };
+    }
+
+    validate_goal_history_close_apply_guard(&parsed, &prepared)?;
+    let revalidated = prepare_goal_history_close(&parsed)?;
+    if revalidated.intent.authority_digest != prepared.intent.authority_digest
+        || revalidated.intent.intent_checksum != prepared.intent.intent_checksum
+        || revalidated.intent.closure_id != prepared.intent.closure_id
+        || revalidated.resolution.disposition != GoalClosureTargetResolutionDispositionV1::Exact
+    {
+        return Err(
+            "goal-history-close authority changed after apply guard validation; rerun --dry-run"
+                .to_string(),
+        );
+    }
+    let executable = parsed
+        .codex_executable
+        .clone()
+        .ok_or_else(|| "goal-history-close --apply requires --codex-exe".to_string())?;
+    let execution = agent_harness_core::codex_runtime::execute_codex_goal_closure(
+        agent_harness_core::codex_runtime::CodexGoalClosureExecutionOptions {
+            harness_home: parsed.harness_home.clone(),
+            intent: revalidated.intent,
+            resolution: revalidated.resolution,
+            executable,
+            arguments: parsed.codex_arguments.clone(),
+            working_directory: parsed.working_directory.clone(),
+            codex_home: parsed.codex_home.clone(),
+            timeout_ms: parsed.timeout_ms,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    report = goal_history_close_report(&parsed, &prepared, Some(execution));
+    print_json(&report)
+}
+
+fn parse_goal_history_close_args(args: &[String]) -> Result<GoalHistoryCloseCliArgs, String> {
+    let options = SimpleOptions::parse(
+        args,
+        "goal-history-close",
+        &[
+            "--platform",
+            "--account-id",
+            "--channel-id",
+            "--user-id",
+            "--agent-id",
+            "--session-key",
+            "--source-thread-id",
+            "--virtual-session-id",
+            "--backend-generation",
+            "--goal-id",
+            "--goal-generation",
+            "--disposition",
+            "--reason",
+            "--expected-projection-checksum",
+            "--caller-effect-id",
+            "--expected-authority-digest",
+            "--expected-intent-checksum",
+            "--codex-exe",
+            "--codex-arg",
+            "--working-directory",
+            "--codex-home",
+            "--timeout-ms",
+        ],
+        &["--dry-run", "--apply"],
+    )?;
+    let dry_run = options.has_flag("--dry-run");
+    let apply = options.has_flag("--apply");
+    if dry_run == apply {
+        return Err("goal-history-close requires exactly one of --dry-run or --apply".to_string());
+    }
+    let lane = ChannelStateLane::new(
+        &options.required("--platform")?,
+        Some(&options.required("--account-id")?),
+        &options.required("--channel-id")?,
+        &options.required("--user-id")?,
+        &options.required("--agent-id")?,
+    )
+    .map_err(|error| error.to_string())?;
+    let disposition = match options.required("--disposition")?.as_str() {
+        "completed" => GoalClosureDispositionV1::Completed,
+        "canceled" | "cancelled" => GoalClosureDispositionV1::Canceled,
+        other => {
+            return Err(format!(
+                "--disposition must be completed or canceled, got: {other}"
+            ));
+        }
+    };
+    let expected_projection_checksum = options.required("--expected-projection-checksum")?;
+    let caller_effect_identity = options
+        .optional("--caller-effect-id")
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "operator-goal-history-close:{}:{}",
+                lane.exact_lane_digest(),
+                expected_projection_checksum
+            )
+        });
+    let mut codex_arguments = options.values("--codex-arg");
+    if codex_arguments.is_empty() {
+        codex_arguments.push("app-server".to_string());
+    }
+    let working_directory = options
+        .optional("--working-directory")
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)
+        .map_err(|error| format!("cannot resolve goal closure working directory: {error}"))?;
+    let timeout_ms = options
+        .optional_u64("--timeout-ms")?
+        .unwrap_or(DEFAULT_CODEX_TIMEOUT_MS);
+    if timeout_ms == 0 {
+        return Err("--timeout-ms must be positive".to_string());
+    }
+    if apply
+        && (options.optional("--expected-authority-digest").is_none()
+            || options.optional("--expected-intent-checksum").is_none())
+    {
+        return Err(
+            "goal-history-close --apply requires the prior dry-run --expected-authority-digest and --expected-intent-checksum"
+                .to_string(),
+        );
+    }
+    Ok(GoalHistoryCloseCliArgs {
+        harness_home: options.target_home.clone(),
+        lane,
+        concrete_session_key: options.required("--session-key")?,
+        source_thread_id: options.required("--source-thread-id")?,
+        virtual_session_id: options
+            .optional("--virtual-session-id")
+            .map(ToString::to_string),
+        backend_generation: options
+            .optional("--backend-generation")
+            .map(ToString::to_string),
+        goal_identity: options.optional("--goal-id").map(ToString::to_string),
+        goal_generation: options
+            .optional("--goal-generation")
+            .map(ToString::to_string),
+        disposition,
+        reason: options.required("--reason")?,
+        expected_projection_checksum,
+        caller_effect_identity,
+        apply,
+        expected_authority_digest: options
+            .optional("--expected-authority-digest")
+            .map(ToString::to_string),
+        expected_intent_checksum: options
+            .optional("--expected-intent-checksum")
+            .map(ToString::to_string),
+        codex_executable: options.optional("--codex-exe").map(PathBuf::from),
+        codex_arguments,
+        working_directory,
+        codex_home: options.optional("--codex-home").map(PathBuf::from),
+        timeout_ms,
+    })
+}
+
+fn prepare_goal_history_close(
+    args: &GoalHistoryCloseCliArgs,
+) -> Result<GoalHistoryClosePrepared, String> {
+    let lane_digest = args.lane.exact_lane_digest();
+    let doctor = run_goal_lineage_doctor(GoalLineageDoctorOptions {
+        harness_home: args.harness_home.clone(),
+        lane_digest: Some(lane_digest.clone()),
+        virtual_session_id: args.virtual_session_id.clone(),
+    })
+    .map_err(|error| error.to_string())?;
+    if !doctor.blockers.is_empty()
+        || matches!(
+            doctor.status,
+            GoalLineageDoctorStatus::Blocked | GoalLineageDoctorStatus::ReconciliationRequired
+        )
+    {
+        return Err(format!(
+            "goal-history-close exact-authority doctor is unsafe: {}",
+            doctor
+                .blockers
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("status={:?}", doctor.status))
+        ));
+    }
+    let selected = doctor
+        .lineages
+        .iter()
+        .filter(|lineage| {
+            lineage.lane_digest.as_deref() == Some(lane_digest.as_str())
+                && lineage.source_session_key == args.concrete_session_key
+                && lineage.source_thread_id == args.source_thread_id
+                && args.backend_generation.as_deref().is_none_or(|generation| {
+                    lineage.backend_context_generation.as_deref() == Some(generation)
+                })
+                && args.goal_identity.as_deref().is_none_or(|goal| {
+                    lineage.goal_reference == goal
+                        || lineage.backend_goal_ref.as_deref() == Some(goal)
+                })
+                && args
+                    .goal_generation
+                    .as_deref()
+                    .is_none_or(|generation| lineage.lineage_id == generation)
+        })
+        .collect::<Vec<_>>();
+    let first = selected.first().ok_or_else(|| {
+        "goal-history-close selectors matched no authoritative goal lineage".to_string()
+    })?;
+    let virtual_session_id = first.virtual_session_id.clone().ok_or_else(|| {
+        "goal-history-close candidate has no authoritative virtual session".to_string()
+    })?;
+    let backend_context_generation = first.backend_context_generation.clone().ok_or_else(|| {
+        "goal-history-close candidate has no authoritative backend generation".to_string()
+    })?;
+    let goal_identity = first
+        .backend_goal_ref
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| first.goal_reference.clone());
+    let goal_generation = first.lineage_id.clone();
+    let authority = GoalClosureAuthorityV1 {
+        lane_digest: lane_digest.clone(),
+        concrete_session_key: args.concrete_session_key.clone(),
+        virtual_session_id,
+        backend_context_generation,
+        source_thread_id: args.source_thread_id.clone(),
+    };
+    let intent = GoalClosureIntentV1::new(
+        GoalClosureTriggerV1::OperatorHistorical,
+        args.disposition,
+        authority,
+        goal_identity,
+        goal_generation,
+        Some(args.expected_projection_checksum.clone()),
+        args.caller_effect_identity.clone(),
+        args.reason.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    let candidates = selected
+        .into_iter()
+        .map(|lineage| {
+            let authority = GoalClosureAuthorityV1 {
+                lane_digest: lineage.lane_digest.clone().unwrap_or_default(),
+                concrete_session_key: lineage.source_session_key.clone(),
+                virtual_session_id: lineage.virtual_session_id.clone().unwrap_or_default(),
+                backend_context_generation: lineage
+                    .backend_context_generation
+                    .clone()
+                    .unwrap_or_default(),
+                source_thread_id: lineage.source_thread_id.clone(),
+            };
+            GoalClosureTargetCandidateV1 {
+                authority,
+                goal_identity: lineage
+                    .backend_goal_ref
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| lineage.goal_reference.clone()),
+                goal_generation: lineage.lineage_id.clone(),
+                projection_checksum: lineage.projection_checksum.clone(),
+                active: lineage.runnable,
+                original_binding: true,
+                latest_authoritative_projection: true,
+                latest_authoritative_lineage: matches!(
+                    lineage.disposition,
+                    GoalLineageDisposition::Runnable | GoalLineageDisposition::Inactive
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    let resolution = resolve_goal_closure_target(&intent, &candidates);
+    Ok(GoalHistoryClosePrepared { intent, resolution })
+}
+
+fn validate_goal_history_close_apply_guard(
+    args: &GoalHistoryCloseCliArgs,
+    prepared: &GoalHistoryClosePrepared,
+) -> Result<(), String> {
+    if prepared.resolution.disposition != GoalClosureTargetResolutionDispositionV1::Exact {
+        return Err(format!(
+            "goal-history-close apply requires one exact authority: {}",
+            prepared.resolution.reason
+        ));
+    }
+    if args.expected_authority_digest.as_deref() != Some(prepared.intent.authority_digest.as_str())
+        || args.expected_intent_checksum.as_deref()
+            != Some(prepared.intent.intent_checksum.as_str())
+    {
+        return Err(
+            "goal-history-close dry-run authority/checksum guard does not match current evidence"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn goal_history_close_report(
+    args: &GoalHistoryCloseCliArgs,
+    prepared: &GoalHistoryClosePrepared,
+    execution: Option<agent_harness_core::codex_runtime::CodexGoalClosureExecutionReport>,
+) -> GoalHistoryCloseReport {
+    GoalHistoryCloseReport {
+        schema: GOAL_HISTORY_CLOSE_REPORT_SCHEMA,
+        mode: if args.apply { "apply" } else { "dry-run" },
+        read_only: !args.apply,
+        safe_to_apply: prepared.resolution.disposition
+            == GoalClosureTargetResolutionDispositionV1::Exact,
+        closure_id: prepared.intent.closure_id.clone(),
+        authority_digest: prepared.intent.authority_digest.clone(),
+        intent_checksum: prepared.intent.intent_checksum.clone(),
+        projection_checksum: args.expected_projection_checksum.clone(),
+        resolution: prepared.resolution.disposition,
+        candidate_count: prepared.resolution.candidate_count,
+        reason: prepared.resolution.reason.clone(),
+        apply_guard: GoalHistoryCloseApplyGuard {
+            expected_authority_digest: prepared.intent.authority_digest.clone(),
+            expected_intent_checksum: prepared.intent.intent_checksum.clone(),
+            expected_projection_checksum: args.expected_projection_checksum.clone(),
+        },
+        execution,
     }
 }
 
@@ -5529,6 +5933,79 @@ fn execute_telegram_poll_once(
             continue;
         };
         next_offset = Some(update_id + 1);
+        match parse_telegram_callback_action(update) {
+            Ok(Some(action)) => {
+                let callback_query_id = action.callback_query_id.clone();
+                match execute_telegram_callback_action(args, &access_policy, &action) {
+                    Ok(outcome) => {
+                        handled_messages += 1;
+                        if let Err(error) = telegram_answer_callback_query(
+                            token,
+                            &callback_query_id,
+                            &outcome.message,
+                        ) {
+                            warnings.push(format!(
+                                "Telegram callback acknowledgement failed after durable {} decision: {error}",
+                                outcome.status
+                            ));
+                        }
+                        if outcome.terminal
+                            && let Err(error) = telegram_clear_inline_keyboard(
+                                token,
+                                &action.chat_id,
+                                &action.provider_message_id,
+                            )
+                        {
+                            warnings.push(format!(
+                                "Telegram callback keyboard clear failed after durable {} decision: {error}",
+                                outcome.status
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        skipped_updates += 1;
+                        warnings.push(format!(
+                            "Telegram callback update {update_id} was rejected: {error}"
+                        ));
+                        if let Err(ack_error) = telegram_answer_callback_query(
+                            token,
+                            &callback_query_id,
+                            "This approval control is invalid, expired, or no longer current.",
+                        ) {
+                            warnings.push(format!(
+                                "Telegram rejected callback acknowledgement also failed: {ack_error}"
+                            ));
+                        }
+                    }
+                }
+                write_telegram_offset(&offset_file, next_offset)?;
+                continue;
+            }
+            Err(error) if update.get("callback_query").is_some() => {
+                skipped_updates += 1;
+                warnings.push(format!(
+                    "Telegram callback update {update_id} failed closed: {error}"
+                ));
+                if let Some(callback_query_id) = update
+                    .get("callback_query")
+                    .and_then(|query| query.get("id"))
+                    .and_then(telegram_id_string)
+                    && let Err(ack_error) = telegram_answer_callback_query(
+                        token,
+                        &callback_query_id,
+                        "This approval control is invalid or unsupported.",
+                    )
+                {
+                    warnings.push(format!(
+                        "Telegram invalid callback acknowledgement failed: {ack_error}"
+                    ));
+                }
+                write_telegram_offset(&offset_file, next_offset)?;
+                continue;
+            }
+            Ok(None) => {}
+            Err(_) => unreachable!("only callback updates can fail callback parsing"),
+        }
         let Some(message) = update
             .get("message")
             .or_else(|| update.get("edited_message"))
@@ -5731,6 +6208,55 @@ fn execute_telegram_poll_once(
     )
     .map_err(|err| err.to_string())?;
     Ok(report)
+}
+
+fn execute_telegram_callback_action(
+    args: &TelegramPollOnceArgs,
+    access_policy: &ChannelAccessPolicy,
+    action: &TelegramCallbackAction,
+) -> Result<ProviderChannelActionOutcome, String> {
+    let account_id = telegram_account_id(args.telegram_account.as_deref());
+    let identity = resolve_channel_identity(ChannelIdentityLookup {
+        harness_home: args.target_home.clone(),
+        platform: "telegram".to_string(),
+        account_id: account_id.clone(),
+        chat_id: action.chat_id.clone(),
+        thread_id: action.thread_id.clone(),
+        requested_agent_id: args.agent_id.clone(),
+    })
+    .map_err(|error| error.to_string())?;
+    if !identity.is_bound() {
+        return Err(format!(
+            "channel identity registry denied callback: {}",
+            identity.reason
+        ));
+    }
+    let agent_id = identity.agent_id.as_deref().ok_or_else(|| {
+        "channel identity registry returned a bound callback without an agent id".to_string()
+    })?;
+    let permission = match telegram_access_decision(
+        access_policy,
+        &action.chat_id,
+        &action.user_id,
+        action.chat_type.as_deref(),
+    ) {
+        ChannelAccessDecision::Allowed(permission) => permission,
+        ChannelAccessDecision::Denied(reason) => return Err(reason),
+    };
+    if permission != ChannelPermission::Admin {
+        return Err("native approval actions require admin channel permission".to_string());
+    }
+    resolve_provider_channel_action(
+        &args.target_home,
+        "telegram",
+        Some(&account_id),
+        &action.chat_id,
+        &action.user_id,
+        agent_id,
+        &action.callback_query_id,
+        Some(action.provider_message_id.clone()),
+        &action.public_action_id,
+    )
 }
 
 fn deliver_telegram_pending_outbox_with_sender<Sender>(
@@ -6664,8 +7190,34 @@ fn execute_discord_outbox_send_once(
 fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
     let args = discord_event_run_once_args_from_args(args)?;
     let event = read_discord_event_json(&args)?;
-    let parsed = parse_discord_gateway_message(&event)?;
+    let inbound = parse_discord_gateway_inbound(&event)?;
     let access_policy = channel_access_policy(&args.target_home)?;
+    if let Some(DiscordGatewayInbound::ComponentAction(action)) = &inbound {
+        let report = execute_discord_component_action(&args, &access_policy, action);
+        write_discord_event_receipt(&report)?;
+        append_harness_log(
+            &args.target_home,
+            &HarnessLogEvent::new(
+                current_log_time_ms().map_err(|err| err.to_string())?,
+                if report.status == "handled" {
+                    HarnessLogLevel::Info
+                } else {
+                    HarnessLogLevel::Warn
+                },
+                "discord",
+                "discord.component-action",
+                format!("status={} reason={}", report.status, report.reason),
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        print_discord_event_run_once_report(&report);
+        return Ok(());
+    }
+    let parsed = match inbound {
+        Some(DiscordGatewayInbound::Message(message)) => Some(message),
+        Some(DiscordGatewayInbound::ComponentAction(_)) => unreachable!("handled above"),
+        None => None,
+    };
     let report = match parsed {
         None => DiscordEventRunOnceReport {
             harness_home: args.target_home.clone(),
@@ -6865,6 +7417,110 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
     .map_err(|err| err.to_string())?;
     print_discord_event_run_once_report(&report);
     Ok(())
+}
+
+fn execute_discord_component_action(
+    args: &DiscordEventRunOnceArgs,
+    access_policy: &ChannelAccessPolicy,
+    action: &DiscordComponentAction,
+) -> DiscordEventRunOnceReport {
+    let base_report = |status: &str, reason: String| DiscordEventRunOnceReport {
+        harness_home: args.target_home.clone(),
+        status: status.to_string(),
+        reason,
+        message_id: Some(action.provider_event_id.clone()),
+        guild_id: action.guild_id.clone(),
+        channel_id: Some(action.channel_id.clone()),
+        user_id: Some(action.user_id.clone()),
+        run: None,
+    };
+    let acl_message = DiscordGatewayMessage {
+        message_id: action.provider_event_id.clone(),
+        guild_id: action.guild_id.clone(),
+        channel_id: action.channel_id.clone(),
+        user_id: action.user_id.clone(),
+        content: String::new(),
+        inbound_context: None,
+        inbound_media_artifacts: Vec::new(),
+        attachments: Vec::new(),
+        reply_context: None,
+        author_is_bot: false,
+    };
+    let permission = match discord_access_decision(access_policy, &acl_message) {
+        ChannelAccessDecision::Allowed(permission) => permission,
+        ChannelAccessDecision::Denied(reason) => return base_report("denied", reason),
+    };
+    if permission != ChannelPermission::Admin {
+        return base_report(
+            "denied",
+            "native approval actions require admin channel permission".to_string(),
+        );
+    }
+    let account_id = discord_account_id(args.discord_account.as_deref());
+    let identity = match resolve_channel_identity(ChannelIdentityLookup {
+        harness_home: args.target_home.clone(),
+        platform: "discord".to_string(),
+        account_id: account_id.clone(),
+        chat_id: action.channel_id.clone(),
+        thread_id: None,
+        requested_agent_id: args.agent_id.clone(),
+    }) {
+        Ok(identity) if identity.is_bound() => identity,
+        Ok(identity) => {
+            return base_report(
+                "denied",
+                format!(
+                    "channel identity registry denied component action: {}",
+                    identity.reason
+                ),
+            );
+        }
+        Err(error) => return base_report("denied", error.to_string()),
+    };
+    let Some(agent_id) = identity.agent_id.as_deref() else {
+        return base_report(
+            "denied",
+            "channel identity registry returned a bound component action without an agent id"
+                .to_string(),
+        );
+    };
+    let outcome = match resolve_provider_channel_action(
+        &args.target_home,
+        "discord",
+        Some(&account_id),
+        &action.channel_id,
+        &action.user_id,
+        agent_id,
+        &action.provider_event_id,
+        Some(action.provider_message_id.clone()),
+        &action.public_action_id,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => return base_report("denied", error),
+    };
+    let mut reason = format!(
+        "Discord component routed as typed channel action without a model turn: {}",
+        outcome.status
+    );
+    if outcome.terminal {
+        match discord_bot_token(&args.target_home, args.discord_account.as_deref()).and_then(
+            |token| {
+                discord_clear_message_components(
+                    &token,
+                    &action.channel_id,
+                    &action.provider_message_id,
+                )
+            },
+        ) {
+            Ok(()) => {}
+            Err(error) => {
+                reason.push_str(&format!(
+                    "; durable decision persisted but bot-token component clear failed: {error}"
+                ));
+            }
+        }
+    }
+    base_report("handled", reason)
 }
 
 fn run_discord_gateway_probe(args: &[String]) -> Result<(), String> {
@@ -7560,6 +8216,12 @@ struct RuntimeLoopTaskResult {
 fn run_runtime_loop(args: &[String]) -> Result<(), String> {
     let args = runtime_loop_args_from_args(args)?;
     let started_at_ms = current_log_time_ms().map_err(|err| err.to_string())?;
+    let transition_executable = args
+        .codex_exe
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("codex"));
+    let transition_working_directory = env::current_dir().map_err(|err| err.to_string())?;
+    let transition_codex_home = env::var_os("CODEX_HOME").map(PathBuf::from);
     let mut iterations = 0usize;
     let mut completed = 0usize;
     let mut idle = 0usize;
@@ -7577,6 +8239,14 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
     let mut active = 0usize;
     let mut runtime_concurrency = args.runtime_concurrency.max(1);
     let mut active_queue_ids = HashSet::new();
+    let mut expiry_reconcile_cursor: Option<String> = None;
+    let mut last_expiry_reconcile_at: Option<Instant> = None;
+    let mut expiry_rows_scanned = 0usize;
+    let mut expiry_settlements = 0usize;
+    let mut session_transitions_scanned = 0usize;
+    let mut session_transitions_committed = 0usize;
+    let mut session_transitions_retry_pending = 0usize;
+    let mut held_messages_replayed = 0usize;
     let (task_tx, task_rx) = mpsc::channel::<RuntimeLoopTaskResult>();
 
     loop {
@@ -7725,6 +8395,114 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                     runtime_concurrency
                 ),
             )?;
+
+            match reconcile_channel_session_transitions(
+                agent_harness_core::ReconcileChannelSessionTransitionsOptionsV1 {
+                    harness_home: args.target_home.clone(),
+                    executable: transition_executable.clone(),
+                    arguments: vec!["app-server".to_string()],
+                    working_directory: transition_working_directory.clone(),
+                    codex_home: transition_codex_home.clone(),
+                    timeout_ms: args.timeout_ms.clamp(10_000, 120_000),
+                    max_transitions: DEFAULT_CHANNEL_SESSION_TRANSITION_RECONCILE_ROWS,
+                    now_ms: current_time_ms()?,
+                },
+            ) {
+                Ok(report) => {
+                    session_transitions_scanned =
+                        session_transitions_scanned.saturating_add(report.scanned);
+                    session_transitions_committed =
+                        session_transitions_committed.saturating_add(report.committed);
+                    session_transitions_retry_pending =
+                        session_transitions_retry_pending.saturating_add(report.retry_pending);
+                    if report.retry_pending > 0 {
+                        last_reason = Some(format!(
+                            "session transition reconciliation retained {} retry-pending transition(s)",
+                            report.retry_pending
+                        ));
+                    }
+                }
+                Err(error) => {
+                    errors = errors.saturating_add(1);
+                    last_reason = Some(format!(
+                        "session transition reconciliation failed before held-message replay: {error}"
+                    ));
+                }
+            }
+
+            match reconcile_held_channel_messages(
+                &args.target_home,
+                DEFAULT_HELD_CHANNEL_MESSAGE_RECONCILE_ROWS,
+                current_time_ms()?,
+            ) {
+                Ok(report) => {
+                    held_messages_replayed = held_messages_replayed.saturating_add(report.replayed);
+                    if report.failed > 0 {
+                        last_reason = Some(format!(
+                            "held channel message reconciliation retained {} failed row(s): {}",
+                            report.failed,
+                            report.warnings.join("; ")
+                        ));
+                    }
+                }
+                Err(error) => {
+                    errors = errors.saturating_add(1);
+                    last_reason = Some(format!(
+                        "held channel message reconciliation failed before queue selection: {error}"
+                    ));
+                }
+            }
+
+            let expiry_due = last_expiry_reconcile_at.is_none_or(|last| {
+                last.elapsed()
+                    >= Duration::from_millis(DEFAULT_EXTERNAL_EFFECT_EXPIRY_RECONCILE_INTERVAL_MS)
+            });
+            if expiry_due {
+                match reconcile_expired_external_effect_approvals(
+                    &args.target_home,
+                    &ExternalEffectExpiryReconcileRequestV1 {
+                        now_ms: current_time_ms()?,
+                        max_rows: DEFAULT_EXTERNAL_EFFECT_EXPIRY_RECONCILE_ROWS,
+                        after_effect_id: expiry_reconcile_cursor.clone(),
+                    },
+                ) {
+                    Ok(report) => {
+                        expiry_rows_scanned =
+                            expiry_rows_scanned.saturating_add(report.scanned_rows);
+                        for resolution in &report.resolutions {
+                            match settle_expired_external_effect_approval(
+                                &args.target_home,
+                                resolution,
+                                current_time_ms()?,
+                            ) {
+                                Ok(settlement) => {
+                                    if settlement.queue_terminal_receipt_appended {
+                                        expiry_settlements = expiry_settlements.saturating_add(1);
+                                    }
+                                    if !settlement.warnings.is_empty() {
+                                        last_reason = Some(settlement.warnings.join("; "));
+                                    }
+                                }
+                                Err(error) => {
+                                    errors = errors.saturating_add(1);
+                                    last_reason = Some(format!(
+                                        "external-effect expiry settlement failed for {}: {error}",
+                                        resolution.effect_id
+                                    ));
+                                }
+                            }
+                        }
+                        expiry_reconcile_cursor = report.next_after_effect_id;
+                    }
+                    Err(error) => {
+                        errors = errors.saturating_add(1);
+                        last_reason = Some(format!(
+                            "external-effect expiry reconciliation failed before queue selection: {error}"
+                        ));
+                    }
+                }
+                last_expiry_reconcile_at = Some(Instant::now());
+            }
 
             let slots = runtime_concurrency.saturating_sub(active);
             let mut spawned = 0usize;
@@ -7921,6 +8699,13 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
         last_queue_id,
         last_reason,
         runtime_concurrency,
+        expiry_rows_scanned,
+        expiry_settlements,
+        expiry_reconcile_cursor,
+        session_transitions_scanned,
+        session_transitions_committed,
+        session_transitions_retry_pending,
+        held_messages_replayed,
         report_file: args
             .target_home
             .join("state")
@@ -10628,6 +11413,38 @@ struct DiscordGatewayMessage {
     author_is_bot: bool,
 }
 
+enum DiscordGatewayInbound {
+    Message(DiscordGatewayMessage),
+    ComponentAction(DiscordComponentAction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscordComponentAction {
+    provider_event_id: String,
+    provider_message_id: String,
+    guild_id: Option<String>,
+    channel_id: String,
+    user_id: String,
+    public_action_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramCallbackAction {
+    callback_query_id: String,
+    provider_message_id: String,
+    chat_id: String,
+    chat_type: Option<String>,
+    thread_id: Option<String>,
+    user_id: String,
+    public_action_id: String,
+}
+
+struct ProviderChannelActionOutcome {
+    status: &'static str,
+    message: String,
+    terminal: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiscordAttachmentMetadata {
     id: Option<String>,
@@ -10790,6 +11607,13 @@ struct RuntimeLoopSummary {
     consecutive_errors: usize,
     safe_mode_restarts: usize,
     runtime_concurrency: usize,
+    expiry_rows_scanned: usize,
+    expiry_settlements: usize,
+    expiry_reconcile_cursor: Option<String>,
+    session_transitions_scanned: usize,
+    session_transitions_committed: usize,
+    session_transitions_retry_pending: usize,
+    held_messages_replayed: usize,
     stop_reason: String,
     last_status: Option<RuntimeRunOnceStatus>,
     last_queue_id: Option<String>,
@@ -16834,6 +17658,165 @@ fn read_discord_event_json(args: &DiscordEventRunOnceArgs) -> Result<serde_json:
     serde_json::from_str(&text).map_err(|err| format!("invalid Discord event JSON: {err}"))
 }
 
+fn parse_discord_gateway_inbound(
+    event: &serde_json::Value,
+) -> Result<Option<DiscordGatewayInbound>, String> {
+    if event.get("t").and_then(serde_json::Value::as_str) == Some("INTERACTION_CREATE") {
+        return parse_discord_component_action(event)
+            .map(|action| action.map(DiscordGatewayInbound::ComponentAction));
+    }
+    parse_discord_gateway_message(event).map(|message| message.map(DiscordGatewayInbound::Message))
+}
+
+fn parse_discord_component_action(
+    event: &serde_json::Value,
+) -> Result<Option<DiscordComponentAction>, String> {
+    let payload = event.get("d").unwrap_or(event);
+    if payload.get("kind").and_then(serde_json::Value::as_str) != Some("component-action") {
+        return Ok(None);
+    }
+    if payload.get("schema").and_then(serde_json::Value::as_str)
+        != Some("agent-harness.discord-component-action.v1")
+        || payload.get("provider").and_then(serde_json::Value::as_str) != Some("discord")
+        || payload
+            .get("interaction_type")
+            .and_then(serde_json::Value::as_u64)
+            != Some(3)
+        || payload
+            .get("component_type")
+            .and_then(serde_json::Value::as_u64)
+            != Some(2)
+    {
+        return Err("unsupported Discord component action envelope".to_string());
+    }
+    let required = |field: &'static str| {
+        payload
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string)
+            .ok_or_else(|| format!("Discord component action missing {field}"))
+    };
+    let public_action_id = required("public_action_id")?;
+    if !is_public_approval_action_id(&public_action_id) {
+        return Err("Discord component action carried an invalid public action ID".to_string());
+    }
+    Ok(Some(DiscordComponentAction {
+        provider_event_id: required("provider_event_id")?,
+        provider_message_id: required("provider_message_id")?,
+        guild_id: payload
+            .get("guild_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string),
+        channel_id: required("channel_id")?,
+        user_id: required("user_id")?,
+        public_action_id,
+    }))
+}
+
+fn parse_telegram_callback_action(
+    update: &serde_json::Value,
+) -> Result<Option<TelegramCallbackAction>, String> {
+    let Some(query) = update.get("callback_query") else {
+        return Ok(None);
+    };
+    let required = |parent: &serde_json::Value, field: &'static str| {
+        parent
+            .get(field)
+            .and_then(telegram_id_string)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("Telegram callback query missing {field}"))
+    };
+    let callback_query_id = required(query, "id")?;
+    let public_action_id = query
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| is_public_approval_action_id(value))
+        .ok_or_else(|| "Telegram callback query carried an invalid public action ID".to_string())?
+        .to_string();
+    let message = query.get("message").ok_or_else(|| {
+        "Telegram inline-message callbacks are not supported for channel actions".to_string()
+    })?;
+    let chat = message
+        .get("chat")
+        .ok_or_else(|| "Telegram callback query message missing chat".to_string())?;
+    Ok(Some(TelegramCallbackAction {
+        callback_query_id,
+        provider_message_id: required(message, "message_id")?,
+        chat_id: required(chat, "id")?,
+        chat_type: chat
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        thread_id: message
+            .get("message_thread_id")
+            .and_then(telegram_id_string),
+        user_id: query
+            .get("from")
+            .ok_or_else(|| "Telegram callback query missing from".to_string())
+            .and_then(|from| required(from, "id"))?,
+        public_action_id,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_provider_channel_action(
+    harness_home: &Path,
+    platform: &str,
+    account_id: Option<&str>,
+    channel_id: &str,
+    user_id: &str,
+    agent_id: &str,
+    provider_event_id: &str,
+    provider_message_id: Option<String>,
+    public_action_id: &str,
+) -> Result<ProviderChannelActionOutcome, String> {
+    let lane = ChannelStateLane::new(platform, account_id, channel_id, user_id, agent_id)
+        .map_err(|error| format!("channel action exact lane was invalid: {error}"))?;
+    let state = read_channel_session_state_v2(harness_home, &lane)
+        .map_err(|error| format!("channel action session lookup failed: {error}"))?
+        .ok_or_else(|| "channel action has no current exact-lane session".to_string())?;
+    let source_session_key_digest =
+        external_effect_source_session_key_digest(&state.active_session_key)
+            .map_err(|error| format!("channel action session digest failed: {error}"))?;
+    let intent = resolve_external_effect_public_channel_action(
+        harness_home,
+        provider_event_id,
+        provider_message_id,
+        public_action_id,
+        &lane.exact_lane_digest(),
+        &source_session_key_digest,
+        None,
+    )
+    .map_err(|error| format!("channel approval action failed closed: {error}"))?;
+    match intent.state {
+        ExternalEffectStateV1::Approved => {
+            let continuation =
+                ensure_external_effect_continuation(harness_home, &intent).map_err(|error| {
+                    format!("approval persisted but continuation scheduling failed closed: {error}")
+                })?;
+            Ok(ProviderChannelActionOutcome {
+                status: if continuation.requeued {
+                    "approved-and-requeued"
+                } else {
+                    "already-approved-and-requeued"
+                },
+                message: "Approved. The exact-lane continuation is scheduled.".to_string(),
+                terminal: true,
+            })
+        }
+        ExternalEffectStateV1::Denied => Ok(ProviderChannelActionOutcome {
+            status: "denied",
+            message: "Denied. No connector mutation was submitted.".to_string(),
+            terminal: true,
+        }),
+        other => Err(format!(
+            "channel approval action did not reach a terminal decision: {other:?}"
+        )),
+    }
+}
+
 fn parse_discord_gateway_message(
     event: &serde_json::Value,
 ) -> Result<Option<DiscordGatewayMessage>, String> {
@@ -18607,14 +19590,7 @@ fn telegram_get_updates(
     limit: usize,
 ) -> Result<Vec<serde_json::Value>, String> {
     let url = format!("https://api.telegram.org/bot{token}/getUpdates");
-    let mut payload = serde_json::json!({
-        "timeout": timeout_seconds,
-        "limit": limit,
-        "allowed_updates": ["message", "edited_message"]
-    });
-    if let Some(offset) = offset {
-        payload["offset"] = serde_json::json!(offset);
-    }
+    let payload = telegram_get_updates_payload(offset, timeout_seconds, limit);
     let agent = telegram_poll_agent(timeout_seconds);
     let response = agent
         .post(&url)
@@ -18631,6 +19607,22 @@ fn telegram_get_updates(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default())
+}
+
+fn telegram_get_updates_payload(
+    offset: Option<i64>,
+    timeout_seconds: u64,
+    limit: usize,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "timeout": timeout_seconds,
+        "limit": limit,
+        "allowed_updates": ["message", "edited_message", "callback_query"]
+    });
+    if let Some(offset) = offset {
+        payload["offset"] = serde_json::json!(offset);
+    }
+    payload
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18654,6 +19646,131 @@ struct ChannelSendError {
     provider_message_id: Option<String>,
     rendered_units: Vec<ChannelDeliveryRenderedUnitReceipt>,
     presentation: Option<ChannelDeliveryPresentationReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderApprovalButton {
+    label: String,
+    public_action_id: String,
+    approve: bool,
+}
+
+fn validated_provider_approval_buttons(
+    units: &[RenderedRichUnit],
+    expected_provider_kind: &str,
+) -> Result<Option<Vec<ProviderApprovalButton>>, String> {
+    let callback_units = units
+        .iter()
+        .filter(|unit| {
+            unit.kind == RenderedRichUnitKind::ComponentAction
+                && unit.provider_action_kind.as_deref() == Some(expected_provider_kind)
+        })
+        .collect::<Vec<_>>();
+    if callback_units.is_empty() {
+        return Ok(None);
+    }
+    if callback_units.len() != 2 {
+        return Err("approval presentation must contain exactly two callback actions".to_string());
+    }
+
+    let mut buttons = Vec::with_capacity(2);
+    let mut approve_count = 0usize;
+    let mut deny_count = 0usize;
+    for unit in callback_units {
+        if !unit.requires_reentry_gate {
+            return Err("approval callback action did not require the reentry gate".to_string());
+        }
+        let public_action_id = unit
+            .action_id
+            .as_deref()
+            .filter(|value| is_public_approval_action_id(value))
+            .ok_or_else(|| "approval callback action ID was not a public ahpa1 ID".to_string())?;
+        let label = unit.text.as_deref().unwrap_or_default().trim();
+        let approve = if label.eq_ignore_ascii_case("approve") {
+            approve_count += 1;
+            true
+        } else if label.eq_ignore_ascii_case("deny") {
+            deny_count += 1;
+            false
+        } else {
+            return Err("approval callback label must be Approve or Deny".to_string());
+        };
+        buttons.push(ProviderApprovalButton {
+            label: label.to_string(),
+            public_action_id: public_action_id.to_string(),
+            approve,
+        });
+    }
+    if approve_count != 1 || deny_count != 1 {
+        return Err("approval presentation requires one Approve and one Deny action".to_string());
+    }
+    if buttons[0].public_action_id == buttons[1].public_action_id {
+        return Err("approval callback action IDs must be unique".to_string());
+    }
+    Ok(Some(buttons))
+}
+
+fn is_public_approval_action_id(value: &str) -> bool {
+    value.strip_prefix("ahpa1_").is_some_and(|digest| {
+        digest.len() == 32
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn telegram_approval_inline_keyboard(buttons: &[ProviderApprovalButton]) -> serde_json::Value {
+    serde_json::json!({
+        "inline_keyboard": [buttons
+            .iter()
+            .map(|button| serde_json::json!({
+                "text": button.label,
+                "callback_data": button.public_action_id,
+            }))
+            .collect::<Vec<_>>()]
+    })
+}
+
+fn discord_approval_components(buttons: &[ProviderApprovalButton]) -> serde_json::Value {
+    serde_json::json!([{
+        "type": 1,
+        "components": buttons
+            .iter()
+            .map(|button| serde_json::json!({
+                "type": 2,
+                "style": if button.approve { 3 } else { 4 },
+                "label": button.label,
+                "custom_id": button.public_action_id,
+            }))
+            .collect::<Vec<_>>()
+    }])
+}
+
+fn provider_approval_text_fallback(message: &ChannelOutboundMessage) -> String {
+    let base = format_channel_reply_text(&message.text);
+    let Some(presentation) = message.presentation.as_ref() else {
+        return base;
+    };
+    let mut approve = None;
+    let mut deny = None;
+    for action in &presentation.actions {
+        if action.kind != agent_harness_core::RichPresentationActionKind::Callback
+            || !is_public_approval_action_id(&action.id)
+        {
+            continue;
+        }
+        if action.label.trim().eq_ignore_ascii_case("approve") && approve.is_none() {
+            approve = Some(action.id.as_str());
+        } else if action.label.trim().eq_ignore_ascii_case("deny") && deny.is_none() {
+            deny = Some(action.id.as_str());
+        }
+    }
+    match (approve, deny) {
+        (Some(approve), Some(deny)) if approve != deny => {
+            format!("{base}\n\n/approve {approve}\n/deny {deny}")
+        }
+        _ => base,
+    }
 }
 
 impl From<String> for ChannelSendError {
@@ -18682,6 +19799,7 @@ struct TelegramSendOptions<'a> {
     reply_to_message_id: Option<i64>,
     message_thread_id: Option<&'a str>,
     formatting_mode: TelegramFormattingMode,
+    reply_markup: Option<&'a serde_json::Value>,
 }
 
 impl Default for TelegramSendOptions<'_> {
@@ -18690,6 +19808,7 @@ impl Default for TelegramSendOptions<'_> {
             reply_to_message_id: None,
             message_thread_id: None,
             formatting_mode: TelegramFormattingMode::Plain,
+            reply_markup: None,
         }
     }
 }
@@ -18717,6 +19836,58 @@ fn telegram_send_message(
         .get("result")
         .and_then(|result| result.get("message_id"))
         .and_then(telegram_id_string))
+}
+
+fn telegram_answer_callback_query(
+    token: &str,
+    callback_query_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let url = format!("https://api.telegram.org/bot{token}/answerCallbackQuery");
+    let response = channel_http_short_agent()
+        .post(&url)
+        .send_json(serde_json::json!({
+            "callback_query_id": callback_query_id,
+            "text": text.chars().take(160).collect::<String>(),
+            "show_alert": false,
+        }))
+        .map_err(telegram_http_error)?;
+    let value: serde_json::Value = response.into_json().map_err(|error| error.to_string())?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Telegram answerCallbackQuery returned non-ok response: {value}"
+        ))
+    }
+}
+
+fn telegram_clear_inline_keyboard(
+    token: &str,
+    chat_id: &str,
+    message_id: &str,
+) -> Result<(), String> {
+    let url = format!("https://api.telegram.org/bot{token}/editMessageReplyMarkup");
+    let message_id = message_id
+        .parse::<i64>()
+        .map(serde_json::Value::from)
+        .unwrap_or_else(|_| serde_json::Value::String(message_id.to_string()));
+    let response = channel_http_short_agent()
+        .post(&url)
+        .send_json(serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": { "inline_keyboard": [] },
+        }))
+        .map_err(telegram_http_error)?;
+    let value: serde_json::Value = response.into_json().map_err(|error| error.to_string())?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Telegram editMessageReplyMarkup returned non-ok response: {value}"
+        ))
+    }
 }
 
 fn telegram_message_payload(
@@ -18760,6 +19931,9 @@ fn telegram_message_payload(
         && let Ok(thread_id) = thread_id.parse::<i64>()
     {
         payload["message_thread_id"] = serde_json::json!(thread_id);
+    }
+    if let Some(reply_markup) = options.reply_markup {
+        payload["reply_markup"] = reply_markup.clone();
     }
     payload
 }
@@ -18891,6 +20065,7 @@ where
                 reply_to_message_id: telegram_reply_to_message_id(message),
                 message_thread_id: telegram_message_thread_id(message),
                 formatting_mode: telegram_formatting_mode_for_message(harness_home, message),
+                reply_markup: None,
             },
             "text:0",
             &mut send_text,
@@ -18904,6 +20079,7 @@ where
             reply_to_message_id: telegram_reply_to_message_id(message),
             message_thread_id: telegram_message_thread_id(message),
             formatting_mode: TelegramFormattingMode::Plain,
+            reply_markup: None,
         },
         &mut send_text,
         &mut send_attachment,
@@ -18969,7 +20145,7 @@ where
         &RichPresentationValidationOptions {
             attachment_count: message.attachments.len(),
             allow_url_actions: true,
-            allow_callback_actions: false,
+            allow_callback_actions: true,
         },
     ) {
         Ok(batch) => batch,
@@ -18987,6 +20163,36 @@ where
             );
         }
     };
+    let approval_buttons =
+        match validated_provider_approval_buttons(&batch.units, "telegram-callback") {
+            Ok(buttons) => buttons,
+            Err(error) => {
+                return telegram_send_plain_fallback_with_senders(
+                    message,
+                    ChannelDeliveryPresentationFallbackReason::ValidationFailure,
+                    format!("Telegram approval component validation failed: {error}"),
+                    &mut send_text,
+                    &mut send_attachment,
+                );
+            }
+        };
+    if approval_buttons.is_some()
+        && !batch
+            .units
+            .iter()
+            .any(|unit| unit.kind == RenderedRichUnitKind::Text)
+    {
+        return telegram_send_plain_fallback_with_senders(
+            message,
+            ChannelDeliveryPresentationFallbackReason::ValidationFailure,
+            "Telegram approval presentation had no text message to own the keyboard".to_string(),
+            &mut send_text,
+            &mut send_attachment,
+        );
+    }
+    let inline_keyboard = approval_buttons
+        .as_deref()
+        .map(telegram_approval_inline_keyboard);
     let mut provider_message_ids = Vec::new();
     let mut rendered_units = Vec::new();
     let mut first_message = true;
@@ -19018,6 +20224,7 @@ where
                             .flatten(),
                         message_thread_id: telegram_message_thread_id(message),
                         formatting_mode: TelegramFormattingMode::TrustedHtml,
+                        reply_markup: first_message.then_some(inline_keyboard.as_ref()).flatten(),
                     },
                     &unit.unit_id,
                     &mut send_text,
@@ -19064,6 +20271,7 @@ where
                                     .flatten(),
                                 message_thread_id: telegram_message_thread_id(message),
                                 formatting_mode: TelegramFormattingMode::Plain,
+                                reply_markup: None,
                             },
                         );
                         first_message = false;
@@ -19079,6 +20287,7 @@ where
                                             reply_to_message_id: None,
                                             message_thread_id: telegram_message_thread_id(message),
                                             formatting_mode: TelegramFormattingMode::Plain,
+                                            reply_markup: None,
                                         },
                                     ) {
                                         Ok(Some(id)) => provider_message_ids.push(id),
@@ -19188,6 +20397,7 @@ where
                                     reply_to_message_id: None,
                                     message_thread_id: telegram_message_thread_id(message),
                                     formatting_mode: TelegramFormattingMode::Plain,
+                                    reply_markup: None,
                                 },
                             ) {
                                 Ok(Some(id)) => provider_message_ids.push(id),
@@ -19244,12 +20454,25 @@ where
                 }
             }
             RenderedRichUnitKind::ComponentAction => {
+                let callback_delivered = unit.provider_action_kind.as_deref()
+                    == Some("telegram-callback")
+                    && inline_keyboard.is_some()
+                    && text_provider_message_id.is_some();
                 rendered_units.push(rendered_unit_receipt(
                     unit.unit_id,
                     unit.kind,
-                    ChannelDeliveryUnitStatus::Delivered,
-                    text_provider_message_id.clone(),
-                    None,
+                    if callback_delivered {
+                        ChannelDeliveryUnitStatus::Delivered
+                    } else {
+                        ChannelDeliveryUnitStatus::Failed
+                    },
+                    callback_delivered
+                        .then(|| text_provider_message_id.clone())
+                        .flatten(),
+                    (!callback_delivered).then(|| {
+                        "Telegram component action was not attached to a provider message"
+                            .to_string()
+                    }),
                 ));
             }
         }
@@ -19277,7 +20500,7 @@ where
     TextSender: FnMut(&str, TelegramSendOptions<'_>) -> Result<Option<String>, String>,
     AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
 {
-    let text = format_channel_reply_text(&message.text);
+    let text = provider_approval_text_fallback(message);
     let full_text_preserved =
         text == message.text.trim() && telegram_message_chunk_bodies_preserve_canonical(&text);
     let mut provider_message_ids = Vec::new();
@@ -19295,6 +20518,7 @@ where
                     reply_to_message_id: telegram_reply_to_message_id(message),
                     message_thread_id: telegram_message_thread_id(message),
                     formatting_mode: TelegramFormattingMode::Plain,
+                    reply_markup: None,
                 },
                 "text:fallback",
                 send_text,
@@ -19409,6 +20633,11 @@ where
             },
             message_thread_id: options.message_thread_id,
             formatting_mode: options.formatting_mode,
+            reply_markup: if index == 0 {
+                options.reply_markup
+            } else {
+                None
+            },
         };
         match send_text(chunk, chunk_options) {
             Ok(provider_message_id) => {
@@ -20357,17 +21586,32 @@ fn discord_send_rich_outbound_message(
         message,
         |text, reference| discord_send_message(token, &message.channel_id, text, reference),
         |attachment| discord_send_attachment(token, &message.channel_id, attachment),
+        |text, reference, components| {
+            discord_send_message_with_components(
+                token,
+                &message.channel_id,
+                text,
+                reference,
+                components,
+            )
+        },
     )
 }
 
-fn discord_send_rich_outbound_message_with_senders<TextSender, AttachmentSender>(
+fn discord_send_rich_outbound_message_with_senders<TextSender, AttachmentSender, ComponentSender>(
     message: &ChannelOutboundMessage,
     mut send_text: TextSender,
     mut send_attachment: AttachmentSender,
+    mut send_component_text: ComponentSender,
 ) -> Result<ChannelSendAttempt, ChannelSendError>
 where
     TextSender: FnMut(&str, Option<serde_json::Value>) -> Result<Option<String>, String>,
     AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
+    ComponentSender: FnMut(
+        &str,
+        Option<serde_json::Value>,
+        &serde_json::Value,
+    ) -> Result<Option<String>, String>,
 {
     let presentation = message
         .presentation
@@ -20401,7 +21645,7 @@ where
         &RichPresentationValidationOptions {
             attachment_count: message.attachments.len(),
             allow_url_actions: true,
-            allow_callback_actions: false,
+            allow_callback_actions: true,
         },
     ) {
         Ok(batch) => batch,
@@ -20419,10 +21663,38 @@ where
             );
         }
     };
+    let approval_buttons =
+        match validated_provider_approval_buttons(&batch.units, "discord-callback") {
+            Ok(buttons) => buttons,
+            Err(error) => {
+                return discord_send_plain_fallback_with_senders(
+                    message,
+                    ChannelDeliveryPresentationFallbackReason::ValidationFailure,
+                    format!("Discord approval component validation failed: {error}"),
+                    &mut send_text,
+                    &mut send_attachment,
+                );
+            }
+        };
+    if approval_buttons.is_some()
+        && !batch
+            .units
+            .iter()
+            .any(|unit| unit.kind == RenderedRichUnitKind::Text)
+    {
+        return discord_send_plain_fallback_with_senders(
+            message,
+            ChannelDeliveryPresentationFallbackReason::ValidationFailure,
+            "Discord approval presentation had no text message to own the components".to_string(),
+            &mut send_text,
+            &mut send_attachment,
+        );
+    }
+    let approval_components = approval_buttons.as_deref().map(discord_approval_components);
     let mut provider_message_ids = Vec::new();
     let mut rendered_units = Vec::new();
     let mut first_message = true;
-    let mut last_text_provider_message_id = None;
+    let mut component_provider_message_id = None;
 
     for unit in batch.units {
         match unit.kind {
@@ -20431,11 +21703,21 @@ where
                 let reference = first_message
                     .then(|| discord_message_reference(message))
                     .flatten();
+                let attaches_components = first_message && approval_components.is_some();
                 first_message = false;
-                match send_text(&text, reference) {
+                let send = if let Some(components) =
+                    approval_components.as_ref().filter(|_| attaches_components)
+                {
+                    send_component_text(&text, reference, components)
+                } else {
+                    send_text(&text, reference)
+                };
+                match send {
                     Ok(provider_message_id) => {
                         if let Some(id) = provider_message_id.clone() {
-                            last_text_provider_message_id = Some(id.clone());
+                            if attaches_components {
+                                component_provider_message_id = Some(id.clone());
+                            }
                             provider_message_ids.push(id);
                         }
                         rendered_units.push(rendered_unit_receipt(
@@ -20534,12 +21816,25 @@ where
                 }
             }
             RenderedRichUnitKind::ComponentAction => {
+                let callback_delivered = unit.provider_action_kind.as_deref()
+                    == Some("discord-callback")
+                    && approval_components.is_some()
+                    && component_provider_message_id.is_some();
                 rendered_units.push(rendered_unit_receipt(
                     unit.unit_id,
                     unit.kind,
-                    ChannelDeliveryUnitStatus::Delivered,
-                    last_text_provider_message_id.clone(),
-                    None,
+                    if callback_delivered {
+                        ChannelDeliveryUnitStatus::Delivered
+                    } else {
+                        ChannelDeliveryUnitStatus::Failed
+                    },
+                    callback_delivered
+                        .then(|| component_provider_message_id.clone())
+                        .flatten(),
+                    (!callback_delivered).then(|| {
+                        "Discord component action was not attached to a provider message"
+                            .to_string()
+                    }),
                 ));
             }
         }
@@ -20566,7 +21861,7 @@ where
     TextSender: FnMut(&str, Option<serde_json::Value>) -> Result<Option<String>, String>,
     AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
 {
-    let text = format_channel_reply_text(&message.text);
+    let text = provider_approval_text_fallback(message);
     let full_text_preserved = text == message.text.trim()
         && discord_message_chunks(&text, DISCORD_MESSAGE_CONTENT_LIMIT).concat() == text;
     let mut provider_message_ids = Vec::new();
@@ -20749,6 +22044,7 @@ where
                 reply_to_message_id: None,
                 message_thread_id: options.message_thread_id,
                 formatting_mode: TelegramFormattingMode::Plain,
+                reply_markup: None,
             },
         )?
     {
@@ -20886,6 +22182,7 @@ where
                             reply_to_message_id: None,
                             message_thread_id: options.message_thread_id,
                             formatting_mode: TelegramFormattingMode::Plain,
+                            reply_markup: None,
                         },
                     )?
                 {
@@ -21005,6 +22302,34 @@ fn discord_send_message(
         .map(ToString::to_string))
 }
 
+fn discord_send_message_with_components(
+    token: &str,
+    channel_id: &str,
+    text: &str,
+    message_reference: Option<serde_json::Value>,
+    components: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    if text.chars().count() > DISCORD_MESSAGE_CONTENT_LIMIT {
+        return Err("Discord message exceeds the 2000 character content limit".to_string());
+    }
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+    let token = normalize_discord_bot_token(token);
+    let auth = format!("Bot {token}");
+    let agent = channel_http_short_agent();
+    let payload = discord_message_payload_with_components(text, message_reference, components);
+    let response = agent
+        .post(&url)
+        .set("Authorization", &auth)
+        .set("Content-Type", "application/json")
+        .send_json(payload)
+        .map_err(discord_http_error)?;
+    let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
+    Ok(value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string))
+}
+
 fn discord_send_attachment(
     token: &str,
     channel_id: &str,
@@ -21081,6 +22406,16 @@ fn discord_message_payload(
     payload
 }
 
+fn discord_message_payload_with_components(
+    text: &str,
+    message_reference: Option<serde_json::Value>,
+    components: &serde_json::Value,
+) -> serde_json::Value {
+    let mut payload = discord_message_payload(text, message_reference);
+    payload["components"] = components.clone();
+    payload
+}
+
 fn discord_attachment_payload(
     attachment: &ChannelOutboundAttachment,
 ) -> Result<serde_json::Value, String> {
@@ -21150,6 +22485,24 @@ fn discord_edit_message(
         .get("id")
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string))
+}
+
+fn discord_clear_message_components(
+    token: &str,
+    channel_id: &str,
+    message_id: &str,
+) -> Result<(), String> {
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}");
+    let token = normalize_discord_bot_token(token);
+    let auth = format!("Bot {token}");
+    let response = channel_http_short_agent()
+        .patch(&url)
+        .set("Authorization", &auth)
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::json!({ "components": [] }))
+        .map_err(discord_http_error)?;
+    let _: serde_json::Value = response.into_json().map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn discord_create_dm_channel(token: &str, user_id: &str) -> Result<String, String> {
@@ -23210,6 +24563,31 @@ fn print_runtime_loop_summary(summary: &RuntimeLoopSummary) {
     println!("Consecutive errors: {}", summary.consecutive_errors);
     println!("Safe-mode restarts: {}", summary.safe_mode_restarts);
     println!("Runtime concurrency: {}", summary.runtime_concurrency);
+    println!(
+        "Approval expiry rows scanned: {}",
+        summary.expiry_rows_scanned
+    );
+    println!(
+        "Approval expiry settlements: {}",
+        summary.expiry_settlements
+    );
+    println!(
+        "Approval expiry cursor: {}",
+        summary.expiry_reconcile_cursor.as_deref().unwrap_or("-")
+    );
+    println!(
+        "Session transitions scanned: {}",
+        summary.session_transitions_scanned
+    );
+    println!(
+        "Session transitions committed: {}",
+        summary.session_transitions_committed
+    );
+    println!(
+        "Session transitions retry-pending: {}",
+        summary.session_transitions_retry_pending
+    );
+    println!("Held messages replayed: {}", summary.held_messages_replayed);
     println!("Stop reason: {}", summary.stop_reason);
     if let Some(status) = summary.last_status {
         println!("Last status: {}", runtime_run_once_status_label(status));
@@ -23239,6 +24617,13 @@ fn write_runtime_loop_summary(summary: &RuntimeLoopSummary) -> Result<(), String
         "consecutiveErrors": summary.consecutive_errors,
         "safeModeRestarts": summary.safe_mode_restarts,
         "runtimeConcurrency": summary.runtime_concurrency,
+        "expiryRowsScanned": summary.expiry_rows_scanned,
+        "expirySettlements": summary.expiry_settlements,
+        "expiryReconcileCursor": summary.expiry_reconcile_cursor.as_deref(),
+        "sessionTransitionsScanned": summary.session_transitions_scanned,
+        "sessionTransitionsCommitted": summary.session_transitions_committed,
+        "sessionTransitionsRetryPending": summary.session_transitions_retry_pending,
+        "heldMessagesReplayed": summary.held_messages_replayed,
         "stopReason": &summary.stop_reason,
         "lastStatus": summary.last_status.map(runtime_run_once_status_label),
         "lastQueueId": summary.last_queue_id.as_deref(),
@@ -23909,6 +25294,9 @@ fn print_help() {
     );
     println!(
         "  goal-lineage-supersede Append an explicit reviewed supersession without deleting goal rows"
+    );
+    println!(
+        "  goal-history-close Dry-run or apply an exact-authority historical Codex goal closure"
     );
     println!(
         "  goal-campaign-status Read-only goal autonomy policy and per-campaign budget status"
@@ -27140,6 +28528,11 @@ mod tests {
                     terminal_control_source: None,
                     suppressed_run_once_reason: None,
                     prepared_execution_terminalization_reason: None,
+                    source_final_expectation: None,
+                    final_outbox_disposition: None,
+                    canonical_source_queue_id: None,
+                    final_delivery_id: None,
+                    source_final_lane_digest: None,
                     reason: "runtime queue lease lock is busy; retrying later".to_string(),
                 },
                 prepare: None,
@@ -27569,6 +28962,27 @@ mod tests {
         }
     }
 
+    fn approval_outbound_message(platform: &str) -> ChannelOutboundMessage {
+        let mut message =
+            rich_outbound_message(platform, "Approval required for connector action.");
+        let presentation = message.presentation.as_mut().unwrap();
+        presentation.actions = vec![
+            agent_harness_core::RichPresentationAction {
+                id: format!("ahpa1_{}", "1".repeat(32)),
+                label: "Approve".to_string(),
+                kind: agent_harness_core::RichPresentationActionKind::Callback,
+                url: None,
+            },
+            agent_harness_core::RichPresentationAction {
+                id: format!("ahpa1_{}", "2".repeat(32)),
+                label: "Deny".to_string(),
+                kind: agent_harness_core::RichPresentationActionKind::Callback,
+                url: None,
+            },
+        ];
+        message
+    }
+
     fn issue9_legacy_lossy_outbound_message(platform: &str) -> ChannelOutboundMessage {
         let sections = (0..20)
             .map(|index| {
@@ -27613,6 +29027,115 @@ mod tests {
             filename: Some(filename.to_string()),
             caption: caption.map(ToString::to_string),
         }
+    }
+
+    #[test]
+    fn telegram_callback_poll_allowed_updates_include_callback_query() {
+        let payload = telegram_get_updates_payload(Some(42), 15, 25);
+        assert_eq!(payload["offset"], 42);
+        assert_eq!(payload["timeout"], 15);
+        assert_eq!(payload["limit"], 25);
+        assert!(
+            payload["allowed_updates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "callback_query")
+        );
+    }
+
+    #[test]
+    fn telegram_approval_prompt_emits_inline_keyboard() {
+        let message = approval_outbound_message("telegram");
+        let mut payloads = Vec::new();
+        let attempt = telegram_send_rich_outbound_message_with_senders(
+            &message,
+            |text, options| {
+                payloads.push(telegram_message_payload(&message.channel_id, text, options));
+                Ok(Some(format!("tg-{}", payloads.len())))
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("approval prompt must not send attachments")
+            },
+            |_attachments, _options| -> Result<Option<String>, String> {
+                panic!("approval prompt must not send media groups")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(payloads.len(), 1);
+        let buttons = payloads[0]["reply_markup"]["inline_keyboard"][0]
+            .as_array()
+            .unwrap();
+        assert_eq!(buttons.len(), 2);
+        assert_eq!(buttons[0]["text"], "Approve");
+        assert_eq!(buttons[1]["text"], "Deny");
+        assert!(is_public_approval_action_id(
+            buttons[0]["callback_data"].as_str().unwrap()
+        ));
+        assert!(!serde_json::to_string(&payloads).unwrap().contains("ahx1_"));
+        assert_eq!(
+            attempt
+                .rendered_units
+                .iter()
+                .filter(|unit| unit.kind == ChannelDeliveryRenderedUnitKind::ComponentAction)
+                .filter(|unit| unit.status == ChannelDeliveryUnitStatus::Delivered)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn telegram_callback_query_routes_typed_action_without_model_turn() {
+        let update = serde_json::json!({
+            "update_id": 9,
+            "callback_query": {
+                "id": "callback-9",
+                "from": { "id": 77 },
+                "message": {
+                    "message_id": 88,
+                    "chat": { "id": 99, "type": "private" }
+                },
+                "data": format!("ahpa1_{}", "a".repeat(32))
+            }
+        });
+        let action = parse_telegram_callback_action(&update).unwrap().unwrap();
+        assert_eq!(action.callback_query_id, "callback-9");
+        assert_eq!(action.provider_message_id, "88");
+        assert_eq!(action.chat_id, "99");
+        assert_eq!(action.user_id, "77");
+        assert!(is_public_approval_action_id(&action.public_action_id));
+        assert!(update.get("message").is_none());
+    }
+
+    #[test]
+    fn telegram_native_failure_uses_secure_text_fallback() {
+        let message = approval_outbound_message("telegram");
+        let mut sends = Vec::new();
+        let attempt = telegram_send_rich_outbound_message_with_senders(
+            &message,
+            |text, options| {
+                sends.push((text.to_string(), options.reply_markup.is_some()));
+                if sends.len() == 1 {
+                    Err("provider rejected inline keyboard".to_string())
+                } else {
+                    Ok(Some("tg-fallback-1".to_string()))
+                }
+            },
+            |_attachment| -> Result<Option<String>, String> { Ok(None) },
+            |_attachments, _options| -> Result<Option<String>, String> { Ok(None) },
+        )
+        .unwrap();
+
+        assert!(sends[0].1);
+        assert!(!sends[1].1);
+        assert!(sends[1].0.contains("/approve ahpa1_"));
+        assert!(sends[1].0.contains("/deny ahpa1_"));
+        assert!(!sends[1].0.contains("ahx1_"));
+        assert_eq!(
+            attempt.presentation.unwrap().fallback_reason,
+            ChannelDeliveryPresentationFallbackReason::ProviderFallback
+        );
     }
 
     #[test]
@@ -27952,6 +29475,7 @@ mod tests {
                 reply_to_message_id: Some(99),
                 message_thread_id: Some("7"),
                 formatting_mode: TelegramFormattingMode::Plain,
+                reply_markup: None,
             },
             &file_fields,
         )
@@ -28389,6 +29913,89 @@ mod tests {
     }
 
     #[test]
+    fn discord_approval_prompt_emits_components() {
+        let message = approval_outbound_message("discord");
+        let mut component_payloads = Vec::new();
+        let attempt = discord_send_rich_outbound_message_with_senders(
+            &message,
+            |_text, _reference| -> Result<Option<String>, String> {
+                panic!("approval prompt text must own the Discord components")
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("approval prompt must not send attachments")
+            },
+            |text, reference, components| {
+                component_payloads.push(discord_message_payload_with_components(
+                    text, reference, components,
+                ));
+                Ok(Some("dc-approval-1".to_string()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(component_payloads.len(), 1);
+        let buttons = component_payloads[0]["components"][0]["components"]
+            .as_array()
+            .unwrap();
+        assert_eq!(buttons.len(), 2);
+        assert_eq!(buttons[0]["style"], 3);
+        assert_eq!(buttons[1]["style"], 4);
+        assert!(
+            buttons
+                .iter()
+                .all(|button| button["custom_id"].as_str().unwrap().len() <= 100)
+        );
+        assert!(
+            component_payloads[0]["allowed_mentions"]["parse"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !serde_json::to_string(&component_payloads)
+                .unwrap()
+                .contains("ahx1_")
+        );
+        assert_eq!(
+            attempt
+                .rendered_units
+                .iter()
+                .filter(|unit| unit.kind == ChannelDeliveryRenderedUnitKind::ComponentAction)
+                .filter(|unit| unit.status == ChannelDeliveryUnitStatus::Delivered)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn discord_component_routes_typed_action_without_model_turn() {
+        let event = serde_json::json!({
+            "t": "INTERACTION_CREATE",
+            "d": {
+                "schema": "agent-harness.discord-component-action.v1",
+                "kind": "component-action",
+                "provider": "discord",
+                "interaction_type": 3,
+                "component_type": 2,
+                "provider_event_id": "interaction-1",
+                "provider_message_id": "message-1",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "user_id": "user-1",
+                "public_action_id": format!("ahpa1_{}", "b".repeat(32))
+            }
+        });
+        let inbound = parse_discord_gateway_inbound(&event).unwrap().unwrap();
+        let DiscordGatewayInbound::ComponentAction(action) = inbound else {
+            panic!("component interaction must not normalize into a message/model turn")
+        };
+        assert_eq!(action.provider_event_id, "interaction-1");
+        assert_eq!(action.provider_message_id, "message-1");
+        assert_eq!(action.user_id, "user-1");
+        assert!(is_public_approval_action_id(&action.public_action_id));
+    }
+
+    #[test]
     fn discord_rich_sender_records_safe_markdown_presentation_receipt() {
         let message = rich_outbound_message(
             "discord",
@@ -28405,6 +30012,9 @@ mod tests {
             },
             |_attachment| -> Result<Option<String>, String> {
                 panic!("rich text fixture must not send attachments")
+            },
+            |_text, _reference, _components| -> Result<Option<String>, String> {
+                panic!("rich text fixture must not send components")
             },
         )
         .unwrap();
@@ -28449,6 +30059,9 @@ mod tests {
             },
             |_attachment| -> Result<Option<String>, String> {
                 panic!("text-only legacy fixture must not send attachments")
+            },
+            |_text, _reference, _components| -> Result<Option<String>, String> {
+                panic!("text-only legacy fixture must not send components")
             },
         )
         .unwrap();
@@ -28495,6 +30108,7 @@ mod tests {
                 }
             },
             |_attachment| -> Result<Option<String>, String> { Ok(None) },
+            |_text, _reference, _components| -> Result<Option<String>, String> { Ok(None) },
         )
         .unwrap_err();
 
@@ -28545,6 +30159,7 @@ mod tests {
                     &pending.message,
                     |_text, _reference| Ok(Some("dc-replay".to_string())),
                     |_attachment| -> Result<Option<String>, String> { Ok(None) },
+                    |_text, _reference, _components| -> Result<Option<String>, String> { Ok(None) },
                 )
                 .unwrap()
             } else {
@@ -28610,6 +30225,9 @@ mod tests {
             |_attachment| -> Result<Option<String>, String> {
                 panic!("provider fallback fixture must not send attachments")
             },
+            |_text, _reference, _components| -> Result<Option<String>, String> {
+                panic!("provider fallback fixture must not send components")
+            },
         )
         .unwrap();
 
@@ -28636,6 +30254,7 @@ mod tests {
                 reply_to_message_id: Some(12),
                 message_thread_id: Some("3"),
                 formatting_mode: TelegramFormattingMode::Html,
+                reply_markup: None,
             },
         );
 
@@ -29477,6 +31096,183 @@ mod tests {
                 .is_none()
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn goal_history_close_fixture(name: &str) -> (PathBuf, GoalHistoryCloseCliArgs) {
+        let root = std::env::temp_dir().join(format!(
+            "agent-harness-cli-goal-history-close-{name}-{}-{}",
+            std::process::id(),
+            current_time_ms().unwrap()
+        ));
+        let home = root.join("runtime-home");
+        let lane =
+            ChannelStateLane::new("telegram", Some("account-1"), "channel-1", "user-1", "main")
+                .unwrap();
+        let lane_digest = lane.exact_lane_digest();
+        let authority_file = home
+            .join("state")
+            .join("context-rollover")
+            .join("virtual-session-authority-receipts.jsonl");
+        let projection_file = home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        append_jsonl_value(
+            &authority_file,
+            &serde_json::json!({
+                "schema": "agent-harness.virtual-session-authority.v1",
+                "queueId": "queue-historical",
+                "virtualSessionId": "virtual-historical",
+                "workingSessionKey": "session-historical",
+                "laneDigest": lane_digest,
+                "backendContextGeneration": "backend-generation-1",
+                "workingSetFile": "opaque-working-set-ref",
+                "status": "authoritative-v2",
+                "reason": "CLI goal-history-close fixture",
+                "updatedAtMs": 10
+            }),
+        )
+        .unwrap();
+        append_jsonl_value(
+            &projection_file,
+            &serde_json::json!({
+                "schema": "agent-harness.codex-goal-projection.v1",
+                "queueId": "queue-historical",
+                "sessionKey": "session-historical",
+                "sourceThreadId": "thread-historical",
+                "sourceTurnId": "turn-historical",
+                "goalReference": "goal-historical",
+                "backendGoalRef": "goal-historical",
+                "laneDigest": lane.exact_lane_digest(),
+                "backendContextGeneration": "backend-generation-1",
+                "objective": "Close the exact historical goal safely.",
+                "status": "active",
+                "observationPhase": "owned-turn",
+                "turnRelation": "current-owned-turn",
+                "sourceFinalEligible": true,
+                "tokenBudget": null,
+                "completionCriteria": [],
+                "goalChecksum": "goal-checksum-1",
+                "completionCriteriaChecksum": "criteria-checksum-1",
+                "projectionChecksum": "projection-checksum-1",
+                "projectionComplete": true,
+                "observationOrder": 1,
+                "observedAtMs": 11
+            }),
+        )
+        .unwrap();
+        let args = GoalHistoryCloseCliArgs {
+            harness_home: home,
+            lane,
+            concrete_session_key: "session-historical".to_string(),
+            source_thread_id: "thread-historical".to_string(),
+            virtual_session_id: None,
+            backend_generation: None,
+            goal_identity: None,
+            goal_generation: None,
+            disposition: GoalClosureDispositionV1::Canceled,
+            reason: "operator reviewed historical cancellation".to_string(),
+            expected_projection_checksum: "projection-checksum-1".to_string(),
+            caller_effect_identity: "operator-effect-1".to_string(),
+            apply: false,
+            expected_authority_digest: None,
+            expected_intent_checksum: None,
+            codex_executable: None,
+            codex_arguments: vec!["app-server".to_string()],
+            working_directory: root.clone(),
+            codex_home: None,
+            timeout_ms: 10_000,
+        };
+        (root, args)
+    }
+
+    #[test]
+    fn goal_history_close_dry_run_requires_one_exact_authority() {
+        let (root, args) = goal_history_close_fixture("exact-authority");
+        let prepared = prepare_goal_history_close(&args).unwrap();
+        assert_eq!(
+            prepared.resolution.disposition,
+            GoalClosureTargetResolutionDispositionV1::Exact
+        );
+        assert_eq!(prepared.resolution.candidate_count, 1);
+
+        let projection_file = args
+            .harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        append_jsonl_value(
+            &projection_file,
+            &serde_json::json!({
+                "schema": "agent-harness.codex-goal-projection.v1",
+                "queueId": "queue-historical",
+                "sessionKey": "session-historical",
+                "sourceThreadId": "thread-historical",
+                "sourceTurnId": "turn-historical-2",
+                "goalReference": "goal-ambiguous",
+                "backendGoalRef": "goal-ambiguous",
+                "laneDigest": args.lane.exact_lane_digest(),
+                "backendContextGeneration": "backend-generation-1",
+                "objective": "Close the exact historical goal safely.",
+                "status": "active",
+                "observationPhase": "owned-turn",
+                "turnRelation": "current-owned-turn",
+                "sourceFinalEligible": true,
+                "goalChecksum": "goal-checksum-2",
+                "projectionChecksum": "projection-checksum-2",
+                "projectionComplete": true,
+                "observationOrder": 2,
+                "observedAtMs": 12
+            }),
+        )
+        .unwrap();
+        let error = prepare_goal_history_close(&args).unwrap_err();
+        assert!(error.contains("unsafe"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn goal_history_close_dry_run_is_read_only_and_emits_apply_guard() {
+        let (root, args) = goal_history_close_fixture("read-only");
+        let prepared = prepare_goal_history_close(&args).unwrap();
+        let report = goal_history_close_report(&args, &prepared, None);
+        assert!(report.read_only);
+        assert!(report.safe_to_apply);
+        assert_eq!(
+            report.apply_guard.expected_authority_digest,
+            prepared.intent.authority_digest
+        );
+        assert_eq!(
+            report.apply_guard.expected_intent_checksum,
+            prepared.intent.intent_checksum
+        );
+        assert!(
+            !args
+                .harness_home
+                .join("state")
+                .join("goal-closure")
+                .exists()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn goal_history_close_apply_rejects_stale_dry_run_guard() {
+        let (root, mut args) = goal_history_close_fixture("stale-guard");
+        let prepared = prepare_goal_history_close(&args).unwrap();
+        args.apply = true;
+        args.expected_authority_digest = Some("sha256:stale-authority".to_string());
+        args.expected_intent_checksum = Some(prepared.intent.intent_checksum.clone());
+        let error = validate_goal_history_close_apply_guard(&args, &prepared).unwrap_err();
+        assert!(error.contains("does not match current evidence"));
+        assert!(
+            !args
+                .harness_home
+                .join("state")
+                .join("goal-closure")
+                .exists()
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

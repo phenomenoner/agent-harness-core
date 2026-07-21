@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added governed backend-goal closure with exact lane, concrete and virtual session, backend
+  generation, source thread, goal generation, projection checksum, and deterministic effect
+  identity. Historical closure is append-only and uses the original thread rather than rebinding a
+  fresh channel turn.
+- Added durable two-phase `/stop` and `/new` session transitions. `/new` freezes one replacement
+  session, holds ordinary ingress before model admission, and replays held messages in FIFO order
+  only after the boundary commits.
+- Added typed connector-approval prompts and non-secret public action IDs, with Telegram inline
+  keyboards, Discord message components, typed callback ingress, bounded expiry reconciliation, and
+  secure text fallback.
+- Added typed source-final expectation and final-outbox disposition fields to runtime receipts so
+  terminal progress can require delivery from the exact source queue and lane.
+
+### Changed
+
+- Parent completion now accepts only events owned by the exact thread, turn, and item set across
+  streamed and stdout-recovery paths; child or foreign completion remains diagnostic evidence.
+- Goal projections now record observation phase, turn relation, and source-final eligibility.
+  Historical/resume observations cannot authorize a fresh campaign final, and authoritative closure
+  projections take precedence over late active rows.
+- `needs-user` work is parked without a lease and excluded from runnable FIFO selection until a
+  durable resolution makes it eligible again, so later same-lane work is not blocked.
+- Connector waits use `ApprovalRequest` instead of a generic error reply. Approval, denial, expiry,
+  stop, and newer-steer resolution remain consume-once and restart-idempotent.
+
+### Security
+
+- Native approval actions bind effect, generation, parameter digest, exact lane, source session,
+  approval authority, decision, expiry, and channel administrator permission. Public callback IDs
+  are not bearer capabilities, and raw protected approval tokens are excluded from serialized
+  prompts, runtime reasons, logs, and debug output.
+- `/stop` and `/new` record the exact goal/session transition intent before cancel markers or session
+  mutation. Ambiguous or incomplete authority fails closed without rotating the session.
+
+### Compatibility
+
+- New receipt fields and schemas are additive. Legacy goal projections remain readable but
+  source-final-ineligible; legacy runtime receipts retain their earlier progress-release behavior
+  with an explicit warning; legacy approval capabilities remain resolvable through the text command
+  path but cannot authorize native callbacks without the new authority digests.
+
+### Verification
+
+- Added focused unit and integration coverage for parent/child completion ownership, governed goal
+  closure, terminal projection precedence, duplicate session transitions, ingress hold/replay,
+  parked approval waits, native Telegram/Discord actions, approval expiry races, canonical final
+  reuse, and exact-source terminal progress.
+- Added sanitized scenario fixtures for interleaved child completion, fresh turns after goal finals,
+  historical goal closure, channel goal cancellation, and approval waiting/restart boundaries.
+  Full provider-visible smoke, stopped-state scenario replay, soak, and live cutover evidence remain
+  release gates and are not claimed by these source changes.
+
 ## v0.11.0 - 2026-07-20
 
 ### Added

@@ -959,6 +959,7 @@ mod tests {
             source_slice_generation: 3,
             decision_generation: 4,
             authority: GoalTransitionAuthority::Ready,
+            relation: crate::goal_transition::GoalTransitionRelation::CurrentGoalSlice,
             decision: GoalTransitionDecision::Continue,
             surface: GoalTransitionSurface::ProgressOnly,
             schedule_continuation: true,

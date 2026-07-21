@@ -1,12 +1,17 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::channel_action::{
+    ChannelApprovalDecisionV1, ChannelInboundActionV1, public_approval_action_id,
+    validate_public_approval_action_id,
+};
 use crate::{current_log_time_ms, write_json_atomic};
 
 pub const EXTERNAL_EFFECT_INTENT_SCHEMA: &str = "agent-harness.external-effect-intent.v1";
@@ -21,6 +26,21 @@ const MAX_CONNECTOR_BYTES: usize = 96;
 const MAX_ACTION_BYTES: usize = 160;
 const MAX_SUMMARY_BYTES: usize = 240;
 const MAX_EFFECT_RECORD_BYTES: u64 = 32 * 1024;
+pub const MAX_EXTERNAL_EFFECT_EXPIRY_SCAN_ROWS: usize = 256;
+const EXTERNAL_EFFECT_PUBLIC_ACTION_INDEX_SCHEMA: &str =
+    "agent-harness.external-effect-public-action-index.v1";
+
+static APPROVAL_RESOLUTION_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExternalEffectPublicActionIndexV1 {
+    schema: String,
+    public_action_id: String,
+    effect_id: String,
+    approval_generation: u64,
+    decision: ChannelApprovalDecisionV1,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -110,6 +130,10 @@ pub struct ConnectorApprovalTokenV1 {
     pub effect_id: String,
     pub exact_lane_digest: String,
     pub params_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_session_key_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub approval_authority_digest: String,
     pub approval_generation: u64,
     pub expires_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +148,10 @@ pub struct ExternalEffectIntentV1 {
     pub exact_lane_digest: String,
     pub logical_lineage_id: String,
     pub source_queue_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_session_key_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub approval_authority_digest: String,
     pub connector: String,
     pub action: String,
     pub params_digest: String,
@@ -136,6 +164,10 @@ pub struct ExternalEffectIntentV1 {
     pub updated_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_resolution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_notice_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +180,10 @@ pub struct ExternalEffectTransitionV1 {
     pub approval_generation: u64,
     pub at_ms: i64,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +191,70 @@ pub struct ExternalEffectRequestContextV1 {
     pub exact_lane_digest: String,
     pub logical_lineage_id: String,
     pub source_queue_id: String,
+    pub source_session_key_digest: String,
+    pub approval_authority_digest: String,
+}
+
+pub fn external_effect_source_session_key_digest(session_key: &str) -> io::Result<String> {
+    if session_key.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "external effect source session key must not be empty",
+        ));
+    }
+    Ok(sha256_tagged(
+        format!("agent-harness.external-effect-source-session.v1\0{session_key}").as_bytes(),
+    ))
+}
+
+pub fn external_effect_approval_authority_digest(
+    exact_lane_digest: &str,
+    source_session_key_digest: &str,
+    logical_lineage_id: &str,
+    source_queue_id: &str,
+) -> io::Result<String> {
+    validate_digest(exact_lane_digest, "exact lane digest")?;
+    validate_digest(source_session_key_digest, "source session key digest")?;
+    if logical_lineage_id.trim().is_empty() || source_queue_id.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "external effect approval authority requires lineage and source queue identity",
+        ));
+    }
+    let payload = serde_json::json!({
+        "schema": "agent-harness.external-effect-approval-authority.v1",
+        "exactLaneDigest": exact_lane_digest,
+        "sourceSessionKeyDigest": source_session_key_digest,
+        "logicalLineageId": logical_lineage_id,
+        "sourceQueueId": source_queue_id,
+    });
+    Ok(sha256_tagged(
+        &serde_json::to_vec(&payload).map_err(io::Error::other)?,
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalEffectExpiryReconcileRequestV1 {
+    pub now_ms: i64,
+    pub max_rows: usize,
+    pub after_effect_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalEffectExpiryResolutionV1 {
+    pub effect_id: String,
+    pub approval_generation: u64,
+    pub resolution_id: String,
+    pub notice_id: String,
+    pub newly_transitioned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalEffectExpiryReconcileReportV1 {
+    pub scanned_rows: usize,
+    pub resolutions: Vec<ExternalEffectExpiryResolutionV1>,
+    pub next_after_effect_id: Option<String>,
+    pub exhausted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,15 +597,33 @@ pub fn begin_external_effect_request(
     policy: &ConnectorApprovalPolicyV1,
 ) -> io::Result<ExternalEffectAdmissionV1> {
     validate_digest(&context.exact_lane_digest, "exact lane digest")?;
+    validate_digest(
+        &context.source_session_key_digest,
+        "source session key digest",
+    )?;
+    validate_digest(
+        &context.approval_authority_digest,
+        "approval authority digest",
+    )?;
     validate_digest(&descriptor.params_digest, "parameter digest")?;
     let effect_id = effect_id(context, descriptor);
     if let Some(latest) = load_external_effect_intent(harness_home, &effect_id)? {
+        if !latest.source_session_key_digest.is_empty()
+            && (latest.source_session_key_digest != context.source_session_key_digest
+                || latest.approval_authority_digest != context.approval_authority_digest)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "existing external effect belongs to another approval authority",
+            ));
+        }
         return match latest.state {
             ExternalEffectStateV1::Approved => Ok(ExternalEffectAdmissionV1::Authorized(latest)),
             ExternalEffectStateV1::Requested => {
                 advance_requested_external_effect(harness_home, latest, policy)
             }
             ExternalEffectStateV1::ApprovalRequired => {
+                ensure_external_effect_public_action_indexes(harness_home, &latest)?;
                 let token = latest
                     .approval_token
                     .as_ref()
@@ -538,6 +656,8 @@ pub fn begin_external_effect_request(
         exact_lane_digest: context.exact_lane_digest.clone(),
         logical_lineage_id: sanitize_bounded(&context.logical_lineage_id, 160, "logical-lineage"),
         source_queue_id: sanitize_bounded(&context.source_queue_id, 160, "source-queue"),
+        source_session_key_digest: context.source_session_key_digest.clone(),
+        approval_authority_digest: context.approval_authority_digest.clone(),
         connector: descriptor.connector.clone(),
         action: descriptor.action.clone(),
         params_digest: descriptor.params_digest.clone(),
@@ -548,6 +668,8 @@ pub fn begin_external_effect_request(
         requested_at_ms: now,
         updated_at_ms: now,
         reason: Some("MCP elicitation observed before any protocol response".to_string()),
+        expiry_resolution_id: None,
+        expiry_notice_id: None,
     };
     persist_transition(harness_home, None, &intent)?;
 
@@ -596,6 +718,7 @@ fn advance_requested_external_effect(
                 Some(ExternalEffectStateV1::Requested),
                 &intent,
             )?;
+            ensure_external_effect_public_action_indexes(harness_home, &intent)?;
             Ok(ExternalEffectAdmissionV1::NeedsUser { intent, token: raw })
         }
     }
@@ -608,20 +731,112 @@ pub fn resolve_external_effect_approval(
     decision: ExternalEffectApprovalDecisionV1,
 ) -> io::Result<ExternalEffectIntentV1> {
     validate_digest(exact_lane_digest, "exact lane digest")?;
+    let _guard = approval_resolution_guard()?;
     let token_digest = sha256_tagged(token.as_bytes());
-    let mut intent =
-        find_external_effect_by_token(harness_home, &token_digest)?.ok_or_else(|| {
+    let intent = find_external_effect_by_token(harness_home, &token_digest)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "connector approval token was not found",
+        )
+    })?;
+    resolve_external_effect_approval_locked(
+        harness_home,
+        intent,
+        token,
+        exact_lane_digest,
+        decision,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_external_effect_public_channel_action(
+    harness_home: &Path,
+    provider_event_id: &str,
+    provider_message_id: Option<String>,
+    public_action_id: &str,
+    exact_lane_digest: &str,
+    source_session_key_digest: &str,
+    expected_decision: Option<ChannelApprovalDecisionV1>,
+) -> io::Result<ExternalEffectIntentV1> {
+    resolve_external_effect_public_channel_action_inner(
+        harness_home,
+        provider_event_id,
+        provider_message_id,
+        public_action_id,
+        exact_lane_digest,
+        source_session_key_digest,
+        expected_decision,
+    )
+}
+
+/// Resolves a provider-native approval action after channel ingress has already
+/// established the concrete exact lane. Unlike the legacy text-token path,
+/// native actions require the complete session and authority digest binding.
+pub fn resolve_external_effect_channel_action(
+    harness_home: &Path,
+    action: &ChannelInboundActionV1,
+    exact_lane_digest: &str,
+) -> io::Result<ExternalEffectIntentV1> {
+    action.validate().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("invalid channel approval action: {error}"),
+        )
+    })?;
+    validate_digest(exact_lane_digest, "exact lane digest")?;
+    let _guard = approval_resolution_guard()?;
+    let intent =
+        load_external_effect_intent(harness_home, &action.effect_id)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "connector approval token was not found",
+                "channel approval action effect was not found",
             )
         })?;
+    let decision = match action.decision {
+        ChannelApprovalDecisionV1::Approve => ExternalEffectApprovalDecisionV1::Approve,
+        ChannelApprovalDecisionV1::Deny => ExternalEffectApprovalDecisionV1::Deny,
+    };
+    resolve_external_effect_approval_locked(
+        harness_home,
+        intent,
+        action.expose_callback_token(),
+        exact_lane_digest,
+        decision,
+        Some(action),
+    )
+}
+
+fn resolve_external_effect_approval_locked(
+    harness_home: &Path,
+    mut intent: ExternalEffectIntentV1,
+    token: &str,
+    exact_lane_digest: &str,
+    decision: ExternalEffectApprovalDecisionV1,
+    native_action: Option<&ChannelInboundActionV1>,
+) -> io::Result<ExternalEffectIntentV1> {
+    let token_digest = sha256_tagged(token.as_bytes());
     if intent.exact_lane_digest != exact_lane_digest {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "connector approval token belongs to another exact lane",
         ));
     }
+    if let Some(action) = native_action {
+        if action.effect_id != intent.effect_id
+            || action.approval_generation != intent.approval_generation
+            || intent.source_session_key_digest.is_empty()
+            || intent.approval_authority_digest.is_empty()
+            || action.source_session_key_digest != intent.source_session_key_digest
+            || action.source_authority_digest != intent.approval_authority_digest
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "channel approval action authority binding does not match the effect",
+            ));
+        }
+    }
+    let expiry_ids = expiry_resolution_identities(&intent);
     let now = current_log_time_ms()?;
     let approval_token = intent.approval_token.as_mut().ok_or_else(|| {
         io::Error::new(
@@ -629,7 +844,10 @@ pub fn resolve_external_effect_approval(
             "effect approval token is missing",
         )
     })?;
-    if approval_token.token_digest != token_digest
+    if approval_token.schema != CONNECTOR_APPROVAL_TOKEN_SCHEMA
+        || approval_token.token_digest != token_digest
+        || approval_token.effect_id != intent.effect_id
+        || approval_token.exact_lane_digest != intent.exact_lane_digest
         || approval_token.params_digest != intent.params_digest
         || approval_token.approval_generation != intent.approval_generation
     {
@@ -638,13 +856,35 @@ pub fn resolve_external_effect_approval(
             "connector approval token binding does not match the effect",
         ));
     }
-    if approval_token.expires_at_ms < now {
+    if native_action.is_some()
+        && (approval_token.source_session_key_digest.is_empty()
+            || approval_token.approval_authority_digest.is_empty()
+            || approval_token.source_session_key_digest != intent.source_session_key_digest
+            || approval_token.approval_authority_digest != intent.approval_authority_digest)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "native approval token is missing its full authority binding",
+        ));
+    }
+    if intent.expiry_resolution_id.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "connector approval token has expired",
+        ));
+    }
+    if approval_token.expires_at_ms <= now {
+        let (resolution_id, notice_id) = expiry_ids;
         approval_token.consumed_at_ms = Some(now);
         let from = intent.state;
         intent.state = ExternalEffectStateV1::Denied;
         intent.updated_at_ms = now;
         intent.reason = Some("connector approval token expired and was fenced".to_string());
-        persist_transition(harness_home, Some(from), &intent)?;
+        intent.expiry_resolution_id = Some(resolution_id);
+        intent.expiry_notice_id = Some(notice_id);
+        if from == ExternalEffectStateV1::ApprovalRequired {
+            persist_transition(harness_home, Some(from), &intent)?;
+        }
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "connector approval token has expired",
@@ -692,6 +932,249 @@ pub fn resolve_external_effect_approval(
     });
     persist_transition(harness_home, Some(from), &intent)?;
     Ok(intent)
+}
+
+fn approval_resolution_guard() -> io::Result<std::sync::MutexGuard<'static, ()>> {
+    APPROVAL_RESOLUTION_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("external effect approval resolution lock was poisoned"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_external_effect_public_channel_action_inner(
+    harness_home: &Path,
+    provider_event_id: &str,
+    provider_message_id: Option<String>,
+    public_action_id: &str,
+    exact_lane_digest: &str,
+    source_session_key_digest: &str,
+    expected_decision: Option<ChannelApprovalDecisionV1>,
+) -> io::Result<ExternalEffectIntentV1> {
+    validate_public_action_id_shape(public_action_id)?;
+    validate_digest(exact_lane_digest, "exact lane digest")?;
+    validate_digest(source_session_key_digest, "source session key digest")?;
+    let bytes = fs::read(external_effect_public_action_index_file(
+        harness_home,
+        public_action_id,
+    ))
+    .map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "channel approval action reference was not found",
+            )
+        } else {
+            error
+        }
+    })?;
+    if bytes.len() > MAX_EFFECT_RECORD_BYTES as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "channel approval action index is unbounded",
+        ));
+    }
+    let index: ExternalEffectPublicActionIndexV1 =
+        serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    validate_external_effect_public_action_index(&index)?;
+    if index.public_action_id != public_action_id {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "channel approval action index does not match the requested reference",
+        ));
+    }
+    if expected_decision.is_some_and(|expected| expected != index.decision) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "public approval action decision does not match the requested command",
+        ));
+    }
+    let intent = load_external_effect_intent(harness_home, &index.effect_id)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "channel approval action effect was not found",
+        )
+    })?;
+    if intent.approval_generation != index.approval_generation
+        || intent.exact_lane_digest != exact_lane_digest
+        || intent.source_session_key_digest != source_session_key_digest
+        || intent.approval_authority_digest.is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "channel approval action authority changed after prompt creation",
+        ));
+    }
+    let raw_token = intent
+        .approval_token
+        .as_ref()
+        .map(|token| token.token.clone())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "channel approval action has no protected bearer binding",
+            )
+        })?;
+    let action = ChannelInboundActionV1::new(
+        provider_event_id,
+        provider_message_id,
+        index.effect_id,
+        index.approval_generation,
+        index.decision,
+        source_session_key_digest,
+        intent.approval_authority_digest.clone(),
+        raw_token,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+    resolve_external_effect_channel_action(harness_home, &action, exact_lane_digest)
+}
+
+/// Advances at most `max_rows` protected snapshots from an expired approval
+/// wait to a durable denial. The caller owns the interval and persists the
+/// returned cursor between bounded runtime-loop iterations.
+pub fn reconcile_expired_external_effect_approvals(
+    harness_home: &Path,
+    request: &ExternalEffectExpiryReconcileRequestV1,
+) -> io::Result<ExternalEffectExpiryReconcileReportV1> {
+    if request.now_ms < 0
+        || request.max_rows == 0
+        || request.max_rows > MAX_EXTERNAL_EFFECT_EXPIRY_SCAN_ROWS
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "external effect expiry scan request is outside its bounded policy",
+        ));
+    }
+    if let Some(cursor) = request.after_effect_id.as_deref() {
+        validate_effect_id(cursor)?;
+    }
+
+    let dir = external_effect_latest_dir(harness_home);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ExternalEffectExpiryReconcileReportV1 {
+                scanned_rows: 0,
+                resolutions: Vec::new(),
+                next_after_effect_id: None,
+                exhausted: true,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let mut effect_ids = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || entry.metadata()?.len() > MAX_EFFECT_RECORD_BYTES {
+            continue;
+        }
+        let path = entry.path();
+        let Some(effect_id) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if validate_effect_id(effect_id).is_ok()
+            && request
+                .after_effect_id
+                .as_deref()
+                .is_none_or(|cursor| effect_id > cursor)
+        {
+            effect_ids.push(effect_id.to_string());
+        }
+    }
+    effect_ids.sort_unstable();
+    let exhausted = effect_ids.len() <= request.max_rows;
+    effect_ids.truncate(request.max_rows);
+    let next_after_effect_id = if exhausted {
+        None
+    } else {
+        effect_ids.last().cloned()
+    };
+
+    let _guard = approval_resolution_guard()?;
+    let mut resolutions = Vec::new();
+    for effect_id in &effect_ids {
+        let Some(mut intent) = load_external_effect_intent(harness_home, effect_id)? else {
+            continue;
+        };
+        if intent.state == ExternalEffectStateV1::Denied {
+            if let (Some(resolution_id), Some(notice_id)) = (
+                intent.expiry_resolution_id.clone(),
+                intent.expiry_notice_id.clone(),
+            ) {
+                resolutions.push(ExternalEffectExpiryResolutionV1 {
+                    effect_id: intent.effect_id,
+                    approval_generation: intent.approval_generation,
+                    resolution_id,
+                    notice_id,
+                    newly_transitioned: false,
+                });
+            }
+            continue;
+        }
+        if intent.state != ExternalEffectStateV1::ApprovalRequired {
+            continue;
+        }
+        let expires_at_ms = intent
+            .approval_token
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "approval-required effect is missing its action token",
+                )
+            })?
+            .expires_at_ms;
+        if expires_at_ms > request.now_ms {
+            continue;
+        }
+        let (resolution_id, notice_id) = expiry_resolution_identities(&intent);
+        let token = intent.approval_token.as_mut().expect("checked above");
+        token.consumed_at_ms = Some(request.now_ms);
+        let from = intent.state;
+        intent.state = ExternalEffectStateV1::Denied;
+        intent.updated_at_ms = request.now_ms;
+        intent.reason = Some("connector approval token expired and was fenced".to_string());
+        intent.expiry_resolution_id = Some(resolution_id.clone());
+        intent.expiry_notice_id = Some(notice_id.clone());
+        persist_transition(harness_home, Some(from), &intent)?;
+        resolutions.push(ExternalEffectExpiryResolutionV1 {
+            effect_id: intent.effect_id,
+            approval_generation: intent.approval_generation,
+            resolution_id,
+            notice_id,
+            newly_transitioned: true,
+        });
+    }
+
+    Ok(ExternalEffectExpiryReconcileReportV1 {
+        scanned_rows: effect_ids.len(),
+        resolutions,
+        next_after_effect_id,
+        exhausted,
+    })
+}
+
+fn expiry_resolution_identities(intent: &ExternalEffectIntentV1) -> (String, String) {
+    let canonical = format!(
+        "external-effect-approval-expiry.v1\0{}\0{}",
+        intent.effect_id, intent.approval_generation
+    );
+    let digest = hex(digest::digest(&digest::SHA256, canonical.as_bytes()).as_ref());
+    (format!("ahex1_{digest}"), format!("ahen1_{digest}"))
+}
+
+fn validate_effect_id(effect_id: &str) -> io::Result<()> {
+    if effect_id.len() != 64
+        || !effect_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "external effect ID must be a lowercase SHA-256 digest",
+        ));
+    }
+    Ok(())
 }
 
 pub fn fence_external_effects_for_lane(
@@ -960,6 +1443,101 @@ fn external_effect_latest_dir(harness_home: &Path) -> PathBuf {
         .join("latest")
 }
 
+fn external_effect_public_action_index_file(
+    harness_home: &Path,
+    public_action_id: &str,
+) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("external-effects")
+        .join("public-actions")
+        .join(format!("{public_action_id}.json"))
+}
+
+fn ensure_external_effect_public_action_indexes(
+    harness_home: &Path,
+    intent: &ExternalEffectIntentV1,
+) -> io::Result<()> {
+    if intent.source_session_key_digest.is_empty()
+        || intent.approval_authority_digest.is_empty()
+        || intent.state != ExternalEffectStateV1::ApprovalRequired
+    {
+        return Ok(());
+    }
+    for decision in [
+        ChannelApprovalDecisionV1::Approve,
+        ChannelApprovalDecisionV1::Deny,
+    ] {
+        let index = ExternalEffectPublicActionIndexV1 {
+            schema: EXTERNAL_EFFECT_PUBLIC_ACTION_INDEX_SCHEMA.to_string(),
+            public_action_id: public_approval_action_id(
+                &intent.effect_id,
+                intent.approval_generation,
+                decision,
+            )
+            .map_err(io::Error::other)?,
+            effect_id: intent.effect_id.clone(),
+            approval_generation: intent.approval_generation,
+            decision,
+        };
+        validate_external_effect_public_action_index(&index)?;
+        let file = external_effect_public_action_index_file(harness_home, &index.public_action_id);
+        if file.exists() {
+            let existing: ExternalEffectPublicActionIndexV1 =
+                serde_json::from_slice(&fs::read(&file)?).map_err(io::Error::other)?;
+            validate_external_effect_public_action_index(&existing)?;
+            if existing != index {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "public approval action index collision",
+                ));
+            }
+        } else {
+            write_json_atomic(&file, &index)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_external_effect_public_action_index(
+    index: &ExternalEffectPublicActionIndexV1,
+) -> io::Result<()> {
+    if index.schema != EXTERNAL_EFFECT_PUBLIC_ACTION_INDEX_SCHEMA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported public approval action index schema",
+        ));
+    }
+    validate_effect_id(&index.effect_id)?;
+    validate_public_approval_action_id(
+        &index.public_action_id,
+        &index.effect_id,
+        index.approval_generation,
+        index.decision,
+    )
+    .map_err(io::Error::other)
+}
+
+fn validate_public_action_id_shape(public_action_id: &str) -> io::Result<()> {
+    let Some(suffix) = public_action_id.strip_prefix("ahpa1_") else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsupported public approval action reference",
+        ));
+    };
+    if suffix.len() != 32
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "malformed public approval action reference",
+        ));
+    }
+    Ok(())
+}
+
 fn persist_transition(
     harness_home: &Path,
     from_state: Option<ExternalEffectStateV1>,
@@ -974,6 +1552,8 @@ fn persist_transition(
         approval_generation: intent.approval_generation,
         at_ms: intent.updated_at_ms,
         reason: intent.reason.clone().unwrap_or_default(),
+        resolution_id: intent.expiry_resolution_id.clone(),
+        notice_id: intent.expiry_notice_id.clone(),
     };
     let file = external_effect_transition_file(harness_home);
     if let Some(parent) = file.parent() {
@@ -1056,6 +1636,8 @@ fn new_approval_token(
         effect_id: intent.effect_id.clone(),
         exact_lane_digest: intent.exact_lane_digest.clone(),
         params_digest: intent.params_digest.clone(),
+        source_session_key_digest: intent.source_session_key_digest.clone(),
+        approval_authority_digest: intent.approval_authority_digest.clone(),
         approval_generation: intent.approval_generation,
         expires_at_ms,
         consumed_at_ms: None,
@@ -1142,6 +1724,10 @@ fn validate_intent(intent: &ExternalEffectIntentV1) -> io::Result<()> {
     }
     validate_digest(&intent.exact_lane_digest, "exact lane digest")?;
     validate_digest(&intent.params_digest, "parameter digest")?;
+    validate_legacy_compatible_authority_binding(
+        &intent.source_session_key_digest,
+        &intent.approval_authority_digest,
+    )?;
     validate_bounded_identifier(&intent.connector, "connector", MAX_CONNECTOR_BYTES)?;
     if intent.action.is_empty() || intent.action.len() > MAX_ACTION_BYTES {
         return Err(io::Error::new(
@@ -1155,7 +1741,53 @@ fn validate_intent(intent: &ExternalEffectIntentV1) -> io::Result<()> {
             "external effect action summary is unbounded",
         ));
     }
+    if let Some(token) = intent.approval_token.as_ref() {
+        if token.schema != CONNECTOR_APPROVAL_TOKEN_SCHEMA
+            || token.effect_id != intent.effect_id
+            || token.exact_lane_digest != intent.exact_lane_digest
+            || token.params_digest != intent.params_digest
+            || token.approval_generation != intent.approval_generation
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "external effect approval token binding does not match its intent",
+            ));
+        }
+        validate_digest(&token.token_digest, "approval token digest")?;
+        validate_legacy_compatible_authority_binding(
+            &token.source_session_key_digest,
+            &token.approval_authority_digest,
+        )?;
+        if (token.source_session_key_digest.is_empty()
+            != intent.source_session_key_digest.is_empty())
+            || (!token.source_session_key_digest.is_empty()
+                && (token.source_session_key_digest != intent.source_session_key_digest
+                    || token.approval_authority_digest != intent.approval_authority_digest))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "external effect approval authority binding is inconsistent",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn validate_legacy_compatible_authority_binding(
+    source_session_key_digest: &str,
+    approval_authority_digest: &str,
+) -> io::Result<()> {
+    if source_session_key_digest.is_empty() && approval_authority_digest.is_empty() {
+        return Ok(());
+    }
+    if source_session_key_digest.is_empty() || approval_authority_digest.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "external effect approval authority binding is partial",
+        ));
+    }
+    validate_digest(source_session_key_digest, "source session key digest")?;
+    validate_digest(approval_authority_digest, "approval authority digest")
 }
 
 fn validate_digest(value: &str, label: &str) -> io::Result<()> {
@@ -1274,6 +1906,8 @@ mod tests {
             exact_lane_digest: format!("sha256:{}", "1".repeat(64)),
             logical_lineage_id: "virtual-session-1".to_string(),
             source_queue_id: "queue-1".to_string(),
+            source_session_key_digest: format!("sha256:{}", "3".repeat(64)),
+            approval_authority_digest: format!("sha256:{}", "4".repeat(64)),
         }
     }
 
@@ -1353,6 +1987,8 @@ mod tests {
             exact_lane_digest: request_context.exact_lane_digest.clone(),
             logical_lineage_id: request_context.logical_lineage_id.clone(),
             source_queue_id: request_context.source_queue_id.clone(),
+            source_session_key_digest: request_context.source_session_key_digest.clone(),
+            approval_authority_digest: request_context.approval_authority_digest.clone(),
             connector: request_descriptor.connector.clone(),
             action: request_descriptor.action.clone(),
             params_digest: request_descriptor.params_digest.clone(),
@@ -1363,6 +1999,8 @@ mod tests {
             requested_at_ms: now,
             updated_at_ms: now,
             reason: Some("synthetic crash after requested snapshot".to_string()),
+            expiry_resolution_id: None,
+            expiry_notice_id: None,
         };
         persist_transition(&harness_home, None, &requested).unwrap();
         assert_eq!(
@@ -1545,6 +2183,395 @@ mod tests {
             )
             .is_err()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_channel_action_requires_full_authority_binding_and_consumes_once() {
+        let root = root("native-authority-binding");
+        let harness_home = root.join("runtime-home");
+        let request_context = context();
+        let (intent, token) = match begin_external_effect_request(
+            &harness_home,
+            &request_context,
+            &descriptor(),
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap()
+        {
+            ExternalEffectAdmissionV1::NeedsUser { intent, token } => (intent, token),
+            other => panic!("unexpected admission {other:?}"),
+        };
+        let action = ChannelInboundActionV1::new(
+            "provider-event-1",
+            Some("provider-message-1".to_string()),
+            &intent.effect_id,
+            intent.approval_generation,
+            ChannelApprovalDecisionV1::Approve,
+            &request_context.source_session_key_digest,
+            &request_context.approval_authority_digest,
+            &token,
+        )
+        .unwrap();
+        let approved = resolve_external_effect_channel_action(
+            &harness_home,
+            &action,
+            &request_context.exact_lane_digest,
+        )
+        .unwrap();
+        assert_eq!(approved.state, ExternalEffectStateV1::Approved);
+        assert_eq!(
+            resolve_external_effect_channel_action(
+                &harness_home,
+                &action,
+                &request_context.exact_lane_digest,
+            )
+            .unwrap()
+            .state,
+            ExternalEffectStateV1::Approved
+        );
+
+        let wrong_authority = ChannelInboundActionV1::new(
+            "provider-event-2",
+            None,
+            &intent.effect_id,
+            intent.approval_generation,
+            ChannelApprovalDecisionV1::Approve,
+            &request_context.source_session_key_digest,
+            format!("sha256:{}", "9".repeat(64)),
+            &token,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_external_effect_channel_action(
+                &harness_home,
+                &wrong_authority,
+                &request_context.exact_lane_digest,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn public_channel_action_resolves_through_protected_index_without_bearer_input() {
+        let root = root("public-action-index");
+        let harness_home = root.join("runtime-home");
+        let request_context = context();
+        let intent = match begin_external_effect_request(
+            &harness_home,
+            &request_context,
+            &descriptor(),
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap()
+        {
+            ExternalEffectAdmissionV1::NeedsUser { intent, .. } => intent,
+            other => panic!("unexpected admission {other:?}"),
+        };
+        let public_action_id = public_approval_action_id(
+            &intent.effect_id,
+            intent.approval_generation,
+            ChannelApprovalDecisionV1::Approve,
+        )
+        .unwrap();
+        let index_file = external_effect_public_action_index_file(&harness_home, &public_action_id);
+        let index_text = fs::read_to_string(&index_file).unwrap();
+        assert!(index_text.contains(&public_action_id));
+        assert!(!index_text.contains("ahx1_"));
+
+        let mismatch = resolve_external_effect_public_channel_action(
+            &harness_home,
+            "provider-event-mismatch",
+            None,
+            &public_action_id,
+            &request_context.exact_lane_digest,
+            &request_context.source_session_key_digest,
+            Some(ChannelApprovalDecisionV1::Deny),
+        )
+        .unwrap_err();
+        assert_eq!(mismatch.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            load_external_effect_intent(&harness_home, &intent.effect_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ExternalEffectStateV1::ApprovalRequired
+        );
+
+        let approved = resolve_external_effect_public_channel_action(
+            &harness_home,
+            "provider-event-approve",
+            Some("provider-message-1".to_string()),
+            &public_action_id,
+            &request_context.exact_lane_digest,
+            &request_context.source_session_key_digest,
+            Some(ChannelApprovalDecisionV1::Approve),
+        )
+        .unwrap();
+        assert_eq!(approved.state, ExternalEffectStateV1::Approved);
+        let replay = resolve_external_effect_public_channel_action(
+            &harness_home,
+            "provider-event-approve-replay",
+            Some("provider-message-1".to_string()),
+            &public_action_id,
+            &request_context.exact_lane_digest,
+            &request_context.source_session_key_digest,
+            None,
+        )
+        .unwrap();
+        assert_eq!(replay.state, ExternalEffectStateV1::Approved);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_approval_token_remains_resolvable_only_through_text_path() {
+        let root = root("legacy-token-continuity");
+        let harness_home = root.join("runtime-home");
+        let request_context = context();
+        let (intent, token) = match begin_external_effect_request(
+            &harness_home,
+            &request_context,
+            &descriptor(),
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap()
+        {
+            ExternalEffectAdmissionV1::NeedsUser { intent, token } => (intent, token),
+            other => panic!("unexpected admission {other:?}"),
+        };
+        let snapshot =
+            external_effect_latest_dir(&harness_home).join(format!("{}.json", intent.effect_id));
+        let mut value: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("sourceSessionKeyDigest");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("approvalAuthorityDigest");
+        value["approvalToken"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sourceSessionKeyDigest");
+        value["approvalToken"]
+            .as_object_mut()
+            .unwrap()
+            .remove("approvalAuthorityDigest");
+        write_json_atomic(&snapshot, &value).unwrap();
+
+        let native = ChannelInboundActionV1::new(
+            "provider-event-legacy",
+            None,
+            &intent.effect_id,
+            intent.approval_generation,
+            ChannelApprovalDecisionV1::Approve,
+            &request_context.source_session_key_digest,
+            &request_context.approval_authority_digest,
+            &token,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_external_effect_channel_action(
+                &harness_home,
+                &native,
+                &request_context.exact_lane_digest,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            resolve_external_effect_approval(
+                &harness_home,
+                &token,
+                &request_context.exact_lane_digest,
+                ExternalEffectApprovalDecisionV1::Approve,
+            )
+            .unwrap()
+            .state,
+            ExternalEffectStateV1::Approved
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn external_effect_expiry_reconciliation_is_bounded_and_idempotent() {
+        let root = root("bounded-expiry");
+        let harness_home = root.join("runtime-home");
+        let mut expected_effect_ids = Vec::new();
+        for digit in ['5', '6'] {
+            let mut request_descriptor = descriptor();
+            request_descriptor.params_digest = format!("sha256:{}", digit.to_string().repeat(64));
+            let intent = match begin_external_effect_request(
+                &harness_home,
+                &context(),
+                &request_descriptor,
+                &ConnectorApprovalPolicyV1::default(),
+            )
+            .unwrap()
+            {
+                ExternalEffectAdmissionV1::NeedsUser { intent, .. } => intent,
+                other => panic!("unexpected admission {other:?}"),
+            };
+            let snapshot = external_effect_latest_dir(&harness_home)
+                .join(format!("{}.json", intent.effect_id));
+            let mut value: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+            value["approvalToken"]["expiresAtMs"] = Value::from(100);
+            write_json_atomic(&snapshot, &value).unwrap();
+            expected_effect_ids.push(intent.effect_id);
+        }
+        expected_effect_ids.sort_unstable();
+
+        let first = reconcile_expired_external_effect_approvals(
+            &harness_home,
+            &ExternalEffectExpiryReconcileRequestV1 {
+                now_ms: 100,
+                max_rows: 1,
+                after_effect_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.scanned_rows, 1);
+        assert!(!first.exhausted);
+        assert_eq!(first.resolutions.len(), 1);
+        assert!(first.resolutions[0].newly_transitioned);
+        let second = reconcile_expired_external_effect_approvals(
+            &harness_home,
+            &ExternalEffectExpiryReconcileRequestV1 {
+                now_ms: 100,
+                max_rows: 1,
+                after_effect_id: first.next_after_effect_id,
+            },
+        )
+        .unwrap();
+        assert!(second.exhausted);
+        assert_eq!(second.resolutions.len(), 1);
+        assert!(second.resolutions[0].newly_transitioned);
+
+        let replay = reconcile_expired_external_effect_approvals(
+            &harness_home,
+            &ExternalEffectExpiryReconcileRequestV1 {
+                now_ms: 101,
+                max_rows: MAX_EXTERNAL_EFFECT_EXPIRY_SCAN_ROWS,
+                after_effect_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(replay.resolutions.len(), 2);
+        assert!(
+            replay
+                .resolutions
+                .iter()
+                .all(|resolution| !resolution.newly_transitioned)
+        );
+        assert_eq!(
+            replay
+                .resolutions
+                .iter()
+                .map(|resolution| resolution.effect_id.clone())
+                .collect::<Vec<_>>(),
+            expected_effect_ids
+        );
+        let transitions =
+            fs::read_to_string(external_effect_transition_file(&harness_home)).unwrap();
+        for resolution in replay.resolutions {
+            assert!(transitions.contains(&resolution.resolution_id));
+            assert!(transitions.contains(&resolution.notice_id));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn external_effect_expiry_and_native_decision_have_one_terminal_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let root = root("expiry-action-race");
+        let harness_home = root.join("runtime-home");
+        let request_context = context();
+        let (intent, token) = match begin_external_effect_request(
+            &harness_home,
+            &request_context,
+            &descriptor(),
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap()
+        {
+            ExternalEffectAdmissionV1::NeedsUser { intent, token } => (intent, token),
+            other => panic!("unexpected admission {other:?}"),
+        };
+        let action = ChannelInboundActionV1::new(
+            "provider-event-race",
+            None,
+            &intent.effect_id,
+            intent.approval_generation,
+            ChannelApprovalDecisionV1::Approve,
+            &request_context.source_session_key_digest,
+            &request_context.approval_authority_digest,
+            token,
+        )
+        .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let action_barrier = Arc::clone(&barrier);
+        let action_home = harness_home.clone();
+        let lane = request_context.exact_lane_digest.clone();
+        let action_thread = std::thread::spawn(move || {
+            action_barrier.wait();
+            resolve_external_effect_channel_action(&action_home, &action, &lane)
+                .map(|resolved| resolved.state)
+                .map_err(|error| error.kind())
+        });
+        let expiry_barrier = Arc::clone(&barrier);
+        let expiry_home = harness_home.clone();
+        let expiry_thread = std::thread::spawn(move || {
+            expiry_barrier.wait();
+            reconcile_expired_external_effect_approvals(
+                &expiry_home,
+                &ExternalEffectExpiryReconcileRequestV1 {
+                    now_ms: i64::MAX,
+                    max_rows: MAX_EXTERNAL_EFFECT_EXPIRY_SCAN_ROWS,
+                    after_effect_id: None,
+                },
+            )
+        });
+        barrier.wait();
+        let action_result = action_thread.join().unwrap();
+        let expiry_result = expiry_thread.join().unwrap().unwrap();
+        let final_intent = load_external_effect_intent(&harness_home, &intent.effect_id)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            final_intent.state,
+            ExternalEffectStateV1::Approved | ExternalEffectStateV1::Denied
+        ));
+        match final_intent.state {
+            ExternalEffectStateV1::Approved => {
+                assert_eq!(action_result.unwrap(), ExternalEffectStateV1::Approved);
+                assert!(expiry_result.resolutions.is_empty());
+            }
+            ExternalEffectStateV1::Denied => {
+                assert_eq!(action_result.unwrap_err(), io::ErrorKind::TimedOut);
+                assert_eq!(expiry_result.resolutions.len(), 1);
+            }
+            _ => unreachable!(),
+        }
+        let terminal_transition_count =
+            fs::read_to_string(external_effect_transition_file(&harness_home))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<ExternalEffectTransitionV1>(line).unwrap())
+                .filter(|transition| {
+                    transition.from_state == Some(ExternalEffectStateV1::ApprovalRequired)
+                        && matches!(
+                            transition.to_state,
+                            ExternalEffectStateV1::Approved | ExternalEffectStateV1::Denied
+                        )
+                })
+                .count();
+        assert_eq!(terminal_transition_count, 1);
         let _ = fs::remove_dir_all(root);
     }
 

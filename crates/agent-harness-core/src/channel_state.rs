@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 use ring::digest;
 use serde::{Deserialize, Serialize};
 
+use crate::channel_session_transition::{
+    ChannelGoalBoundaryV1, ChannelSessionTransitionClosureMaterialV1,
+    ChannelSessionTransitionCommandV1, ChannelSessionTransitionIntentV1,
+    ChannelSessionTransitionPhaseV1, PrepareChannelSessionTransitionOptionsV1,
+    channel_session_transition_boundary_is_ready, channel_session_transition_closure_material,
+    pending_channel_session_transition_intents, prepare_channel_session_transition,
+    record_channel_session_transition_phase,
+};
 use crate::context_rollover::{
     VirtualSessionTaskBoundaryCloseV2Options, close_virtual_session_for_task_boundary_for_lane,
 };
@@ -17,7 +25,10 @@ use crate::{
     admission::{ScopedStopOptions, ScopedStopTarget, record_scoped_stop},
     backend_reasoning::{BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference},
     close_virtual_session_for_task_boundary,
-    codex_runtime::{CodexTurnSteerRequestOptions, queue_codex_turn_steer_request},
+    codex_runtime::{
+        CodexGoalClosureExecutionOptions, CodexTurnSteerRequestOptions, execute_codex_goal_closure,
+        queue_codex_turn_steer_request,
+    },
     progress::{AgentProgressSessionSupersedeOptions, supersede_agent_progress_session_surfaces},
     write_json_atomic,
 };
@@ -38,6 +49,44 @@ const MAX_CHANNEL_STATE_LANE_AXIS_BYTES: usize = 4 * 1024;
 pub struct ChannelCommandApplyOptions {
     pub harness_home: PathBuf,
     pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileChannelSessionTransitionsOptionsV1 {
+    pub harness_home: PathBuf,
+    pub executable: PathBuf,
+    pub arguments: Vec<String>,
+    pub working_directory: PathBuf,
+    pub codex_home: Option<PathBuf>,
+    pub timeout_ms: u64,
+    pub max_transitions: usize,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChannelSessionTransitionReconcileStatusV1 {
+    BoundaryCommitted,
+    RetryPending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSessionTransitionReconcileItemV1 {
+    pub transition_id: String,
+    pub command: ChannelSessionTransitionCommandV1,
+    pub status: ChannelSessionTransitionReconcileStatusV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSessionTransitionReconcileReportV1 {
+    pub scanned: usize,
+    pub committed: usize,
+    pub retry_pending: usize,
+    pub items: Vec<ChannelSessionTransitionReconcileItemV1>,
 }
 
 /// Exact durable ownership boundary for v2 channel session state.
@@ -191,6 +240,10 @@ pub struct ChannelCommandApplyReceipt {
     pub stop_applied_queue_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate_sibling_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_transition_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_transition_phase: Option<ChannelSessionTransitionPhaseV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -396,6 +449,8 @@ pub fn apply_channel_command_step(
             stop_scope: None,
             stop_applied_queue_ids: Vec::new(),
             duplicate_sibling_count: None,
+            session_transition_id: None,
+            session_transition_phase: None,
         };
         append_json_line(&receipts_file, &receipt)?;
         return Ok(ChannelCommandApplyReport {
@@ -420,13 +475,17 @@ pub fn apply_channel_command_step(
     if let Some(lane) = exact_lane.as_ref() {
         bind_channel_session_state_to_lane_v2(&mut state, lane);
     }
-    let stop_applied_queue_ids = apply_effect(
+    let applied_effect = apply_effect(
         &mut state,
         &effect,
         &options.harness_home,
         options.now_ms,
         &mut warnings,
     )?;
+    if let Some(lane) = exact_lane.as_ref() {
+        bind_channel_session_state_to_lane_v2(&mut state, lane);
+    }
+    let stop_applied_queue_ids = applied_effect.stop_applied_queue_ids.clone();
     let stop_scope = if stop_applied_queue_ids.is_empty() {
         None
     } else {
@@ -457,6 +516,27 @@ pub fn apply_channel_command_step(
     } else {
         write_json_atomic(&state_file, &state)?;
     }
+    let session_transition_phase = if let Some(intent) = applied_effect.transition.as_ref() {
+        let phase = if applied_effect.boundary_committed {
+            ChannelSessionTransitionPhaseV1::BoundaryCommitted
+        } else if intent.goal_boundary == ChannelGoalBoundaryV1::Ambiguous {
+            ChannelSessionTransitionPhaseV1::RetryPending
+        } else {
+            ChannelSessionTransitionPhaseV1::GoalClosurePending
+        };
+        if applied_effect.boundary_committed {
+            record_channel_session_transition_phase(
+                &options.harness_home,
+                intent,
+                phase,
+                "channel session state write committed",
+                options.now_ms,
+            )?;
+        }
+        Some(phase)
+    } else {
+        None
+    };
     append_json_line(&events_file, &event)?;
 
     let receipt = ChannelCommandApplyReceipt {
@@ -473,6 +553,11 @@ pub fn apply_channel_command_step(
         stop_scope,
         stop_applied_queue_ids,
         duplicate_sibling_count,
+        session_transition_id: applied_effect
+            .transition
+            .as_ref()
+            .map(|intent| intent.transition_id.clone()),
+        session_transition_phase,
     };
     append_json_line(&receipts_file, &receipt)?;
 
@@ -488,6 +573,238 @@ pub fn apply_channel_command_step(
         receipt,
         warnings,
     })
+}
+
+pub fn reconcile_channel_session_transitions(
+    options: ReconcileChannelSessionTransitionsOptionsV1,
+) -> io::Result<ChannelSessionTransitionReconcileReportV1> {
+    let execution = options.clone();
+    reconcile_channel_session_transitions_with(options, move |material| {
+        execute_codex_goal_closure(CodexGoalClosureExecutionOptions {
+            harness_home: execution.harness_home.clone(),
+            intent: material.goal_closure_intent.clone(),
+            resolution: material.resolution.clone(),
+            executable: execution.executable.clone(),
+            arguments: execution.arguments.clone(),
+            working_directory: execution.working_directory.clone(),
+            codex_home: execution.codex_home.clone(),
+            timeout_ms: execution.timeout_ms,
+        })?;
+        Ok(())
+    })
+}
+
+fn reconcile_channel_session_transitions_with<F>(
+    options: ReconcileChannelSessionTransitionsOptionsV1,
+    mut execute_closure: F,
+) -> io::Result<ChannelSessionTransitionReconcileReportV1>
+where
+    F: FnMut(&ChannelSessionTransitionClosureMaterialV1) -> io::Result<()>,
+{
+    if options.timeout_ms == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session transition closure timeout must be positive",
+        ));
+    }
+    let pending =
+        pending_channel_session_transition_intents(&options.harness_home, options.max_transitions)?;
+    let mut report = ChannelSessionTransitionReconcileReportV1 {
+        scanned: pending.len(),
+        committed: 0,
+        retry_pending: 0,
+        items: Vec::with_capacity(pending.len()),
+    };
+    for intent in pending {
+        let result =
+            reconcile_one_channel_session_transition(&options, &intent, &mut execute_closure);
+        match result {
+            Ok(()) => {
+                report.committed += 1;
+                report.items.push(ChannelSessionTransitionReconcileItemV1 {
+                    transition_id: intent.transition_id,
+                    command: intent.command,
+                    status: ChannelSessionTransitionReconcileStatusV1::BoundaryCommitted,
+                    reason: None,
+                });
+            }
+            Err(error) => {
+                let reason = format!(
+                    "session transition reconciliation is retry-pending after {} failure",
+                    error.kind()
+                );
+                record_channel_session_transition_phase(
+                    &options.harness_home,
+                    &intent,
+                    ChannelSessionTransitionPhaseV1::RetryPending,
+                    &reason,
+                    options.now_ms,
+                )?;
+                report.retry_pending += 1;
+                report.items.push(ChannelSessionTransitionReconcileItemV1 {
+                    transition_id: intent.transition_id,
+                    command: intent.command,
+                    status: ChannelSessionTransitionReconcileStatusV1::RetryPending,
+                    reason: Some(reason),
+                });
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn reconcile_one_channel_session_transition<F>(
+    options: &ReconcileChannelSessionTransitionsOptionsV1,
+    intent: &ChannelSessionTransitionIntentV1,
+    execute_closure: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(&ChannelSessionTransitionClosureMaterialV1) -> io::Result<()>,
+{
+    let (lane, mut state) = exact_state_for_transition(&options.harness_home, intent)?;
+    if state.active_session_key == intent.old_session_key {
+        fence_channel_external_effects(
+            &options.harness_home,
+            &state,
+            "session transition recovery fenced pending connector approval",
+            &mut Vec::new(),
+        )?;
+        write_runtime_cancel_request(
+            &options.harness_home,
+            &state,
+            intent.reason.clone(),
+            options.now_ms,
+        )?;
+        let _ = record_active_session_sibling_stops(
+            &options.harness_home,
+            &state,
+            intent.reason.clone(),
+            options.now_ms,
+        )?;
+    }
+
+    if !channel_session_transition_boundary_is_ready(&options.harness_home, intent)? {
+        let material = channel_session_transition_closure_material(&options.harness_home, intent)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "session transition has no exact goal closure authority",
+                )
+            })?;
+        execute_closure(&material)?;
+    }
+    if !channel_session_transition_boundary_is_ready(&options.harness_home, intent)? {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "goal closure execution did not produce durable completed evidence",
+        ));
+    }
+
+    match intent.command {
+        ChannelSessionTransitionCommandV1::Stop => {
+            if state.active_session_key != intent.old_session_key {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "stop transition old session is no longer authoritative",
+                ));
+            }
+        }
+        ChannelSessionTransitionCommandV1::New => {
+            let proposed_frozen = intent.frozen_new_session_key.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable /new transition has no frozen target session",
+                )
+            })?;
+            let frozen = canonical_session_key_for_lane(proposed_frozen, &lane)?;
+            if state.active_session_key != frozen {
+                if state.active_session_key != intent.old_session_key {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "channel state moved to a session other than the frozen transition target",
+                    ));
+                }
+                commit_new_session_transition_state(
+                    &options.harness_home,
+                    &lane,
+                    &mut state,
+                    intent,
+                    options.now_ms,
+                )?;
+                write_channel_session_state_v2(&options.harness_home, &lane, &state)?;
+            }
+        }
+    }
+    record_channel_session_transition_phase(
+        &options.harness_home,
+        intent,
+        ChannelSessionTransitionPhaseV1::BoundaryCommitted,
+        "autonomous session transition reconciliation committed exact-lane state",
+        options.now_ms,
+    )?;
+    Ok(())
+}
+
+fn exact_state_for_transition(
+    harness_home: &Path,
+    intent: &ChannelSessionTransitionIntentV1,
+) -> io::Result<(ChannelStateLane, ChannelSessionState)> {
+    let key = intent
+        .lane_digest
+        .strip_prefix("sha256:")
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session transition lane digest is not a canonical v2 state key",
+            )
+        })?;
+    let state_file = harness_home
+        .join("state")
+        .join("channels")
+        .join("v2")
+        .join(key)
+        .join("state.json");
+    let state = read_channel_state(&state_file)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "exact v2 channel state is unavailable for session transition recovery",
+        )
+    })?;
+    let agent_id = state.agent_id.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "v2 channel state has no exact agent identity",
+        )
+    })?;
+    let lane = ChannelStateLane::new(
+        &state.platform,
+        state.account_id.as_deref(),
+        &state.channel_id,
+        &state.user_id,
+        agent_id,
+    )?;
+    let frozen_new_session_key = intent
+        .frozen_new_session_key
+        .as_deref()
+        .map(|session_key| canonical_session_key_for_lane(session_key, &lane))
+        .transpose()?;
+    if lane.exact_lane_digest() != intent.lane_digest
+        || (state.active_session_key != intent.old_session_key
+            && frozen_new_session_key.as_deref() != Some(state.active_session_key.as_str()))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted channel state does not match the frozen transition authority",
+        ));
+    }
+    validate_channel_session_state_v2_lane(&state, &lane)?;
+    Ok((lane, state))
 }
 
 pub fn read_channel_session_state(
@@ -970,28 +1287,84 @@ fn step_agent_id(step: &ChannelStep) -> Option<String> {
         .or_else(|| active_session_key_agent_segment(&step.session_key))
 }
 
+struct AppliedChannelEffect {
+    stop_applied_queue_ids: Vec<String>,
+    transition: Option<ChannelSessionTransitionIntentV1>,
+    boundary_committed: bool,
+}
+
 fn apply_effect(
     state: &mut ChannelSessionState,
     effect: &ChannelCommandEffect,
     harness_home: &Path,
     now_ms: i64,
     warnings: &mut Vec<String>,
-) -> io::Result<Vec<String>> {
+) -> io::Result<AppliedChannelEffect> {
     state.last_command = Some(command_name(effect).to_string());
     state.updated_at_ms = now_ms;
     let mut stop_applied_queue_ids = Vec::new();
+    let mut transition = None;
+    let mut boundary_committed = false;
 
     match effect {
         ChannelCommandEffect::StartNewSession {
             topic,
             new_session_key,
         } => {
+            let lane_digest = channel_state_boundary_lane_digest(state)?;
+            let prepared =
+                prepare_channel_session_transition(PrepareChannelSessionTransitionOptionsV1 {
+                    harness_home: harness_home.to_path_buf(),
+                    command: ChannelSessionTransitionCommandV1::New,
+                    lane_digest,
+                    old_session_key: state.active_session_key.clone(),
+                    proposed_new_session_key: Some(new_session_key.clone()),
+                    topic: topic.clone(),
+                    reason: Some("channel command /new".to_string()),
+                    now_ms,
+                })?;
+            let boundary_ready = prepared.boundary_ready;
+            let transition_intent = prepared.intent;
             fence_channel_external_effects(
                 harness_home,
                 state,
                 "new session superseded pending connector approval",
                 warnings,
             )?;
+            let new_boundary_reason = Some("new session boundary requested".to_string());
+            write_runtime_cancel_request(harness_home, state, new_boundary_reason.clone(), now_ms)?;
+            stop_applied_queue_ids = record_active_session_sibling_stops(
+                harness_home,
+                state,
+                new_boundary_reason,
+                now_ms,
+            )?;
+            if !boundary_ready {
+                if transition_intent.goal_boundary == ChannelGoalBoundaryV1::Ambiguous {
+                    record_channel_session_transition_phase(
+                        harness_home,
+                        &transition_intent,
+                        ChannelSessionTransitionPhaseV1::RetryPending,
+                        "goal closure authority is ambiguous or unavailable",
+                        now_ms,
+                    )?;
+                }
+                return Ok(AppliedChannelEffect {
+                    stop_applied_queue_ids,
+                    transition: Some(transition_intent),
+                    boundary_committed: false,
+                });
+            }
+            let frozen_new_session_key = transition_intent
+                .frozen_new_session_key
+                .as_deref()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "durable /new transition has no frozen target session",
+                    )
+                })?
+                .to_string();
             let close_result = match (state.account_id.as_deref(), state.agent_id.as_deref()) {
                 (Some(account_id), Some(agent_id)) => match ChannelStateLane::new(
                     &state.platform,
@@ -1025,12 +1398,21 @@ fn apply_effect(
                 ),
             };
             if let Err(error) = close_result {
-                warnings.push(format!(
-                    "virtual session task boundary close failed for previous session `{}`: {error}",
-                    state.active_session_key
+                record_channel_session_transition_phase(
+                    harness_home,
+                    &transition_intent,
+                    ChannelSessionTransitionPhaseV1::RetryPending,
+                    &format!("virtual session task boundary close failed: {error}"),
+                    now_ms,
+                )?;
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "session transition remains pending because the old virtual session could not close: {error}"
+                    ),
                 ));
             }
-            if state.active_session_key != *new_session_key
+            if state.active_session_key != frozen_new_session_key
                 && let Err(error) = supersede_agent_progress_session_surfaces(
                     AgentProgressSessionSupersedeOptions {
                         harness_home: harness_home.to_path_buf(),
@@ -1044,12 +1426,21 @@ fn apply_effect(
                     },
                 )
             {
-                warnings.push(format!(
-                    "progress surfaces could not be superseded for previous session `{}`: {error}",
-                    state.active_session_key
+                record_channel_session_transition_phase(
+                    harness_home,
+                    &transition_intent,
+                    ChannelSessionTransitionPhaseV1::RetryPending,
+                    &format!("old-session progress supersession failed: {error}"),
+                    now_ms,
+                )?;
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "session transition remains pending because old-session progress could not be superseded: {error}"
+                    ),
                 ));
             }
-            if let Some(agent_id) = active_session_key_agent_segment(new_session_key) {
+            if let Some(agent_id) = active_session_key_agent_segment(&frozen_new_session_key) {
                 if state.agent_id.as_deref() != Some(agent_id.as_str()) {
                     state.provider = None;
                     state.model = None;
@@ -1059,8 +1450,8 @@ fn apply_effect(
                 }
                 state.agent_id = Some(agent_id);
             }
-            state.active_session_key = new_session_key.clone();
-            state.session_topic = topic.clone();
+            state.active_session_key = frozen_new_session_key;
+            state.session_topic = transition_intent.topic.clone();
             state.thinking_enabled = false;
             state.thinking_level = None;
             state.thinking_instruction = None;
@@ -1071,6 +1462,8 @@ fn apply_effect(
             state.stop_reason = None;
             state.steering_notes.clear();
             state.btw_notes.clear();
+            transition = Some(transition_intent);
+            boundary_committed = true;
         }
         ChannelCommandEffect::ShowThinking {
             agent_id,
@@ -1129,7 +1522,11 @@ fn apply_effect(
                     warnings.push(format!(
                         "rejected inconsistent backend reasoning effect: {error}"
                     ));
-                    return Ok(stop_applied_queue_ids);
+                    return Ok(AppliedChannelEffect {
+                        stop_applied_queue_ids,
+                        transition: None,
+                        boundary_committed: false,
+                    });
                 }
                 update_model_context(state, agent_id, provider, model);
                 state.reasoning_preference = Some(preference.clone());
@@ -1186,6 +1583,19 @@ fn apply_effect(
             }
         }
         ChannelCommandEffect::StopCurrentRun { reason } => {
+            let prepared =
+                prepare_channel_session_transition(PrepareChannelSessionTransitionOptionsV1 {
+                    harness_home: harness_home.to_path_buf(),
+                    command: ChannelSessionTransitionCommandV1::Stop,
+                    lane_digest: channel_state_boundary_lane_digest(state)?,
+                    old_session_key: state.active_session_key.clone(),
+                    proposed_new_session_key: None,
+                    topic: None,
+                    reason: reason.clone(),
+                    now_ms,
+                })?;
+            let boundary_ready = prepared.boundary_ready;
+            let transition_intent = prepared.intent;
             fence_channel_external_effects(
                 harness_home,
                 state,
@@ -1197,6 +1607,8 @@ fn apply_effect(
             write_runtime_cancel_request(harness_home, state, reason.clone(), now_ms)?;
             stop_applied_queue_ids =
                 record_active_session_sibling_stops(harness_home, state, reason.clone(), now_ms)?;
+            boundary_committed = boundary_ready;
+            transition = Some(transition_intent);
         }
         ChannelCommandEffect::RestartChannel { .. } => {}
         ChannelCommandEffect::RestartGateway { .. } => {}
@@ -1315,7 +1727,11 @@ fn apply_effect(
     if state.model_override.is_some() && state.model_override_model.is_none() {
         warnings.push("model override target did not include a usable model name".to_string());
     }
-    Ok(stop_applied_queue_ids)
+    Ok(AppliedChannelEffect {
+        stop_applied_queue_ids,
+        transition,
+        boundary_committed,
+    })
 }
 
 fn fence_channel_external_effects(
@@ -1343,6 +1759,114 @@ fn fence_channel_external_effects(
         ));
     }
     Ok(())
+}
+
+fn channel_state_boundary_lane_digest(state: &ChannelSessionState) -> io::Result<String> {
+    let agent_id = state
+        .agent_id
+        .clone()
+        .or_else(|| active_session_key_agent_segment(&state.active_session_key))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "channel session boundary has no exact agent identity",
+            )
+        })?;
+    Ok(ChannelStateLane::new(
+        &state.platform,
+        state.account_id.as_deref(),
+        &state.channel_id,
+        &state.user_id,
+        &agent_id,
+    )?
+    .exact_lane_digest())
+}
+
+fn commit_new_session_transition_state(
+    harness_home: &Path,
+    lane: &ChannelStateLane,
+    state: &mut ChannelSessionState,
+    intent: &ChannelSessionTransitionIntentV1,
+    now_ms: i64,
+) -> io::Result<()> {
+    if intent.command != ChannelSessionTransitionCommandV1::New
+        || intent.lane_digest != lane.exact_lane_digest()
+        || state.active_session_key != intent.old_session_key
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "new-session commit does not match the frozen exact-lane transition authority",
+        ));
+    }
+    let proposed_new_session_key = intent.frozen_new_session_key.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable /new transition has no frozen target session",
+        )
+    })?;
+    let frozen_new_session_key = canonical_session_key_for_lane(proposed_new_session_key, lane)?;
+    close_virtual_session_for_task_boundary_for_lane(VirtualSessionTaskBoundaryCloseV2Options {
+        harness_home: harness_home.to_path_buf(),
+        channel_lane: lane.clone(),
+        previous_session_key: state.active_session_key.clone(),
+        ended_by: "new session boundary requested".to_string(),
+        now_ms,
+    })?;
+    if state.active_session_key != frozen_new_session_key {
+        supersede_agent_progress_session_surfaces(AgentProgressSessionSupersedeOptions {
+            harness_home: harness_home.to_path_buf(),
+            platform: state.platform.clone(),
+            account_id: state.account_id.clone(),
+            channel_id: state.channel_id.clone(),
+            user_id: state.user_id.clone(),
+            agent_id: state.agent_id.clone(),
+            session_key: state.active_session_key.clone(),
+            now_ms,
+        })?;
+    }
+    if let Some(agent_id) = active_session_key_agent_segment(&frozen_new_session_key) {
+        if state.agent_id.as_deref() != Some(agent_id.as_str()) {
+            state.provider = None;
+            state.model = None;
+            state.model_override = None;
+            state.model_override_provider = None;
+            state.model_override_model = None;
+            state.reasoning_preference = None;
+            state.backend_reasoning_policy = None;
+        }
+        state.agent_id = Some(agent_id);
+    }
+    state.active_session_key = frozen_new_session_key;
+    state.session_topic = intent.topic.clone();
+    state.thinking_enabled = false;
+    state.thinking_level = None;
+    state.thinking_instruction = None;
+    state.reasoning_preference = None;
+    state.backend_reasoning_policy = None;
+    state.fast_mode = None;
+    state.stop_requested = false;
+    state.stop_reason = None;
+    state.steering_notes.clear();
+    state.btw_notes.clear();
+    state.last_command = Some("new".to_string());
+    state.updated_at_ms = now_ms;
+    Ok(())
+}
+
+fn canonical_session_key_for_lane(
+    session_key: &str,
+    lane: &ChannelStateLane,
+) -> io::Result<String> {
+    crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+        session_key,
+        lane.platform(),
+        lane.account_id(),
+        lane.channel_id(),
+        lane.user_id(),
+        lane.agent_id(),
+    )
+    .map(|parsed| parsed.canonical_string())
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn active_session_key_agent_segment(session_key: &str) -> Option<String> {
@@ -2364,6 +2888,121 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&fs::read(marker).unwrap()).unwrap();
         assert_eq!(value["sessionKey"], "telegram:dm:user:main");
         assert_eq!(value["reason"], "operator stop");
+        assert!(report.receipt.session_transition_id.is_some());
+        assert_eq!(
+            report.receipt.session_transition_phase,
+            Some(ChannelSessionTransitionPhaseV1::BoundaryCommitted)
+        );
+        let transition_receipts = fs::read_to_string(
+            crate::channel_session_transition_receipts_file(&harness_home),
+        )
+        .unwrap();
+        assert!(transition_receipts.contains("\"goalBoundary\":\"not-applicable\""));
+        assert!(transition_receipts.contains("\"phase\":\"boundary-committed\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_without_active_goal_uses_not_applicable_fast_path() {
+        stop_command_writes_runtime_cancel_marker();
+    }
+
+    #[test]
+    fn new_keeps_old_session_active_until_goal_cancel_is_proven() {
+        let root = temp_root("new_keeps_old_session_active_until_goal_cancel_is_proven");
+        let harness_home = root.join(".agent-harness");
+        let old_session = "telegram:dm:user:main";
+        let lane = ChannelStateLane::new("telegram", None, "dm", "user", "main").unwrap();
+        let authority_file = harness_home
+            .join("state")
+            .join("context-rollover")
+            .join("virtual-session-authority-receipts.jsonl");
+        crate::append_jsonl_value(
+            &authority_file,
+            &serde_json::json!({
+                "schema": "agent-harness.virtual-session-authority.v1",
+                "queueId": "queue-active-goal",
+                "virtualSessionId": "virtual-active-goal",
+                "workingSessionKey": old_session,
+                "laneDigest": lane.exact_lane_digest(),
+                "backendContextGeneration": "generation-active-goal",
+                "workingSetFile": "opaque-working-set-ref",
+                "status": "authoritative-v2",
+                "reason": "fixture",
+                "updatedAtMs": 900
+            }),
+        )
+        .unwrap();
+        let projection_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        crate::append_jsonl_value(
+            &projection_file,
+            &serde_json::json!({
+                "schema": "agent-harness.codex-goal-projection.v1",
+                "queueId": "queue-active-goal",
+                "sessionKey": old_session,
+                "sourceThreadId": "thread-active-goal",
+                "sourceTurnId": "turn-active-goal",
+                "backendGoalRef": "goal-active",
+                "goalReference": "goal-active",
+                "laneDigest": lane.exact_lane_digest(),
+                "backendContextGeneration": "generation-active-goal",
+                "objective": "finish the active goal",
+                "status": "active",
+                "observationPhase": "owned-turn",
+                "turnRelation": "current-owned-turn",
+                "sourceFinalEligible": true,
+                "goalChecksum": "goal-checksum-active",
+                "projectionChecksum": "projection-checksum-active",
+                "projectionComplete": true,
+                "observationOrder": 1,
+                "observedAtMs": 901
+            }),
+        )
+        .unwrap();
+
+        let report = apply_channel_command_step(
+            &command_step_with_session(
+                old_session,
+                ChannelCommandEffect::StartNewSession {
+                    topic: Some("next task".to_string()),
+                    new_session_key: "telegram:dm:user:main:session-new".to_string(),
+                },
+            ),
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 1000,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.state.as_ref().unwrap().active_session_key,
+            old_session
+        );
+        assert_eq!(
+            report.receipt.session_transition_phase,
+            Some(ChannelSessionTransitionPhaseV1::GoalClosurePending)
+        );
+        assert!(crate::goal_closure_intents_file(&harness_home).is_file());
+        let cancel_marker = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("cancel-requests")
+            .join("telegram_dm_user_main.json");
+        assert!(cancel_marker.is_file());
+        assert_eq!(
+            crate::channel_session_transition_admission(
+                &harness_home,
+                &lane.exact_lane_digest(),
+                old_session,
+            )
+            .unwrap(),
+            crate::ChannelSessionAdmissionV1::HoldPendingNew
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2982,6 +3621,139 @@ mod tests {
         assert_eq!(
             read_channel_session_state_v2(&harness_home, &lane).unwrap(),
             Some(migrated)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn autonomous_new_reconciliation_commits_frozen_target_and_releases_admission() {
+        let root =
+            temp_root("autonomous_new_reconciliation_commits_frozen_target_and_releases_admission");
+        let harness_home = root.join(".agent-harness");
+        let lane =
+            ChannelStateLane::new("telegram", Some("default"), "dm", "user", "main").unwrap();
+        let mut state = sample_channel_state("telegram", "dm", "user", "main", "old topic");
+        bind_channel_session_state_to_lane_v2(&mut state, &lane);
+        let old_session = state.active_session_key.clone();
+        let proposed_new_session = "telegram:dm:user:main:session-recovered".to_string();
+        let frozen_new_session =
+            canonical_session_key_for_lane(&proposed_new_session, &lane).unwrap();
+        write_channel_session_state_v2(&harness_home, &lane, &state).unwrap();
+        let prepared =
+            prepare_channel_session_transition(PrepareChannelSessionTransitionOptionsV1 {
+                harness_home: harness_home.clone(),
+                command: ChannelSessionTransitionCommandV1::New,
+                lane_digest: lane.exact_lane_digest(),
+                old_session_key: old_session.clone(),
+                proposed_new_session_key: Some(proposed_new_session),
+                topic: Some("recovered topic".to_string()),
+                reason: Some("recover pending new".to_string()),
+                now_ms: 1000,
+            })
+            .unwrap();
+        assert_eq!(
+            prepared.intent.goal_boundary,
+            ChannelGoalBoundaryV1::NotApplicable
+        );
+        assert_eq!(
+            crate::channel_session_transition_admission(
+                &harness_home,
+                &lane.exact_lane_digest(),
+                &old_session,
+            )
+            .unwrap(),
+            crate::ChannelSessionAdmissionV1::HoldPendingNew
+        );
+
+        let options = ReconcileChannelSessionTransitionsOptionsV1 {
+            harness_home: harness_home.clone(),
+            executable: PathBuf::from("unused"),
+            arguments: Vec::new(),
+            working_directory: root.clone(),
+            codex_home: None,
+            timeout_ms: 1000,
+            max_transitions: 8,
+            now_ms: 1100,
+        };
+        let report = reconcile_channel_session_transitions_with(options.clone(), |_| {
+            panic!("not-applicable transition must not execute a backend goal mutation")
+        })
+        .unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.committed, 1, "{report:?}");
+        assert_eq!(report.retry_pending, 0);
+        let recovered = read_channel_session_state_v2(&harness_home, &lane)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.active_session_key, frozen_new_session);
+        assert_eq!(recovered.session_topic.as_deref(), Some("recovered topic"));
+        assert_eq!(
+            crate::channel_session_transition_admission(
+                &harness_home,
+                &lane.exact_lane_digest(),
+                &old_session,
+            )
+            .unwrap(),
+            crate::ChannelSessionAdmissionV1::Open
+        );
+
+        let replay = reconcile_channel_session_transitions_with(options, |_| {
+            panic!("committed transition must not execute again")
+        })
+        .unwrap();
+        assert_eq!(replay.scanned, 0);
+        assert_eq!(replay.committed, 0);
+        let receipts = fs::read_to_string(crate::channel_session_transition_receipts_file(
+            &harness_home,
+        ))
+        .unwrap();
+        assert_eq!(
+            receipts.matches("\"phase\":\"boundary-committed\"").count(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn account_scoped_new_commits_canonical_frozen_session() {
+        let root = temp_root("account_scoped_new_commits_canonical_frozen_session");
+        let harness_home = root.join(".agent-harness");
+        let mut step = command_step_with_session(
+            "telegram:dm:user:main",
+            ChannelCommandEffect::StartNewSession {
+                topic: Some("account-bound topic".to_string()),
+                new_session_key: "telegram:dm:user:main:session-account-bound".to_string(),
+            },
+        );
+        step.account_id = Some("bot-primary".to_string());
+        step.outbound_messages[0].account_id = Some("bot-primary".to_string());
+
+        let report = apply_channel_command_step(
+            &step,
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 1200,
+            },
+        )
+        .unwrap();
+        let state = report.state.unwrap();
+        let lane =
+            ChannelStateLane::new("telegram", Some("bot-primary"), "dm", "user", "main").unwrap();
+        let parsed = crate::channel_session_key::CanonicalChannelSessionKey::parse_for_lane(
+            &state.active_session_key,
+            lane.platform(),
+            lane.account_id(),
+            lane.channel_id(),
+            lane.user_id(),
+            lane.agent_id(),
+        )
+        .unwrap();
+        assert_eq!(parsed.canonical_string(), state.active_session_key);
+        assert_eq!(
+            report.receipt.session_transition_phase,
+            Some(ChannelSessionTransitionPhaseV1::BoundaryCommitted)
         );
 
         let _ = fs::remove_dir_all(root);
