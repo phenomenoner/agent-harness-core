@@ -3467,8 +3467,8 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
                 "services": [
                   {
                     "enabled": true,
-                    "serviceId": "custom-loop",
-                    "serviceKind": "custom-kind",
+                    "serviceId": "runtime-loop",
+                    "serviceKind": "runtime",
                     "args": [],
                     "priority": "latency",
                     "restartDelayMs": 1000,
@@ -3476,8 +3476,8 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
                   },
                   {
                     "enabled": false,
-                    "serviceId": "disabled-custom-loop",
-                    "serviceKind": "custom-kind",
+                    "serviceId": "discord-gateway-loop",
+                    "serviceKind": "discord-gateway",
                     "args": [],
                     "priority": "latency",
                     "restartDelayMs": 1000,
@@ -3494,7 +3494,7 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
             ("ledger-maintenance-loop", "ledger-maintenance"),
             ("telegram-loop-team-a", "telegram-ingress"),
             ("discord-outbox-loop", "final-outbox"),
-            ("custom-loop", "custom-kind"),
+            ("runtime-loop", "runtime"),
         ] {
             write_reconcile_service_state(&services_dir, service_id, service_kind);
         }
