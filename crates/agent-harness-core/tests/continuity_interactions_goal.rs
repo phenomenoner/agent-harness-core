@@ -421,6 +421,42 @@ fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
             },
         })
         .unwrap();
+        let runtime_receipt = codex_runtime_receipt_for_queue(&harness_home, &queue_id);
+        let lifecycle = &runtime_receipt["subagentLifecycle"];
+        assert_eq!(lifecycle["childStartedCount"], 2, "{case}");
+        assert_eq!(lifecycle["childCompletedCount"], 2, "{case}");
+        assert_eq!(lifecycle["childErroredCount"], 0, "{case}");
+        assert_eq!(lifecycle["parentWaitCompletedCount"], 1, "{case}");
+        assert_eq!(
+            lifecycle["parentProcessStartFailure"], shell_drift,
+            "{case}"
+        );
+        assert_eq!(lifecycle["childProcessStartFailure"], false, "{case}");
+        assert_eq!(lifecycle["childFinalObservedCount"], 2, "{case}");
+        assert_eq!(lifecycle["finalOwner"], "parent", "{case}");
+        assert_eq!(lifecycle["children"].as_array().unwrap().len(), 2, "{case}");
+        assert!(
+            lifecycle["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|child| child["commandCount"] == 1 && child["fileChangeCount"] == 0),
+            "{case}"
+        );
+        let bounded = serde_json::to_string(lifecycle).unwrap();
+        for forbidden in [
+            "turn-child-a",
+            "turn-child-b",
+            "routing-reader",
+            "lifecycle-reader",
+            "Inspect the routing contract",
+            "Inspect the lifecycle contract",
+            "Get-Content docs/invariants.md",
+            "Get-Content docs/agent-harness-topology-contract.md",
+            stale_shell_path(),
+        ] {
+            assert!(!bounded.contains(forbidden), "{case} leaked {forbidden}");
+        }
 
         if expected == "shell-child" {
             assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Skipped);
@@ -1388,8 +1424,7 @@ fn fake_active_goal_blocker_codex(root: &Path) -> PathBuf {
 }
 
 fn fake_active_goal_shell_case_codex(root: &Path, shell_drift: bool) -> PathBuf {
-    let stale =
-        r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.3.0_x64__8wekyb3d8bbwe\pwsh.exe";
+    let stale = stale_shell_path();
     let (exit_code, duration_ms, output) = if shell_drift {
         (-1, 0, "process start failed: OS error 3; path not found")
     } else {
@@ -1402,9 +1437,21 @@ fn fake_active_goal_shell_case_codex(root: &Path, shell_drift: bool) -> PathBuf 
     let rows = [
         json!({"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular"}}}),
         json!({"method":"thread/goal/updated","params":{"threadId":"thread-parent","turnId":"turn-parent","goal":{"id":"goal-active","objective":"finish the durable implementation","status":"active","completionCriteria":["T3 replay passes"]}}}),
+        json!({"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-child-a","kind":"subAgent","name":"routing-reader","path":["parent","routing-reader"]}}}),
+        json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-child-a","item":{"type":"commandExecution","id":"child-a-command","command":"Get-Content docs/invariants.md"}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-child-a","item":{"type":"commandExecution","id":"child-a-command","status":"completed","exitCode":0,"durationMs":20}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-child-a","item":{"type":"agentMessage","id":"child-a-final","phase":"final_answer","text":"Inspect the routing contract"}}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-child-a","status":"completed"}}}),
+        json!({"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-child-b","kind":"subAgent","name":"lifecycle-reader","path":["parent","lifecycle-reader"]}}}),
+        json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-child-b","item":{"type":"commandExecution","id":"child-b-command","command":"Get-Content docs/agent-harness-topology-contract.md"}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-child-b","item":{"type":"commandExecution","id":"child-b-command","status":"completed","exitCode":0,"durationMs":25}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-child-b","item":{"type":"agentMessage","id":"child-b-final","phase":"final_answer","text":"Inspect the lifecycle contract"}}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-child-b","status":"completed"}}}),
+        json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"collabToolCall","id":"parent-wait","toolName":"wait_agent"}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"collabToolCall","id":"parent-wait","toolName":"wait_agent","status":"completed"}}}),
         json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"shell-drift","command":format!(r#""{stale}" -NoProfile -Command Get-ChildItem"#),"cwd":root}}}),
         json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"shell-drift","status":"failed","exitCode":exit_code,"durationMs":duration_ms,"aggregatedOutput":output}}}),
-        json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-parent","turnId":"turn-parent","itemId":"parent-blocker","delta":"The goal remains active after the shell failed to start."}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"agentMessage","id":"parent-blocker","phase":"final_answer","text":"The goal remains active after the shell failed to start."}}}),
         json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","status":"completed"}}}),
     ];
     #[cfg(windows)]
@@ -1435,6 +1482,19 @@ fn fake_active_goal_shell_case_codex(root: &Path, shell_drift: bool) -> PathBuf 
             .join("\n");
         fake_unix_codex(root, "active-goal-shell-drift", &body)
     }
+}
+
+fn stale_shell_path() -> &'static str {
+    r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.3.0_x64__8wekyb3d8bbwe\pwsh.exe"
+}
+
+fn codex_runtime_receipt_for_queue(harness_home: &Path, queue_id: &str) -> Value {
+    fs::read_to_string(harness_home.join("state/runtime-queue/codex-runtime-run-receipts.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|receipt| receipt["queueId"] == queue_id)
+        .expect("runtime receipt for source queue")
 }
 
 #[cfg(windows)]

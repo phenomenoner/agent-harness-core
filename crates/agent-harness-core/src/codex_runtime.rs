@@ -798,6 +798,8 @@ pub struct CodexRuntimeRunReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_execution_failure: Option<CodexShellExecutionFailureV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_lifecycle: Option<CodexSubagentLifecycleSummaryV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interruption_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interrupted_tool_uses: Vec<CodexInterruptedToolUse>,
@@ -984,6 +986,46 @@ pub struct CodexShellExecutionFailureV1 {
     pub refreshed_shell_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refreshed_boundary_kind: Option<RefreshedShellBoundaryKind>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexFinalOwnerV1 {
+    #[default]
+    None,
+    Parent,
+    Child,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentChildLifecycleV1 {
+    pub logical_path: String,
+    pub logical_name: String,
+    pub completed: bool,
+    pub errored: bool,
+    pub command_count: usize,
+    pub file_change_count: usize,
+    pub process_start_failure: bool,
+    pub final_observed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSubagentLifecycleSummaryV1 {
+    pub child_started_count: usize,
+    pub child_completed_count: usize,
+    pub child_errored_count: usize,
+    pub parent_wait_started_count: usize,
+    pub parent_wait_completed_count: usize,
+    pub parent_wait_errored_count: usize,
+    pub parent_wait_timed_out_count: usize,
+    pub parent_process_start_failure: bool,
+    pub child_process_start_failure: bool,
+    pub child_final_observed_count: usize,
+    pub final_owner: CodexFinalOwnerV1,
+    pub children: Vec<CodexSubagentChildLifecycleV1>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1262,6 +1304,236 @@ fn classify_shell_execution_failure_from_stdout_with_boundary(
         latest = Some(classified);
     }
     Ok(latest)
+}
+
+const MAX_SUBAGENT_LIFECYCLE_CHILDREN: usize = 32;
+
+#[derive(Debug)]
+struct SubagentLifecycleAccumulator {
+    child: CodexSubagentChildLifecycleV1,
+    command_items: BTreeSet<String>,
+    file_change_items: BTreeSet<String>,
+}
+
+fn summarize_subagent_lifecycle_from_stdout(
+    stdout_log: Option<&Path>,
+) -> io::Result<Option<CodexSubagentLifecycleSummaryV1>> {
+    let Some(stdout_log) = stdout_log.filter(|path| path.is_file()) else {
+        return Ok(None);
+    };
+    let reader = BufReader::new(fs::File::open(stdout_log)?);
+    let mut parent_turn_id = None;
+    let mut child_by_turn = BTreeMap::<String, usize>::new();
+    let mut children = Vec::<SubagentLifecycleAccumulator>::new();
+    let mut child_started_count = 0usize;
+    let mut child_completed_count = 0usize;
+    let mut child_errored_count = 0usize;
+    let mut parent_wait_started = BTreeSet::<String>::new();
+    let mut parent_wait_completed = BTreeSet::<String>::new();
+    let mut parent_wait_errored = BTreeSet::<String>::new();
+    let mut parent_wait_timed_out = BTreeSet::<String>::new();
+    let mut parent_process_start_failure = false;
+    let mut child_process_start_failure = false;
+    let mut child_final_observed_count = 0usize;
+    let mut parent_final_observed = false;
+    let mut truncated = false;
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let method = json_method(&value).unwrap_or_default();
+        if method == "turn/started" {
+            let turn = value.pointer("/params/turn").unwrap_or(&Value::Null);
+            let turn_id = string_field(turn, &["id"]).map(ToString::to_string);
+            let kind = string_field(turn, &["kind"])
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .replace(['-', '_', ' '], "");
+            if kind == "regular" {
+                parent_turn_id = turn_id;
+                continue;
+            }
+            if matches!(kind.as_str(), "subagent" | "child") {
+                child_started_count = child_started_count.saturating_add(1);
+                let Some(turn_id) = turn_id else {
+                    truncated = true;
+                    continue;
+                };
+                if children.len() >= MAX_SUBAGENT_LIFECYCLE_CHILDREN {
+                    truncated = true;
+                    continue;
+                }
+                let ordinal = children.len() + 1;
+                let (logical_path, logical_name) = logical_child_identity(turn, ordinal);
+                child_by_turn.insert(turn_id, children.len());
+                children.push(SubagentLifecycleAccumulator {
+                    child: CodexSubagentChildLifecycleV1 {
+                        logical_path,
+                        logical_name,
+                        completed: false,
+                        errored: false,
+                        command_count: 0,
+                        file_change_count: 0,
+                        process_start_failure: false,
+                        final_observed: false,
+                    },
+                    command_items: BTreeSet::new(),
+                    file_change_items: BTreeSet::new(),
+                });
+                continue;
+            }
+        }
+
+        if method == "turn/completed" || method == "turn/failed" || method == "turn/error" {
+            let turn = value.pointer("/params/turn").unwrap_or(&Value::Null);
+            let turn_id = string_field(turn, &["id"]);
+            if let Some(child_index) = turn_id
+                .and_then(|turn_id| child_by_turn.get(turn_id))
+                .copied()
+            {
+                let status = string_field(turn, &["status"])
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let errored = method != "turn/completed"
+                    || matches!(status.as_str(), "failed" | "error" | "errored" | "canceled");
+                if errored {
+                    child_errored_count = child_errored_count.saturating_add(1);
+                    children[child_index].child.errored = true;
+                } else {
+                    child_completed_count = child_completed_count.saturating_add(1);
+                    children[child_index].child.completed = true;
+                }
+            }
+            continue;
+        }
+
+        let item = value.pointer("/params/item").unwrap_or(&Value::Null);
+        let item_type = string_field(item, &["type"])
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if item_type.is_empty() {
+            continue;
+        }
+        let turn_id = first_string_pointer(&value, &["/params/turnId", "/params/turn/id"]);
+        let child_index = turn_id
+            .as_deref()
+            .and_then(|turn_id| child_by_turn.get(turn_id))
+            .copied();
+        let is_parent = turn_id.as_deref() == parent_turn_id.as_deref();
+        let item_key = string_field(item, &["id"])
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("line-{line_index}"));
+
+        if let Some(child_index) = child_index {
+            if item_type == "commandexecution"
+                && children[child_index].command_items.insert(item_key.clone())
+            {
+                children[child_index].child.command_count =
+                    children[child_index].child.command_count.saturating_add(1);
+            }
+            if matches!(item_type.as_str(), "filechange" | "file_change")
+                && children[child_index]
+                    .file_change_items
+                    .insert(item_key.clone())
+            {
+                children[child_index].child.file_change_count = children[child_index]
+                    .child
+                    .file_change_count
+                    .saturating_add(1);
+            }
+            if item_type == "commandexecution" && item_has_process_start_failure(item) {
+                children[child_index].child.process_start_failure = true;
+                child_process_start_failure = true;
+            }
+            if item_is_final_answer(item) {
+                children[child_index].child.final_observed = true;
+                child_final_observed_count = child_final_observed_count.saturating_add(1);
+            }
+        } else if is_parent {
+            if item_type == "commandexecution" && item_has_process_start_failure(item) {
+                parent_process_start_failure = true;
+            }
+            if item_is_final_answer(item) {
+                parent_final_observed = true;
+            }
+            if item_is_parent_wait(item) {
+                let status = string_field(item, &["status"])
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if method == "item/started" {
+                    parent_wait_started.insert(item_key);
+                } else if matches!(status.as_str(), "failed" | "error" | "errored") {
+                    parent_wait_errored.insert(item_key);
+                } else if matches!(status.as_str(), "timeout" | "timed-out" | "timed_out") {
+                    parent_wait_timed_out.insert(item_key);
+                } else if method == "item/completed" {
+                    parent_wait_completed.insert(item_key);
+                }
+            }
+        }
+    }
+
+    if child_started_count == 0 {
+        return Ok(None);
+    }
+    let final_owner = if parent_final_observed {
+        CodexFinalOwnerV1::Parent
+    } else if child_final_observed_count > 0 {
+        CodexFinalOwnerV1::Child
+    } else {
+        CodexFinalOwnerV1::None
+    };
+    Ok(Some(CodexSubagentLifecycleSummaryV1 {
+        child_started_count,
+        child_completed_count,
+        child_errored_count,
+        parent_wait_started_count: parent_wait_started.len(),
+        parent_wait_completed_count: parent_wait_completed.len(),
+        parent_wait_errored_count: parent_wait_errored.len(),
+        parent_wait_timed_out_count: parent_wait_timed_out.len(),
+        parent_process_start_failure,
+        child_process_start_failure,
+        child_final_observed_count,
+        final_owner,
+        children: children.into_iter().map(|entry| entry.child).collect(),
+        truncated,
+    }))
+}
+
+fn logical_child_identity(_turn: &Value, ordinal: usize) -> (String, String) {
+    let name = format!("child-{ordinal}");
+    (format!("parent/{name}"), name)
+}
+
+fn item_has_process_start_failure(item: &Value) -> bool {
+    signed_number_field(item, &["exitCode", "exit_code"]) == Some(-1)
+        && unsigned_number_field(item, &["durationMs", "duration_ms"])
+            .is_some_and(|duration| duration <= 250)
+        && string_field(item, &["aggregatedOutput", "output", "stderr", "error"])
+            .is_some_and(has_process_start_path_not_found_evidence)
+}
+
+fn item_is_final_answer(item: &Value) -> bool {
+    string_field(item, &["type"]).is_some_and(|kind| {
+        kind.eq_ignore_ascii_case("agentMessage") || kind.eq_ignore_ascii_case("agent_message")
+    }) && string_field(item, &["phase"])
+        .is_some_and(|phase| phase.eq_ignore_ascii_case("final_answer"))
+}
+
+fn item_is_parent_wait(item: &Value) -> bool {
+    let item_type = string_field(item, &["type"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let tool_name = string_field(item, &["toolName", "tool", "name"])
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    (item_type.contains("collab") || item_type.contains("tool"))
+        && matches!(tool_name.as_str(), "wait" | "wait_agent" | "wait_for_agent")
 }
 
 fn signed_number_field(value: &Value, keys: &[&str]) -> Option<i64> {
@@ -3519,6 +3791,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 context_recovery: None,
                 tool_use_timeout: None,
                 shell_execution_failure: None,
+                subagent_lifecycle: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,
@@ -3577,6 +3850,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 context_recovery: None,
                 tool_use_timeout: None,
                 shell_execution_failure: None,
+                subagent_lifecycle: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,
@@ -3638,6 +3912,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             context_recovery: None,
             tool_use_timeout: None,
             shell_execution_failure: None,
+            subagent_lifecycle: None,
             interruption_reason: None,
             interrupted_tool_uses: Vec::new(),
             backend_reasoning_execution: None,
@@ -3703,6 +3978,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             context_recovery: None,
             tool_use_timeout: None,
             shell_execution_failure: None,
+            subagent_lifecycle: None,
             interruption_reason: None,
             interrupted_tool_uses: Vec::new(),
             backend_reasoning_execution: run_file
@@ -4166,6 +4442,8 @@ fn finish_codex_runtime_run(
         inspect_protocol_failure_evidence(run_result.stdout_log.as_deref());
     let shell_execution_failure =
         classify_shell_execution_failure_from_stdout(run_result.stdout_log.as_deref())?;
+    let subagent_lifecycle =
+        summarize_subagent_lifecycle_from_stdout(run_result.stdout_log.as_deref())?;
     if let Some(shell_failure) = shell_execution_failure.as_ref()
         && shell_failure.kind == CodexShellExecutionFailureKindV1::AppxExecutableDrift
     {
@@ -4231,6 +4509,7 @@ fn finish_codex_runtime_run(
         context_recovery: run_result.context_recovery,
         tool_use_timeout: run_result.tool_use_timeout,
         shell_execution_failure,
+        subagent_lifecycle,
         interruption_reason: run_result.interruption_reason,
         interrupted_tool_uses: run_result.interrupted_tool_uses,
         backend_reasoning_execution: run_result.backend_reasoning_execution,
@@ -17484,6 +17763,72 @@ mod tests {
         assert!(serialized.contains("sha256:"));
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn subagent_lifecycle_stdout_replay_is_bounded_and_parent_owned() {
+        let root = temp_root("subagent-lifecycle-stdout-replay");
+        fs::create_dir_all(&root).unwrap();
+        let stdout = root.join("stdout.jsonl");
+        let stale = r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.3.0_x64__8wekyb3d8bbwe\pwsh.exe";
+        let rows = [
+            json!({"method":"turn/started","params":{"threadId":"private-parent-thread","turn":{"id":"private-parent-turn","kind":"regular"}}}),
+            json!({"method":"turn/started","params":{"threadId":"private-parent-thread","turn":{"id":"private-child-a","kind":"subAgent","name":"preflight-reader","path":["parent","preflight-reader"]}}}),
+            json!({"method":"item/started","params":{"threadId":"private-parent-thread","turnId":"private-child-a","item":{"id":"child-a-command","type":"commandExecution","command":"secret-tool --token must-not-persist"}}}),
+            json!({"method":"item/completed","params":{"threadId":"private-parent-thread","turnId":"private-child-a","item":{"id":"child-a-command","type":"commandExecution","status":"completed","exitCode":0,"durationMs":25,"aggregatedOutput":"private command output"}}}),
+            json!({"method":"item/completed","params":{"threadId":"private-parent-thread","turnId":"private-child-a","item":{"id":"child-a-file","type":"fileChange","status":"completed","path":"private/file.txt"}}}),
+            json!({"method":"item/completed","params":{"threadId":"private-parent-thread","turnId":"private-child-a","item":{"id":"child-a-final","type":"agentMessage","phase":"final_answer","text":"PRIVATE CHILD PROSE MUST NOT PERSIST"}}}),
+            json!({"method":"turn/completed","params":{"threadId":"private-parent-thread","turn":{"id":"private-child-a","status":"completed"}}}),
+            json!({"method":"turn/started","params":{"threadId":"private-parent-thread","turn":{"id":"private-child-b","kind":"subAgent","name":"contract-reader","path":["parent","contract-reader"]}}}),
+            json!({"method":"item/started","params":{"threadId":"private-parent-thread","turnId":"private-child-b","item":{"id":"child-b-command","type":"commandExecution","command":"read-only-secret-command"}}}),
+            json!({"method":"item/completed","params":{"threadId":"private-parent-thread","turnId":"private-child-b","item":{"id":"child-b-command","type":"commandExecution","status":"completed","exitCode":0,"durationMs":30}}}),
+            json!({"method":"turn/completed","params":{"threadId":"private-parent-thread","turn":{"id":"private-child-b","status":"completed"}}}),
+            json!({"method":"item/started","params":{"threadId":"private-parent-thread","turnId":"private-parent-turn","item":{"id":"parent-wait","type":"collabToolCall","toolName":"wait_agent"}}}),
+            json!({"method":"item/completed","params":{"threadId":"private-parent-thread","turnId":"private-parent-turn","item":{"id":"parent-wait","type":"collabToolCall","toolName":"wait_agent","status":"completed"}}}),
+            json!({"method":"item/started","params":{"threadId":"private-parent-thread","turnId":"private-parent-turn","item":{"id":"parent-shell","type":"commandExecution","command":format!(r#""{stale}" -Command Get-Location"#)}}}),
+            json!({"method":"item/completed","params":{"threadId":"private-parent-thread","turnId":"private-parent-turn","item":{"id":"parent-shell","type":"commandExecution","status":"failed","exitCode":-1,"durationMs":0,"aggregatedOutput":"process start failed: OS error 3; path not found"}}}),
+            json!({"method":"item/completed","params":{"threadId":"private-parent-thread","turnId":"private-parent-turn","item":{"id":"parent-final","type":"agentMessage","phase":"final_answer","text":"PRIVATE PARENT PROSE MUST NOT PERSIST"}}}),
+            json!({"method":"turn/completed","params":{"threadId":"private-parent-thread","turn":{"id":"private-parent-turn","status":"completed"}}}),
+        ];
+        fs::write(
+            &stdout,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let summary = summarize_subagent_lifecycle_from_stdout(Some(&stdout))
+            .unwrap()
+            .expect("two-child lifecycle summary");
+        assert_eq!(summary.child_started_count, 2);
+        assert_eq!(summary.child_completed_count, 2);
+        assert_eq!(summary.child_errored_count, 0);
+        assert_eq!(summary.parent_wait_completed_count, 1);
+        assert!(summary.parent_process_start_failure);
+        assert!(!summary.child_process_start_failure);
+        assert_eq!(summary.final_owner, CodexFinalOwnerV1::Parent);
+        assert_eq!(summary.children[0].logical_path, "parent/child-1");
+        assert_eq!(summary.children[0].command_count, 1);
+        assert_eq!(summary.children[0].file_change_count, 1);
+        assert_eq!(summary.children[1].logical_path, "parent/child-2");
+        assert_eq!(summary.children[1].command_count, 1);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        for forbidden in [
+            "private-parent-thread",
+            "private-child-a",
+            "preflight-reader",
+            "contract-reader",
+            "PRIVATE CHILD PROSE",
+            "PRIVATE PARENT PROSE",
+            "must-not-persist",
+            "read-only-secret-command",
+            stale,
+        ] {
+            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -20396,6 +20741,27 @@ done
         .unwrap();
 
         assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let lifecycle = report
+            .receipt
+            .subagent_lifecycle
+            .as_ref()
+            .expect("bounded child lifecycle receipt");
+        assert_eq!(lifecycle.child_started_count, 1);
+        assert_eq!(lifecycle.child_completed_count, 1);
+        assert_eq!(lifecycle.child_errored_count, 0);
+        assert_eq!(lifecycle.child_final_observed_count, 1);
+        assert_eq!(lifecycle.final_owner, CodexFinalOwnerV1::Parent);
+        assert_eq!(lifecycle.children.len(), 1);
+        assert_eq!(lifecycle.children[0].logical_name, "child-1");
+        let lifecycle_json = serde_json::to_string(lifecycle).unwrap();
+        for forbidden in [
+            "turn-child",
+            "thread-test",
+            "CHILD FINAL MUST BE QUARANTINED",
+            "CROSS THREAD CHILD TEXT",
+        ] {
+            assert!(!lifecycle_json.contains(forbidden));
+        }
         assert_eq!(
             report
                 .receipt
