@@ -80,7 +80,7 @@ Run or add tests equivalent to these scenarios for channel/runtime/session chang
 2. Different agents, same platform/channel/user, one agent has an active session in shared channel state: the other agent's completed turn is not suppressed solely because the shared state belongs to a different `agentId`.
 3. Non-main agent normal message reaches prompt assembly with that `agentId`, its own workspace/prompt files, provider/model defaults, Codex home, and memory namespace.
 4. Completed turn produces exactly one source-correlated final outbox record or one terminal error/dead-letter notification.
-5. Trace reconstruction can connect ingress, queue id, Codex completion, final outbox, and delivery or terminal notification.
+5. `trace --queue-id <id>` reconstructs ingress, queue id, Codex completion, final outbox, and delivery or terminal notification; legacy `--id` remains compatible, and supplying both selectors fails closed.
 6. Fresh request after `/new` uses the new concrete session as a task boundary: previous-task imported memory context is not injected unless a later policy explicitly opts in.
 7. `/think max` and `/reasoning max` are command-only aliases over one agent-scoped state; the next normal turn carries exact `max`, while a sibling agent sharing platform/account/channel/user does not inherit it. Exact `ultra` is rejected and `ultra-high` remains the legacy `xhigh` alias.
 8. Prompt manifest and injection ledger bind to the exact full lane plus backend context generation. A sibling agent or different lane cannot reuse another agent's injected configuration, and a changed/deleted config file or changed backend generation produces the expected bounded reinjection/tombstone behavior.

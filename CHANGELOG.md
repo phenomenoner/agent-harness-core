@@ -29,6 +29,12 @@
 - Connector waits use `ApprovalRequest` instead of a generic error reply. Approval, denial, expiry,
   stop, and newer-steer resolution remain consume-once and restart-idempotent.
 
+### Fixed
+
+- `trace` now accepts the documented canonical `--queue-id` selector while retaining the legacy
+  `--id` spelling. Supplying both fails closed, and general help names the trace selector contract
+  instead of describing `--queue-id` only as a queue-preparation option.
+
 ### Security
 
 - Native approval actions bind effect, generation, parameter digest, exact lane, source session,
