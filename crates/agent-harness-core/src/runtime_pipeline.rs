@@ -1650,7 +1650,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         let shell_recovery_effect_fenced = classified_shell_drift && !shell_effect_fence_clear;
         let continuation_authorized = goal_transition.schedule_continuation || eligible_shell_drift;
         let transition_park_reason =
-            (!continuation_authorized).then(|| match goal_transition.decision {
+            (!continuation_authorized).then_some(match goal_transition.decision {
                 GoalTransitionDecision::NeedsAuthority => "goal-transition-needs-authority",
                 GoalTransitionDecision::NeedsOperatorAuth => "goal-transition-needs-operator-auth",
                 GoalTransitionDecision::NeedsUser => "goal-transition-needs-user",
