@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.12.0 - 2026-07-22
 
 ### Added
 
@@ -16,6 +16,9 @@
   secure text fallback.
 - Added typed source-final expectation and final-outbox disposition fields to runtime receipts so
   terminal progress can require delivery from the exact source queue and lane.
+- Added a bounded parent runtime summary for child starts, completions, errors, waits, command and
+  file-change counts, process-start location, and final ownership. Child prose, prompts, runtime
+  identifiers, complete commands, channel identities, and secrets are not copied into the summary.
 
 ### Changed
 
@@ -28,12 +31,21 @@
   durable resolution makes it eligible again, so later same-lane work is not blocked.
 - Connector waits use `ApprovalRequest` instead of a generic error reply. Approval, denial, expiry,
   stop, and newer-steer resolution remain consume-once and restart-idempotent.
+- Nonterminal active-goal turns now resolve through exactly one durable outcome: an admitted
+  exact-lane continuation, a visible parked blocker, or typed non-delivery. Parent output is
+  suppressed only after the replacement outcome is durable.
 
 ### Fixed
 
 - `trace` now accepts the documented canonical `--queue-id` selector while retaining the legacy
   `--id` spelling. Supplying both fails closed, and general help names the trace selector contract
   instead of describing `--queue-id` only as a queue-preparation option.
+- Version-qualified AppX PowerShell replacement is classified separately from missing working
+  directories, ordinary command failures, unrelated path loss, and ambiguous failures. An exact
+  active lane may schedule one fresh-runtime recovery when external-effect evidence is safe; a
+  second drift or an observation-only lane parks visibly.
+- Active goals can no longer end as silent source success when policy denies continuation. Visible
+  park notices, continuation children, and source-final disposition remain restart-idempotent.
 
 ### Security
 
@@ -50,6 +62,8 @@
   source-final-ineligible; legacy runtime receipts retain their earlier progress-release behavior
   with an explicit warning; legacy approval capabilities remain resolvable through the text command
   path but cannot authorize native callbacks without the new authority digests.
+- Automatic fresh-runtime shell recovery remains bounded to exact active-lane authority and one
+  recovery depth. Observation and disabled policies do not gain execution authority.
 
 ### Verification
 
@@ -59,8 +73,10 @@
   reuse, and exact-source terminal progress.
 - Added sanitized scenario fixtures for interleaved child completion, fresh turns after goal finals,
   historical goal closure, channel goal cancellation, and approval waiting/restart boundaries.
-  Full provider-visible smoke, stopped-state scenario replay, soak, and live cutover evidence remain
-  release gates and are not claimed by these source changes.
+- Added Discord and Telegram scenario replay for active, observation, disabled, and wrong-lane goal
+  policies, two normally completing children, parent AppX shell replacement, ordinary missing-file
+  failure, exact-source progress ordering, typed non-delivery, and restart deduplication. Live
+  provider-visible smoke and post-cutover readback remain separate release evidence.
 
 ## v0.11.0 - 2026-07-20
 

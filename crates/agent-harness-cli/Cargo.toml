@@ -1,6 +1,6 @@
 [package]
 name = "agent-harness-cli"
-version = "0.11.0"
+version = "0.12.0"
 description = "CLI for the self-hosted Agent Harness runtime: run LLM agents over Telegram/Discord with durable queues and auditable receipts"
 edition.workspace = true
 license.workspace = true
