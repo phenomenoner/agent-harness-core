@@ -21,6 +21,7 @@ use agent_harness_core::goal_closure::{
     GoalClosurePhaseV1, GoalClosureResultV1, GoalClosureTriggerV1, goal_closure_intents_file,
     goal_closure_receipts_for_id, record_goal_closure_intent, record_goal_closure_phase,
 };
+use agent_harness_core::goal_continuation::goal_continuation_intents_file;
 use agent_harness_core::goal_lineage::{
     GoalLineageDoctorOptions, GoalLineageDoctorStatus, GoalProjectionObservationPhaseV1,
     GoalProjectionTurnRelationV1, latest_goal_projection_for_queue, run_goal_lineage_doctor,
@@ -480,6 +481,185 @@ fn discord_active_goal_authority_conflict_parks_visibly_instead_of_silent_succes
         1,
         "restart must not duplicate the authority-conflict parked source outbox"
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn discord_active_goal_authority_conflict_fences_shell_recovery_child() {
+    // Contract: I2/I7/I9/I10/I17/I31/I36/I37.
+    // Source: live-shaped cross-product of unresolved exact authority and AppX drift.
+    // Fails on: shell recovery overriding scheduleContinuation=false under authority conflict.
+    // Asserts: a visible authority park, zero child/recovery depth, and restart idempotency.
+    let root = temp_root("discord-active-goal-authority-conflict-shell-drift");
+    let harness_home = root.join("harness");
+    let codex_home = root.join("codex-home");
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(codex_home.join("auth.json"), "{}").unwrap();
+    let refreshed_shell = root.join("stable-pwsh.exe");
+    fs::write(&refreshed_shell, "test shell boundary").unwrap();
+    let _codex_home = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+    let _shell_boundary = EnvGuard::set(
+        "AGENT_HARNESS_POWERSHELL_EXECUTABLE",
+        refreshed_shell.into_os_string(),
+    );
+
+    let seed_source = write_source(&root);
+    let seed_skills = build_source_skill_index(&seed_source).unwrap();
+    let seed_receive = receive_channel_message(ChannelReceiveOptions {
+        source: seed_source,
+        runtime_workspace: None,
+        harness_home: harness_home.clone(),
+        skill_index: seed_skills,
+        platform: "discord".to_string(),
+        account_id: Some("account-sanitized".to_string()),
+        channel_id: "channel-sanitized".to_string(),
+        user_id: "user-sanitized".to_string(),
+        agent_id: Some("main".to_string()),
+        session_key: None,
+        message: "Continue the durable implementation goal.".to_string(),
+        inbound_context: None,
+        inbound_media_artifacts: Vec::new(),
+        inbound_event_kind: None,
+        inbound_event_id: None,
+        skill_limit: 3,
+        now_ms: 16_000,
+    })
+    .unwrap();
+    let seed_queue_id = seed_receive.queue_id.expect("seed queue id");
+    let seed_report = run_runtime_queue_once(RuntimeRunOnceOptions {
+        harness_home: harness_home.clone(),
+        queue_id: Some(seed_queue_id),
+        codex_executable: Some(fake_active_goal_conflict_codex(&root, "seed")),
+        timeout_ms: 30_000,
+        idle_timeout_ms: 30_000,
+        prompt_options: PromptAssemblyOptions {
+            harness_home: Some(harness_home.clone()),
+            ..PromptAssemblyOptions::default()
+        },
+    })
+    .unwrap();
+    assert_eq!(seed_report.receipt.status, RuntimeRunOnceStatus::NeedsUser);
+    remove_codex_bindings(&harness_home);
+
+    let current_source = write_source(&root);
+    let current_skills = build_source_skill_index(&current_source).unwrap();
+    let current_receive = receive_channel_message(ChannelReceiveOptions {
+        source: current_source,
+        runtime_workspace: None,
+        harness_home: harness_home.clone(),
+        skill_index: current_skills,
+        platform: "discord".to_string(),
+        account_id: Some("account-sanitized".to_string()),
+        channel_id: "channel-sanitized".to_string(),
+        user_id: "user-sanitized".to_string(),
+        agent_id: Some("main".to_string()),
+        session_key: None,
+        message: "Continue the durable implementation goal.".to_string(),
+        inbound_context: None,
+        inbound_media_artifacts: Vec::new(),
+        inbound_event_kind: None,
+        inbound_event_id: None,
+        skill_limit: 3,
+        now_ms: 16_001,
+    })
+    .unwrap();
+    let current_queue_id = current_receive.queue_id.expect("current queue id");
+    let lane_digest = exact_full_lane_digest(&harness_home, &current_queue_id);
+    fs::write(
+        harness_home.join("harness-config.json"),
+        serde_json::to_vec_pretty(&json!({
+            "goalAutonomy": {
+                "mode": "active",
+                "activeLaneDigests": [lane_digest]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+        harness_home: harness_home.clone(),
+        queue_id: Some(current_queue_id.clone()),
+        codex_executable: Some(fake_active_goal_shell_case_codex(&root, true, None)),
+        timeout_ms: 30_000,
+        idle_timeout_ms: 30_000,
+        prompt_options: PromptAssemblyOptions {
+            harness_home: Some(harness_home.clone()),
+            ..PromptAssemblyOptions::default()
+        },
+    })
+    .unwrap();
+    let doctor = run_goal_lineage_doctor(GoalLineageDoctorOptions {
+        harness_home: harness_home.clone(),
+        lane_digest: None,
+        virtual_session_id: None,
+    })
+    .unwrap();
+    assert_eq!(
+        doctor.status,
+        GoalLineageDoctorStatus::ReconciliationRequired
+    );
+    assert_eq!(
+        report.receipt.status,
+        RuntimeRunOnceStatus::NeedsUser,
+        "shell drift must not override unresolved exact-goal authority: {:#?}",
+        report.receipt
+    );
+    assert_eq!(
+        report.receipt.source_closure_reason.as_deref(),
+        Some("goal-transition-needs-authority")
+    );
+    assert!(report.receipt.child_queue_id.is_none());
+    assert!(report.receipt.continuation_link.is_none());
+    assert_eq!(
+        nonempty_lines(&goal_continuation_intents_file(&harness_home)),
+        0,
+        "authority conflict must not commit a shell-recovery continuation intent"
+    );
+    assert_eq!(
+        pending_shell_recovery_depth_count(&harness_home, 1),
+        0,
+        "authority conflict must not advance the fresh-runtime recovery depth"
+    );
+    let source_outbox = load_outbox(&harness_home)
+        .into_iter()
+        .filter(|row| row["sourceQueueId"] == current_queue_id)
+        .collect::<Vec<_>>();
+    assert_eq!(source_outbox.len(), 1);
+    assert!(
+        source_outbox[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("authority requires reconciliation"))
+    );
+
+    let replay = run_runtime_queue_once(RuntimeRunOnceOptions {
+        harness_home: harness_home.clone(),
+        queue_id: Some(current_queue_id.clone()),
+        codex_executable: Some(fake_active_goal_shell_case_codex(&root, true, None)),
+        timeout_ms: 30_000,
+        idle_timeout_ms: 30_000,
+        prompt_options: PromptAssemblyOptions {
+            harness_home: Some(harness_home.clone()),
+            ..PromptAssemblyOptions::default()
+        },
+    })
+    .unwrap();
+    assert!(matches!(
+        replay.receipt.status,
+        RuntimeRunOnceStatus::NoWork | RuntimeRunOnceStatus::Suppressed
+    ));
+    assert_eq!(
+        load_outbox(&harness_home)
+            .iter()
+            .filter(|row| row["sourceQueueId"] == current_queue_id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        nonempty_lines(&goal_continuation_intents_file(&harness_home)),
+        0
+    );
+    assert_eq!(pending_shell_recovery_depth_count(&harness_home, 1), 0);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1680,6 +1860,15 @@ fn pending_queue(harness_home: &Path, queue_id: &str) -> Value {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|row| row["queueId"] == queue_id)
         .unwrap_or_else(|| panic!("pending queue {queue_id} was not durable"))
+}
+
+fn pending_shell_recovery_depth_count(harness_home: &Path, depth: u64) -> usize {
+    fs::read_to_string(harness_home.join("state/runtime-queue/pending.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| row["shellRecoveryDepth"].as_u64() == Some(depth))
+        .count()
 }
 
 fn set_pending_shell_recovery_depth(harness_home: &Path, queue_id: &str, depth: u64) {

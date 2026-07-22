@@ -1646,9 +1646,19 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         active_goal && goal_transition.surface == GoalTransitionSurface::ProgressOnly;
     if active_goal && (active_progress_only || classified_shell_drift) {
         let shell_effect_fence_clear = shell_recovery_effect_fence_clear(&run.receipt);
-        let eligible_shell_drift = classified_shell_drift && shell_effect_fence_clear;
+        let exact_continuation_authority = goal_transition.authority
+            == GoalTransitionAuthority::Ready
+            && matches!(
+                goal_transition.relation,
+                GoalTransitionRelation::CurrentGoalSlice
+                    | GoalTransitionRelation::AuthorizedCampaignContinuation
+            );
+        let eligible_shell_drift =
+            classified_shell_drift && shell_effect_fence_clear && exact_continuation_authority;
         let shell_recovery_effect_fenced = classified_shell_drift && !shell_effect_fence_clear;
-        let continuation_authorized = goal_transition.schedule_continuation || eligible_shell_drift;
+        let continuation_authorized = (goal_transition.schedule_continuation
+            && exact_continuation_authority)
+            || eligible_shell_drift;
         let transition_park_reason =
             (!continuation_authorized).then_some(match goal_transition.decision {
                 GoalTransitionDecision::NeedsAuthority => "goal-transition-needs-authority",
