@@ -1638,15 +1638,24 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 failure.recovery_eligible
                     && failure.kind == CodexShellExecutionFailureKindV1::AppxExecutableDrift
             });
-    if goal_transition
+    let active_goal = goal_transition
         .goal_status
         .as_deref()
-        .is_some_and(is_goal_status_active)
-        && (goal_transition.schedule_continuation || classified_shell_drift)
-    {
+        .is_some_and(is_goal_status_active);
+    let active_progress_only =
+        active_goal && goal_transition.surface == GoalTransitionSurface::ProgressOnly;
+    if active_goal && (active_progress_only || classified_shell_drift) {
         let shell_effect_fence_clear = shell_recovery_effect_fence_clear(&run.receipt);
         let eligible_shell_drift = classified_shell_drift && shell_effect_fence_clear;
         let shell_recovery_effect_fenced = classified_shell_drift && !shell_effect_fence_clear;
+        let continuation_authorized = goal_transition.schedule_continuation || eligible_shell_drift;
+        let transition_park_reason =
+            (!continuation_authorized).then(|| match goal_transition.decision {
+                GoalTransitionDecision::NeedsAuthority => "goal-transition-needs-authority",
+                GoalTransitionDecision::NeedsOperatorAuth => "goal-transition-needs-operator-auth",
+                GoalTransitionDecision::NeedsUser => "goal-transition-needs-user",
+                _ => "goal-transition-nonterminal-parked",
+            });
         let source_shell_recovery_depth = prepare
             .item
             .as_ref()
@@ -1664,12 +1673,15 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         } else if shell_recovery_budget_exhausted {
             activation.reason =
                 "shell-recovery-budget-exhausted-after-fresh-runtime-continuation".to_string();
+        } else if let Some(reason) = transition_park_reason {
+            activation.reason = format!("{reason}: {}", goal_transition.reason);
         }
         warnings.push(format!(
             "goal autonomy mode {:?}: {}",
             activation.mode, activation.reason
         ));
         if activation.mode == GoalAutonomyMode::Active
+            && continuation_authorized
             && !shell_recovery_budget_exhausted
             && !shell_recovery_effect_fenced
         {
@@ -1741,6 +1753,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 "shell-recovery-external-effect-fenced".to_string()
             } else if shell_recovery_budget_exhausted {
                 "shell-recovery-budget-exhausted".to_string()
+            } else if let Some(reason) = transition_park_reason {
+                reason.to_string()
             } else {
                 match activation.configured_mode {
                     GoalAutonomyMode::Disabled => "goal-autonomy-disabled",
@@ -2716,7 +2730,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             );
         }
     }
-    if goal_transition.schedule_continuation
+    if goal_transition.surface == GoalTransitionSurface::ProgressOnly
         && goal_transition
             .goal_status
             .as_deref()
@@ -6637,6 +6651,23 @@ fn active_goal_parked_notice_text(
         .starts_with("shell-recovery-budget-exhausted")
     {
         "The one automatic fresh-runtime shell recovery was already used, so another continuation child was not started."
+    } else if activation
+        .reason
+        .starts_with("goal-transition-needs-authority")
+    {
+        "Exact goal authority requires reconciliation, so no continuation child was started."
+    } else if activation.reason.starts_with("goal-transition-needs-user") {
+        "The active goal requires user input, so no continuation child was started."
+    } else if activation
+        .reason
+        .starts_with("goal-transition-needs-operator-auth")
+    {
+        "The active goal requires operator authentication, so no continuation child was started."
+    } else if activation
+        .reason
+        .starts_with("goal-transition-nonterminal-parked")
+    {
+        "The active goal is not authorized to continue automatically, so no continuation child was started."
     } else {
         match activation.configured_mode {
             GoalAutonomyMode::Observe => {

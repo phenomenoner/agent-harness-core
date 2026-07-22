@@ -22,8 +22,8 @@ use agent_harness_core::goal_closure::{
     goal_closure_receipts_for_id, record_goal_closure_intent, record_goal_closure_phase,
 };
 use agent_harness_core::goal_lineage::{
-    GoalLineageDoctorOptions, GoalProjectionObservationPhaseV1, GoalProjectionTurnRelationV1,
-    latest_goal_projection_for_queue, run_goal_lineage_doctor,
+    GoalLineageDoctorOptions, GoalLineageDoctorStatus, GoalProjectionObservationPhaseV1,
+    GoalProjectionTurnRelationV1, latest_goal_projection_for_queue, run_goal_lineage_doctor,
 };
 use agent_harness_core::lane::FullLaneKeyV1;
 use agent_harness_core::progress::{
@@ -313,6 +313,173 @@ fn discord_active_goal_observe_replay_parks_visibly_instead_of_silent_success() 
         "FIFO claim must select the later same-session item"
     );
     release_runtime_queue_lease(&harness_home, &later_queue_id).unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn discord_active_goal_authority_conflict_parks_visibly_instead_of_silent_success() {
+    // Contract: I2/I7/I9/I10/I17/I31/I36/I37.
+    // Source: sanitized live-shaped replay of two unresolved active projections in one exact lane.
+    // Fails on: ProgressOnly + active + authority conflict bypassing source-closure resolution.
+    // Asserts: no child, exactly one visible parent park, and restart-safe source finalization.
+    let root = temp_root("discord-active-goal-authority-conflict");
+    let harness_home = root.join("harness");
+    let codex_home = root.join("codex-home");
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(codex_home.join("auth.json"), "{}").unwrap();
+    let _codex_home = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+    let seed_source = write_source(&root);
+    let seed_skills = build_source_skill_index(&seed_source).unwrap();
+    let seed_receive = receive_channel_message(ChannelReceiveOptions {
+        source: seed_source,
+        runtime_workspace: None,
+        harness_home: harness_home.clone(),
+        skill_index: seed_skills,
+        platform: "discord".to_string(),
+        account_id: Some("account-sanitized".to_string()),
+        channel_id: "channel-sanitized".to_string(),
+        user_id: "user-sanitized".to_string(),
+        agent_id: Some("main".to_string()),
+        session_key: None,
+        message: "Continue the durable implementation goal.".to_string(),
+        inbound_context: None,
+        inbound_media_artifacts: Vec::new(),
+        inbound_event_kind: None,
+        inbound_event_id: None,
+        skill_limit: 3,
+        now_ms: 15_000,
+    })
+    .unwrap();
+    let seed_queue_id = seed_receive.queue_id.expect("seed queue id");
+    let seed_report = run_runtime_queue_once(RuntimeRunOnceOptions {
+        harness_home: harness_home.clone(),
+        queue_id: Some(seed_queue_id.clone()),
+        codex_executable: Some(fake_active_goal_conflict_codex(&root, "seed")),
+        timeout_ms: 30_000,
+        idle_timeout_ms: 30_000,
+        prompt_options: PromptAssemblyOptions {
+            harness_home: Some(harness_home.clone()),
+            ..PromptAssemblyOptions::default()
+        },
+    })
+    .unwrap();
+    assert_eq!(seed_report.receipt.status, RuntimeRunOnceStatus::NeedsUser);
+    remove_codex_bindings(&harness_home);
+
+    let current_source = write_source(&root);
+    let current_skills = build_source_skill_index(&current_source).unwrap();
+    let current_receive = receive_channel_message(ChannelReceiveOptions {
+        source: current_source,
+        runtime_workspace: None,
+        harness_home: harness_home.clone(),
+        skill_index: current_skills,
+        platform: "discord".to_string(),
+        account_id: Some("account-sanitized".to_string()),
+        channel_id: "channel-sanitized".to_string(),
+        user_id: "user-sanitized".to_string(),
+        agent_id: Some("main".to_string()),
+        session_key: None,
+        message: "Continue the durable implementation goal.".to_string(),
+        inbound_context: None,
+        inbound_media_artifacts: Vec::new(),
+        inbound_event_kind: None,
+        inbound_event_id: None,
+        skill_limit: 3,
+        now_ms: 15_001,
+    })
+    .unwrap();
+    let current_queue_id = current_receive.queue_id.expect("current queue id");
+    assert_ne!(seed_queue_id, current_queue_id);
+    assert_eq!(
+        pending_queue(&harness_home, &seed_queue_id)["sessionKey"],
+        pending_queue(&harness_home, &current_queue_id)["sessionKey"],
+        "the replay must retain one exact source session"
+    );
+
+    let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+        harness_home: harness_home.clone(),
+        queue_id: Some(current_queue_id.clone()),
+        codex_executable: Some(fake_active_goal_conflict_codex(&root, "current")),
+        timeout_ms: 30_000,
+        idle_timeout_ms: 30_000,
+        prompt_options: PromptAssemblyOptions {
+            harness_home: Some(harness_home.clone()),
+            ..PromptAssemblyOptions::default()
+        },
+    })
+    .unwrap();
+    let doctor = run_goal_lineage_doctor(GoalLineageDoctorOptions {
+        harness_home: harness_home.clone(),
+        lane_digest: None,
+        virtual_session_id: None,
+    })
+    .unwrap();
+    assert_eq!(
+        doctor.status,
+        GoalLineageDoctorStatus::ReconciliationRequired,
+        "two unresolved exact-lane active projections must reproduce authority conflict"
+    );
+    assert_eq!(
+        report.receipt.status,
+        RuntimeRunOnceStatus::NeedsUser,
+        "authority-conflicted active source work must park instead of terminalizing silently: {:#?}",
+        report.receipt
+    );
+    assert_eq!(
+        report.receipt.terminal_disposition,
+        Some(agent_harness_core::RuntimeTerminalDispositionV1::NeedsUser)
+    );
+    assert_eq!(
+        report.receipt.source_final_expectation,
+        Some(SourceFinalExpectationV1::Required)
+    );
+    assert!(matches!(
+        report.receipt.source_closure_kind,
+        Some(RuntimeSourceClosureKindV1::ParkedObserve)
+            | Some(RuntimeSourceClosureKindV1::ParkedPolicyDenied)
+    ));
+    assert_eq!(
+        report.receipt.source_closure_reason.as_deref(),
+        Some("goal-transition-needs-authority")
+    );
+    assert!(report.receipt.child_queue_id.is_none());
+    assert!(report.receipt.continuation_link.is_none());
+    let source_outbox = load_outbox(&harness_home)
+        .into_iter()
+        .filter(|row| row["sourceQueueId"] == current_queue_id)
+        .collect::<Vec<_>>();
+    assert_eq!(source_outbox.len(), 1);
+    assert!(
+        source_outbox[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("authority requires reconciliation"))
+    );
+
+    let replay = run_runtime_queue_once(RuntimeRunOnceOptions {
+        harness_home: harness_home.clone(),
+        queue_id: Some(current_queue_id.clone()),
+        codex_executable: Some(fake_active_goal_conflict_codex(&root, "current")),
+        timeout_ms: 30_000,
+        idle_timeout_ms: 30_000,
+        prompt_options: PromptAssemblyOptions {
+            harness_home: Some(harness_home.clone()),
+            ..PromptAssemblyOptions::default()
+        },
+    })
+    .unwrap();
+    assert!(matches!(
+        replay.receipt.status,
+        RuntimeRunOnceStatus::NoWork | RuntimeRunOnceStatus::Suppressed
+    ));
+    assert_eq!(
+        load_outbox(&harness_home)
+            .iter()
+            .filter(|row| row["sourceQueueId"] == current_queue_id)
+            .count(),
+        1,
+        "restart must not duplicate the authority-conflict parked source outbox"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1492,6 +1659,20 @@ fn nonempty_lines(path: &Path) -> usize {
         .count()
 }
 
+fn remove_codex_bindings(harness_home: &Path) {
+    let sessions = harness_home.join("agents/main/sessions");
+    for entry in fs::read_dir(sessions).unwrap().filter_map(Result::ok) {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".codex-app-server.json"))
+        {
+            fs::remove_file(path).unwrap();
+        }
+    }
+}
+
 fn pending_queue(harness_home: &Path, queue_id: &str) -> Value {
     fs::read_to_string(harness_home.join("state/runtime-queue/pending.jsonl"))
         .unwrap()
@@ -1643,6 +1824,17 @@ fn fake_active_goal_blocker_codex(root: &Path) -> PathBuf {
         json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular","status":"completed"}}}),
     ];
     fake_event_codex(root, "active-goal-blocker", &rows)
+}
+
+fn fake_active_goal_conflict_codex(root: &Path, suffix: &str) -> PathBuf {
+    let goal_id = format!("goal-active-{suffix}");
+    let rows = vec![
+        json!({"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular"}}}),
+        json!({"method":"thread/goal/updated","params":{"threadId":"thread-parent","turnId":"turn-parent","goal":{"id":goal_id,"objective":"finish the durable implementation","status":"active","completionCriteria":["T3 replay passes"]}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"agentMessage","id":format!("parent-blocker-{suffix}"),"phase":"final_answer","text":"The goal remains active while exact authority is evaluated."}}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular","status":"completed"}}}),
+    ];
+    fake_event_codex(root, &format!("active-goal-conflict-{suffix}"), &rows)
 }
 
 fn fake_active_goal_shell_case_codex(
