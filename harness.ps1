@@ -7,8 +7,12 @@ $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $HarnessHome = Join-Path $Root '.agent-harness'
-$HarnessExe = Join-Path $Root 'target\debug\agent-harness.exe'
-$SupervisorScripts = Join-Path $HarnessHome 'state\supervisor\windows-scheduled-tasks\scripts'
+$HarnessExe = Join-Path $HarnessHome 'bin\current\agent-harness.exe'
+$AgentWorkspace = Join-Path $HarnessHome 'workspace'
+$RuntimeWorkspace = Join-Path $HarnessHome 'runtime-workspace\default'
+$CodexExe = Join-Path $HarnessHome 'tools\codex-cli\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
+$DiscordGateway = Join-Path $HarnessHome 'tools\agent-discord-gateway\index.mjs'
+$NodeExe = 'C:\Program Files\nodejs\node.exe'
 $SupervisorLogs = Join-Path $HarnessHome 'state\logs\supervisor'
 $HarnessLog = Join-Path $HarnessHome 'state\logs\harness.jsonl'
 $ProgressLog = Join-Path $HarnessHome 'state\runtime-queue\progress-events.jsonl'
@@ -46,22 +50,48 @@ function Require-File {
     }
 }
 
-function Invoke-SupervisorScript {
+function Invoke-LiveOpsControl {
     param(
-        [string] $Name,
+        [ValidateSet('start', 'stop')]
+        [string] $Action,
         [string] $LiveControlToken
     )
-    $script = Join-Path $SupervisorScripts $Name
-    Require-File $script "Run supervisor-plan first or verify .agent-harness exists."
-    $previousToken = $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($LiveControlToken)) {
-            $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN = $LiveControlToken
-        }
-        & $script
-    } finally {
-        $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN = $previousToken
+    $args = @('ops-control', '--harness-home', $HarnessHome, '--action', $Action,
+        '--reason', "harness.ps1 gateway $Action")
+    if (-not [string]::IsNullOrWhiteSpace($LiveControlToken)) {
+        $args += @('--live-control-token', $LiveControlToken)
     }
+    & $HarnessExe @args
+    if ($LASTEXITCODE -ne 0) {
+        throw "ops-control $Action failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Start-LiveSupervisors {
+    param([string] $LiveControlToken)
+    Require-File $HarnessExe "Deploy .agent-harness\bin\current\agent-harness.exe first."
+    Require-File $CodexExe "Deploy the Codex CLI below .agent-harness\tools first."
+    Require-File $DiscordGateway "Deploy the Discord gateway below .agent-harness\tools first."
+    Invoke-LiveOpsControl 'start' $LiveControlToken
+    & $HarnessExe supervisor-reconcile --harness-home $HarnessHome --source-home $HarnessHome `
+        --workspace $AgentWorkspace --runtime-workspace $RuntimeWorkspace --harness-cli $HarnessExe `
+        --codex-exe $CodexExe --node-exe $NodeExe --gateway-script $DiscordGateway --all --apply
+    if ($LASTEXITCODE -ne 0) {
+        throw "supervisor-reconcile --apply failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Wait-LiveSupervisorsStopped {
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    do {
+        $remaining = @(Get-CimInstance Win32_Process -Filter "name = 'agent-harness.exe'" |
+            Where-Object { $_.CommandLine -like "*$HarnessHome*" })
+        if ($remaining.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Seconds 1
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for live Agent Harness processes to stop"
 }
 
 function Test-LiveFlag {
@@ -98,7 +128,7 @@ function Assert-LiveGatewayControlAllowed {
     if ([string]::IsNullOrWhiteSpace($LiveControlToken)) {
         throw "live-control token is required for live gateway $Action"
     }
-    Require-File $HarnessExe "Build or deploy target\debug\agent-harness.exe first."
+    Require-File $HarnessExe "Deploy .agent-harness\bin\current\agent-harness.exe first. Cargo target\ is source/staging output only."
     $status = & $HarnessExe ops-cutover-status --harness-home $HarnessHome --action $Action --live-control-token $LiveControlToken | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or $status.status -ne 'ready') {
         throw "live-control token validation failed for live gateway $Action"
@@ -106,7 +136,7 @@ function Assert-LiveGatewayControlAllowed {
 }
 
 function Show-Status {
-    Require-File $HarnessExe "Build or deploy target\debug\agent-harness.exe first."
+    Require-File $HarnessExe "Deploy .agent-harness\bin\current\agent-harness.exe first. Cargo target\ is source/staging output only."
     & $HarnessExe status --harness-home $HarnessHome
 }
 
@@ -200,17 +230,17 @@ $liveControlToken = Get-LiveControlTokenArg
 switch ($action) {
     'start' {
         Assert-LiveGatewayControlAllowed 'start' $liveControlToken
-        Invoke-SupervisorScript 'start-scheduled-tasks.ps1' $liveControlToken
+        Start-LiveSupervisors $liveControlToken
     }
     'stop' {
         Assert-LiveGatewayControlAllowed 'stop' $liveControlToken
-        Invoke-SupervisorScript 'stop-scheduled-tasks.ps1' $liveControlToken
+        Invoke-LiveOpsControl 'stop' $liveControlToken
     }
     'restart' {
         Assert-LiveGatewayControlAllowed 'restart' $liveControlToken
-        Invoke-SupervisorScript 'stop-scheduled-tasks.ps1' $liveControlToken
-        Start-Sleep -Seconds 5
-        Invoke-SupervisorScript 'start-scheduled-tasks.ps1' $liveControlToken
+        Invoke-LiveOpsControl 'stop' $liveControlToken
+        Wait-LiveSupervisorsStopped
+        Start-LiveSupervisors $liveControlToken
     }
     'status' {
         Show-Status

@@ -4,6 +4,23 @@ Date: 2026-07-22
 
 This contract turns the architecture handoff into release-gate input. Use it before changing channel ingress, channel state, prompt assembly, runtime queueing, Codex execution, final outbox, delivery, progress, workers, cron, or memory. The operations handbook remains the live operational source of truth; this file is the compact dependency map and scenario matrix that reviewers and external coding agents should apply to code changes.
 
+## Source And Deployment Boundary
+
+The source checkout and the nested live deployment are separate authority roots even when they share a parent directory. Source code, public documentation, tests, and Cargo build output belong to the checkout. Live config, state, agent workspace, execution workspace, deployed tools, rollback generations, and cutover evidence belong below `.agent-harness/`.
+
+| Role | Canonical relative path | Contract |
+|---|---|---|
+| live CLI | `.agent-harness/bin/current/agent-harness.exe` | The only executable path used by live supervisors and loop children. |
+| immutable release copy | `.agent-harness/bin/releases/<release>/agent-harness.exe` | Hash-addressed or release-labelled candidate retained for provenance. |
+| agent source workspace | `.agent-harness/workspace/` | Prompt, rule, skill, and durable agent-document authority. |
+| default execution cwd | `.agent-harness/runtime-workspace/default/` | Ordinary live Codex cwd; not a source checkout. |
+| deployed dependencies | `.agent-harness/tools/` and `.agent-harness/scripts/` | Exact gateway, Codex CLI, and bridge dependencies used by live commands. |
+| hot rollback | `.agent-harness/rollback/hot/<generation>/` | Complete, verified generations; retain the newest three. |
+| cutover evidence | `.agent-harness/evidence/cutovers/<generation>/` | Sanitized path, hash, gate, and post-readback evidence. |
+| source build output | `target/` | Rebuildable source/staging output; never the canonical live executable or rollback store. |
+
+Every cutover must fail closed if a desired supervisor or child resolves its executable, runtime workspace, gateway script, Codex CLI, bridge command, rollback bundle, or evidence directory to the source checkout. An explicitly scoped source-development turn may select the source checkout as its execution cwd, but that exception must be supplied per task and must not rewrite the default live supervisor topology.
+
 ## Identity Axes
 
 Every channel-origin turn is keyed by these axes. A change that drops, normalizes, or compares only a subset of them can create cross-agent or cross-session regressions.

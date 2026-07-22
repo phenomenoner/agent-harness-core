@@ -13,6 +13,10 @@
 
 - Develop and verify changes in the source repository and staging locations. Mutate the live `.agent-harness/` deployment only during an explicitly authorized cutover or live-operations task, using the applicable current runbook and rollback evidence.
 - Treat the deployed path as a compatibility boundary. Moving `.agent-harness/` is a separate migration project, not routine cleanup; it requires a path-consumer inventory, compatibility or redirect plan, staged validation, intentional cutover, and rollback plan.
+- The canonical live executable is `.agent-harness/bin/current/agent-harness.exe`. Cargo `target/` is rebuildable source build and staging output only; never launch or retain the live supervisor set from `target/debug/`.
+- The default live Codex execution cwd is `.agent-harness/runtime-workspace/default`. The repository root is source-only and may be used as a runtime workspace only for an explicitly scoped source-development task.
+- Live dependencies belong below `.agent-harness/`: deployed tools under `tools/`, hot rollback generations under `rollback/hot/`, and cutover evidence under `evidence/cutovers/`. Keep the newest three complete rollback generations; archive older generations recoverably outside the live home.
+- Before every cutover, read back each supervisor and child process's executable path plus `--harness-home`, `--source-home`, `--workspace`, `--runtime-workspace`, `--harness-cli`, and gateway/tool paths. A healthy process using a source-tree path is a deployment-boundary failure.
 
 ## Development Gates
 
