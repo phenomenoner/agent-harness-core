@@ -14,8 +14,9 @@ use crate::runtime_receipt_history::{
     find_runtime_queue_terminal_history, runtime_queue_receipt_history_file,
 };
 use crate::runtime_worker::{
-    refresh_runtime_queue_state_index, runtime_queue_state_index_file,
-    terminal_run_once_ids_from_index, terminal_runtime_queue_hot_receipt_from_index,
+    parked_run_once_ids_from_index, refresh_runtime_queue_state_index,
+    runtime_queue_state_index_file, terminal_run_once_ids_from_index,
+    terminal_runtime_queue_hot_receipt_from_index,
 };
 use crate::{
     AuthorizedExecutionModeSnapshotV2, CronRunSummary, HarnessLogEvent, HarnessLogLevel,
@@ -961,6 +962,7 @@ fn collect_downstream_runtime_status(
     let mut index_warnings = Vec::new();
     let hot_index = refresh_runtime_queue_state_index(&queue_dir, &mut index_warnings)?;
     let mut terminal_ids = terminal_run_once_ids_from_index(&hot_index);
+    let parked_ids = parked_run_once_ids_from_index(&hot_index);
     let pending_values = if runtime_queue_file.is_file() {
         fs::read_to_string(&runtime_queue_file)?
             .lines()
@@ -988,7 +990,7 @@ fn collect_downstream_runtime_status(
         let Some(queue_id) = string_path_any(&value, &["queueId", "queue_id"]) else {
             continue;
         };
-        if terminal_ids.contains(queue_id) {
+        if terminal_ids.contains(queue_id) || parked_ids.contains(queue_id) {
             continue;
         }
         let platform = string_path_any(&value, &["platform"]).unwrap_or("worker");
@@ -4929,6 +4931,33 @@ mod tests {
 
         assert_eq!(status.open_runtime_items, 0);
         assert_eq!(status.open_cron_runtime_items, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn downstream_runtime_status_excludes_durable_parked_run_once() {
+        let root = temp_root("downstream_runtime_status_excludes_durable_parked_run_once");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            r#"{"queueId":"q-parked","platform":"discord","runtimeClass":"interactive","origin":"channel"}"#,
+        )
+        .unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            r#"{"queueId":"q-parked","status":"needs-user","terminalDisposition":"needs-user","sourceClosureKind":"parked-observe","sourceClosureReason":"goal-transition-needs-authority"}"#,
+        )
+        .unwrap();
+
+        let status = collect_downstream_runtime_status(&harness_home).unwrap();
+
+        assert_eq!(status.open_runtime_items, 0);
+        assert_eq!(status.open_cron_runtime_items, 0);
+        assert!(status.open_by_runtime_class.is_empty());
+        assert!(status.open_by_origin.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
