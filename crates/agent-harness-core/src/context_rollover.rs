@@ -106,6 +106,8 @@ pub struct RuntimeContinuationMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition_recovery_depth: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_recovery_depth: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_intent_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_kind: Option<String>,
@@ -328,6 +330,7 @@ pub struct ContextRolloverRequeuePreparedOptions {
     pub task_family_version: Option<u64>,
     pub task_root_queue_id: Option<String>,
     pub disposition_recovery_depth: Option<u64>,
+    pub shell_recovery_depth: Option<u64>,
     pub replacement_message_text: Option<String>,
     pub continuation_intent_key: Option<String>,
     pub completion_kind: Option<String>,
@@ -347,6 +350,7 @@ pub struct ContextRolloverPreparedRequeueReport {
     pub campaign_slice_generation: Option<u64>,
     pub task_slice_generation: Option<u64>,
     pub disposition_recovery_depth: Option<u64>,
+    pub shell_recovery_depth: Option<u64>,
     pub continuation_intent_key: Option<String>,
     pub completion_kind: String,
     pub pending_queue_file: PathBuf,
@@ -2234,6 +2238,12 @@ fn requeue_prepared_context_rollover_legacy(
                 Value::Number(serde_json::Number::from(depth)),
             );
         }
+        if let Some(depth) = options.shell_recovery_depth {
+            object.insert(
+                "shellRecoveryDepth".to_string(),
+                Value::Number(serde_json::Number::from(depth)),
+            );
+        }
         if let Some(message_text) = options.replacement_message_text.as_ref() {
             object.insert(
                 "messageText".to_string(),
@@ -2373,6 +2383,7 @@ fn requeue_prepared_context_rollover_legacy(
         campaign_slice_generation: options.campaign_slice_generation,
         task_slice_generation: options.task_slice_generation,
         disposition_recovery_depth: options.disposition_recovery_depth,
+        shell_recovery_depth: options.shell_recovery_depth,
         continuation_intent_key: options.continuation_intent_key,
         completion_kind,
         pending_queue_file: queue_file,
@@ -2632,6 +2643,12 @@ fn requeue_prepared_context_rollover_for_lane(
             Value::Number(serde_json::Number::from(depth)),
         );
     }
+    if let Some(depth) = options.shell_recovery_depth {
+        object.insert(
+            "shellRecoveryDepth".to_string(),
+            Value::Number(serde_json::Number::from(depth)),
+        );
+    }
     if let Some(message_text) = options.replacement_message_text.as_ref() {
         object.insert(
             "messageText".to_string(),
@@ -2786,6 +2803,7 @@ fn requeue_prepared_context_rollover_for_lane(
         campaign_slice_generation: options.campaign_slice_generation,
         task_slice_generation: options.task_slice_generation,
         disposition_recovery_depth: options.disposition_recovery_depth,
+        shell_recovery_depth: options.shell_recovery_depth,
         continuation_intent_key: options.continuation_intent_key,
         completion_kind,
         pending_queue_file: queue_file,
@@ -5145,6 +5163,7 @@ mod tests {
             task_family_version: None,
             task_root_queue_id: None,
             disposition_recovery_depth: None,
+            shell_recovery_depth: None,
             replacement_message_text: None,
             continuation_intent_key: None,
             completion_kind: None,
@@ -5286,6 +5305,7 @@ mod tests {
                 task_family_version: None,
                 task_root_queue_id: None,
                 disposition_recovery_depth: None,
+                shell_recovery_depth: None,
                 replacement_message_text: None,
                 continuation_intent_key: None,
                 completion_kind: None,
@@ -5407,6 +5427,7 @@ mod tests {
                 task_family_version: None,
                 task_root_queue_id: None,
                 disposition_recovery_depth: None,
+                shell_recovery_depth: None,
                 replacement_message_text: None,
                 continuation_intent_key: None,
                 completion_kind: None,

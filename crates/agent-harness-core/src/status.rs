@@ -80,6 +80,7 @@ pub struct HarnessRuntimeStatus {
     pub class_leases: Vec<HarnessRuntimeClassLeaseStatus>,
     pub pending_invalid_lines: usize,
     pub latest_non_idle_run_once: Option<HarnessRuntimeReceiptStatus>,
+    pub latest_shell_execution_failure: Option<HarnessShellExecutionFailureStatus>,
     pub execution_receipts: HarnessJsonlStatus,
     pub run_once_receipts: HarnessJsonlStatus,
     pub codex_plan_receipts: HarnessJsonlStatus,
@@ -90,6 +91,20 @@ pub struct HarnessRuntimeStatus {
     pub dead_letter_receipts: HarnessJsonlStatus,
     pub goal_closures: HarnessGovernedTransitionStatus,
     pub session_transitions: HarnessGovernedTransitionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessShellExecutionFailureStatus {
+    pub path: PathBuf,
+    pub line_number: usize,
+    pub queue_id: Option<String>,
+    pub kind: String,
+    pub recovery_eligible: bool,
+    pub reason_code: String,
+    pub recorded_shell_version: Option<String>,
+    pub refreshed_shell_version: Option<String>,
+    pub refreshed_boundary_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1652,6 +1667,9 @@ fn runtime_status(
         latest_non_idle_run_once: latest_non_idle_runtime_receipt(
             &queue_dir.join("run-once-receipts.jsonl"),
         )?,
+        latest_shell_execution_failure: latest_shell_execution_failure(
+            &queue_dir.join("codex-runtime-run-receipts.jsonl"),
+        )?,
         execution_receipts: jsonl_status(queue_dir.join("execution-receipts.jsonl"))?,
         run_once_receipts: jsonl_status(queue_dir.join("run-once-receipts.jsonl"))?,
         codex_plan_receipts: jsonl_status(queue_dir.join("codex-runtime-receipts.jsonl"))?,
@@ -2184,6 +2202,42 @@ fn latest_non_idle_runtime_receipt(path: &Path) -> io::Result<Option<HarnessRunt
             cron_run_id: string_path_any(&value, &["cronRunId", "cron_run_id"]),
             scheduled_for_ms: i64_path(&value, &["scheduledForMs"])
                 .or_else(|| i64_path(&value, &["scheduled_for_ms"])),
+        });
+    }
+    Ok(latest)
+}
+
+fn latest_shell_execution_failure(
+    path: &Path,
+) -> io::Result<Option<HarnessShellExecutionFailureStatus>> {
+    let Some(sample) = read_tail_sample(path, STATUS_JSONL_SAMPLE_BYTES)? else {
+        return Ok(None);
+    };
+    let mut latest = None;
+    for (index, line) in sample.text.lines().enumerate() {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let Some(failure) = value.get("shellExecutionFailure") else {
+            continue;
+        };
+        let Some(kind) = string_path(failure, &["kind"]) else {
+            continue;
+        };
+        latest = Some(HarnessShellExecutionFailureStatus {
+            path: path.to_path_buf(),
+            line_number: index + 1,
+            queue_id: queue_id_from_value(&value),
+            kind,
+            recovery_eligible: failure
+                .get("recoveryEligible")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            reason_code: string_path(failure, &["reasonCode"])
+                .unwrap_or_else(|| "unclassified".to_string()),
+            recorded_shell_version: string_path(failure, &["recordedShellVersion"]),
+            refreshed_shell_version: string_path(failure, &["refreshedShellVersion"]),
+            refreshed_boundary_kind: string_path(failure, &["refreshedBoundaryKind"]),
         });
     }
     Ok(latest)
@@ -2862,6 +2916,36 @@ fn epoch_ms() -> io::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_surfaces_latest_bounded_shell_failure() {
+        let root = temp_root("status-surfaces-latest-bounded-shell-failure");
+        fs::create_dir_all(&root).unwrap();
+        let receipts = root.join("codex-runtime-run-receipts.jsonl");
+        fs::write(
+            &receipts,
+            concat!(
+                "{\"queueId\":\"q-old\",\"status\":\"completed\"}\n",
+                "{\"queueId\":\"q-shell\",\"status\":\"completed\",\"shellExecutionFailure\":{\"kind\":\"appx-executable-drift\",\"recoveryEligible\":true,\"reasonCode\":\"version-qualified-appx-powershell-replaced\",\"recordedShellVersion\":\"7.6.3.0\",\"refreshedBoundaryKind\":\"stable-external\",\"commandDigest\":\"sha256:bounded\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let status = latest_shell_execution_failure(&receipts)
+            .unwrap()
+            .expect("latest classified shell failure");
+        assert_eq!(status.queue_id.as_deref(), Some("q-shell"));
+        assert_eq!(status.kind, "appx-executable-drift");
+        assert!(status.recovery_eligible);
+        assert_eq!(status.recorded_shell_version.as_deref(), Some("7.6.3.0"));
+        assert_eq!(
+            status.refreshed_boundary_kind.as_deref(),
+            Some("stable-external")
+        );
+        let rendered = serde_json::to_string(&status).unwrap();
+        assert!(!rendered.contains("pwsh.exe"));
+        let _ = fs::remove_dir_all(root);
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

@@ -83,6 +83,8 @@ pub struct GoalContinuationIntentV1 {
     pub active_item_version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition_recovery_depth: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_recovery_depth: Option<u64>,
     pub reason: String,
     pub observed_at_ms: i64,
 }
@@ -238,6 +240,7 @@ pub fn commit_goal_continuation_intent(
         active_item_id: None,
         active_item_version: None,
         disposition_recovery_depth: None,
+        shell_recovery_depth: continuation.shell_recovery_depth,
         reason: "continuation intent committed before child enqueue".to_string(),
         observed_at_ms: now_ms,
     };
@@ -317,6 +320,7 @@ pub fn commit_task_continuation_intent(
         active_item_id: authority.active_item_id.clone(),
         active_item_version: authority.active_item_version,
         disposition_recovery_depth: disposition_recovery.then_some(1),
+        shell_recovery_depth: continuation.shell_recovery_depth,
         reason: if disposition_recovery {
             "disposition recovery intent committed before observation-only child enqueue"
                 .to_string()
@@ -400,6 +404,7 @@ pub fn ensure_goal_continuation_enqueued(
             .as_ref()
             .map(|family| family.root_queue_id.clone()),
         disposition_recovery_depth: latest.disposition_recovery_depth,
+        shell_recovery_depth: latest.shell_recovery_depth,
         replacement_message_text: latest.disposition_recovery_depth.map(|_| {
             "Disposition recovery only: inspect the current task-family state without starting new long work or authorizing/replaying any external effect. Return exactly one valid agent-harness.drain-disposition.v1 marker for the current outcome."
                 .to_string()

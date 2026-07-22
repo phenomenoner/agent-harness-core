@@ -7462,6 +7462,10 @@ fn continuation_metadata_from_value(value: &Value) -> RuntimeContinuationMetadat
             .get("dispositionRecoveryDepth")
             .or_else(|| value.get("disposition_recovery_depth"))
             .and_then(Value::as_u64),
+        shell_recovery_depth: value
+            .get("shellRecoveryDepth")
+            .or_else(|| value.get("shell_recovery_depth"))
+            .and_then(Value::as_u64),
         continuation_intent_key: string_field(
             value,
             &["continuationIntentKey", "continuation_intent_key"],

@@ -796,6 +796,8 @@ pub struct CodexRuntimeRunReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_timeout: Option<CodexToolUseTimeout>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_execution_failure: Option<CodexShellExecutionFailureV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interruption_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interrupted_tool_uses: Vec<CodexInterruptedToolUse>,
@@ -953,6 +955,386 @@ pub struct CodexContextRecoveryReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_backup_file: Option<PathBuf>,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexShellExecutionFailureKindV1 {
+    AppxExecutableDrift,
+    MissingWorkingDirectory,
+    OrdinaryCommandFailure,
+    OrdinaryPathNotFound,
+    AmbiguousFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexShellExecutionFailureV1 {
+    pub kind: CodexShellExecutionFailureKindV1,
+    pub recovery_eligible: bool,
+    pub reason_code: String,
+    pub command_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_shell_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refreshed_shell_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refreshed_boundary_kind: Option<RefreshedShellBoundaryKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RefreshedShellBoundaryKind {
+    StableExternal,
+    VersionIndependentAlias,
+    CurrentAppxPackage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefreshedShellBoundary {
+    executable: PathBuf,
+    kind: RefreshedShellBoundaryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellExecutionFailureObservation {
+    item_type: String,
+    status: String,
+    exit_code: Option<i64>,
+    duration_ms: Option<u64>,
+    output: String,
+    command: String,
+    cwd: Option<PathBuf>,
+    recorded_executable: Option<PathBuf>,
+    cwd_exists: bool,
+    recorded_executable_exists: bool,
+    refreshed_boundary: Option<RefreshedShellBoundary>,
+}
+
+fn classify_shell_execution_failure(
+    observation: &ShellExecutionFailureObservation,
+) -> CodexShellExecutionFailureV1 {
+    let recorded_shell_version = observation
+        .recorded_executable
+        .as_deref()
+        .and_then(appx_powershell_version);
+    let refreshed_shell_version = observation
+        .refreshed_boundary
+        .as_ref()
+        .and_then(|boundary| appx_powershell_version(&boundary.executable));
+    let command_digest = sha256_prefixed(observation.command.as_bytes());
+    let executable_digest = observation
+        .recorded_executable
+        .as_ref()
+        .map(|path| sha256_prefixed(path.to_string_lossy().as_bytes()));
+    let cwd_digest = observation
+        .cwd
+        .as_ref()
+        .map(|path| sha256_prefixed(path.to_string_lossy().as_bytes()));
+    let base = |kind, recovery_eligible, reason_code: &str| CodexShellExecutionFailureV1 {
+        kind,
+        recovery_eligible,
+        reason_code: reason_code.to_string(),
+        command_digest: command_digest.clone(),
+        executable_digest: executable_digest.clone(),
+        cwd_digest: cwd_digest.clone(),
+        recorded_shell_version: recorded_shell_version.clone(),
+        refreshed_shell_version: refreshed_shell_version.clone(),
+        refreshed_boundary_kind: observation
+            .refreshed_boundary
+            .as_ref()
+            .map(|boundary| boundary.kind),
+    };
+
+    if !observation
+        .item_type
+        .eq_ignore_ascii_case("commandExecution")
+        || !observation.status.eq_ignore_ascii_case("failed")
+    {
+        return base(
+            CodexShellExecutionFailureKindV1::AmbiguousFailure,
+            false,
+            "not-a-failed-command-execution",
+        );
+    }
+    if observation.exit_code != Some(-1) {
+        return base(
+            CodexShellExecutionFailureKindV1::OrdinaryCommandFailure,
+            false,
+            "command-returned-ordinary-exit-code",
+        );
+    }
+    if !observation.cwd_exists {
+        return base(
+            CodexShellExecutionFailureKindV1::MissingWorkingDirectory,
+            false,
+            "working-directory-missing",
+        );
+    }
+    if observation.output.trim().is_empty() {
+        return base(
+            CodexShellExecutionFailureKindV1::AmbiguousFailure,
+            false,
+            "failed-command-output-empty",
+        );
+    }
+    if !has_process_start_path_not_found_evidence(&observation.output) {
+        return base(
+            CodexShellExecutionFailureKindV1::AmbiguousFailure,
+            false,
+            "process-start-path-not-found-evidence-missing",
+        );
+    }
+    if recorded_shell_version.is_none() {
+        return base(
+            CodexShellExecutionFailureKindV1::OrdinaryPathNotFound,
+            false,
+            "failed-executable-is-not-version-qualified-appx-powershell",
+        );
+    }
+    if observation
+        .duration_ms
+        .is_none_or(|duration| duration > 250)
+    {
+        return base(
+            CodexShellExecutionFailureKindV1::AmbiguousFailure,
+            false,
+            "process-start-duration-not-near-zero",
+        );
+    }
+    if observation.recorded_executable_exists {
+        return base(
+            CodexShellExecutionFailureKindV1::OrdinaryPathNotFound,
+            false,
+            "recorded-appx-executable-still-exists",
+        );
+    }
+    let Some(refreshed) = observation.refreshed_boundary.as_ref() else {
+        return base(
+            CodexShellExecutionFailureKindV1::AmbiguousFailure,
+            false,
+            "refreshed-shell-boundary-unavailable",
+        );
+    };
+    if refreshed.executable == observation.recorded_executable.clone().unwrap_or_default() {
+        return base(
+            CodexShellExecutionFailureKindV1::AmbiguousFailure,
+            false,
+            "refreshed-shell-boundary-matches-stale-executable",
+        );
+    }
+    base(
+        CodexShellExecutionFailureKindV1::AppxExecutableDrift,
+        true,
+        "version-qualified-appx-powershell-replaced",
+    )
+}
+
+fn has_process_start_path_not_found_evidence(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    let code_three =
+        lower.contains("code: 3") || lower.contains("os error 3") || lower.contains("error code 3");
+    let path_not_found = lower.contains("path not found")
+        || lower.contains("kind: notfound")
+        || lower.contains("cannot find the path")
+        || lower.contains("system cannot find the path");
+    code_three && path_not_found
+}
+
+fn appx_powershell_version(path: &Path) -> Option<String> {
+    let normalized = path.to_string_lossy().replace('/', "\\");
+    let lower = normalized.to_ascii_lowercase();
+    let marker = "\\windowsapps\\microsoft.powershell_";
+    let start = lower.find(marker)? + marker.len();
+    if !lower.ends_with("\\pwsh.exe") {
+        return None;
+    }
+    let suffix = &normalized[start..];
+    let version = suffix.split('_').next()?.trim();
+    (!version.is_empty()
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.'))
+    .then(|| version.to_string())
+}
+
+#[derive(Debug, Clone)]
+struct StartedShellCommand {
+    command: String,
+    cwd: Option<PathBuf>,
+}
+
+fn classify_shell_execution_failure_from_stdout(
+    stdout_log: Option<&Path>,
+) -> io::Result<Option<CodexShellExecutionFailureV1>> {
+    classify_shell_execution_failure_from_stdout_with_boundary(stdout_log, None)
+}
+
+fn classify_shell_execution_failure_from_stdout_with_boundary(
+    stdout_log: Option<&Path>,
+    test_boundary: Option<&RefreshedShellBoundary>,
+) -> io::Result<Option<CodexShellExecutionFailureV1>> {
+    let Some(stdout_log) = stdout_log.filter(|path| path.is_file()) else {
+        return Ok(None);
+    };
+    let reader = BufReader::new(fs::File::open(stdout_log)?);
+    let mut started = BTreeMap::<String, StartedShellCommand>::new();
+    let mut latest = None;
+    for line in reader.lines() {
+        let line = line?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let method = json_method(&value).unwrap_or_default();
+        let item = value.pointer("/params/item").unwrap_or(&Value::Null);
+        if !string_field(item, &["type"])
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("commandExecution"))
+        {
+            continue;
+        }
+        let item_id = string_field(item, &["id"])
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        if method == "item/started" {
+            if let Some(command) = string_field(item, &["command"]).map(ToString::to_string) {
+                started.insert(
+                    item_id,
+                    StartedShellCommand {
+                        command,
+                        cwd: string_field(item, &["cwd", "workingDirectory"]).map(PathBuf::from),
+                    },
+                );
+            }
+            continue;
+        }
+        if method != "item/completed" {
+            continue;
+        }
+        let status = string_field(item, &["status"])
+            .or_else(|| {
+                string_field(
+                    value.pointer("/params").unwrap_or(&Value::Null),
+                    &["status"],
+                )
+            })
+            .unwrap_or_default();
+        if !status.eq_ignore_ascii_case("failed") {
+            continue;
+        }
+        let prior = started.get(&item_id);
+        let command = string_field(item, &["command"])
+            .map(ToString::to_string)
+            .or_else(|| prior.map(|prior| prior.command.clone()))
+            .unwrap_or_default();
+        let cwd = string_field(item, &["cwd", "workingDirectory"])
+            .map(PathBuf::from)
+            .or_else(|| prior.and_then(|prior| prior.cwd.clone()));
+        let recorded_executable = extract_command_executable(&command);
+        let refreshed_boundary = test_boundary.cloned().or_else(|| {
+            recorded_executable
+                .as_deref()
+                .and_then(resolve_refreshed_shell_boundary)
+        });
+        let output = string_field(item, &["aggregatedOutput", "output", "stderr", "error"])
+            .unwrap_or_default()
+            .to_string();
+        let observation = ShellExecutionFailureObservation {
+            item_type: "commandExecution".to_string(),
+            status: status.to_string(),
+            exit_code: signed_number_field(item, &["exitCode", "exit_code"]),
+            duration_ms: unsigned_number_field(item, &["durationMs", "duration_ms"]),
+            output,
+            command,
+            cwd_exists: cwd.as_deref().is_some_and(Path::is_dir),
+            recorded_executable_exists: recorded_executable.as_deref().is_some_and(Path::is_file),
+            cwd,
+            recorded_executable,
+            refreshed_boundary,
+        };
+        let classified = classify_shell_execution_failure(&observation);
+        if classified.kind == CodexShellExecutionFailureKindV1::AppxExecutableDrift {
+            return Ok(Some(classified));
+        }
+        latest = Some(classified);
+    }
+    Ok(latest)
+}
+
+fn signed_number_field(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_i64))
+}
+
+fn unsigned_number_field(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_u64))
+}
+
+fn extract_command_executable(command: &str) -> Option<PathBuf> {
+    let normalized = command.replace('/', "\\");
+    let lower = normalized.to_ascii_lowercase();
+    let appx_marker = "\\windowsapps\\microsoft.powershell_";
+    if let Some(marker_at) = lower.find(appx_marker)
+        && let Some(end_offset) = lower[marker_at..].find("\\pwsh.exe")
+    {
+        let end = marker_at + end_offset + "\\pwsh.exe".len();
+        let start = normalized[..marker_at]
+            .rfind('"')
+            .map(|quote| quote + 1)
+            .or_else(|| {
+                normalized[..marker_at]
+                    .rfind(|ch: char| ch.is_whitespace())
+                    .map(|space| space + 1)
+            })
+            .unwrap_or(0);
+        return Some(PathBuf::from(normalized[start..end].trim_matches('"')));
+    }
+    let trimmed = command.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        return rest.find('"').map(|end| PathBuf::from(&rest[..end]));
+    }
+    trimmed
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn resolve_refreshed_shell_boundary(stale: &Path) -> Option<RefreshedShellBoundary> {
+    if let Some(configured) = env::var_os("AGENT_HARNESS_POWERSHELL_EXECUTABLE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file() && path != stale)
+    {
+        return Some(RefreshedShellBoundary {
+            executable: configured,
+            kind: RefreshedShellBoundaryKind::StableExternal,
+        });
+    }
+    #[cfg(windows)]
+    {
+        let installed = PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        if installed.is_file() && installed != stale {
+            return Some(RefreshedShellBoundary {
+                executable: installed,
+                kind: RefreshedShellBoundaryKind::StableExternal,
+            });
+        }
+        if let Some(alias) = env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|root| root.join("Microsoft").join("WindowsApps").join("pwsh.exe"))
+            .filter(|path| path.is_file() && path != stale)
+        {
+            return Some(RefreshedShellBoundary {
+                executable: alias,
+                kind: RefreshedShellBoundaryKind::VersionIndependentAlias,
+            });
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3136,6 +3518,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 media_plan: InboundMediaInputPlan::default(),
                 context_recovery: None,
                 tool_use_timeout: None,
+                shell_execution_failure: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,
@@ -3193,6 +3576,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 media_plan: InboundMediaInputPlan::default(),
                 context_recovery: None,
                 tool_use_timeout: None,
+                shell_execution_failure: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,
@@ -3253,6 +3637,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             media_plan: InboundMediaInputPlan::default(),
             context_recovery: None,
             tool_use_timeout: None,
+            shell_execution_failure: None,
             interruption_reason: None,
             interrupted_tool_uses: Vec::new(),
             backend_reasoning_execution: None,
@@ -3317,6 +3702,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             media_plan: plan.media_plan.clone(),
             context_recovery: None,
             tool_use_timeout: None,
+            shell_execution_failure: None,
             interruption_reason: None,
             interrupted_tool_uses: Vec::new(),
             backend_reasoning_execution: run_file
@@ -3778,6 +4164,16 @@ fn finish_codex_runtime_run(
     };
     let (protocol_failure, protocol_mutation_evidence) =
         inspect_protocol_failure_evidence(run_result.stdout_log.as_deref());
+    let shell_execution_failure =
+        classify_shell_execution_failure_from_stdout(run_result.stdout_log.as_deref())?;
+    if let Some(shell_failure) = shell_execution_failure.as_ref()
+        && shell_failure.kind == CodexShellExecutionFailureKindV1::AppxExecutableDrift
+    {
+        warnings.push(format!(
+            "classified stale AppX PowerShell executable drift; recoveryEligible={} reasonCode={}",
+            shell_failure.recovery_eligible, shell_failure.reason_code
+        ));
+    }
     if should_rotate_stale_stdout_log(&status, &run_result)
         && let Some(stale_stdout_log) = rotate_stale_stdout_log(
             run_result.stdout_log.as_deref(),
@@ -3834,6 +4230,7 @@ fn finish_codex_runtime_run(
         media_plan: plan.media_plan.clone(),
         context_recovery: run_result.context_recovery,
         tool_use_timeout: run_result.tool_use_timeout,
+        shell_execution_failure,
         interruption_reason: run_result.interruption_reason,
         interrupted_tool_uses: run_result.interrupted_tool_uses,
         backend_reasoning_execution: run_result.backend_reasoning_execution,
@@ -16895,6 +17292,198 @@ mod tests {
         enqueue_channel_step, load_agent_registry, prepare_runtime_queue_item,
         runtime_worker::release_runtime_queue_lease,
     };
+
+    #[test]
+    fn shell_execution_failure_classifier_requires_complete_appx_drift_evidence() {
+        let stale = PathBuf::from(
+            r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.3.0_x64__8wekyb3d8bbwe\pwsh.exe",
+        );
+        let refreshed = RefreshedShellBoundary {
+            executable: PathBuf::from(
+                r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe\pwsh.exe",
+            ),
+            kind: RefreshedShellBoundaryKind::CurrentAppxPackage,
+        };
+        let positive = ShellExecutionFailureObservation {
+            item_type: "commandExecution".to_string(),
+            status: "failed".to_string(),
+            exit_code: Some(-1),
+            duration_ms: Some(0),
+            output: "process start failed: Io(Os { code: 3, kind: NotFound, message: The system cannot find the path specified. })".to_string(),
+            command: format!("\"{}\" -NoProfile -Command Get-ChildItem", stale.display()),
+            cwd: Some(PathBuf::from("workspace")),
+            recorded_executable: Some(stale),
+            cwd_exists: true,
+            recorded_executable_exists: false,
+            refreshed_boundary: Some(refreshed),
+        };
+        let classified = classify_shell_execution_failure(&positive);
+        assert_eq!(
+            classified.kind,
+            CodexShellExecutionFailureKindV1::AppxExecutableDrift
+        );
+        assert!(classified.recovery_eligible);
+        assert_eq!(
+            classified.recorded_shell_version.as_deref(),
+            Some("7.6.3.0")
+        );
+        assert_eq!(
+            classified.refreshed_shell_version.as_deref(),
+            Some("7.6.4.0")
+        );
+        assert!(classified.command_digest.starts_with("sha256:"));
+        assert!(
+            classified
+                .executable_digest
+                .as_deref()
+                .is_some_and(|value| value.starts_with("sha256:"))
+        );
+        assert!(
+            classified
+                .cwd_digest
+                .as_deref()
+                .is_some_and(|value| value.starts_with("sha256:"))
+        );
+    }
+
+    #[test]
+    fn shell_execution_failure_classifier_rejects_near_misses() {
+        let base = ShellExecutionFailureObservation {
+            item_type: "commandExecution".to_string(),
+            status: "failed".to_string(),
+            exit_code: Some(-1),
+            duration_ms: Some(0),
+            output: "process start failed: OS error 3; path not found".to_string(),
+            command: r#""C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.3.0_x64__8wekyb3d8bbwe\pwsh.exe" -File task.ps1"#.to_string(),
+            cwd: Some(PathBuf::from("workspace")),
+            recorded_executable: Some(PathBuf::from(
+                r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.3.0_x64__8wekyb3d8bbwe\pwsh.exe",
+            )),
+            cwd_exists: true,
+            recorded_executable_exists: false,
+            refreshed_boundary: Some(RefreshedShellBoundary {
+                executable: PathBuf::from(
+                    r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe\pwsh.exe",
+                ),
+                kind: RefreshedShellBoundaryKind::CurrentAppxPackage,
+            }),
+        };
+        let cases = [
+            (
+                "missing-task-input",
+                ShellExecutionFailureObservation {
+                    exit_code: Some(1),
+                    output: "Get-Content: Cannot find archived-task/missing.json because it does not exist".to_string(),
+                    ..base.clone()
+                },
+                CodexShellExecutionFailureKindV1::OrdinaryCommandFailure,
+            ),
+            (
+                "missing-cwd",
+                ShellExecutionFailureObservation {
+                    cwd_exists: false,
+                    ..base.clone()
+                },
+                CodexShellExecutionFailureKindV1::MissingWorkingDirectory,
+            ),
+            (
+                "rust-assertion",
+                ShellExecutionFailureObservation {
+                    exit_code: Some(1),
+                    duration_ms: Some(1_250),
+                    output: "test result: FAILED. assertion `left == right` failed".to_string(),
+                    ..base.clone()
+                },
+                CodexShellExecutionFailureKindV1::OrdinaryCommandFailure,
+            ),
+            (
+                "ambiguous",
+                ShellExecutionFailureObservation {
+                    output: String::new(),
+                    ..base.clone()
+                },
+                CodexShellExecutionFailureKindV1::AmbiguousFailure,
+            ),
+            (
+                "unrelated-path-not-found",
+                ShellExecutionFailureObservation {
+                    command: "custom-runner.exe task".to_string(),
+                    recorded_executable: Some(PathBuf::from("tools/custom-runner.exe")),
+                    ..base
+                },
+                CodexShellExecutionFailureKindV1::OrdinaryPathNotFound,
+            ),
+        ];
+        for (name, observation, expected) in cases {
+            let classified = classify_shell_execution_failure(&observation);
+            assert_eq!(classified.kind, expected, "{name}");
+            assert!(!classified.recovery_eligible, "{name}");
+        }
+    }
+
+    #[test]
+    fn shell_execution_failure_stdout_replay_emits_bounded_drift_receipt() {
+        let root = temp_root("shell-execution-failure-stdout-replay");
+        let cwd = root.join("existing-worktree");
+        fs::create_dir_all(&cwd).unwrap();
+        let stdout = root.join("stdout.jsonl");
+        let stale = r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.3.0_x64__8wekyb3d8bbwe\pwsh.exe";
+        let command = format!(r#""{stale}" -NoProfile -Command Get-ChildItem"#);
+        let rows = [
+            json!({
+                "method": "item/started",
+                "params": {"item": {
+                    "type": "commandExecution",
+                    "id": "shell-drift",
+                    "command": command,
+                    "cwd": cwd
+                }}
+            }),
+            json!({
+                "method": "item/completed",
+                "params": {"item": {
+                    "type": "commandExecution",
+                    "id": "shell-drift",
+                    "status": "failed",
+                    "exitCode": -1,
+                    "durationMs": 0,
+                    "aggregatedOutput": "process start failed: OS error 3; path not found"
+                }}
+            }),
+        ];
+        fs::write(
+            &stdout,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let boundary = RefreshedShellBoundary {
+            executable: PathBuf::from(
+                r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe\pwsh.exe",
+            ),
+            kind: RefreshedShellBoundaryKind::CurrentAppxPackage,
+        };
+
+        let receipt = classify_shell_execution_failure_from_stdout_with_boundary(
+            Some(&stdout),
+            Some(&boundary),
+        )
+        .unwrap()
+        .expect("complete AppX replacement evidence must classify");
+        assert_eq!(
+            receipt.kind,
+            CodexShellExecutionFailureKindV1::AppxExecutableDrift
+        );
+        assert!(receipt.recovery_eligible);
+        let serialized = serde_json::to_string(&receipt).unwrap();
+        assert!(!serialized.contains(stale));
+        assert!(!serialized.contains("Get-ChildItem"));
+        assert!(!serialized.contains(&cwd.to_string_lossy().to_string()));
+        assert!(serialized.contains("sha256:"));
+        let _ = fs::remove_dir_all(root);
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

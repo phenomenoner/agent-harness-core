@@ -9769,6 +9769,7 @@ fn run_context_rollover(args: &[String]) -> Result<(), String> {
                 task_family_version: None,
                 task_root_queue_id: None,
                 disposition_recovery_depth: None,
+                shell_recovery_depth: None,
                 replacement_message_text: None,
                 continuation_intent_key: None,
                 completion_kind: None,

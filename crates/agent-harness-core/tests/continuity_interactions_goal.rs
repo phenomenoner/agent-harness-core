@@ -346,6 +346,165 @@ fn active_goal_policy_matrix_preserves_exact_closure_on_discord_and_telegram() {
 }
 
 #[test]
+fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
+    for (case, prior_depth, mode, shell_drift, expected) in [
+        ("first-recovery", None, "active", true, "shell-child"),
+        ("repeat-drift", Some(1), "active", true, "budget-park"),
+        (
+            "missing-artifact-near-miss",
+            None,
+            "active",
+            false,
+            "ordinary-child",
+        ),
+        ("observe-drift", None, "observe", true, "policy-park"),
+    ] {
+        let root = temp_root(&format!("active-goal-shell-drift-{case}"));
+        let source = write_source(&root);
+        let harness_home = root.join("harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "discord".to_string(),
+            account_id: Some("account-sanitized".to_string()),
+            channel_id: "channel-sanitized".to_string(),
+            user_id: "user-sanitized".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "Continue the durable implementation goal.".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 30_000,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.expect("source queue id");
+        let lane_digest = exact_full_lane_digest(&harness_home, &queue_id);
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec_pretty(&json!({
+                "goalAutonomy": {
+                    "mode": mode,
+                    "activeLaneDigests": [lane_digest]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        if let Some(depth) = prior_depth {
+            set_pending_shell_recovery_depth(&harness_home, &queue_id, depth);
+        }
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let refreshed_shell = root.join("stable-pwsh.exe");
+        fs::write(&refreshed_shell, "test shell boundary").unwrap();
+        let _codex_home = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+        let _shell_boundary = EnvGuard::set(
+            "AGENT_HARNESS_POWERSHELL_EXECUTABLE",
+            refreshed_shell.into_os_string(),
+        );
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_active_goal_shell_case_codex(&root, shell_drift)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        if expected == "shell-child" {
+            assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Skipped);
+            assert_eq!(
+                report.receipt.source_closure_reason.as_deref(),
+                Some("shell-runtime-drift-continuation-committed")
+            );
+            let child = report
+                .receipt
+                .child_queue_id
+                .as_deref()
+                .expect("one fresh-runtime child");
+            assert_eq!(pending_queue(&harness_home, child)["shellRecoveryDepth"], 1);
+            assert!(load_outbox(&harness_home).is_empty());
+        } else if expected == "ordinary-child" {
+            assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Skipped);
+            assert_eq!(
+                report.receipt.source_closure_reason.as_deref(),
+                Some("goal-continuation-committed")
+            );
+            let child = report
+                .receipt
+                .child_queue_id
+                .as_deref()
+                .expect("ordinary active-goal child");
+            assert!(pending_queue(&harness_home, child)["shellRecoveryDepth"].is_null());
+            assert!(load_outbox(&harness_home).is_empty());
+        } else {
+            assert_eq!(report.receipt.status, RuntimeRunOnceStatus::NeedsUser);
+            let expected_reason = if expected == "budget-park" {
+                "shell-recovery-budget-exhausted"
+            } else {
+                "goal-autonomy-observe"
+            };
+            assert_eq!(
+                report.receipt.source_closure_reason.as_deref(),
+                Some(expected_reason)
+            );
+            assert!(report.receipt.child_queue_id.is_none());
+            let source_outbox = load_outbox(&harness_home)
+                .into_iter()
+                .filter(|row| row["sourceQueueId"] == queue_id)
+                .collect::<Vec<_>>();
+            assert_eq!(source_outbox.len(), 1);
+            let expected_notice = if expected == "budget-park" {
+                "one automatic fresh-runtime shell recovery"
+            } else {
+                "observation-only"
+            };
+            assert!(
+                source_outbox[0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(expected_notice))
+            );
+            let replay = run_runtime_queue_once(RuntimeRunOnceOptions {
+                harness_home: harness_home.clone(),
+                queue_id: Some(queue_id.clone()),
+                codex_executable: Some(fake_active_goal_shell_case_codex(&root, shell_drift)),
+                timeout_ms: 30_000,
+                idle_timeout_ms: 30_000,
+                prompt_options: PromptAssemblyOptions {
+                    harness_home: Some(harness_home.clone()),
+                    ..PromptAssemblyOptions::default()
+                },
+            })
+            .unwrap();
+            assert!(matches!(
+                replay.receipt.status,
+                RuntimeRunOnceStatus::NoWork | RuntimeRunOnceStatus::Suppressed
+            ));
+            assert_eq!(
+                load_outbox(&harness_home)
+                    .iter()
+                    .filter(|row| row["sourceQueueId"] == queue_id)
+                    .count(),
+                1,
+                "restart must not duplicate the recovery-exhausted park"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
 fn child_final_during_stop_is_internal_and_cannot_reopen_closed_goal() {
     let root = temp_root("child-final-during-stop");
     let source = write_source(&root);
@@ -1094,6 +1253,29 @@ fn pending_queue(harness_home: &Path, queue_id: &str) -> Value {
         .unwrap_or_else(|| panic!("pending queue {queue_id} was not durable"))
 }
 
+fn set_pending_shell_recovery_depth(harness_home: &Path, queue_id: &str, depth: u64) {
+    let file = harness_home.join("state/runtime-queue/pending.jsonl");
+    let mut rows = fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let row = rows
+        .iter_mut()
+        .find(|row| row["queueId"] == queue_id)
+        .unwrap_or_else(|| panic!("pending queue {queue_id} was not durable"));
+    row["shellRecoveryDepth"] = json!(depth);
+    fs::write(
+        file,
+        rows.iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+}
+
 fn exact_channel_state_file(harness_home: &Path) -> PathBuf {
     let root = harness_home.join("state/channels/v2");
     let mut states = fs::read_dir(&root)
@@ -1203,6 +1385,56 @@ fn fake_active_goal_blocker_codex(root: &Path) -> PathBuf {
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","status":"completed"}}}')
 "#,
     )
+}
+
+fn fake_active_goal_shell_case_codex(root: &Path, shell_drift: bool) -> PathBuf {
+    let stale =
+        r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.3.0_x64__8wekyb3d8bbwe\pwsh.exe";
+    let (exit_code, duration_ms, output) = if shell_drift {
+        (-1, 0, "process start failed: OS error 3; path not found")
+    } else {
+        (
+            1,
+            25,
+            "Get-Content could not find archived-task/missing.json",
+        )
+    };
+    let rows = [
+        json!({"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular"}}}),
+        json!({"method":"thread/goal/updated","params":{"threadId":"thread-parent","turnId":"turn-parent","goal":{"id":"goal-active","objective":"finish the durable implementation","status":"active","completionCriteria":["T3 replay passes"]}}}),
+        json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"shell-drift","command":format!(r#""{stale}" -NoProfile -Command Get-ChildItem"#),"cwd":root}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"shell-drift","status":"failed","exitCode":exit_code,"durationMs":duration_ms,"aggregatedOutput":output}}}),
+        json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-parent","turnId":"turn-parent","itemId":"parent-blocker","delta":"The goal remains active after the shell failed to start."}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","status":"completed"}}}),
+    ];
+    #[cfg(windows)]
+    {
+        let body = rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "[Console]::Out.WriteLine('{}')",
+                    serde_json::to_string(row).unwrap().replace('\'', "''")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fake_windows_codex(root, "active-goal-shell-drift", &body)
+    }
+    #[cfg(not(windows))]
+    {
+        let body = rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "printf '%s\\n' '{}'",
+                    serde_json::to_string(row).unwrap().replace('\'', "'\\''")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fake_unix_codex(root, "active-goal-shell-drift", &body)
+    }
 }
 
 #[cfg(windows)]

@@ -44,6 +44,9 @@ pub struct TraceRecord {
     pub final_outbox_disposition: Option<String>,
     pub authority_digest: Option<String>,
     pub phase: Option<String>,
+    pub shell_failure_kind: Option<String>,
+    pub shell_recovery_eligible: Option<bool>,
+    pub shell_failure_reason_code: Option<String>,
     pub summary: String,
 }
 
@@ -83,6 +86,9 @@ pub fn trace_harness_event(options: TraceOptions) -> io::Result<TraceReport> {
                     final_outbox_disposition: None,
                     authority_digest: None,
                     phase: None,
+                    shell_failure_kind: None,
+                    shell_recovery_eligible: None,
+                    shell_failure_reason_code: None,
                     summary: summary.chars().take(240).collect(),
                 });
             }
@@ -215,6 +221,16 @@ fn read_matching_records(path: &PathBuf, id: &str) -> io::Result<Vec<TraceRecord
             ),
             authority_digest: string_path(&value, &["authorityDigest", "authority_digest"]),
             phase: string_path(&value, &["phase"]),
+            shell_failure_kind: nested_string_path(&value, "shellExecutionFailure", &["kind"]),
+            shell_recovery_eligible: value
+                .get("shellExecutionFailure")
+                .and_then(|failure| failure.get("recoveryEligible"))
+                .and_then(Value::as_bool),
+            shell_failure_reason_code: nested_string_path(
+                &value,
+                "shellExecutionFailure",
+                &["reasonCode"],
+            ),
             summary: summarize_record(&value),
         });
     }
@@ -244,12 +260,35 @@ fn value_matches_id(value: &Value, id: &str) -> bool {
 }
 
 fn summarize_record(value: &Value) -> String {
+    if let Some(failure) = value.get("shellExecutionFailure") {
+        let kind = failure
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let reason = failure
+            .get("reasonCode")
+            .and_then(Value::as_str)
+            .unwrap_or("unclassified");
+        let eligible = failure
+            .get("recoveryEligible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return format!(
+            "shell execution failure `{kind}`; recoveryEligible={eligible}; reasonCode={reason}"
+        );
+    }
     for key in ["reason", "message", "status", "event", "method"] {
         if let Some(raw) = value.get(key).and_then(Value::as_str) {
             return raw.chars().take(240).collect();
         }
     }
     "matched trace record".to_string()
+}
+
+fn nested_string_path(value: &Value, object: &str, keys: &[&str]) -> Option<String> {
+    value
+        .get(object)
+        .and_then(|nested| string_path(nested, keys))
 }
 
 fn string_path(value: &Value, keys: &[&str]) -> Option<String> {
@@ -298,6 +337,39 @@ mod tests {
         assert!(report.terminal);
         assert!(report.diagnostics.is_empty());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trace_surfaces_bounded_shell_failure_classification() {
+        let root = temp_root("trace_surfaces_bounded_shell_failure_classification");
+        let harness_home = root.join(".agent-harness");
+        let queue = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue).unwrap();
+        fs::write(
+            queue.join("codex-runtime-run-receipts.jsonl"),
+            r#"{"queueId":"q-shell","status":"completed","reason":"turn completed","shellExecutionFailure":{"kind":"appx-executable-drift","recoveryEligible":true,"reasonCode":"version-qualified-appx-powershell-replaced","commandDigest":"sha256:bounded"}}"#,
+        )
+        .unwrap();
+
+        let report = trace_harness_event(TraceOptions {
+            harness_home,
+            id: "q-shell".to_string(),
+        })
+        .unwrap();
+
+        let record = report.records.first().expect("shell trace record");
+        assert_eq!(
+            record.shell_failure_kind.as_deref(),
+            Some("appx-executable-drift")
+        );
+        assert_eq!(record.shell_recovery_eligible, Some(true));
+        assert_eq!(
+            record.shell_failure_reason_code.as_deref(),
+            Some("version-qualified-appx-powershell-replaced")
+        );
+        assert!(record.summary.contains("recoveryEligible=true"));
+        assert!(!record.summary.contains("pwsh.exe"));
         let _ = fs::remove_dir_all(root);
     }
 

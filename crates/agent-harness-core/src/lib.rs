@@ -269,12 +269,13 @@ pub use codex_runtime::{
     CodexRuntimePreflightReport, CodexRuntimePreflightStatus, CodexRuntimePrimaryOutcomeV1,
     CodexRuntimeReceipt, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
     CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexRuntimeSecondaryDiagnosticV1,
-    CodexSandboxInspection, CodexTransportPlan, CodexTurnSteerQueueStatus,
-    CodexTurnSteerRequestOptions, CodexTurnSteerRequestReport, RuntimeMutationEvidenceClass,
-    WorkAuthorityClassV1, inspect_codex_approval_policy, inspect_codex_sandbox,
-    inspect_codex_sandbox_policy, load_assistant_narration_config, plan_codex_runtime,
-    preflight_codex_runtime, probe_codex_runtime_launch, queue_codex_turn_steer_request,
-    record_codex_runtime_completion, run_codex_runtime,
+    CodexSandboxInspection, CodexShellExecutionFailureKindV1, CodexShellExecutionFailureV1,
+    CodexTransportPlan, CodexTurnSteerQueueStatus, CodexTurnSteerRequestOptions,
+    CodexTurnSteerRequestReport, RuntimeMutationEvidenceClass, WorkAuthorityClassV1,
+    inspect_codex_approval_policy, inspect_codex_sandbox, inspect_codex_sandbox_policy,
+    load_assistant_narration_config, plan_codex_runtime, preflight_codex_runtime,
+    probe_codex_runtime_launch, queue_codex_turn_steer_request, record_codex_runtime_completion,
+    run_codex_runtime,
 };
 pub use config::{
     HARNESS_CONFIG_FILE_NAME, HarnessConfigValidationReport, HarnessConfigValidationStatus,
@@ -805,9 +806,9 @@ pub use status::{
     GatewayRestartServiceStatus, GatewayRestartStatusReport, HarnessChannelStatus,
     HarnessCronSchedulerStatus, HarnessGovernedTransitionStatus, HarnessJsonlStatus,
     HarnessLearningStatus, HarnessMemoryStatus, HarnessOperationalLogStatus, HarnessOutboxStatus,
-    HarnessPluginStatus, HarnessRuntimeReceiptStatus, HarnessRuntimeStatus, HarnessSkillStatus,
-    HarnessStatusOptions, HarnessStatusReport, collect_gateway_restart_status,
-    collect_harness_status,
+    HarnessPluginStatus, HarnessRuntimeReceiptStatus, HarnessRuntimeStatus,
+    HarnessShellExecutionFailureStatus, HarnessSkillStatus, HarnessStatusOptions,
+    HarnessStatusReport, collect_gateway_restart_status, collect_harness_status,
 };
 pub use subagent_lifecycle::{
     SubagentLifecycleCleanup, SubagentLifecycleCloseOptions, SubagentLifecycleReceipt,

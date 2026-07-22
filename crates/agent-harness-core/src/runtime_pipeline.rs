@@ -9,7 +9,8 @@ use serde_json::Value;
 
 use crate::channel_state::ChannelStateLane;
 use crate::codex_runtime::{
-    CodexContextRecoveryReceipt, CodexThreadHealthStatus, tool_timeout_summary,
+    CodexContextRecoveryReceipt, CodexShellExecutionFailureKindV1, CodexThreadHealthStatus,
+    tool_timeout_summary,
 };
 use crate::context_rollover::{
     CompletedTurnWorkingSetSnapshotV2Options, VirtualSessionTerminalV2Options,
@@ -1635,15 +1636,43 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             .as_deref()
             .is_some_and(is_goal_status_active)
     {
-        let activation = load_goal_autonomy_activation(
+        let classified_shell_drift =
+            run.receipt
+                .shell_execution_failure
+                .as_ref()
+                .is_some_and(|failure| {
+                    failure.recovery_eligible
+                        && failure.kind == CodexShellExecutionFailureKindV1::AppxExecutableDrift
+                });
+        let shell_effect_fence_clear = shell_recovery_effect_fence_clear(&run.receipt);
+        let eligible_shell_drift = classified_shell_drift && shell_effect_fence_clear;
+        let shell_recovery_effect_fenced = classified_shell_drift && !shell_effect_fence_clear;
+        let source_shell_recovery_depth = prepare
+            .item
+            .as_ref()
+            .and_then(|item| item.continuation.shell_recovery_depth)
+            .unwrap_or(0);
+        let shell_recovery_budget_exhausted =
+            eligible_shell_drift && source_shell_recovery_depth >= 1;
+        let mut activation = load_goal_autonomy_activation(
             &options.harness_home,
             goal_transition.lane_digest.as_deref(),
         )?;
+        if shell_recovery_effect_fenced && activation.mode == GoalAutonomyMode::Active {
+            activation.reason =
+                "shell-recovery-fenced-by-external-effect-or-mutation-evidence".to_string();
+        } else if shell_recovery_budget_exhausted {
+            activation.reason =
+                "shell-recovery-budget-exhausted-after-fresh-runtime-continuation".to_string();
+        }
         warnings.push(format!(
             "goal autonomy mode {:?}: {}",
             activation.mode, activation.reason
         ));
-        if activation.mode == GoalAutonomyMode::Active {
+        if activation.mode == GoalAutonomyMode::Active
+            && !shell_recovery_budget_exhausted
+            && !shell_recovery_effect_fenced
+        {
             let scheduling_result = (|| -> io::Result<_> {
                 let item = prepare.item.as_ref().ok_or_else(|| {
                     io::Error::new(
@@ -1652,11 +1681,15 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     )
                 })?;
                 let now_ms = current_log_time_ms()?;
+                let mut continuation = item.continuation.clone();
+                if eligible_shell_drift {
+                    continuation.shell_recovery_depth = Some(1);
+                }
                 let intent = commit_goal_continuation_intent(
                     &options.harness_home,
                     &goal_transition,
                     &item.session_key,
-                    &item.continuation,
+                    &continuation,
                     now_ms,
                 )?;
                 ensure_goal_continuation_enqueued(&options.harness_home, &intent.intent_key, now_ms)
@@ -1689,7 +1722,14 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 enqueued.intent_key
             ));
             source_closure_decision = Some(RuntimeSourceClosureDecision::CommittedHandoff);
-            source_closure_reason = Some("goal-continuation-committed".to_string());
+            source_closure_reason = Some(
+                if eligible_shell_drift {
+                    "shell-runtime-drift-continuation-committed"
+                } else {
+                    "goal-continuation-committed"
+                }
+                .to_string(),
+            );
         } else {
             source_closure_decision =
                 Some(if activation.configured_mode == GoalAutonomyMode::Observe {
@@ -1697,14 +1737,18 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 } else {
                     RuntimeSourceClosureDecision::ParkedPolicyDenied
                 });
-            source_closure_reason = Some(
+            source_closure_reason = Some(if shell_recovery_effect_fenced {
+                "shell-recovery-external-effect-fenced".to_string()
+            } else if shell_recovery_budget_exhausted {
+                "shell-recovery-budget-exhausted".to_string()
+            } else {
                 match activation.configured_mode {
                     GoalAutonomyMode::Disabled => "goal-autonomy-disabled",
                     GoalAutonomyMode::Active => "goal-autonomy-lane-denied",
                     GoalAutonomyMode::Observe => "goal-autonomy-observe",
                 }
-                .to_string(),
-            );
+                .to_string()
+            });
             receipt_status = RuntimeRunOnceStatus::NeedsUser;
             receipt_reason = format!(
                 "active goal parked without an automatic child: {}; priorReason={}",
@@ -4016,6 +4060,7 @@ fn maybe_enqueue_server_overloaded_retry_continuation(
             task_family_version: None,
             task_root_queue_id: None,
             disposition_recovery_depth: None,
+            shell_recovery_depth: None,
             replacement_message_text: None,
             continuation_intent_key: None,
             completion_kind: None,
@@ -4098,6 +4143,7 @@ fn maybe_enqueue_tool_timeout_retry_continuation(
             task_family_version: None,
             task_root_queue_id: None,
             disposition_recovery_depth: None,
+            shell_recovery_depth: None,
             replacement_message_text: None,
             continuation_intent_key: None,
             completion_kind: None,
@@ -4195,6 +4241,7 @@ fn maybe_enqueue_polluted_thread_continuation(
             task_family_version: None,
             task_root_queue_id: None,
             disposition_recovery_depth: None,
+            shell_recovery_depth: None,
             replacement_message_text: None,
             continuation_intent_key: None,
             completion_kind: None,
@@ -4295,6 +4342,7 @@ fn maybe_enqueue_stream_unstable_retry_continuation(
             task_family_version: None,
             task_root_queue_id: None,
             disposition_recovery_depth: None,
+            shell_recovery_depth: None,
             replacement_message_text: None,
             continuation_intent_key: None,
             completion_kind: None,
@@ -6579,15 +6627,27 @@ fn active_goal_parked_notice_text(
     activation: &GoalAutonomyActivation,
     safe_checkpoint: Option<&str>,
 ) -> String {
-    let policy = match activation.configured_mode {
-        GoalAutonomyMode::Observe => {
-            "This exact lane is observation-only, so no automatic continuation child was started."
-        }
-        GoalAutonomyMode::Disabled => {
-            "Automatic goal continuation is disabled, so no continuation child was started."
-        }
-        GoalAutonomyMode::Active => {
-            "Automatic goal continuation is not admitted for this exact lane, so no continuation child was started."
+    let policy = if activation
+        .reason
+        .starts_with("shell-recovery-fenced-by-external-effect")
+    {
+        "Automatic shell recovery was fenced because external-effect or mutation evidence requires explicit reconciliation, so no continuation child was started."
+    } else if activation
+        .reason
+        .starts_with("shell-recovery-budget-exhausted")
+    {
+        "The one automatic fresh-runtime shell recovery was already used, so another continuation child was not started."
+    } else {
+        match activation.configured_mode {
+            GoalAutonomyMode::Observe => {
+                "This exact lane is observation-only, so no automatic continuation child was started."
+            }
+            GoalAutonomyMode::Disabled => {
+                "Automatic goal continuation is disabled, so no continuation child was started."
+            }
+            GoalAutonomyMode::Active => {
+                "Automatic goal continuation is not admitted for this exact lane, so no continuation child was started."
+            }
         }
     };
     let mut notice = format!(
@@ -6601,6 +6661,17 @@ fn active_goal_parked_notice_text(
         notice.push_str(&truncate_for_channel(checkpoint, 1_000));
     }
     notice
+}
+
+fn shell_recovery_effect_fence_clear(receipt: &crate::CodexRuntimeRunReceipt) -> bool {
+    receipt.external_effect.is_none()
+        && !matches!(
+            receipt.mutation_evidence,
+            Some(
+                crate::RuntimeMutationEvidenceClass::MutationObserved
+                    | crate::RuntimeMutationEvidenceClass::Unknown
+            )
+        )
 }
 
 fn goal_terminal_outbox_receipts_file(harness_home: &Path) -> PathBuf {
@@ -11334,6 +11405,7 @@ mod tests {
             media_plan: Default::default(),
             context_recovery: None,
             tool_use_timeout: None,
+            shell_execution_failure: None,
             interruption_reason: Some("interrupted_by_new_turn".to_string()),
             interrupted_tool_uses: vec![crate::codex_runtime::CodexInterruptedToolUse {
                 method: "item/started".to_string(),
@@ -13493,6 +13565,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shell_recovery_effect_fence_rejects_mutation_or_ambiguous_evidence() {
+        let mut receipt = polluted_thread_failed_run("queue-shell-fence").receipt;
+        receipt.mutation_evidence = None;
+        assert!(shell_recovery_effect_fence_clear(&receipt));
+        receipt.mutation_evidence = Some(crate::RuntimeMutationEvidenceClass::NoObservableMutation);
+        assert!(shell_recovery_effect_fence_clear(&receipt));
+        receipt.mutation_evidence = Some(crate::RuntimeMutationEvidenceClass::MutationObserved);
+        assert!(!shell_recovery_effect_fence_clear(&receipt));
+        receipt.mutation_evidence = Some(crate::RuntimeMutationEvidenceClass::Unknown);
+        assert!(!shell_recovery_effect_fence_clear(&receipt));
+    }
+
     fn polluted_thread_failed_run(queue_id: &str) -> CodexRuntimeRunReport {
         CodexRuntimeRunReport {
             schema: "agent-harness.codex-runtime-run.v1",
@@ -13535,6 +13620,7 @@ mod tests {
                         .to_string(),
                 }),
                 tool_use_timeout: None,
+                shell_execution_failure: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,
@@ -13607,6 +13693,7 @@ mod tests {
                 media_plan,
                 context_recovery: None,
                 tool_use_timeout: None,
+                shell_execution_failure: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,
@@ -13683,6 +13770,7 @@ mod tests {
                     started_at_ms: Some(1_000),
                     reason: "tool execution exceeded timeout".to_string(),
                 }),
+                shell_execution_failure: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,

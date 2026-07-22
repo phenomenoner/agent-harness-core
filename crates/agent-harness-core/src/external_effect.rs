@@ -1315,6 +1315,7 @@ pub fn ensure_external_effect_continuation(
             task_family_version: None,
             task_root_queue_id: None,
             disposition_recovery_depth: None,
+            shell_recovery_depth: None,
             replacement_message_text: None,
             continuation_intent_key: Some(intent.effect_id.clone()),
             completion_kind: Some("external-effect-continuation".to_string()),
