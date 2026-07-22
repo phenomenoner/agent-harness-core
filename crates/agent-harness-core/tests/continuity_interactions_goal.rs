@@ -37,13 +37,13 @@ use agent_harness_core::runtime_pipeline::{
 };
 use agent_harness_core::{
     AgentSource, ChannelReceiveOptions, ChannelReceiveStatus, ChannelStateLane,
-    PromptAssemblyOptions, RuntimeExecutionReceiptStatus, RuntimeQueueEnqueueOptions,
-    RuntimeQueueLeaseObservationOptions, RuntimeQueueLeaseObservationStatus,
-    RuntimeQueuePrepareOptions, ScopedStopOptions, ScopedStopTarget, TurnPlanInput,
-    build_channel_step, build_source_skill_index, build_turn_plan_for_account,
-    enqueue_channel_step, load_agent_registry, observe_runtime_queue_lease,
-    prepare_runtime_queue_item, receive_channel_message, record_scoped_stop,
-    release_runtime_queue_lease,
+    PromptAssemblyOptions, RuntimeExecutionReceiptStatus, RuntimeMutationEvidenceClass,
+    RuntimeQueueEnqueueOptions, RuntimeQueueLeaseObservationOptions,
+    RuntimeQueueLeaseObservationStatus, RuntimeQueuePrepareOptions, ScopedStopOptions,
+    ScopedStopTarget, TurnPlanInput, build_channel_step, build_source_skill_index,
+    build_turn_plan_for_account, enqueue_channel_step, load_agent_registry,
+    observe_runtime_queue_lease, prepare_runtime_queue_item, receive_channel_message,
+    record_scoped_stop, release_runtime_queue_lease,
 };
 use serde_json::{Value, json};
 
@@ -109,6 +109,88 @@ fn discord_active_goal_observe_replay_parks_visibly_instead_of_silent_success() 
         },
     })
     .unwrap();
+
+    let incident_events = fs::read_to_string(
+        report
+            .run
+            .as_ref()
+            .and_then(|run| run.stdout_log.as_ref())
+            .expect("incident replay stdout log"),
+    )
+    .unwrap()
+    .lines()
+    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    .collect::<Vec<_>>();
+    assert_eq!(
+        incident_events
+            .iter()
+            .filter(|event| {
+                event["method"] == "turn/completed" && event["params"]["turn"]["kind"] == "subAgent"
+            })
+            .count(),
+        2,
+        "the sanitized replay must execute both completed child turns"
+    );
+    assert_eq!(
+        incident_events
+            .iter()
+            .filter(|event| event["params"]["item"]["type"] == "fileChange")
+            .count(),
+        1,
+        "the sanitized replay must execute the parent file change"
+    );
+    let failed_commands = incident_events
+        .iter()
+        .filter(|event| {
+            event["method"] == "item/completed"
+                && event["params"]["item"]["type"] == "commandExecution"
+                && event["params"]["item"]["status"] == "failed"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failed_commands.len(),
+        4,
+        "ordinary, ambiguous, and both process-start failures must be replayed"
+    );
+    assert_eq!(
+        failed_commands
+            .iter()
+            .filter(|event| event["params"]["item"]["exitCode"] == -1)
+            .count(),
+        2,
+        "both repeated process-start failures must be replayed"
+    );
+    let started_failures = failed_commands
+        .iter()
+        .filter(|event| event["params"]["item"]["exitCode"] == 1)
+        .collect::<Vec<_>>();
+    assert_eq!(started_failures.len(), 2);
+    assert_eq!(
+        started_failures
+            .iter()
+            .filter(|event| event["params"]["item"]["aggregatedOutput"] == "")
+            .count(),
+        1,
+        "one process-started failure must preserve ambiguous empty output"
+    );
+    assert_eq!(
+        started_failures
+            .iter()
+            .filter(|event| event["params"]["item"]["aggregatedOutput"] != "")
+            .count(),
+        1,
+        "one process-started failure must preserve an ordinary CLI error"
+    );
+    assert_eq!(
+        fixture["incidentSequence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "command-failed")
+            .count(),
+        failed_commands.len(),
+        "the executable replay must cover every fixture command failure"
+    );
 
     assert_eq!(
         report.receipt.status,
@@ -347,17 +429,55 @@ fn active_goal_policy_matrix_preserves_exact_closure_on_discord_and_telegram() {
 
 #[test]
 fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
-    for (case, prior_depth, mode, shell_drift, expected) in [
-        ("first-recovery", None, "active", true, "shell-child"),
-        ("repeat-drift", Some(1), "active", true, "budget-park"),
+    for (case, prior_depth, mode, shell_drift, fence, expected) in [
+        (
+            "first-recovery",
+            None,
+            "active",
+            true,
+            "none",
+            "shell-child",
+        ),
+        (
+            "repeat-drift",
+            Some(1),
+            "active",
+            true,
+            "none",
+            "budget-park",
+        ),
         (
             "missing-artifact-near-miss",
             None,
             "active",
             false,
+            "none",
             "ordinary-child",
         ),
-        ("observe-drift", None, "observe", true, "policy-park"),
+        (
+            "observe-drift",
+            None,
+            "observe",
+            true,
+            "none",
+            "policy-park",
+        ),
+        (
+            "mutation-fenced",
+            None,
+            "active",
+            true,
+            "mutation",
+            "effect-fence-park",
+        ),
+        (
+            "external-effect-fenced",
+            None,
+            "active",
+            true,
+            "external-effect",
+            "effect-fence-park",
+        ),
     ] {
         let root = temp_root(&format!("active-goal-shell-drift-{case}"));
         let source = write_source(&root);
@@ -399,6 +519,10 @@ fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
         if let Some(depth) = prior_depth {
             set_pending_shell_recovery_depth(&harness_home, &queue_id, depth);
         }
+        let external_effect_id =
+            (fence == "external-effect").then(|| seed_external_effect(&harness_home, &queue_id));
+        let external_effect_transitions =
+            nonempty_lines(&harness_home.join("state/external-effects/transitions.jsonl"));
         let codex_home = root.join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
         fs::write(codex_home.join("auth.json"), "{}").unwrap();
@@ -409,10 +533,22 @@ fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
             "AGENT_HARNESS_POWERSHELL_EXECUTABLE",
             refreshed_shell.into_os_string(),
         );
+        let protocol_failure = match fence {
+            "mutation" => Some("Synthetic failure after a mutation-capable command".to_string()),
+            "external-effect" => Some(format!(
+                "Synthetic failure after external effect effectId={}",
+                external_effect_id.as_deref().unwrap()
+            )),
+            _ => None,
+        };
         let report = run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: harness_home.clone(),
             queue_id: Some(queue_id.clone()),
-            codex_executable: Some(fake_active_goal_shell_case_codex(&root, shell_drift)),
+            codex_executable: Some(fake_active_goal_shell_case_codex(
+                &root,
+                shell_drift,
+                protocol_failure.as_deref(),
+            )),
             timeout_ms: 30_000,
             idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
@@ -457,6 +593,24 @@ fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
         ] {
             assert!(!bounded.contains(forbidden), "{case} leaked {forbidden}");
         }
+        if fence == "mutation" {
+            assert_eq!(
+                report.receipt.mutation_evidence,
+                Some(RuntimeMutationEvidenceClass::MutationObserved),
+                "mutation-capable protocol failure must fence shell recovery"
+            );
+            assert!(report.receipt.external_effect.is_none());
+        } else if fence == "external-effect" {
+            assert_eq!(
+                report
+                    .receipt
+                    .external_effect
+                    .as_ref()
+                    .map(|effect| effect.effect_id.as_str()),
+                external_effect_id.as_deref(),
+                "the referenced durable effect must be carried into the run-once fence"
+            );
+        }
 
         if expected == "shell-child" {
             assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Skipped);
@@ -486,10 +640,10 @@ fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
             assert!(load_outbox(&harness_home).is_empty());
         } else {
             assert_eq!(report.receipt.status, RuntimeRunOnceStatus::NeedsUser);
-            let expected_reason = if expected == "budget-park" {
-                "shell-recovery-budget-exhausted"
-            } else {
-                "goal-autonomy-observe"
+            let expected_reason = match expected {
+                "budget-park" => "shell-recovery-budget-exhausted",
+                "effect-fence-park" => "shell-recovery-external-effect-fenced",
+                _ => "goal-autonomy-observe",
             };
             assert_eq!(
                 report.receipt.source_closure_reason.as_deref(),
@@ -501,10 +655,10 @@ fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
                 .filter(|row| row["sourceQueueId"] == queue_id)
                 .collect::<Vec<_>>();
             assert_eq!(source_outbox.len(), 1);
-            let expected_notice = if expected == "budget-park" {
-                "one automatic fresh-runtime shell recovery"
-            } else {
-                "observation-only"
+            let expected_notice = match expected {
+                "budget-park" => "one automatic fresh-runtime shell recovery",
+                "effect-fence-park" => "external-effect or mutation evidence",
+                _ => "observation-only",
             };
             assert!(
                 source_outbox[0]["text"]
@@ -514,7 +668,11 @@ fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
             let replay = run_runtime_queue_once(RuntimeRunOnceOptions {
                 harness_home: harness_home.clone(),
                 queue_id: Some(queue_id.clone()),
-                codex_executable: Some(fake_active_goal_shell_case_codex(&root, shell_drift)),
+                codex_executable: Some(fake_active_goal_shell_case_codex(
+                    &root,
+                    shell_drift,
+                    protocol_failure.as_deref(),
+                )),
                 timeout_ms: 30_000,
                 idle_timeout_ms: 30_000,
                 prompt_options: PromptAssemblyOptions {
@@ -535,6 +693,20 @@ fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
                 1,
                 "restart must not duplicate the recovery-exhausted park"
             );
+            assert_eq!(
+                nonempty_lines(&harness_home.join("state/external-effects/transitions.jsonl")),
+                external_effect_transitions,
+                "restart must not duplicate an external-effect transition"
+            );
+            if let Some(effect_id) = external_effect_id.as_deref() {
+                assert_eq!(
+                    load_external_effect_intent(&harness_home, effect_id)
+                        .unwrap()
+                        .expect("seeded external effect remains durable")
+                        .state,
+                    ExternalEffectStateV1::ApprovalRequired
+                );
+            }
         }
         let _ = fs::remove_dir_all(root);
     }
@@ -1255,6 +1427,46 @@ fn external_effect_context() -> ExternalEffectRequestContextV1 {
     }
 }
 
+fn seed_external_effect(harness_home: &Path, queue_id: &str) -> String {
+    let pending = pending_queue(harness_home, queue_id);
+    let exact_lane_digest = exact_full_lane_digest(harness_home, queue_id);
+    let source_session_key_digest = external_effect_source_session_key_digest(
+        pending["sessionKey"].as_str().expect("source session key"),
+    )
+    .unwrap();
+    let context = ExternalEffectRequestContextV1 {
+        approval_authority_digest: external_effect_approval_authority_digest(
+            &exact_lane_digest,
+            &source_session_key_digest,
+            "shell-replay-lineage",
+            queue_id,
+        )
+        .unwrap(),
+        exact_lane_digest,
+        logical_lineage_id: "shell-replay-lineage".to_string(),
+        source_queue_id: queue_id.to_string(),
+        source_session_key_digest,
+    };
+    let descriptor = McpElicitationDescriptorV1 {
+        connector: "sanitized-calendar".to_string(),
+        action: "create-bounded-event".to_string(),
+        params_digest: format!("sha256:{}", "4".repeat(64)),
+        action_summary: "create one sanitized bounded event".to_string(),
+        mode: "form".to_string(),
+    };
+    match begin_external_effect_request(
+        harness_home,
+        &context,
+        &descriptor,
+        &ConnectorApprovalPolicyV1::default(),
+    )
+    .unwrap()
+    {
+        ExternalEffectAdmissionV1::NeedsUser { intent, .. } => intent.effect_id,
+        other => panic!("unexpected external-effect admission: {other:?}"),
+    }
+}
+
 fn lane_digest() -> String {
     ChannelStateLane::new("telegram", None, "dm-42", "user-7", "main")
         .unwrap()
@@ -1409,21 +1621,35 @@ fn exact_full_lane_digest(harness_home: &Path, queue_id: &str) -> String {
     .unwrap()
 }
 
-#[cfg(windows)]
 fn fake_active_goal_blocker_codex(root: &Path) -> PathBuf {
-    fake_windows_codex(
-        root,
-        "active-goal-blocker",
-        r#"
-        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular"}}}')
-        [Console]::Out.WriteLine('{"method":"thread/goal/updated","params":{"threadId":"thread-parent","turnId":"turn-parent","goal":{"id":"goal-active","objective":"finish the durable implementation","status":"active","completionCriteria":["T3 replay passes"]}}}')
-        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"threadId":"thread-parent","turnId":"turn-parent","itemId":"parent-blocker","delta":"The goal remains active, but command execution is blocked."}}')
-        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","status":"completed"}}}')
-"#,
-    )
+    let stale = stale_shell_path();
+    let rows = vec![
+        json!({"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular"}}}),
+        json!({"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-child-a","kind":"subAgent","name":"child-review-a","path":["parent","child-review-a"]}}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-child-a","kind":"subAgent","status":"completed"}}}),
+        json!({"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-child-b","kind":"subAgent","name":"child-review-b","path":["parent","child-review-b"]}}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-child-b","kind":"subAgent","status":"completed"}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"fileChange","id":"parent-file-change","status":"completed","changes":[{"path":"sanitized-source.rs","kind":"update"}]}}}),
+        json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"ordinary-failure","command":"Get-Content sanitized-missing-input.json","cwd":root}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"ordinary-failure","status":"failed","exitCode":1,"durationMs":20,"aggregatedOutput":"Get-Content could not find sanitized-missing-input.json"}}}),
+        json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"ambiguous-failure","command":"sanitized-cli inspect","cwd":root}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"ambiguous-failure","status":"failed","exitCode":1,"durationMs":15,"aggregatedOutput":""}}}),
+        json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"process-start-failure-a","command":format!(r#""{stale}" -NoProfile -Command Get-ChildItem"#),"cwd":root}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"process-start-failure-a","status":"failed","exitCode":-1,"durationMs":0,"aggregatedOutput":"process start failed: OS error 3; path not found"}}}),
+        json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"process-start-failure-b","command":format!(r#""{stale}" -NoProfile -Command Get-Location"#),"cwd":root}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"process-start-failure-b","status":"failed","exitCode":-1,"durationMs":0,"aggregatedOutput":"process start failed: OS error 3; path not found"}}}),
+        json!({"method":"thread/goal/updated","params":{"threadId":"thread-parent","turnId":"turn-parent","goal":{"id":"goal-active","objective":"finish the durable implementation","status":"active","completionCriteria":["T3 replay passes"]}}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"agentMessage","id":"parent-blocker","phase":"final_answer","text":"The goal remains active, but command execution is blocked."}}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular","status":"completed"}}}),
+    ];
+    fake_event_codex(root, "active-goal-blocker", &rows)
 }
 
-fn fake_active_goal_shell_case_codex(root: &Path, shell_drift: bool) -> PathBuf {
+fn fake_active_goal_shell_case_codex(
+    root: &Path,
+    shell_drift: bool,
+    protocol_failure: Option<&str>,
+) -> PathBuf {
     let stale = stale_shell_path();
     let (exit_code, duration_ms, output) = if shell_drift {
         (-1, 0, "process start failed: OS error 3; path not found")
@@ -1434,26 +1660,36 @@ fn fake_active_goal_shell_case_codex(root: &Path, shell_drift: bool) -> PathBuf 
             "Get-Content could not find archived-task/missing.json",
         )
     };
-    let rows = [
+    let mut rows = vec![
         json!({"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular"}}}),
         json!({"method":"thread/goal/updated","params":{"threadId":"thread-parent","turnId":"turn-parent","goal":{"id":"goal-active","objective":"finish the durable implementation","status":"active","completionCriteria":["T3 replay passes"]}}}),
         json!({"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-child-a","kind":"subAgent","name":"routing-reader","path":["parent","routing-reader"]}}}),
         json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-child-a","item":{"type":"commandExecution","id":"child-a-command","command":"Get-Content docs/invariants.md"}}}),
         json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-child-a","item":{"type":"commandExecution","id":"child-a-command","status":"completed","exitCode":0,"durationMs":20}}}),
         json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-child-a","item":{"type":"agentMessage","id":"child-a-final","phase":"final_answer","text":"Inspect the routing contract"}}}),
-        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-child-a","status":"completed"}}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-child-a","kind":"subAgent","status":"completed"}}}),
         json!({"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-child-b","kind":"subAgent","name":"lifecycle-reader","path":["parent","lifecycle-reader"]}}}),
         json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-child-b","item":{"type":"commandExecution","id":"child-b-command","command":"Get-Content docs/agent-harness-topology-contract.md"}}}),
         json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-child-b","item":{"type":"commandExecution","id":"child-b-command","status":"completed","exitCode":0,"durationMs":25}}}),
         json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-child-b","item":{"type":"agentMessage","id":"child-b-final","phase":"final_answer","text":"Inspect the lifecycle contract"}}}),
-        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-child-b","status":"completed"}}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-child-b","kind":"subAgent","status":"completed"}}}),
         json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"collabToolCall","id":"parent-wait","toolName":"wait_agent"}}}),
         json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"collabToolCall","id":"parent-wait","toolName":"wait_agent","status":"completed"}}}),
         json!({"method":"item/started","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"shell-drift","command":format!(r#""{stale}" -NoProfile -Command Get-ChildItem"#),"cwd":root}}}),
         json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"commandExecution","id":"shell-drift","status":"failed","exitCode":exit_code,"durationMs":duration_ms,"aggregatedOutput":output}}}),
         json!({"method":"item/completed","params":{"threadId":"thread-parent","turnId":"turn-parent","item":{"type":"agentMessage","id":"parent-blocker","phase":"final_answer","text":"The goal remains active after the shell failed to start."}}}),
-        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","status":"completed"}}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular","status":"completed"}}}),
     ];
+    if let Some(reason) = protocol_failure {
+        rows.insert(
+            rows.len() - 1,
+            json!({"method":"error","params":{"error":{"message":reason,"codexErrorInfo":"other","additionalDetails":null},"willRetry":false,"threadId":"thread-parent","turnId":"turn-parent"}}),
+        );
+    }
+    fake_event_codex(root, "active-goal-shell-drift", &rows)
+}
+
+fn fake_event_codex(root: &Path, name: &str, rows: &[Value]) -> PathBuf {
     #[cfg(windows)]
     {
         let body = rows
@@ -1466,7 +1702,7 @@ fn fake_active_goal_shell_case_codex(root: &Path, shell_drift: bool) -> PathBuf 
             })
             .collect::<Vec<_>>()
             .join("\n");
-        fake_windows_codex(root, "active-goal-shell-drift", &body)
+        fake_windows_codex(root, name, &body)
     }
     #[cfg(not(windows))]
     {
@@ -1480,7 +1716,7 @@ fn fake_active_goal_shell_case_codex(root: &Path, shell_drift: bool) -> PathBuf 
             })
             .collect::<Vec<_>>()
             .join("\n");
-        fake_unix_codex(root, "active-goal-shell-drift", &body)
+        fake_unix_codex(root, name, &body)
     }
 }
 
@@ -1592,20 +1828,6 @@ fn fake_parent_final_codex(root: &Path) -> PathBuf {
         r#"
             printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular"}}}'
             printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-parent","turnId":"turn-parent","itemId":"parent-message","delta":"Fresh queue B completed."}}'
-            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","status":"completed"}}}'
-"#,
-    )
-}
-
-#[cfg(not(windows))]
-fn fake_active_goal_blocker_codex(root: &Path) -> PathBuf {
-    fake_unix_codex(
-        root,
-        "active-goal-blocker",
-        r#"
-            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular"}}}'
-            printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-parent","turnId":"turn-parent","goal":{"id":"goal-active","objective":"finish the durable implementation","status":"active","completionCriteria":["T3 replay passes"]}}}'
-            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-parent","turnId":"turn-parent","itemId":"parent-blocker","delta":"The goal remains active, but command execution is blocked."}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","status":"completed"}}}'
 "#,
     )

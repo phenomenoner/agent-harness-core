@@ -1630,20 +1630,20 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             },
         )?;
     }
-    if goal_transition.schedule_continuation
-        && goal_transition
-            .goal_status
-            .as_deref()
-            .is_some_and(is_goal_status_active)
+    let classified_shell_drift =
+        run.receipt
+            .shell_execution_failure
+            .as_ref()
+            .is_some_and(|failure| {
+                failure.recovery_eligible
+                    && failure.kind == CodexShellExecutionFailureKindV1::AppxExecutableDrift
+            });
+    if goal_transition
+        .goal_status
+        .as_deref()
+        .is_some_and(is_goal_status_active)
+        && (goal_transition.schedule_continuation || classified_shell_drift)
     {
-        let classified_shell_drift =
-            run.receipt
-                .shell_execution_failure
-                .as_ref()
-                .is_some_and(|failure| {
-                    failure.recovery_eligible
-                        && failure.kind == CodexShellExecutionFailureKindV1::AppxExecutableDrift
-                });
         let shell_effect_fence_clear = shell_recovery_effect_fence_clear(&run.receipt);
         let eligible_shell_drift = classified_shell_drift && shell_effect_fence_clear;
         let shell_recovery_effect_fenced = classified_shell_drift && !shell_effect_fence_clear;
