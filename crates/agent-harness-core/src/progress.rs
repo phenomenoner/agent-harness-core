@@ -2820,7 +2820,44 @@ fn final_source_delivery_is_still_pending(
         return Ok(false);
     };
     if expectation == "not-applicable" {
-        return Ok(false);
+        let Some(closure_kind) = receipt.get("sourceClosureKind").and_then(Value::as_str) else {
+            warnings.push(format!(
+                "legacy-closure: runtime receipt for queue {queue_id} predates typed source closure; preserving legacy progress release"
+            ));
+            return Ok(false);
+        };
+        if closure_kind == "committed-handoff" {
+            let link = receipt.get("continuationLink");
+            let committed = link
+                .and_then(|value| value.get("parentQueueId"))
+                .and_then(Value::as_str)
+                == Some(queue_id)
+                && link
+                    .and_then(|value| value.get("childQueueId"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|child| !child.is_empty());
+            if committed {
+                return Ok(false);
+            }
+            warnings.push(format!(
+                "typed committed handoff evidence is incomplete for terminal queue {queue_id}; holding progress"
+            ));
+            return Ok(true);
+        }
+        if closure_kind == "suppressed-exact-owner-mismatch"
+            && receipt.get("terminalDisposition").and_then(Value::as_str)
+                == Some("terminal-suppression")
+            && receipt
+                .get("sourceClosureReason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| !reason.is_empty())
+        {
+            return Ok(false);
+        }
+        warnings.push(format!(
+            "source-final not-applicable has unsupported closure `{closure_kind}` for terminal queue {queue_id}; holding progress"
+        ));
+        return Ok(true);
     }
     let recorded_lane_digest = receipt.get("sourceFinalLaneDigest").and_then(Value::as_str);
     if recorded_lane_digest.is_none() || recorded_lane_digest != expected_lane_digest.as_deref() {
@@ -3874,6 +3911,35 @@ mod tests {
                 serde_json::json!({
                     "queueId": context.queue_id,
                     "status": "completed",
+                })
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_typed_source_closure_receipt(
+        harness_home: &Path,
+        context: &AgentProgressContext,
+        closure_kind: &str,
+        continuation_link: Option<Value>,
+    ) {
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("run-once-receipts.jsonl");
+        fs::create_dir_all(receipts_file.parent().unwrap()).unwrap();
+        fs::write(
+            receipts_file,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "queueId": context.queue_id,
+                    "status": "skipped",
+                    "terminalDisposition": "continuation-handoff",
+                    "sourceFinalExpectation": "not-applicable",
+                    "sourceClosureKind": closure_kind,
+                    "sourceClosureReason": "test-closure",
+                    "continuationLink": continuation_link,
                 })
             ),
         )
@@ -6323,6 +6389,118 @@ mod tests {
             .unwrap()
         );
         assert!(warnings.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_progress_holds_unexplained_new_format_not_applicable() {
+        let root = temp_root("terminal_progress_holds_unexplained_new_format_not_applicable");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        write_typed_source_closure_receipt(&harness_home, &context, "ordinary-final", None);
+        let event = AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::Runtime,
+            "run",
+            "completed",
+            AgentProgressStatus::Completed,
+            3_000,
+        );
+        let mut warnings = Vec::new();
+        assert!(
+            final_source_delivery_is_still_pending(
+                &harness_home,
+                &context.queue_id,
+                &event,
+                &mut warnings,
+            )
+            .unwrap()
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("unsupported closure"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_progress_releases_only_complete_typed_handoff() {
+        let root = temp_root("terminal_progress_releases_only_complete_typed_handoff");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        let event = AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::Runtime,
+            "run",
+            "completed",
+            AgentProgressStatus::Completed,
+            3_000,
+        );
+        write_typed_source_closure_receipt(&harness_home, &context, "committed-handoff", None);
+        let mut warnings = Vec::new();
+        assert!(
+            final_source_delivery_is_still_pending(
+                &harness_home,
+                &context.queue_id,
+                &event,
+                &mut warnings,
+            )
+            .unwrap()
+        );
+        write_typed_source_closure_receipt(
+            &harness_home,
+            &context,
+            "committed-handoff",
+            Some(serde_json::json!({
+                "parentQueueId": context.queue_id,
+                "childQueueId": "child-queue",
+                "continuationIndex": 1,
+            })),
+        );
+        warnings.clear();
+        assert!(
+            !final_source_delivery_is_still_pending(
+                &harness_home,
+                &context.queue_id,
+                &event,
+                &mut warnings,
+            )
+            .unwrap()
+        );
+        assert!(warnings.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_progress_preserves_legacy_not_applicable_release() {
+        let root = temp_root("terminal_progress_preserves_legacy_not_applicable_release");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        write_source_final_expectation(&harness_home, &context, "not-applicable", "not-applicable");
+        let event = AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::Runtime,
+            "run",
+            "completed",
+            AgentProgressStatus::Completed,
+            3_000,
+        );
+        let mut warnings = Vec::new();
+        assert!(
+            !final_source_delivery_is_still_pending(
+                &harness_home,
+                &context.queue_id,
+                &event,
+                &mut warnings,
+            )
+            .unwrap()
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("legacy-closure"))
+        );
         let _ = fs::remove_dir_all(root);
     }
 

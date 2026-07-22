@@ -28542,6 +28542,8 @@ mod tests {
                     suppressed_run_once_reason: None,
                     prepared_execution_terminalization_reason: None,
                     source_final_expectation: None,
+                    source_closure_kind: None,
+                    source_closure_reason: None,
                     final_outbox_disposition: None,
                     canonical_source_queue_id: None,
                     final_delivery_id: None,

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use ring::digest::{SHA256, digest};
 use serde_json::Value;
 
-const FIXTURES: [(&str, &str); 5] = [
+const FIXTURES: [(&str, &str); 6] = [
     (
         "parent-subagent-completion-ownership-replay.json",
         "a0b1db48d61e3663788a646e8ed941e485ddaed220d8d2b4d20e2487b25f5ef6",
@@ -24,6 +24,10 @@ const FIXTURES: [(&str, &str); 5] = [
     (
         "approval-waiting-channel-actions-replay.json",
         "0e03fa3ff5e1abcab0bd6ee0bc2c8d54293b1081fb33581b0b326c2628fd7112",
+    ),
+    (
+        "discord-active-goal-observe-silent-stop-replay.json",
+        "e93849f941790b9201bef3cd4181440d55343f93e8c7b015a65d9d2d2f937308",
     ),
 ];
 
@@ -144,4 +148,17 @@ fn approval_fixture_covers_parked_non_blocking_and_restart_authority() {
             "missing approval replay variant {required}"
         );
     }
+}
+
+#[test]
+fn active_goal_observe_fixture_covers_incident_and_near_miss_controls() {
+    let fixture = read_fixture("discord-active-goal-observe-silent-stop-replay.json");
+    assert_eq!(fixture["source"]["platform"], "discord");
+    assert_eq!(fixture["goalProjection"]["decision"], "continue");
+    assert_eq!(fixture["goalProjection"]["terminal"], false);
+    assert_eq!(fixture["policy"]["configuredMode"], "observe");
+    assert_eq!(fixture["expected"]["observe"]["sourceFinalOutboxCount"], 1);
+    assert_eq!(fixture["expected"]["activeExactLane"]["childQueueCount"], 1);
+    assert_eq!(fixture["nearMiss"]["processStarted"], true);
+    assert_eq!(fixture["nearMiss"]["shellDriftRecoveryAttempts"], 0);
 }

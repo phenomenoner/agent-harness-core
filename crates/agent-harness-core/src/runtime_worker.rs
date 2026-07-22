@@ -54,7 +54,7 @@ const RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA: &str =
     "agent-harness.runtime-queue-lease-observation.v1";
 const RUNTIME_QUEUE_LEASE_RENEWAL_SCHEMA: &str = "agent-harness.runtime-queue-lease-renewal.v1";
 const RUNTIME_QUEUE_STATE_INDEX_SCHEMA: &str = "agent-harness.runtime-queue-state-index.v1";
-const RUNTIME_QUEUE_STATE_INDEX_REVISION: u32 = 5;
+const RUNTIME_QUEUE_STATE_INDEX_REVISION: u32 = 6;
 const RUNTIME_QUEUE_RECEIPT_COMPACTION_SCHEMA: &str =
     "agent-harness.runtime-queue-receipt-compaction.v1";
 const RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA: &str =
@@ -380,6 +380,8 @@ pub(crate) struct RuntimeQueueStateIndexEntry {
     terminal_run_once_ever: bool,
     #[serde(default)]
     suppression_recorded: bool,
+    #[serde(default)]
+    parked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     latest_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4682,6 +4684,11 @@ fn apply_runtime_queue_receipt_to_index(index: &mut RuntimeQueueStateIndex, valu
         .entry(status.to_string())
         .or_default();
     *status_count = status_count.saturating_add(1);
+    if status == "needs-user" {
+        entry.parked = true;
+    } else if !matches!(status, "no-work" | "lease-busy") {
+        entry.parked = false;
+    }
     if is_terminal_run_once_status(status) {
         entry.terminal_run_once_ever = true;
     }
@@ -6939,7 +6946,8 @@ pub(crate) fn parked_run_once_ids_from_index(index: &RuntimeQueueStateIndex) -> 
         .queues
         .iter()
         .filter_map(|(queue_id, entry)| {
-            (entry.latest_status.as_deref() == Some("needs-user")).then_some(queue_id.clone())
+            let parked_without_later_terminal = entry.parked && !entry.terminal_ever;
+            parked_without_later_terminal.then_some(queue_id.clone())
         })
         .collect()
 }
@@ -12681,6 +12689,17 @@ mod tests {
             "parked work must not emit a provider typing indicator"
         );
 
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-run-once.v1",
+                "queueId": parent_queue_id.clone(),
+                "status": "no-work",
+                "reason": "restart observed an already parked item"
+            }),
+        )
+        .unwrap();
+
         let capacity = inspect_runtime_queue_capacity(RuntimeQueueCapacityOptions {
             harness_home: harness_home.clone(),
         })
@@ -12718,7 +12737,12 @@ mod tests {
         let rebuilt = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
         assert_eq!(
             rebuilt.queues[&parent_queue_id].latest_status.as_deref(),
-            Some("needs-user")
+            Some("no-work"),
+            "administrative restart observation remains the latest receipt"
+        );
+        assert!(
+            parked_run_once_ids_from_index(&rebuilt).contains(&parent_queue_id),
+            "administrative no-work must not erase durable parked membership"
         );
         assert_eq!(
             runtime_queue_prior_failure_count_from_index(&rebuilt, &parent_queue_id),

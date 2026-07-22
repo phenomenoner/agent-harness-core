@@ -8,6 +8,7 @@ use agent_harness_core::codex_runtime::{
     CodexRuntimePlanOptions, CodexRuntimeRunOptions, CodexRuntimeRunStatus, plan_codex_runtime,
     run_codex_runtime,
 };
+use agent_harness_core::context_rollover::root_working_session_key;
 use agent_harness_core::external_effect::{
     ConnectorApprovalPolicyV1, ExternalEffectAdmissionV1, ExternalEffectApprovalDecisionV1,
     ExternalEffectRequestContextV1, ExternalEffectStateV1, McpElicitationDescriptorV1,
@@ -24,6 +25,7 @@ use agent_harness_core::goal_lineage::{
     GoalLineageDoctorOptions, GoalProjectionObservationPhaseV1, GoalProjectionTurnRelationV1,
     latest_goal_projection_for_queue, run_goal_lineage_doctor,
 };
+use agent_harness_core::lane::FullLaneKeyV1;
 use agent_harness_core::progress::{
     AgentProgressContext, AgentProgressDeliveryPlanOptions, AgentProgressDeliveryRecordOptions,
     AgentProgressDeliveryStatus, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
@@ -31,15 +33,317 @@ use agent_harness_core::progress::{
 };
 use agent_harness_core::runtime_pipeline::{
     FinalOutboxDispositionV1, RuntimeRunOnceOptions, RuntimeRunOnceStatus,
-    SourceFinalExpectationV1, run_runtime_queue_once,
+    RuntimeSourceClosureKindV1, SourceFinalExpectationV1, run_runtime_queue_once,
 };
 use agent_harness_core::{
     AgentSource, ChannelReceiveOptions, ChannelReceiveStatus, ChannelStateLane,
-    PromptAssemblyOptions, RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions,
-    ScopedStopOptions, ScopedStopTarget, build_source_skill_index, prepare_runtime_queue_item,
-    receive_channel_message, record_scoped_stop, release_runtime_queue_lease,
+    PromptAssemblyOptions, RuntimeExecutionReceiptStatus, RuntimeQueueEnqueueOptions,
+    RuntimeQueueLeaseObservationOptions, RuntimeQueueLeaseObservationStatus,
+    RuntimeQueuePrepareOptions, ScopedStopOptions, ScopedStopTarget, TurnPlanInput,
+    build_channel_step, build_source_skill_index, build_turn_plan_for_account,
+    enqueue_channel_step, load_agent_registry, observe_runtime_queue_lease,
+    prepare_runtime_queue_item, receive_channel_message, record_scoped_stop,
+    release_runtime_queue_lease,
 };
 use serde_json::{Value, json};
+
+#[test]
+fn discord_active_goal_observe_replay_parks_visibly_instead_of_silent_success() {
+    // Contract: I2/I7/I9/I10/I17/I31/I36/I37.
+    // Source: sanitized active-goal silent-stop incident replay.
+    // Fails on: nonterminal Continue + observe mode becoming logical success with no outbox.
+    // Asserts: exactly one visible parent park, no child, and no silent terminal success.
+    let fixture: Value = serde_json::from_slice(
+        &fs::read(fixture_path(
+            "discord-active-goal-observe-silent-stop-replay.json",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fixture["source"]["platform"], "discord");
+    assert_eq!(fixture["policy"]["configuredMode"], "observe");
+    assert_eq!(fixture["incidentSequence"][1]["kind"], "subagent-completed");
+    assert_eq!(fixture["incidentSequence"][2]["kind"], "subagent-completed");
+
+    let root = temp_root("discord-active-goal-observe-replay");
+    let source = write_source(&root);
+    let harness_home = root.join("harness");
+    let skills = build_source_skill_index(&source).unwrap();
+    let receive = receive_channel_message(ChannelReceiveOptions {
+        source,
+        runtime_workspace: None,
+        harness_home: harness_home.clone(),
+        skill_index: skills,
+        platform: fixture["source"]["platform"].as_str().unwrap().to_string(),
+        account_id: fixture["source"]["accountId"]
+            .as_str()
+            .map(ToString::to_string),
+        channel_id: fixture["source"]["channelId"].as_str().unwrap().to_string(),
+        user_id: fixture["source"]["userId"].as_str().unwrap().to_string(),
+        agent_id: Some(fixture["source"]["agentId"].as_str().unwrap().to_string()),
+        session_key: None,
+        message: fixture["source"]["message"].as_str().unwrap().to_string(),
+        inbound_context: None,
+        inbound_media_artifacts: Vec::new(),
+        inbound_event_kind: None,
+        inbound_event_id: None,
+        skill_limit: 3,
+        now_ms: 10_000,
+    })
+    .unwrap();
+    assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+    let queue_id = receive.queue_id.expect("source queue id");
+    let codex_home = root.join("codex-home");
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(codex_home.join("auth.json"), "{}").unwrap();
+    let _codex_home = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+    let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+        harness_home: harness_home.clone(),
+        queue_id: Some(queue_id.clone()),
+        codex_executable: Some(fake_active_goal_blocker_codex(&root)),
+        timeout_ms: 30_000,
+        idle_timeout_ms: 30_000,
+        prompt_options: PromptAssemblyOptions {
+            harness_home: Some(harness_home.clone()),
+            ..PromptAssemblyOptions::default()
+        },
+    })
+    .unwrap();
+
+    assert_eq!(
+        report.receipt.status,
+        RuntimeRunOnceStatus::NeedsUser,
+        "observe-mode nonterminal source work must park instead of terminalizing as success: {:#?}",
+        report.receipt
+    );
+    assert_eq!(
+        report.receipt.terminal_disposition,
+        Some(agent_harness_core::RuntimeTerminalDispositionV1::NeedsUser)
+    );
+    assert_eq!(
+        report.receipt.source_final_expectation,
+        Some(SourceFinalExpectationV1::Required)
+    );
+    assert!(report.receipt.continuation_link.is_none());
+    assert!(report.receipt.child_queue_id.is_none());
+    let source_outbox = load_outbox(&harness_home)
+        .into_iter()
+        .filter(|row| row["sourceQueueId"] == queue_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        source_outbox.len(),
+        1,
+        "park must have exactly one source outbox row"
+    );
+    assert!(
+        source_outbox[0]["text"].as_str().is_some_and(
+            |text| text.contains("observation-only") && text.contains("remains active")
+        ),
+        "parked notice must state the bounded policy reason: {source_outbox:#?}"
+    );
+    let replay = run_runtime_queue_once(RuntimeRunOnceOptions {
+        harness_home: harness_home.clone(),
+        queue_id: Some(queue_id.clone()),
+        codex_executable: Some(fake_active_goal_blocker_codex(&root)),
+        timeout_ms: 30_000,
+        idle_timeout_ms: 30_000,
+        prompt_options: PromptAssemblyOptions {
+            harness_home: Some(harness_home.clone()),
+            ..PromptAssemblyOptions::default()
+        },
+    })
+    .unwrap();
+    assert!(matches!(
+        replay.receipt.status,
+        RuntimeRunOnceStatus::NoWork | RuntimeRunOnceStatus::Suppressed
+    ));
+    assert_eq!(
+        load_outbox(&harness_home)
+            .iter()
+            .filter(|row| row["sourceQueueId"] == queue_id)
+            .count(),
+        1,
+        "restart must not duplicate the parked source outbox"
+    );
+    let released = observe_runtime_queue_lease(RuntimeQueueLeaseObservationOptions {
+        harness_home: harness_home.clone(),
+        queue_id: queue_id.clone(),
+        observed_at_ms: 10_001,
+    });
+    assert_eq!(
+        released.status,
+        RuntimeQueueLeaseObservationStatus::Released,
+        "parked source work must not retain a runtime lease"
+    );
+    let later_source = write_source(&root);
+    let later_registry = load_agent_registry(&later_source).unwrap();
+    let later_skills = build_source_skill_index(&later_source).unwrap();
+    let source_pending = pending_queue(&harness_home, &queue_id);
+    let later_turn = build_turn_plan_for_account(
+        &later_source,
+        &later_registry,
+        &later_skills,
+        TurnPlanInput {
+            harness_home: None,
+            platform: "discord".to_string(),
+            channel_id: "channel-sanitized".to_string(),
+            user_id: "user-sanitized".to_string(),
+            text: "Later same-session FIFO work must remain claimable.".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            requested_agent_id: Some("main".to_string()),
+            session_hint: source_pending["sessionKey"]
+                .as_str()
+                .map(ToString::to_string),
+            skill_limit: 3,
+        },
+        Some("account-sanitized".to_string()),
+    )
+    .unwrap();
+    let later = enqueue_channel_step(
+        &build_channel_step(&later_registry, &later_turn),
+        RuntimeQueueEnqueueOptions {
+            harness_home: harness_home.clone(),
+            runtime_workspace: None,
+            inbound_canonical_id: None,
+            now_ms: 10_001,
+        },
+    )
+    .unwrap();
+    let later_queue_id = later.receipt.queue_id.expect("later queue id");
+    let later_prepare = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+        harness_home: harness_home.clone(),
+        queue_id: None,
+        prompt_options: PromptAssemblyOptions {
+            harness_home: Some(harness_home.clone()),
+            ..PromptAssemblyOptions::default()
+        },
+    })
+    .unwrap();
+    assert_eq!(
+        later_prepare.receipt.status,
+        RuntimeExecutionReceiptStatus::Prepared,
+        "parked goal work must release its lease and leave later FIFO work claimable"
+    );
+    assert_eq!(
+        later_prepare.receipt.queue_id.as_deref(),
+        Some(later_queue_id.as_str()),
+        "FIFO claim must select the later same-session item"
+    );
+    release_runtime_queue_lease(&harness_home, &later_queue_id).unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn active_goal_policy_matrix_preserves_exact_closure_on_discord_and_telegram() {
+    let cases = [
+        ("telegram", "observe", false),
+        ("telegram", "disabled", false),
+        ("discord", "active-wrong-lane", false),
+        ("discord", "active", true),
+    ];
+    for (platform, policy, admits_child) in cases {
+        let root = temp_root(&format!("active-goal-policy-{platform}-{policy}"));
+        let source = write_source(&root);
+        let harness_home = root.join("harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: platform.to_string(),
+            account_id: Some("account-sanitized".to_string()),
+            channel_id: "channel-sanitized".to_string(),
+            user_id: "user-sanitized".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "Continue the durable implementation goal.".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 20_000,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.expect("source queue id");
+        if policy != "observe" {
+            let mode = if policy == "disabled" {
+                "disabled"
+            } else {
+                "active"
+            };
+            let lane_digest = if admits_child {
+                exact_full_lane_digest(&harness_home, &queue_id)
+            } else {
+                "0".repeat(64)
+            };
+            fs::write(
+                harness_home.join("harness-config.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "goalAutonomy": {
+                        "mode": mode,
+                        "activeLaneDigests": [lane_digest]
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _codex_home = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_active_goal_blocker_codex(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        if admits_child {
+            assert_eq!(
+                report.receipt.status,
+                RuntimeRunOnceStatus::Skipped,
+                "{platform}/{policy}"
+            );
+            assert_eq!(
+                report.receipt.source_closure_kind,
+                Some(RuntimeSourceClosureKindV1::CommittedHandoff)
+            );
+            assert!(report.receipt.child_queue_id.is_some());
+            assert!(report.outbound_message.is_none());
+            assert_eq!(load_outbox(&harness_home).len(), 0);
+        } else {
+            assert_eq!(
+                report.receipt.status,
+                RuntimeRunOnceStatus::NeedsUser,
+                "{platform}/{policy}"
+            );
+            assert!(matches!(
+                report.receipt.source_closure_kind,
+                Some(RuntimeSourceClosureKindV1::ParkedObserve)
+                    | Some(RuntimeSourceClosureKindV1::ParkedPolicyDenied)
+            ));
+            assert!(report.receipt.child_queue_id.is_none());
+            assert_eq!(
+                load_outbox(&harness_home)
+                    .iter()
+                    .filter(|row| row["sourceQueueId"] == queue_id)
+                    .count(),
+                1,
+                "{platform}/{policy}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+}
 
 #[test]
 fn child_final_during_stop_is_internal_and_cannot_reopen_closed_goal() {
@@ -861,6 +1165,46 @@ fn write_source(root: &Path) -> AgentSource {
     AgentSource::with_workspace(home, workspace)
 }
 
+fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("continuity-effects")
+        .join(name)
+}
+
+fn exact_full_lane_digest(harness_home: &Path, queue_id: &str) -> String {
+    let pending = pending_queue(harness_home, queue_id);
+    let session_key = pending["sessionKey"].as_str().unwrap();
+    FullLaneKeyV1::new(
+        pending["platform"].as_str().unwrap(),
+        pending["accountId"].as_str().unwrap_or("default"),
+        pending["channelId"].as_str().unwrap(),
+        pending["userId"].as_str().unwrap(),
+        pending["agentId"].as_str().unwrap(),
+        pending["runtimeClass"].as_str().unwrap(),
+        root_working_session_key(session_key),
+        session_key,
+    )
+    .unwrap()
+    .identity_hash()
+    .unwrap()
+}
+
+#[cfg(windows)]
+fn fake_active_goal_blocker_codex(root: &Path) -> PathBuf {
+    fake_windows_codex(
+        root,
+        "active-goal-blocker",
+        r#"
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"thread/goal/updated","params":{"threadId":"thread-parent","turnId":"turn-parent","goal":{"id":"goal-active","objective":"finish the durable implementation","status":"active","completionCriteria":["T3 replay passes"]}}}')
+        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"threadId":"thread-parent","turnId":"turn-parent","itemId":"parent-blocker","delta":"The goal remains active, but command execution is blocked."}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","status":"completed"}}}')
+"#,
+    )
+}
+
 #[cfg(windows)]
 fn fake_parent_final_codex(root: &Path) -> PathBuf {
     fake_windows_codex(
@@ -956,6 +1300,20 @@ fn fake_parent_final_codex(root: &Path) -> PathBuf {
         r#"
             printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular"}}}'
             printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-parent","turnId":"turn-parent","itemId":"parent-message","delta":"Fresh queue B completed."}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","status":"completed"}}}'
+"#,
+    )
+}
+
+#[cfg(not(windows))]
+fn fake_active_goal_blocker_codex(root: &Path) -> PathBuf {
+    fake_unix_codex(
+        root,
+        "active-goal-blocker",
+        r#"
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","kind":"regular"}}}'
+            printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-parent","turnId":"turn-parent","goal":{"id":"goal-active","objective":"finish the durable implementation","status":"active","completionCriteria":["T3 replay passes"]}}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-parent","turnId":"turn-parent","itemId":"parent-blocker","delta":"The goal remains active, but command execution is blocked."}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-parent","turn":{"id":"turn-parent","status":"completed"}}}'
 "#,
     )

@@ -1,0 +1,68 @@
+{
+  "schema": "agent-harness.acceptance-fixture.discord-active-goal-observe-silent-stop-replay.v1",
+  "source": {
+    "platform": "discord",
+    "accountId": "account-sanitized",
+    "channelId": "channel-sanitized",
+    "userId": "user-sanitized",
+    "agentId": "main",
+    "message": "Open a durable goal and complete the requested implementation."
+  },
+  "incidentSequence": [
+    {"seq": 1, "kind": "ingress", "owner": "parent"},
+    {"seq": 2, "kind": "subagent-completed", "owner": "child-a", "writeCount": 0},
+    {"seq": 3, "kind": "subagent-completed", "owner": "child-b", "writeCount": 0},
+    {"seq": 4, "kind": "file-change", "owner": "parent", "failFirst": true},
+    {"seq": 5, "kind": "command-failed", "failureClass": "ordinary-cli-error", "processStarted": true},
+    {"seq": 6, "kind": "command-failed", "failureClass": "ambiguous-empty-output", "processStarted": true},
+    {"seq": 7, "kind": "command-failed", "failureClass": "process-start-path-not-found", "processStarted": false},
+    {"seq": 8, "kind": "command-failed", "failureClass": "process-start-path-not-found", "processStarted": false},
+    {"seq": 9, "kind": "parent-final", "classification": "parent-blocker", "text": "The goal remains active, but command execution is blocked."}
+  ],
+  "goalProjection": {
+    "status": "active",
+    "turnRelation": "current-owned-turn",
+    "sourceFinalEligible": true,
+    "authority": "ready",
+    "decision": "continue",
+    "surface": "progress-only",
+    "scheduleContinuation": true,
+    "terminal": false
+  },
+  "policy": {
+    "configuredMode": "observe",
+    "exactLaneAdmitted": false
+  },
+  "preExistingDurableOutcome": {
+    "continuationIntentCount": 0,
+    "childQueueCount": 0,
+    "sourceFinalOutboxCount": 0,
+    "parkedOutcomeCount": 0
+  },
+  "nearMiss": {
+    "failureClass": "missing-task-input",
+    "processStarted": true,
+    "shellDriftRecoveryAttempts": 0,
+    "requiredOutcome": "visible-ordinary-blocker"
+  },
+  "expected": {
+    "preFixInvalidTuple": {
+      "runStatus": "completed",
+      "terminalDisposition": "logical-success",
+      "sourceFinalExpectation": "not-applicable",
+      "sourceFinalOutboxCount": 0
+    },
+    "observe": {
+      "runStatus": "needs-user",
+      "sourceFinalExpectation": "required",
+      "sourceFinalOutboxCount": 1,
+      "childQueueCount": 0
+    },
+    "activeExactLane": {
+      "terminalDisposition": "continuation-handoff",
+      "sourceFinalExpectation": "not-applicable",
+      "sourceFinalOutboxCount": 0,
+      "childQueueCount": 1
+    }
+  }
+}

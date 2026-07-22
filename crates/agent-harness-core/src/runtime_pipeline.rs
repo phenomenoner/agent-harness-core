@@ -20,9 +20,9 @@ use crate::goal_budget::{
     load_goal_campaign_policy,
 };
 use crate::goal_continuation::{
-    GoalAutonomyMode, acknowledge_goal_continuation_after_lease, commit_goal_continuation_intent,
-    ensure_goal_continuation_enqueued, load_goal_autonomy_activation,
-    reconcile_goal_continuation_intents,
+    GoalAutonomyActivation, GoalAutonomyMode, acknowledge_goal_continuation_after_lease,
+    commit_goal_continuation_intent, ensure_goal_continuation_enqueued,
+    load_goal_autonomy_activation, reconcile_goal_continuation_intents,
 };
 use crate::goal_lineage::{
     GoalLineageDisposition, GoalLineageDoctorOptions, GoalLineageDoctorStatus, GoalProjectionHint,
@@ -274,6 +274,10 @@ pub struct RuntimeRunOnceReceipt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_final_expectation: Option<SourceFinalExpectationV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_closure_kind: Option<RuntimeSourceClosureKindV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_closure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub final_outbox_disposition: Option<FinalOutboxDispositionV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_source_queue_id: Option<String>,
@@ -290,6 +294,68 @@ pub enum SourceFinalExpectationV1 {
     Required,
     ExplicitNonDelivery,
     NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeSourceClosureKindV1 {
+    CommittedHandoff,
+    TerminalGoalSurface,
+    ParkedObserve,
+    ParkedPolicyDenied,
+    OrdinaryFinal,
+    SuppressedExactOwnerMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeSourceClosureDecision {
+    CommittedHandoff,
+    TerminalGoalSurface,
+    ParkedObserve,
+    ParkedPolicyDenied,
+    OrdinaryFinal,
+    SuppressedExactOwnerMismatch,
+}
+
+impl RuntimeSourceClosureDecision {
+    fn kind(self) -> RuntimeSourceClosureKindV1 {
+        match self {
+            Self::CommittedHandoff => RuntimeSourceClosureKindV1::CommittedHandoff,
+            Self::TerminalGoalSurface => RuntimeSourceClosureKindV1::TerminalGoalSurface,
+            Self::ParkedObserve => RuntimeSourceClosureKindV1::ParkedObserve,
+            Self::ParkedPolicyDenied => RuntimeSourceClosureKindV1::ParkedPolicyDenied,
+            Self::OrdinaryFinal => RuntimeSourceClosureKindV1::OrdinaryFinal,
+            Self::SuppressedExactOwnerMismatch => {
+                RuntimeSourceClosureKindV1::SuppressedExactOwnerMismatch
+            }
+        }
+    }
+
+    fn terminal_disposition(self) -> crate::RuntimeTerminalDispositionV1 {
+        match self {
+            Self::CommittedHandoff => crate::RuntimeTerminalDispositionV1::ContinuationHandoff,
+            Self::ParkedObserve | Self::ParkedPolicyDenied => {
+                crate::RuntimeTerminalDispositionV1::NeedsUser
+            }
+            Self::SuppressedExactOwnerMismatch => {
+                crate::RuntimeTerminalDispositionV1::TerminalSuppression
+            }
+            Self::TerminalGoalSurface | Self::OrdinaryFinal => {
+                crate::RuntimeTerminalDispositionV1::LogicalSuccess
+            }
+        }
+    }
+
+    fn source_final_expectation(self) -> SourceFinalExpectationV1 {
+        match self {
+            Self::CommittedHandoff => SourceFinalExpectationV1::NotApplicable,
+            Self::SuppressedExactOwnerMismatch => SourceFinalExpectationV1::ExplicitNonDelivery,
+            Self::TerminalGoalSurface
+            | Self::ParkedObserve
+            | Self::ParkedPolicyDenied
+            | Self::OrdinaryFinal => SourceFinalExpectationV1::Required,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -764,6 +830,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             suppressed_run_once_reason: None,
             prepared_execution_terminalization_reason: None,
             source_final_expectation: Some(SourceFinalExpectationV1::NotApplicable),
+            source_closure_kind: None,
+            source_closure_reason: None,
             final_outbox_disposition: Some(FinalOutboxDispositionV1::NotApplicable),
             canonical_source_queue_id: None,
             final_delivery_id: None,
@@ -833,6 +901,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             suppressed_run_once_reason: prepare.receipt.suppressed_run_once_reason.clone(),
             prepared_execution_terminalization_reason: None,
             source_final_expectation: Some(SourceFinalExpectationV1::NotApplicable),
+            source_closure_kind: None,
+            source_closure_reason: None,
             final_outbox_disposition: Some(FinalOutboxDispositionV1::NotApplicable),
             canonical_source_queue_id: None,
             final_delivery_id: None,
@@ -954,6 +1024,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 suppressed_run_once_reason: Some("terminal-control-present".to_string()),
                 prepared_execution_terminalization_reason: None,
                 source_final_expectation: Some(SourceFinalExpectationV1::NotApplicable),
+                source_closure_kind: None,
+                source_closure_reason: None,
                 final_outbox_disposition: Some(FinalOutboxDispositionV1::NotApplicable),
                 canonical_source_queue_id: None,
                 final_delivery_id: None,
@@ -1056,6 +1128,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             suppressed_run_once_reason: None,
             prepared_execution_terminalization_reason: terminalization_reason.clone(),
             source_final_expectation: Some(SourceFinalExpectationV1::NotApplicable),
+            source_closure_kind: None,
+            source_closure_reason: None,
             final_outbox_disposition: Some(FinalOutboxDispositionV1::NotApplicable),
             canonical_source_queue_id: None,
             final_delivery_id: None,
@@ -1262,6 +1336,9 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     let mut stale_session_explicit_non_delivery = false;
     let mut child_queue_id = None;
     let mut child_session_key = None;
+    let mut source_closure_decision = None;
+    let mut source_closure_reason = None;
+    let mut parked_goal_activation = None;
     let goal_authority = establish_runtime_goal_authority_before_outbox(
         &options.harness_home,
         prepare.item.as_ref(),
@@ -1611,6 +1688,29 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 "goal continuation intent {} enqueued one logical child before final-outbox selection",
                 enqueued.intent_key
             ));
+            source_closure_decision = Some(RuntimeSourceClosureDecision::CommittedHandoff);
+            source_closure_reason = Some("goal-continuation-committed".to_string());
+        } else {
+            source_closure_decision =
+                Some(if activation.configured_mode == GoalAutonomyMode::Observe {
+                    RuntimeSourceClosureDecision::ParkedObserve
+                } else {
+                    RuntimeSourceClosureDecision::ParkedPolicyDenied
+                });
+            source_closure_reason = Some(
+                match activation.configured_mode {
+                    GoalAutonomyMode::Disabled => "goal-autonomy-disabled",
+                    GoalAutonomyMode::Active => "goal-autonomy-lane-denied",
+                    GoalAutonomyMode::Observe => "goal-autonomy-observe",
+                }
+                .to_string(),
+            );
+            receipt_status = RuntimeRunOnceStatus::NeedsUser;
+            receipt_reason = format!(
+                "active goal parked without an automatic child: {}; priorReason={}",
+                activation.reason, receipt_reason
+            );
+            parked_goal_activation = Some(activation);
         }
     }
     if child_queue_id.is_none()
@@ -1681,7 +1781,98 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             enqueued.intent_key
         ));
     }
-    if goal_transition.surface == GoalTransitionSurface::TerminalNotice
+    if let Some(activation) = parked_goal_activation.as_ref() {
+        if let Some(context) = channel_context {
+            let agent_id = prepare
+                .item
+                .as_ref()
+                .map(|item| item.agent_id.as_str())
+                .or_else(|| plan.plan.as_ref().and_then(|plan| plan.agent_id.as_deref()));
+            let run_session_key = prepare
+                .item
+                .as_ref()
+                .map(|item| item.session_key.as_str())
+                .or_else(|| plan.plan.as_ref().map(|plan| plan.session_key.as_str()));
+            if !final_outbox_run_owns_channel_parent(
+                prepare.receipt.runtime_class.as_deref(),
+                prepare.receipt.origin.as_deref(),
+                agent_id,
+                run_session_key,
+                &context.session_key,
+            ) {
+                warnings.push(
+                    "active-goal parked notice suppressed because this run does not own the exact channel parent"
+                        .to_string(),
+                );
+            } else if !channel_session_is_current(&options.harness_home, &context, &mut warnings)? {
+                warnings.push(
+                    "active-goal parked notice held because the exact channel session is stale"
+                        .to_string(),
+                );
+            } else {
+                let safe_checkpoint = match run.receipt.transcript_file.as_ref() {
+                    Some(transcript_file) => latest_assistant_response(
+                        transcript_file,
+                        &AssistantNarrationConfig::default(),
+                    )?
+                    .and_then(|response| {
+                        let input_kind = final_outbox_input_kind_for_completed_response(
+                            prepare.receipt.runtime_class.as_deref(),
+                            prepare.receipt.origin.as_deref(),
+                            agent_id,
+                            run_session_key,
+                            &context.session_key,
+                            response.prior_user_text.as_deref(),
+                            &response.final_text,
+                        );
+                        final_outbox_decision(input_kind)
+                            .may_write_final_outbox()
+                            .then_some(response.final_text)
+                    }),
+                    None => None,
+                };
+                let mut message = ChannelOutboundMessage {
+                    platform: context.platform.clone(),
+                    account_id: context.account_id.clone(),
+                    channel_id: context.channel_id.clone(),
+                    user_id: context.user_id.clone(),
+                    session_key: context.session_key.clone(),
+                    delivery_id: None,
+                    kind: ChannelOutboundMessageKind::AgentReply,
+                    source_queue_id: run.receipt.queue_id.clone(),
+                    source_completion_file: run.receipt.completion_file.clone(),
+                    presentation: None,
+                    text: active_goal_parked_notice_text(activation, safe_checkpoint.as_deref()),
+                    delivery_intent: delivery_intent_from_inbound_context(
+                        &context.platform,
+                        &context.channel_id,
+                        context.inbound_context.as_deref(),
+                    ),
+                    attachments: Vec::new(),
+                };
+                let outcome = append_final_outbound_message_once(
+                    &options.harness_home,
+                    run.receipt.execution_dir.as_deref(),
+                    run.receipt.completion_file.as_deref(),
+                    &mut message,
+                    &mut warnings,
+                )?;
+                let appended = outcome.appended();
+                outbox_file = Some(outcome.outbox_file.clone());
+                final_outbox_disposition = outcome.disposition;
+                canonical_source_queue_id = outcome.canonical_source_queue_id;
+                final_delivery_id = outcome.delivery_id;
+                if appended {
+                    outbound_message = Some(message);
+                }
+            }
+        } else {
+            warnings.push(
+                "queue channel context was unavailable; active-goal parked notice was not written"
+                    .to_string(),
+            );
+        }
+    } else if goal_transition.surface == GoalTransitionSurface::TerminalNotice
         && goal_transition.campaign_family_id.is_some()
     {
         if let Some(context) = channel_context {
@@ -1908,6 +2099,12 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                     source_final_expectation: Some(
                                         SourceFinalExpectationV1::ExplicitNonDelivery,
                                     ),
+                                    source_closure_kind: Some(
+                                        RuntimeSourceClosureKindV1::SuppressedExactOwnerMismatch,
+                                    ),
+                                    source_closure_reason: Some(
+                                        "completed-response-not-parent-final".to_string(),
+                                    ),
                                     final_outbox_disposition: Some(
                                         FinalOutboxDispositionV1::ExplicitNonDelivery,
                                     ),
@@ -2086,6 +2283,12 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 prepared_execution_terminalization_reason: None,
                                 source_final_expectation: Some(
                                     SourceFinalExpectationV1::ExplicitNonDelivery,
+                                ),
+                                source_closure_kind: Some(
+                                    RuntimeSourceClosureKindV1::SuppressedExactOwnerMismatch,
+                                ),
+                                source_closure_reason: Some(
+                                    "failure-response-not-parent-final".to_string(),
                                 ),
                                 final_outbox_disposition: Some(
                                     FinalOutboxDispositionV1::ExplicitNonDelivery,
@@ -2266,6 +2469,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 suppressed_run_once_reason: None,
                 prepared_execution_terminalization_reason: None,
                 source_final_expectation: Some(SourceFinalExpectationV1::ExplicitNonDelivery),
+                source_closure_kind: Some(RuntimeSourceClosureKindV1::SuppressedExactOwnerMismatch),
+                source_closure_reason: Some("stale-exact-session".to_string()),
                 final_outbox_disposition: Some(FinalOutboxDispositionV1::ExplicitNonDelivery),
                 canonical_source_queue_id: None,
                 final_delivery_id: None,
@@ -2429,8 +2634,58 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     }),
                 virtual_lane_digest: None,
             });
-    let terminal_disposition = if continuation_link.is_some() {
-        Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff)
+    if source_closure_decision.is_none() && continuation_link.is_some() {
+        source_closure_decision = Some(RuntimeSourceClosureDecision::CommittedHandoff);
+        source_closure_reason = Some("deterministic-continuation-committed".to_string());
+    }
+    if stale_session_explicit_non_delivery {
+        source_closure_decision = Some(RuntimeSourceClosureDecision::SuppressedExactOwnerMismatch);
+        source_closure_reason = Some("stale-exact-session".to_string());
+    }
+    if source_closure_decision.is_none() {
+        source_closure_decision = match goal_transition.surface {
+            GoalTransitionSurface::TerminalNotice | GoalTransitionSurface::CampaignFinal => {
+                Some(RuntimeSourceClosureDecision::TerminalGoalSurface)
+            }
+            GoalTransitionSurface::OrdinaryFinal => {
+                Some(RuntimeSourceClosureDecision::OrdinaryFinal)
+            }
+            GoalTransitionSurface::FailureNotice => {
+                Some(RuntimeSourceClosureDecision::TerminalGoalSurface)
+            }
+            GoalTransitionSurface::SuppressStale => {
+                Some(RuntimeSourceClosureDecision::SuppressedExactOwnerMismatch)
+            }
+            GoalTransitionSurface::ProgressOnly => None,
+        };
+        if source_closure_decision.is_some() {
+            source_closure_reason = Some(
+                match goal_transition.surface {
+                    GoalTransitionSurface::TerminalNotice
+                    | GoalTransitionSurface::CampaignFinal => "terminal-goal-surface",
+                    GoalTransitionSurface::OrdinaryFinal => "ordinary-final",
+                    GoalTransitionSurface::FailureNotice => "failure-notice",
+                    GoalTransitionSurface::SuppressStale => "suppressed-stale-owner",
+                    GoalTransitionSurface::ProgressOnly => unreachable!(),
+                }
+                .to_string(),
+            );
+        }
+    }
+    if goal_transition.schedule_continuation
+        && goal_transition
+            .goal_status
+            .as_deref()
+            .is_some_and(is_goal_status_active)
+        && source_closure_decision.is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "active nonterminal goal has no committed continuation or visible parked outcome",
+        ));
+    }
+    let terminal_disposition = if let Some(decision) = source_closure_decision {
+        Some(decision.terminal_disposition())
     } else {
         match receipt_status {
             RuntimeRunOnceStatus::Completed => {
@@ -2460,22 +2715,23 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     let source_final_expectation = if stale_session_explicit_non_delivery {
         final_outbox_disposition = FinalOutboxDispositionV1::ExplicitNonDelivery;
         SourceFinalExpectationV1::ExplicitNonDelivery
-    } else if receipt_status == RuntimeRunOnceStatus::Completed
-        && matches!(
-            goal_transition.surface,
-            GoalTransitionSurface::CampaignFinal | GoalTransitionSurface::OrdinaryFinal
-        )
-    {
-        if matches!(
-            final_outbox_disposition,
-            FinalOutboxDispositionV1::Appended
-                | FinalOutboxDispositionV1::AlreadyPresent
-                | FinalOutboxDispositionV1::ReusedCanonicalCampaign
-        ) {
-            SourceFinalExpectationV1::Required
-        } else {
-            final_outbox_disposition = FinalOutboxDispositionV1::ExplicitNonDelivery;
-            SourceFinalExpectationV1::ExplicitNonDelivery
+    } else if let Some(decision) = source_closure_decision {
+        match decision {
+            RuntimeSourceClosureDecision::TerminalGoalSurface
+            | RuntimeSourceClosureDecision::OrdinaryFinal => {
+                if matches!(
+                    final_outbox_disposition,
+                    FinalOutboxDispositionV1::Appended
+                        | FinalOutboxDispositionV1::AlreadyPresent
+                        | FinalOutboxDispositionV1::ReusedCanonicalCampaign
+                ) {
+                    SourceFinalExpectationV1::Required
+                } else {
+                    final_outbox_disposition = FinalOutboxDispositionV1::ExplicitNonDelivery;
+                    SourceFinalExpectationV1::ExplicitNonDelivery
+                }
+            }
+            _ => decision.source_final_expectation(),
         }
     } else {
         SourceFinalExpectationV1::NotApplicable
@@ -2518,6 +2774,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         suppressed_run_once_reason: None,
         prepared_execution_terminalization_reason: None,
         source_final_expectation: Some(source_final_expectation),
+        source_closure_kind: source_closure_decision.map(RuntimeSourceClosureDecision::kind),
+        source_closure_reason,
         final_outbox_disposition: Some(final_outbox_disposition),
         canonical_source_queue_id,
         final_delivery_id,
@@ -6317,6 +6575,34 @@ fn goal_terminal_notice_text(decision: GoalTransitionDecision) -> Option<&'stati
     }
 }
 
+fn active_goal_parked_notice_text(
+    activation: &GoalAutonomyActivation,
+    safe_checkpoint: Option<&str>,
+) -> String {
+    let policy = match activation.configured_mode {
+        GoalAutonomyMode::Observe => {
+            "This exact lane is observation-only, so no automatic continuation child was started."
+        }
+        GoalAutonomyMode::Disabled => {
+            "Automatic goal continuation is disabled, so no continuation child was started."
+        }
+        GoalAutonomyMode::Active => {
+            "Automatic goal continuation is not admitted for this exact lane, so no continuation child was started."
+        }
+    };
+    let mut notice = format!(
+        "The goal remains active and is parked safely. {policy} Resume it manually or authorize a reviewed exact-lane cohort."
+    );
+    if let Some(checkpoint) = safe_checkpoint
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        notice.push_str("\n\nLatest parent checkpoint:\n");
+        notice.push_str(&truncate_for_channel(checkpoint, 1_000));
+    }
+    notice
+}
+
 fn goal_terminal_outbox_receipts_file(harness_home: &Path) -> PathBuf {
     harness_home
         .join("state")
@@ -7469,6 +7755,53 @@ mod tests {
     }
 
     #[test]
+    fn runtime_source_closure_decisions_have_one_consistent_terminal_contract() {
+        let cases = [
+            (
+                RuntimeSourceClosureDecision::CommittedHandoff,
+                RuntimeSourceClosureKindV1::CommittedHandoff,
+                crate::RuntimeTerminalDispositionV1::ContinuationHandoff,
+                SourceFinalExpectationV1::NotApplicable,
+            ),
+            (
+                RuntimeSourceClosureDecision::TerminalGoalSurface,
+                RuntimeSourceClosureKindV1::TerminalGoalSurface,
+                crate::RuntimeTerminalDispositionV1::LogicalSuccess,
+                SourceFinalExpectationV1::Required,
+            ),
+            (
+                RuntimeSourceClosureDecision::ParkedObserve,
+                RuntimeSourceClosureKindV1::ParkedObserve,
+                crate::RuntimeTerminalDispositionV1::NeedsUser,
+                SourceFinalExpectationV1::Required,
+            ),
+            (
+                RuntimeSourceClosureDecision::ParkedPolicyDenied,
+                RuntimeSourceClosureKindV1::ParkedPolicyDenied,
+                crate::RuntimeTerminalDispositionV1::NeedsUser,
+                SourceFinalExpectationV1::Required,
+            ),
+            (
+                RuntimeSourceClosureDecision::OrdinaryFinal,
+                RuntimeSourceClosureKindV1::OrdinaryFinal,
+                crate::RuntimeTerminalDispositionV1::LogicalSuccess,
+                SourceFinalExpectationV1::Required,
+            ),
+            (
+                RuntimeSourceClosureDecision::SuppressedExactOwnerMismatch,
+                RuntimeSourceClosureKindV1::SuppressedExactOwnerMismatch,
+                crate::RuntimeTerminalDispositionV1::TerminalSuppression,
+                SourceFinalExpectationV1::ExplicitNonDelivery,
+            ),
+        ];
+        for (decision, kind, disposition, expectation) in cases {
+            assert_eq!(decision.kind(), kind);
+            assert_eq!(decision.terminal_disposition(), disposition);
+            assert_eq!(decision.source_final_expectation(), expectation);
+        }
+    }
+
+    #[test]
     fn active_goal_completed_slice_is_transitioned_before_final_outbox() {
         let _guard = env_lock();
         let root = temp_root("active-goal-pre-outbox-transition");
@@ -7512,13 +7845,28 @@ mod tests {
             },
         })
         .unwrap();
-        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::NeedsUser);
         assert_eq!(
             report.run.as_ref().unwrap().receipt.status,
             CodexRuntimeRunStatus::Completed
         );
-        assert!(report.outbound_message.is_none());
-        assert!(report.outbox_file.is_none());
+        assert!(report.outbound_message.as_ref().is_some_and(|message| {
+            message.text.contains("remains active") && message.text.contains("observation-only")
+        }));
+        assert!(report.outbox_file.is_some());
+        assert_eq!(
+            report.receipt.terminal_disposition,
+            Some(crate::RuntimeTerminalDispositionV1::NeedsUser)
+        );
+        assert_eq!(
+            report.receipt.source_final_expectation,
+            Some(SourceFinalExpectationV1::Required)
+        );
+        assert_eq!(
+            report.receipt.source_closure_kind,
+            Some(RuntimeSourceClosureKindV1::ParkedObserve)
+        );
+        assert!(report.receipt.continuation_link.is_none());
         let transitions = fs::read_to_string(
             crate::goal_transition::goal_transition_receipts_file(&harness_home),
         )
@@ -7628,7 +7976,7 @@ mod tests {
             GoalTransitionSurface::SuppressStale
         );
         assert!(!late_transition.allow_campaign_final);
-        assert!(report.outbox_file.is_none());
+        assert!(report.outbox_file.is_some());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7912,6 +8260,18 @@ mod tests {
         .unwrap();
         assert_eq!(first.receipt.status, RuntimeRunOnceStatus::Skipped);
         assert!(first.outbox_file.is_none());
+        assert_eq!(
+            first.receipt.terminal_disposition,
+            Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff)
+        );
+        assert_eq!(
+            first.receipt.source_final_expectation,
+            Some(SourceFinalExpectationV1::NotApplicable)
+        );
+        assert_eq!(
+            first.receipt.source_closure_kind,
+            Some(RuntimeSourceClosureKindV1::CommittedHandoff)
+        );
         let first_child = first.receipt.child_queue_id.clone().unwrap();
         assert_eq!(
             first.receipt.child_session_key.as_deref(),

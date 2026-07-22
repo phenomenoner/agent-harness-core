@@ -64,7 +64,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I2",
-            statement: "every logical turn lineage has exactly one delivery, explicit error notification, needs-user surface, or dead-letter notification; a continuation handoff is not a completed final",
+            statement: "every accepted source-owned terminal turn resolves to exactly one typed source closure: delivery, explicit typed non-delivery or error, committed continuation, or visible needs-user park; a nonterminal goal cannot become logical success without handoff or visible closure",
             owner: "runtime_pipeline/channel_delivery",
         },
         InvariantEntry {
@@ -139,7 +139,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I17",
-            statement: "durable control artifacts are authoritative before ingress admission, runtime execution, retry or continuation, progress delivery, restart consumption, and notification; transition holds, parked waits, expiry, stop, skip, and quarantine are checked before acting and every suppression, settlement, or replay is idempotently receipted",
+            statement: "durable control artifacts are authoritative before ingress admission, runtime execution, retry or continuation, progress delivery, restart consumption, and notification; transition holds, parked waits, expiry, stop, skip, and quarantine are checked before acting, administrative no-work or lease-busy cannot erase a durable park, and every suppression, settlement, or replay is idempotently receipted",
             owner: "channel_ingress/channel_session_transition/runtime_worker/runtime_pipeline/runtime_queue/progress/channel_runtime/task_transition/external_effect/dream_director/cron_scheduler/deterministic_cron",
         },
         InvariantEntry {
@@ -239,7 +239,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I37",
-            statement: "every goal, ordinary task, bounded-yield completion, and needs-user wait passes typed transition authority before final or progress selection; each terminal receipt states its source-final expectation and outbox disposition, parked approval is lease-free, and continuations commit before enqueue then acknowledge only after child lease ownership",
+            statement: "every goal, ordinary task, bounded-yield completion, and needs-user wait passes typed transition authority before final or progress selection; each applicable terminal receipt states one source-closure kind and reason with derived source-final expectation and outbox disposition, policy-denied goals park visibly and lease-free, and continuations commit before parent suppression then acknowledge only after child lease ownership",
             owner: "goal_transition/task_transition/goal_continuation/runtime_pipeline/context_rollover/runtime_worker/progress/external_effect",
         },
         InvariantEntry {
@@ -255,7 +255,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.runtime-run-once.v1",
             owner_module: "runtime_pipeline",
-            compatibility: "append-only JSONL, additive fields and statuses only in v1 including terminalDisposition, continuationLink, retrySchedule, taskDrainEvaluation, externalEffect, nonterminal auth-deferred, and deterministic eventKey retry-pending wakes; active retry sequences remain hot through compaction while terminal summaries use nullable cold-history disposition columns",
+            compatibility: "append-only JSONL, additive fields and statuses only in v1 including sourceClosureKind/sourceClosureReason, terminalDisposition, sourceFinalExpectation, finalOutboxDisposition, continuationLink, retrySchedule, taskDrainEvaluation, externalEffect, nonterminal auth-deferred, and deterministic eventKey retry-pending wakes; active retry sequences remain hot through compaction while terminal summaries use nullable cold-history disposition columns",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.ledger-maintenance.v1",
