@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -13,7 +14,7 @@ use crate::{
         inspect_codex_sandbox_policy,
     },
     collect_worker_status,
-    config::{HarnessConfigValidationStatus, validate_harness_config},
+    config::{HarnessConfigValidationStatus, harness_config_candidates, validate_harness_config},
     logging::current_log_time_ms,
     loop_health::{process_alive_for_pid, read_supervisor_stop_file},
     probe_harness_log_writable,
@@ -860,44 +861,361 @@ fn check_codex_launch_probe(harness_home: &Path, checks: &mut Vec<ActivationRead
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisorReadinessMode {
+    ReconcileManaged,
+    ScheduledTask,
+}
+
+fn configured_loop_enabled(supervisor: &Value, key: &str, all: bool) -> bool {
+    supervisor
+        .get(key)
+        .and_then(|value| value.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(all)
+}
+
+fn supervisor_loop_service_kind(service_id: &str) -> &'static str {
+    match service_id {
+        "runtime-loop" => "runtime",
+        "worker-loop" => "worker",
+        "cron-scheduler-loop" => "cron",
+        "progress-delivery-loop" => "progress-delivery",
+        "ledger-maintenance-loop" => "ledger-maintenance",
+        "telegram-loop" => "telegram-ingress",
+        "discord-outbox-loop" => "final-outbox",
+        "discord-gateway-loop" => "discord-gateway",
+        service_id if service_id.starts_with("telegram-loop") => "telegram-ingress",
+        _ => "loop",
+    }
+}
+
+fn supervisor_service_id_suffix(value: &str) -> String {
+    let mut suffix = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while suffix.contains("--") {
+        suffix = suffix.replace("--", "-");
+    }
+    suffix.trim_matches('-').to_string()
+}
+
+fn reconcile_managed_expected_services(config: &Value) -> io::Result<BTreeMap<String, String>> {
+    let supervisor = config.get("supervisor").unwrap_or(&Value::Null);
+    let all = supervisor
+        .get("manageAllLoops")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut expected = BTreeMap::new();
+
+    if let Some(raw_services) = supervisor.get("services") {
+        let services = serde_json::from_value::<
+            Vec<crate::supervisor_inventory::SupervisorInventoryServiceConfig>,
+        >(raw_services.clone())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        for service in services {
+            if service.enabled {
+                expected.insert(service.service_id, service.service_kind);
+            }
+        }
+    }
+
+    let mut insert_default = |service_id: &str| {
+        expected.insert(
+            service_id.to_string(),
+            supervisor_loop_service_kind(service_id).to_string(),
+        );
+    };
+    for (key, service_id) in [
+        ("runtimeLoop", "runtime-loop"),
+        ("workerLoop", "worker-loop"),
+    ] {
+        if configured_loop_enabled(supervisor, key, all) {
+            insert_default(service_id);
+        }
+    }
+    let cron_enabled = supervisor
+        .get("cronSchedulerLoop")
+        .and_then(|value| value.get("enabled"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            config
+                .get("cronScheduler")
+                .and_then(|value| value.get("enabled"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(all);
+    if cron_enabled {
+        insert_default("cron-scheduler-loop");
+    }
+    for (key, service_id) in [
+        ("progressDeliveryLoop", "progress-delivery-loop"),
+        ("ledgerMaintenanceLoop", "ledger-maintenance-loop"),
+        ("telegramLoop", "telegram-loop"),
+    ] {
+        if configured_loop_enabled(supervisor, key, all) {
+            insert_default(service_id);
+        }
+    }
+    if let Some(telegram_loops) = supervisor.get("telegramLoops").and_then(Value::as_array) {
+        for entry in telegram_loops {
+            if !entry
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let service_id = entry
+                .get("serviceId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| {
+                    entry
+                        .get("account")
+                        .or_else(|| entry.get("telegramAccount"))
+                        .and_then(Value::as_str)
+                        .map(supervisor_service_id_suffix)
+                        .map(|suffix| format!("telegram-loop-{suffix}"))
+                })
+                .unwrap_or_else(|| "telegram-loop".to_string());
+            insert_default(&service_id);
+        }
+    }
+    for (key, service_id) in [
+        ("discordOutboxLoop", "discord-outbox-loop"),
+        ("discordGatewayLoop", "discord-gateway-loop"),
+    ] {
+        if configured_loop_enabled(supervisor, key, all) {
+            insert_default(service_id);
+        }
+    }
+    Ok(expected)
+}
+
+fn supervisor_readiness_mode(
+    harness_home: &Path,
+) -> io::Result<(SupervisorReadinessMode, BTreeMap<String, String>)> {
+    let Some(config_file) = harness_config_candidates(harness_home)
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
+        return Ok((SupervisorReadinessMode::ScheduledTask, BTreeMap::new()));
+    };
+    let config = read_json_value(&config_file)?;
+    let supervisor = config.get("supervisor");
+    let manage_all_loops = supervisor
+        .and_then(|value| value.get("manageAllLoops"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(if manage_all_loops {
+        (
+            SupervisorReadinessMode::ReconcileManaged,
+            reconcile_managed_expected_services(&config)?,
+        )
+    } else {
+        (SupervisorReadinessMode::ScheduledTask, BTreeMap::new())
+    })
+}
+
+fn check_reconcile_managed_supervisor(
+    harness_home: &Path,
+    expected_services: &BTreeMap<String, String>,
+    checks: &mut Vec<ActivationReadinessCheck>,
+) {
+    let services_dir = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("services");
+    let entries = match fs::read_dir(&services_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            checks.push(warn(
+                "supervisor-plan",
+                format!(
+                    "reconcile-managed supervisor has no desired-service inventory at {}",
+                    services_dir.display()
+                ),
+            ));
+            return;
+        }
+        Err(error) => {
+            checks.push(warn(
+                "supervisor-plan",
+                format!(
+                    "could not inspect reconcile-managed supervisor inventory {}: {error}",
+                    services_dir.display()
+                ),
+            ));
+            return;
+        }
+    };
+
+    let mut services = BTreeMap::new();
+    let mut invalid = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                invalid.push(format!("directory entry could not be read: {error}"));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let value = match read_json_value(&path) {
+            Ok(value) => value,
+            Err(error) => {
+                invalid.push(format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        let service_id = value
+            .get("serviceId")
+            .and_then(Value::as_str)
+            .filter(|service_id| !service_id.is_empty());
+        let service_kind = value
+            .get("serviceKind")
+            .and_then(Value::as_str)
+            .filter(|service_kind| !service_kind.is_empty());
+        let expected_file_name = service_id.map(|service_id| format!("{service_id}.json"));
+        let valid = value.get("schema").and_then(Value::as_str)
+            == Some("agent-harness.supervisor-service-state.v1")
+            && expected_file_name.as_deref() == path.file_name().and_then(|name| name.to_str())
+            && service_kind.is_some()
+            && value.get("desiredState").and_then(Value::as_str) == Some("running")
+            && value.get("launchOwner").and_then(Value::as_str) == Some("rust-supervisor-run")
+            && value.get("observedOnly").and_then(Value::as_bool) == Some(false);
+        if !valid {
+            invalid.push(format!(
+                "{} is not a deployment-owned desired-running supervisor service",
+                path.display()
+            ));
+            continue;
+        }
+        let service_id = service_id.expect("validated serviceId must be present");
+        let service_kind = service_kind.expect("validated serviceKind must be present");
+        if services
+            .insert(service_id.to_string(), service_kind.to_string())
+            .is_some()
+        {
+            invalid.push(format!("duplicate serviceId `{service_id}`"));
+        }
+    }
+
+    let actual_service_ids = services.keys().cloned().collect::<BTreeSet<_>>();
+    let expected_service_ids = expected_services.keys().cloned().collect::<BTreeSet<_>>();
+    let missing = expected_service_ids
+        .difference(&actual_service_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        invalid.push(format!(
+            "missing configured desired service(s): {}",
+            missing.join(", ")
+        ));
+    }
+    let unexpected = actual_service_ids
+        .difference(&expected_service_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        invalid.push(format!(
+            "unexpected desired service(s): {}",
+            unexpected.join(", ")
+        ));
+    }
+    for (service_id, expected_kind) in expected_services {
+        if let Some(actual_kind) = services.get(service_id)
+            && actual_kind != expected_kind
+        {
+            invalid.push(format!(
+                "service `{service_id}` kind mismatch: expected `{expected_kind}`, found `{actual_kind}`"
+            ));
+        }
+    }
+
+    if expected_services.is_empty() || !invalid.is_empty() {
+        let detail = if invalid.is_empty() {
+            "configured desired-service inventory is empty".to_string()
+        } else {
+            invalid.join("; ")
+        };
+        checks.push(warn(
+            "supervisor-plan",
+            format!(
+                "reconcile-managed supervisor inventory is not ready at {}: {detail}",
+                services_dir.display()
+            ),
+        ));
+    } else {
+        checks.push(pass(
+            "supervisor-plan",
+            format!(
+                "reconcile-managed supervisor inventory has {} deployment-owned desired service(s) at {}; scheduled-task plan is not applicable",
+                expected_services.len(),
+                services_dir.display()
+            ),
+        ));
+    }
+}
+
 fn check_supervisor_plan(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
     let path = harness_home
         .join("state")
         .join("supervisor")
         .join("windows-scheduled-tasks")
         .join("supervisor-plan.json");
-    match read_json_value(&path) {
-        Ok(value) => {
-            let task_count = value
-                .get("tasks")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            if task_count > 0 {
-                checks.push(pass(
-                    "supervisor-plan",
-                    format!(
-                        "found {task_count} scheduled task plan(s) at {}",
-                        path.display()
-                    ),
-                ));
-            } else {
-                checks.push(warn(
-                    "supervisor-plan",
-                    format!("supervisor plan has no tasks at {}", path.display()),
-                ));
-            }
+    match supervisor_readiness_mode(harness_home) {
+        Ok((SupervisorReadinessMode::ReconcileManaged, expected_service_ids)) => {
+            check_reconcile_managed_supervisor(harness_home, &expected_service_ids, checks)
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
-            "supervisor-plan",
-            format!(
-                "not found yet: {}; run supervisor-plan before service handoff",
-                path.display()
-            ),
-        )),
+        Ok((SupervisorReadinessMode::ScheduledTask, _)) => match read_json_value(&path) {
+            Ok(value) => {
+                let task_count = value
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                if task_count > 0 {
+                    checks.push(pass(
+                        "supervisor-plan",
+                        format!(
+                            "found {task_count} scheduled task plan(s) at {}",
+                            path.display()
+                        ),
+                    ));
+                } else {
+                    checks.push(warn(
+                        "supervisor-plan",
+                        format!("supervisor plan has no tasks at {}", path.display()),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+                "supervisor-plan",
+                format!(
+                    "not found yet: {}; run supervisor-plan before service handoff",
+                    path.display()
+                ),
+            )),
+            Err(error) => checks.push(fail(
+                "supervisor-plan",
+                format!("could not read supervisor plan {}: {error}", path.display()),
+            )),
+        },
         Err(error) => checks.push(fail(
             "supervisor-plan",
-            format!("could not read supervisor plan {}: {error}", path.display()),
+            format!("could not resolve supervisor readiness mode from harness config: {error}"),
         )),
     }
     check_loop_heartbeats(harness_home, checks);
@@ -2903,6 +3221,390 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
 
         assert!(report.checks.iter().any(|check| {
             check.name == "supervisor-plan" && check.status == ActivationReadinessStatus::Pass
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_reconcile_service_state(services_dir: &Path, service_id: &str, service_kind: &str) {
+        fs::write(
+            services_dir.join(format!("{service_id}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": service_id,
+                "serviceKind": service_kind,
+                "desiredState": "running",
+                "actualState": "running",
+                "launchOwner": "rust-supervisor-run",
+                "observedOnly": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_default_reconcile_service_states(services_dir: &Path) {
+        for service_id in [
+            "runtime-loop",
+            "worker-loop",
+            "cron-scheduler-loop",
+            "progress-delivery-loop",
+            "ledger-maintenance-loop",
+            "telegram-loop",
+            "discord-outbox-loop",
+            "discord-gateway-loop",
+        ] {
+            write_reconcile_service_state(
+                services_dir,
+                service_id,
+                supervisor_loop_service_kind(service_id),
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan() {
+        let root =
+            temp_root("readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan");
+        let harness_home = root.join(".agent-harness");
+        let services_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services_dir).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{
+              "supervisor": {
+                "enabled": true,
+                "manageAllLoops": true,
+                "telegramLoops": [
+                  {
+                    "enabled": true,
+                    "serviceId": "telegram-loop-secondary",
+                    "telegramAccount": "secondary",
+                    "agent": "secondary"
+                  }
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+
+        for service_id in [
+            "runtime-loop",
+            "worker-loop",
+            "cron-scheduler-loop",
+            "progress-delivery-loop",
+            "ledger-maintenance-loop",
+            "telegram-loop",
+            "telegram-loop-secondary",
+            "discord-outbox-loop",
+            "discord-gateway-loop",
+        ] {
+            write_reconcile_service_state(
+                &services_dir,
+                service_id,
+                supervisor_loop_service_kind(service_id),
+            );
+        }
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "supervisor-plan"
+                && check.status == ActivationReadinessStatus::Pass
+                && check.detail.contains("reconcile-managed")
+                && check
+                    .detail
+                    .contains("9 deployment-owned desired service(s)")
+                && check
+                    .detail
+                    .contains("scheduled-task plan is not applicable")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_warns_when_reconcile_managed_inventory_is_absent() {
+        let root = temp_root("readiness_warns_when_reconcile_managed_inventory_is_absent");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{
+              "supervisor": {
+                "enabled": true,
+                "manageAllLoops": true
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "supervisor-plan"
+                && check.status == ActivationReadinessStatus::Warn
+                && check
+                    .detail
+                    .contains("reconcile-managed supervisor has no desired-service inventory")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_warns_when_reconcile_managed_inventory_omits_configured_service() {
+        let root =
+            temp_root("readiness_warns_when_reconcile_managed_inventory_omits_configured_service");
+        let harness_home = root.join(".agent-harness");
+        let services_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services_dir).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{
+              "supervisor": {
+                "enabled": true,
+                "manageAllLoops": true
+              }
+            }"#,
+        )
+        .unwrap();
+        for service_id in [
+            "runtime-loop",
+            "worker-loop",
+            "cron-scheduler-loop",
+            "progress-delivery-loop",
+            "ledger-maintenance-loop",
+            "telegram-loop",
+            "discord-outbox-loop",
+        ] {
+            write_reconcile_service_state(
+                &services_dir,
+                service_id,
+                supervisor_loop_service_kind(service_id),
+            );
+        }
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "supervisor-plan"
+                && check.status == ActivationReadinessStatus::Warn
+                && check
+                    .detail
+                    .contains("missing configured desired service(s): discord-gateway-loop")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_uses_reconcile_mode_when_manage_all_loops_true_and_supervisor_disabled() {
+        let root = temp_root(
+            "readiness_uses_reconcile_mode_when_manage_all_loops_true_and_supervisor_disabled",
+        );
+        let harness_home = root.join(".agent-harness");
+        let services_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services_dir).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{
+              "supervisor": {
+                "enabled": false,
+                "manageAllLoops": true
+              }
+            }"#,
+        )
+        .unwrap();
+        write_default_reconcile_service_states(&services_dir);
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "supervisor-plan"
+                && check.status == ActivationReadinessStatus::Pass
+                && check.detail.contains("reconcile-managed")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_matches_reconcile_config_overrides_and_service_kinds() {
+        let root = temp_root("readiness_matches_reconcile_config_overrides_and_service_kinds");
+        let harness_home = root.join(".agent-harness");
+        let services_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services_dir).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{
+              "cronScheduler": { "enabled": false },
+              "supervisor": {
+                "manageAllLoops": true,
+                "runtimeLoop": { "enabled": false },
+                "telegramLoop": { "enabled": false },
+                "discordGatewayLoop": { "enabled": false },
+                "telegramLoops": [
+                  { "enabled": true, "telegramAccount": "Team A" },
+                  { "enabled": false, "serviceId": "telegram-loop-disabled" }
+                ],
+                "services": [
+                  {
+                    "enabled": true,
+                    "serviceId": "custom-loop",
+                    "serviceKind": "custom-kind",
+                    "args": [],
+                    "priority": "latency",
+                    "restartDelayMs": 1000,
+                    "heartbeatTimeoutMs": 120000
+                  },
+                  {
+                    "enabled": false,
+                    "serviceId": "disabled-custom-loop",
+                    "serviceKind": "custom-kind",
+                    "args": [],
+                    "priority": "latency",
+                    "restartDelayMs": 1000,
+                    "heartbeatTimeoutMs": 120000
+                  }
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+        for (service_id, service_kind) in [
+            ("worker-loop", "worker"),
+            ("progress-delivery-loop", "progress-delivery"),
+            ("ledger-maintenance-loop", "ledger-maintenance"),
+            ("telegram-loop-team-a", "telegram-ingress"),
+            ("discord-outbox-loop", "final-outbox"),
+            ("custom-loop", "custom-kind"),
+        ] {
+            write_reconcile_service_state(&services_dir, service_id, service_kind);
+        }
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "supervisor-plan"
+                && check.status == ActivationReadinessStatus::Pass
+                && check
+                    .detail
+                    .contains("6 deployment-owned desired service(s)")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_fails_closed_for_invalid_reconcile_service_records() {
+        for case in [
+            "wrong-kind",
+            "missing-kind",
+            "observed-only",
+            "missing-observed-only",
+            "wrong-owner",
+            "unexpected",
+        ] {
+            let root = temp_root(&format!(
+                "readiness_fails_closed_for_invalid_reconcile_service_records-{case}"
+            ));
+            let harness_home = root.join(".agent-harness");
+            let services_dir = harness_home
+                .join("state")
+                .join("supervisor")
+                .join("services");
+            fs::create_dir_all(&services_dir).unwrap();
+            fs::write(
+                harness_home.join("harness-config.json"),
+                r#"{ "supervisor": { "manageAllLoops": true } }"#,
+            )
+            .unwrap();
+            write_default_reconcile_service_states(&services_dir);
+
+            if case == "unexpected" {
+                write_reconcile_service_state(&services_dir, "unexpected-loop", "loop");
+            } else {
+                let path = services_dir.join("runtime-loop.json");
+                let mut value = read_json_value(&path).unwrap();
+                match case {
+                    "wrong-kind" => value["serviceKind"] = Value::String("loop".to_string()),
+                    "missing-kind" => {
+                        value.as_object_mut().unwrap().remove("serviceKind");
+                    }
+                    "observed-only" => value["observedOnly"] = Value::Bool(true),
+                    "missing-observed-only" => {
+                        value.as_object_mut().unwrap().remove("observedOnly");
+                    }
+                    "wrong-owner" => {
+                        value["launchOwner"] = Value::String("external-owner".to_string())
+                    }
+                    _ => unreachable!(),
+                }
+                fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+            }
+
+            let report = check_activation_readiness(ActivationReadinessOptions {
+                harness_home: harness_home.clone(),
+            })
+            .unwrap();
+
+            assert!(
+                report.checks.iter().any(|check| {
+                    check.name == "supervisor-plan"
+                        && check.status == ActivationReadinessStatus::Warn
+                        && check.detail.contains("inventory is not ready")
+                }),
+                "case {case} must fail closed: {:?}",
+                report.checks
+            );
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn readiness_keeps_missing_plan_warning_for_scheduled_task_mode() {
+        let root = temp_root("readiness_keeps_missing_plan_warning_for_scheduled_task_mode");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{
+              "supervisor": {
+                "enabled": true,
+                "manageAllLoops": false
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_supervisor_plan(&harness_home, &mut checks);
+
+        assert!(checks.iter().any(|check| {
+            check.name == "supervisor-plan"
+                && check.status == ActivationReadinessStatus::Warn
+                && check
+                    .detail
+                    .contains("run supervisor-plan before service handoff")
         }));
 
         let _ = fs::remove_dir_all(root);

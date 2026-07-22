@@ -184,8 +184,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I26",
-            statement: "the Windows Task Scheduler plan preserves every enabled configured supervisor.telegramLoops runner while adding the isolated ledger-maintenance owner; plan and reconcile derive custom channel loop identity from the same harness config",
-            owner: "supervisor/harness_config/supervisor_inventory",
+            statement: "supervisor readiness follows configured ownership: supervisor.manageAllLoops=true makes the exact deployment-owned reconcile inventory authoritative even when supervisor.enabled=false and makes a scheduled-task plan not applicable, while scheduled-task mode retains plan checks; both surfaces preserve enabled configured supervisor.telegramLoops and the isolated ledger-maintenance owner",
+            owner: "activation/supervisor/harness_config/supervisor_inventory",
         },
         InvariantEntry {
             id: "I27",
@@ -1940,8 +1940,10 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
         },
         ScenarioMatrixEntry {
             id: "supervisor-plan-configured-loop-parity",
-            title: "Task Scheduler plan preserves configured channel loops with maintenance owner",
+            title: "Supervisor readiness preserves configured ownership-mode inventory",
             changed_areas: vec![
+                "activation readiness",
+                "reconcile-managed desired-service inventory",
                 "Windows Task Scheduler plan",
                 "configured Telegram loop inventory",
                 "ledger maintenance cutover ownership",
@@ -1949,16 +1951,27 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             required_invariants: vec!["I26"],
             required_evidence: vec![
                 "the authoritative harness config validates before plan generation",
+                "reconcile-managed readiness accepts an exact deployment-owned desired-service inventory without supervisor-plan.json",
+                "reconcile-managed readiness matches reconcile mode selection, configured service derivation, and exact service kinds",
+                "reconcile-managed readiness fails closed on absent, partial, unexpected, malformed, observed-only, or wrong-owner inventory",
+                "scheduled-task readiness still warns when supervisor-plan.json is missing",
                 "a staged plan includes the main Telegram loop, every enabled configured Telegram loop, and ledger-maintenance-loop",
                 "the generated start/stop bundle contains each configured channel loop and the maintenance owner",
-                "candidate reconcile and generated Task Scheduler plan agree before live promotion",
+                "candidate status and reconcile agree with the configured ownership mode before live promotion",
             ],
             runnable_tests: vec![
+                "activation::tests::readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan",
+                "activation::tests::readiness_uses_reconcile_mode_when_manage_all_loops_true_and_supervisor_disabled",
+                "activation::tests::readiness_matches_reconcile_config_overrides_and_service_kinds",
+                "activation::tests::readiness_fails_closed_for_invalid_reconcile_service_records",
+                "activation::tests::readiness_warns_when_reconcile_managed_inventory_is_absent",
+                "activation::tests::readiness_warns_when_reconcile_managed_inventory_omits_configured_service",
+                "activation::tests::readiness_keeps_missing_plan_warning_for_scheduled_task_mode",
                 "supervisor::tests::plan_includes_enabled_configured_telegram_loop_with_ledger_maintenance",
                 "supervisor_inventory::tests::inventory_accepts_isolated_ledger_maintenance_service_and_plans_owner",
                 "agent-harness-cli::tests::supervisor_reconcile_all_includes_isolated_ledger_maintenance_owner",
             ],
-            promotion_gate: "Promote only after a staged nine-owner bundle and candidate reconcile preserve configured channel loops, then post-cutover readback confirms all expected owner heartbeats are fresh.",
+            promotion_gate: "Promote only after candidate status and reconcile prove the exact configured ownership-mode inventory, scheduled-task compatibility remains green, and post-cutover readback confirms all expected owner heartbeats are fresh.",
         },
     ]
 }
@@ -2017,6 +2030,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "progress source-authority changes passed non-fresh-cache defer, historical fresh-send suppression, and stop-file claim-release checks",
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
             "interactive receipt readers passed bounded-history, busy-lock, and isolated ledger-maintenance-owner scenario checks",
+            "supervisor readiness changes passed reconcile-managed exact-inventory, absent and partial inventory, scheduled-task compatibility, and candidate status/reconcile parity checks",
             "cron freshness changes passed config run-cap validation, cron-canon health/status warnings, deterministic catch-up, and stale-source sender suppression checks",
             "cron/backup incident hardening passed exact-source, timezone/calendar, per-entry timeout/attempt, pre-lease exhaustion, process-tree timeout, occurrence-idempotency, verified-retention, and zero-stale-catch-up checks",
             "Codex tool-use timeout changes passed bounded recovery checks",
@@ -2430,6 +2444,18 @@ mod tests {
             .expect("supervisor plan configured loop parity scenario");
         assert!(supervisor_plan.required_invariants.contains(&"I26"));
         assert!(supervisor_plan.runnable_tests.contains(
+            &"activation::tests::readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan"
+        ));
+        assert!(supervisor_plan.runnable_tests.contains(
+            &"activation::tests::readiness_keeps_missing_plan_warning_for_scheduled_task_mode"
+        ));
+        assert!(supervisor_plan.runnable_tests.contains(
+            &"activation::tests::readiness_matches_reconcile_config_overrides_and_service_kinds"
+        ));
+        assert!(supervisor_plan.runnable_tests.contains(
+            &"activation::tests::readiness_fails_closed_for_invalid_reconcile_service_records"
+        ));
+        assert!(supervisor_plan.runnable_tests.contains(
             &"supervisor::tests::plan_includes_enabled_configured_telegram_loop_with_ledger_maintenance"
         ));
 
@@ -2475,6 +2501,9 @@ mod tests {
 
         assert!(release_checklist().required_items.contains(
             &"GPT-5.6 and multi-agent orchestration changes passed max-only reasoning, exact-lane prompt, heterogeneous-child, master-owned mailbox, lease-safe resume, and child-final suppression scenario gates"
+        ));
+        assert!(release_checklist().required_items.contains(
+            &"supervisor readiness changes passed reconcile-managed exact-inventory, absent and partial inventory, scheduled-task compatibility, and candidate status/reconcile parity checks"
         ));
     }
 
