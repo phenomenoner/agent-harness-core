@@ -15,6 +15,9 @@ pub const WINDOWS_RECONCILE_KEEPER_OBSERVATION_SCHEMA: &str =
 const DEFAULT_KEEPER_TASK_NAME_PREFIX: &str = "AgentHarness-Supervisor-Reconcile-Keeper";
 const KEEPER_STATE_SCHEMA: &str = "agent-harness.supervisor-reconcile-keeper.v1";
 const TASK_RESTART_COUNT: u16 = 255;
+const KEEPER_RECOVERY_TRIGGER_KIND: &str = "Time";
+const KEEPER_RECOVERY_START_BOUNDARY: &str = "2000-01-01T00:00:00";
+const KEEPER_RECOVERY_INTERVAL: &str = "PT1M";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsReconcileKeeperPlanOptions {
@@ -103,6 +106,11 @@ pub struct WindowsReconcileKeeperPrincipal {
 pub struct WindowsReconcileKeeperTrigger {
     pub kind: &'static str,
     pub user_id: String,
+    pub recovery_kind: &'static str,
+    pub recovery_start_boundary: &'static str,
+    pub recovery_interval: &'static str,
+    pub recovery_duration: Option<&'static str>,
+    pub recovery_stop_at_duration_end: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -336,6 +344,11 @@ fn build_windows_reconcile_keeper_plan(
         trigger: WindowsReconcileKeeperTrigger {
             kind: "AtLogOn",
             user_id: user_id.to_string(),
+            recovery_kind: KEEPER_RECOVERY_TRIGGER_KIND,
+            recovery_start_boundary: KEEPER_RECOVERY_START_BOUNDARY,
+            recovery_interval: KEEPER_RECOVERY_INTERVAL,
+            recovery_duration: None,
+            recovery_stop_at_duration_end: false,
         },
         settings: WindowsReconcileKeeperSettings {
             multiple_instances: "IgnoreNew",
@@ -603,6 +616,7 @@ fn install_script_body(plan_file: &Path, live_deployment: bool) -> String {
     let mut body = script_control_header(plan_file, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
+    body.push_str(account_identity_function_body());
     body.push_str(task_scheduler_guard_function_body());
     body.push_str(legacy_task_preflight_function_body());
     if live_deployment {
@@ -618,7 +632,7 @@ fn install_script_body(plan_file: &Path, live_deployment: bool) -> String {
 Assert-LegacySupervisorTasksQuiescent -Phase 'install'
 
 $CurrentUserId = if ($KeeperFixtureMode) { [string]$Plan.task.principal.userId } else { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
-if (-not [string]::Equals($CurrentUserId, [string]$Plan.task.principal.userId, [StringComparison]::OrdinalIgnoreCase)) {
+if (-not (Test-KeeperAccountIdentityExact -ExpectedUserId ([string]$Plan.task.principal.userId) -ObservedUserId $CurrentUserId)) {
   throw "keeper task principal mismatch: plan=$($Plan.task.principal.userId) current=$CurrentUserId"
 }
 if (-not (Test-Path -LiteralPath $Plan.executable.path -PathType Leaf)) {
@@ -784,6 +798,7 @@ fn start_script_body(plan_file: &Path, live_deployment: bool) -> String {
     let mut body = script_control_header(plan_file, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
+    body.push_str(account_identity_function_body());
     body.push_str(task_scheduler_guard_function_body());
     body.push_str(legacy_task_preflight_function_body());
     body.push_str(&start_rollback_function_body(live_deployment));
@@ -808,6 +823,7 @@ if ($ObservedExecutableDigest -ne [string]$Plan.executable.sha256) {
 r#"Assert-KeeperLiveControlAuthorization -Action 'start'
 Assert-LegacySupervisorTasksQuiescent -Phase 'start'
 $StartProcessTreeSnapshot = if ($KeeperFixtureMode) { @() } else { @(Get-KeeperRollbackProcessTreeSnapshot) }
+$StartProcessTreeSnapshot = @($StartProcessTreeSnapshot)
 $StartStopMarkerSnapshot = @()
 $StopDirectory = Join-Path ([string]$Plan.harnessHome) 'state\supervisor\stop'
 foreach ($Marker in @(Get-ChildItem -LiteralPath $StopDirectory -Filter '*.stop' -File -ErrorAction SilentlyContinue)) {
@@ -905,6 +921,7 @@ fn stop_script_body(plan_file: &Path, live_deployment: bool) -> String {
     let mut body = script_control_header(plan_file, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
+    body.push_str(account_identity_function_body());
     body.push_str(task_scheduler_guard_function_body());
     if live_deployment {
         body.push_str("$KeeperFixtureMode = $false\n");
@@ -1005,7 +1022,8 @@ function Get-ExactKeeperProcessTreeSnapshot {
 }
 
 function Get-ExactKeeperProcessTreeSurvivors {
-  param([Parameter(Mandatory = $true)] $InitialTree)
+  param([AllowNull()][AllowEmptyCollection()][object[]] $InitialTree = @())
+  $InitialTree = @($InitialTree)
   $AllProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
   $TrackedIds = New-Object 'Collections.Generic.HashSet[int]'
   foreach ($Process in $AllProcesses) {
@@ -1060,6 +1078,7 @@ Assert-KeeperLiveControlAuthorization -Action 'stop'
 $InitialTask = Get-KeeperTaskSnapshot
 $PreState = Get-KeeperState
 $InitialProcessTree = if ($KeeperFixtureMode) { @() } else { @(Get-ExactKeeperProcessTreeSnapshot -KeeperState $PreState) }
+$InitialProcessTree = @($InitialProcessTree)
 $StopRequestedAtMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 "#,
     );
@@ -1115,9 +1134,13 @@ $FallbackRequested = $false
 $Proof = $null
 $Deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
 do {
+  $PostRequestTerminalObserved = $false
+  $IdempotentExternalQuiescence = $false
   if ($KeeperFixtureMode -and -not [string]::IsNullOrWhiteSpace($env:AGENT_HARNESS_KEEPER_TEST_STOP_PROOF_FILE)) {
     $Proof = Get-Content -LiteralPath $env:AGENT_HARNESS_KEEPER_TEST_STOP_PROOF_FILE -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    $TerminalMatches = $Proof.keeperTerminalMatches -eq $true
+    $PostRequestTerminalObserved = $Proof.keeperTerminalMatches -eq $true
+    $IdempotentExternalQuiescence = $Proof.idempotentExternalQuiescence -eq $true
+    $TerminalMatches = $PostRequestTerminalObserved -or $IdempotentExternalQuiescence
     $KeeperPidAlive = $Proof.keeperPidAlive -eq $true
     $OwnerDispositions = @($Proof.ownerDispositions)
     $DeploymentProcesses = @($Proof.deploymentProcesses)
@@ -1125,7 +1148,7 @@ do {
   } else {
     $PostState = Get-KeeperState
     $KeeperPidAlive = if ($PreStateExact) { Test-ExactKeeperProcessAlive -State $PreState } else { $false }
-    $TerminalMatches = if ($PreStateExact) {
+    $PostRequestTerminalObserved = if ($PreStateExact) {
       ($null -ne $PostState) -and
         ([string]$PostState.schema -eq 'agent-harness.supervisor-reconcile-keeper.v1') -and
         ([string]$PostState.generationId -eq [string]$PreState.generationId) -and
@@ -1134,8 +1157,12 @@ do {
         (@('stopped', 'dead') -contains ([string]$PostState.status).ToLowerInvariant()) -and
         ([int64]$PostState.lastHeartbeatAtMs -ge $StopRequestedAtMs)
     } else {
-      -not $InitialTaskRunning
+      $false
     }
+    $IdempotentExternalQuiescence = (-not $InitialTaskRunning) -and
+      (-not $KeeperPidAlive) -and
+      ($InitialProcessTree.Count -eq 0)
+    $TerminalMatches = $PostRequestTerminalObserved -or $IdempotentExternalQuiescence
     $OwnerDispositions = @()
     $ServicesDir = Join-Path ([string]$Plan.harnessHome) 'state\supervisor\services'
     foreach ($StateFile in @(Get-ChildItem -LiteralPath $ServicesDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
@@ -1177,7 +1204,7 @@ do {
       taskName = $Plan.task.name
       action = 'Stop-ScheduledTask'
       status = 'requested'
-      reason = 'post-request terminal/PID/child-owner proof timeout'
+      reason = 'post-request terminal or idempotent external-quiescence proof timeout'
       timeoutSeconds = $TimeoutSeconds
       observedAtMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     }
@@ -1210,7 +1237,7 @@ try {
   $FinalTask = $null
 }
 if (-not $StopProofComplete) {
-  $StopErrors += 'matching post-request terminal state, dead keeper PID, or exact child/process absence was not proven'
+  $StopErrors += 'matching post-request terminal state or idempotent external quiescence, dead keeper PID, and exact child/process absence were not proven'
 }
 $StopProofReceipt = [ordered]@{
   schema = 'agent-harness.windows-reconcile-keeper-stop-proof.v1'
@@ -1222,6 +1249,8 @@ $StopProofReceipt = [ordered]@{
   stopRequestedAtMs = $StopRequestedAtMs
   preState = $PreState
   terminalMatchesPreRequestGeneration = $TerminalMatches
+  postRequestTerminalObserved = $PostRequestTerminalObserved
+  idempotentExternalQuiescence = $IdempotentExternalQuiescence
   keeperPidAlive = $KeeperPidAlive
   ownerDispositions = $OwnerDispositions
   deploymentProcesses = $DeploymentProcesses
@@ -1250,6 +1279,7 @@ fn uninstall_script_body(plan_file: &Path, live_deployment: bool) -> String {
     let mut body = script_control_header(plan_file, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
+    body.push_str(account_identity_function_body());
     body.push_str(task_scheduler_guard_function_body());
     body.push_str(
         r#"$KeeperFixtureMode = ($Plan.deploymentMode -eq 'developer-staging') -and (-not [string]::IsNullOrWhiteSpace($env:AGENT_HARNESS_KEEPER_TEST_TASK_OBSERVATION_FILE))
@@ -1327,6 +1357,7 @@ fn rollback_script_body(plan_file: &Path) -> String {
     body.push_str(live_control_token_body());
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
+    body.push_str(account_identity_function_body());
     body.push_str(task_scheduler_guard_function_body());
     body.push_str(legacy_task_preflight_function_body());
     body.push_str(
@@ -1545,13 +1576,23 @@ fn readback_script_body(plan_file: &Path) -> String {
     let mut body = String::from("param([string] $QueryNonce)\n");
     body.push_str(&script_plan_header(plan_file));
     body.push_str(atomic_json_function_body());
+    body.push_str(account_identity_function_body());
     body.push_str(
         r#"$TaskMatches = @(Get-ScheduledTask -TaskPath $Plan.task.path -TaskName $Plan.task.name -ErrorAction SilentlyContinue)
 if ($TaskMatches.Count -gt 1) { throw "keeper readback returned multiple tasks for exact path/name" }
 $Task = if ($TaskMatches.Count -eq 1) { $TaskMatches[0] } else { $null }
 $TaskInfo = if ($null -ne $Task) { Get-ScheduledTaskInfo -TaskPath $Plan.task.path -TaskName $Plan.task.name -ErrorAction SilentlyContinue } else { $null }
-$Action = if ($null -ne $Task) { @($Task.Actions)[0] } else { $null }
-$Trigger = if ($null -ne $Task) { @($Task.Triggers)[0] } else { $null }
+$Actions = @()
+$Triggers = @()
+if ($null -ne $Task) {
+  $Actions = @($Task.Actions)
+  $Triggers = @($Task.Triggers)
+}
+$LogonTriggers = @($Triggers | Where-Object { [string]$_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })
+$RecoveryTriggers = @($Triggers | Where-Object { [string]$_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' })
+$Action = if ($Actions.Count -eq 1) { $Actions[0] } else { $null }
+$Trigger = if ($LogonTriggers.Count -eq 1) { $LogonTriggers[0] } else { $null }
+$RecoveryTrigger = if ($RecoveryTriggers.Count -eq 1) { $RecoveryTriggers[0] } else { $null }
 $KeeperState = $null
 $KeeperStateError = $null
 if (Test-Path -LiteralPath $Plan.stateFile -PathType Leaf) {
@@ -1563,6 +1604,11 @@ if (Test-Path -LiteralPath $Plan.stateFile -PathType Leaf) {
 }
 $ExecutableExists = Test-Path -LiteralPath $Plan.executable.path -PathType Leaf
 $ExecutableDigest = if ($ExecutableExists) { Get-FileSha256 -Path $Plan.executable.path } else { $null }
+$ObservedPrincipalUserId = if ($null -ne $Task) { [string]$Task.Principal.UserId } else { $null }
+$PrincipalIdentityMatches = ($null -ne $Task) -and (Test-KeeperAccountIdentityExact -ExpectedUserId ([string]$Plan.task.principal.userId) -ObservedUserId $ObservedPrincipalUserId)
+$ObservedTriggerUserId = if ($null -ne $Trigger) { [string]$Trigger.UserId } else { $null }
+$TriggerIdentityMatches = ($null -ne $Trigger) -and (Test-KeeperAccountIdentityExact -ExpectedUserId ([string]$Plan.task.trigger.userId) -ObservedUserId $ObservedTriggerUserId)
+$RecoveryDuration = if ($null -ne $RecoveryTrigger -and -not [string]::IsNullOrWhiteSpace([string]$RecoveryTrigger.Repetition.Duration)) { [string]$RecoveryTrigger.Repetition.Duration } else { $null }
 $Observation = [ordered]@{
   schema = 'agent-harness.windows-reconcile-keeper-observation.v1'
   planSchema = $Plan.schema
@@ -1581,18 +1627,32 @@ $Observation = [ordered]@{
   }
   principal = [ordered]@{
     plannedUserId = $Plan.task.principal.userId
-    userId = if ($null -ne $Task) { [string]$Task.Principal.UserId } else { $null }
+    observedUserId = $ObservedPrincipalUserId
+    userId = if ($PrincipalIdentityMatches) { [string]$Plan.task.principal.userId } else { $ObservedPrincipalUserId }
+    identityMatches = $PrincipalIdentityMatches
     logonType = if ($null -ne $Task) { [string]$Task.Principal.LogonType } else { $null }
     runLevel = if ($null -ne $Task) { [string]$Task.Principal.RunLevel } else { $null }
   }
   action = [ordered]@{
+    count = $Actions.Count
     execute = if ($null -ne $Action) { [string]$Action.Execute } else { $null }
     arguments = if ($null -ne $Action) { [string]$Action.Arguments } else { $null }
     workingDirectory = if ($null -ne $Action) { [string]$Action.WorkingDirectory } else { $null }
   }
   trigger = [ordered]@{
-    userId = if ($null -ne $Trigger) { [string]$Trigger.UserId } else { $null }
+    count = $Triggers.Count
+    logonCount = $LogonTriggers.Count
+    recoveryCount = $RecoveryTriggers.Count
+    plannedUserId = $Plan.task.trigger.userId
+    observedUserId = $ObservedTriggerUserId
+    userId = if ($TriggerIdentityMatches) { [string]$Plan.task.trigger.userId } else { $ObservedTriggerUserId }
+    identityMatches = $TriggerIdentityMatches
     triggerType = if ($null -ne $Trigger) { [string]$Trigger.CimClass.CimClassName } else { $null }
+    recoveryTriggerType = if ($null -ne $RecoveryTrigger) { [string]$RecoveryTrigger.CimClass.CimClassName } else { $null }
+    recoveryStartBoundary = if ($null -ne $RecoveryTrigger) { [string]$RecoveryTrigger.StartBoundary } else { $null }
+    recoveryInterval = if ($null -ne $RecoveryTrigger) { [string]$RecoveryTrigger.Repetition.Interval } else { $null }
+    recoveryDuration = $RecoveryDuration
+    recoveryStopAtDurationEnd = if ($null -ne $RecoveryTrigger) { [bool]$RecoveryTrigger.Repetition.StopAtDurationEnd } else { $null }
   }
   settings = [ordered]@{
     multipleInstances = if ($null -ne $Task) { [string]$Task.Settings.MultipleInstances } else { $null }
@@ -1604,8 +1664,8 @@ $Observation = [ordered]@{
     executionTimeLimit = if ($null -ne $Task) { [string]$Task.Settings.ExecutionTimeLimit } else { $null }
   }
   runtime = [ordered]@{
-    lastRunTime = if ($null -ne $TaskInfo) { $TaskInfo.LastRunTime.ToUniversalTime().ToString('o') } else { $null }
-    nextRunTime = if ($null -ne $TaskInfo) { $TaskInfo.NextRunTime.ToUniversalTime().ToString('o') } else { $null }
+    lastRunTime = if ($null -ne $TaskInfo -and $null -ne $TaskInfo.LastRunTime) { $TaskInfo.LastRunTime.ToUniversalTime().ToString('o') } else { $null }
+    nextRunTime = if ($null -ne $TaskInfo -and $null -ne $TaskInfo.NextRunTime) { $TaskInfo.NextRunTime.ToUniversalTime().ToString('o') } else { $null }
     lastTaskResult = if ($null -ne $TaskInfo) { $TaskInfo.LastTaskResult } else { $null }
     numberOfMissedRuns = if ($null -ne $TaskInfo) { $TaskInfo.NumberOfMissedRuns } else { $null }
     keeperStateFile = $Plan.stateFile
@@ -1834,7 +1894,8 @@ function Get-KeeperRollbackProcessTreeSnapshot {{
 }}
 
 function Get-KeeperRollbackProcessTreeSurvivors {{
-  param([Parameter(Mandatory = $true)] $InitialTree)
+  param([AllowNull()][AllowEmptyCollection()][object[]] $InitialTree = @())
+  $InitialTree = @($InitialTree)
   $AllProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
   $TrackedIds = New-Object 'Collections.Generic.HashSet[int]'
   foreach ($Process in $AllProcesses) {{
@@ -1901,9 +1962,11 @@ function Test-ExactKeeperServiceOwnerAlive {{
 function Invoke-KeeperTransactionalStartRollback {{
   param([Parameter(Mandatory = $true)][string] $Failure)
   $RollbackProcessTreeSnapshot = if ($KeeperFixtureMode) {{ @() }} else {{ @(Get-KeeperRollbackProcessTreeSnapshot) }}
+  $RollbackProcessTreeSnapshot = @($RollbackProcessTreeSnapshot)
   $RollbackTrackedProcessTree = @($StartProcessTreeSnapshot) + @($RollbackProcessTreeSnapshot) |
     Group-Object -Property pid,processStartTimeMs |
     ForEach-Object {{ $_.Group[0] }}
+  $RollbackTrackedProcessTree = @($RollbackTrackedProcessTree)
   Ensure-KeeperHold -Reason 'transactional-start-rollback'
 {rollback_invocation}  $RollbackErrors = @()
   $RollbackStop = $null
@@ -2045,8 +2108,48 @@ function Write-KeeperFixtureEffect {
 "#
 }
 
+fn account_identity_function_body() -> &'static str {
+    r#"function Resolve-KeeperAccountSid {
+  param([Parameter(Mandatory = $true)][string] $UserId)
+  if ([string]::IsNullOrWhiteSpace($UserId)) { return $null }
+  try {
+    if ($UserId -match '^S-1-(?:\d+-)+\d+$') {
+      return ([Security.Principal.SecurityIdentifier]::new($UserId)).Value
+    }
+    return ([Security.Principal.NTAccount]::new($UserId)).Translate([Security.Principal.SecurityIdentifier]).Value
+  } catch {
+    return $null
+  }
+}
+
+function Test-KeeperAccountIdentityExact {
+  param(
+    [Parameter(Mandatory = $true)][string] $ExpectedUserId,
+    [Parameter(Mandatory = $true)][string] $ObservedUserId
+  )
+  if ([string]::Equals($ExpectedUserId, $ObservedUserId, [StringComparison]::OrdinalIgnoreCase)) {
+    return $true
+  }
+  $ExpectedSid = Resolve-KeeperAccountSid -UserId $ExpectedUserId
+  $ObservedSid = Resolve-KeeperAccountSid -UserId $ObservedUserId
+  return (-not [string]::IsNullOrWhiteSpace($ExpectedSid)) -and
+    (-not [string]::IsNullOrWhiteSpace($ObservedSid)) -and
+    [string]::Equals($ExpectedSid, $ObservedSid, [StringComparison]::OrdinalIgnoreCase)
+}
+
+"#
+}
+
 fn task_scheduler_guard_function_body() -> &'static str {
-    r#"function Get-KeeperTaskSnapshot {
+    r#"function Get-KeeperRecoveryStartBoundaryText {
+  $Value = $Plan.task.trigger.recoveryStartBoundary
+  if ($Value -is [DateTime]) {
+    return $Value.ToString("yyyy-MM-dd'T'HH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
+  }
+  return [string]$Value
+}
+
+function Get-KeeperTaskSnapshot {
   if ($KeeperFixtureMode) {
     if ([string]::IsNullOrWhiteSpace($env:AGENT_HARNESS_KEEPER_TEST_TASK_OBSERVATION_FILE)) {
       throw 'developer keeper task observation file is required'
@@ -2076,8 +2179,14 @@ fn task_scheduler_guard_function_body() -> &'static str {
     throw "keeper task query returned $($Tasks.Count) objects for exact path/name"
   }
   $Task = $Tasks[0]
-  $Action = @($Task.Actions)[0]
-  $Trigger = @($Task.Triggers)[0]
+  $Actions = @($Task.Actions)
+  $Triggers = @($Task.Triggers)
+  $LogonTriggers = @($Triggers | Where-Object { [string]$_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })
+  $RecoveryTriggers = @($Triggers | Where-Object { [string]$_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' })
+  $Action = if ($Actions.Count -eq 1) { $Actions[0] } else { $null }
+  $Trigger = if ($LogonTriggers.Count -eq 1) { $LogonTriggers[0] } else { $null }
+  $RecoveryTrigger = if ($RecoveryTriggers.Count -eq 1) { $RecoveryTriggers[0] } else { $null }
+  $RecoveryDuration = if ($null -ne $RecoveryTrigger -and -not [string]::IsNullOrWhiteSpace([string]$RecoveryTrigger.Repetition.Duration)) { [string]$RecoveryTrigger.Repetition.Duration } else { $null }
   return [pscustomobject]@{
     exists = $true
     task = [pscustomobject]@{
@@ -2093,13 +2202,22 @@ fn task_scheduler_guard_function_body() -> &'static str {
       runLevel = [string]$Task.Principal.RunLevel
     }
     action = [pscustomobject]@{
+      count = $Actions.Count
       execute = [string]$Action.Execute
       arguments = [string]$Action.Arguments
       workingDirectory = [string]$Action.WorkingDirectory
     }
     trigger = [pscustomobject]@{
+      count = $Triggers.Count
+      logonCount = $LogonTriggers.Count
+      recoveryCount = $RecoveryTriggers.Count
       userId = [string]$Trigger.UserId
       triggerType = [string]$Trigger.CimClass.CimClassName
+      recoveryTriggerType = [string]$RecoveryTrigger.CimClass.CimClassName
+      recoveryStartBoundary = [string]$RecoveryTrigger.StartBoundary
+      recoveryInterval = [string]$RecoveryTrigger.Repetition.Interval
+      recoveryDuration = $RecoveryDuration
+      recoveryStopAtDurationEnd = [bool]$RecoveryTrigger.Repetition.StopAtDurationEnd
     }
     settings = [pscustomobject]@{
       multipleInstances = [string]$Task.Settings.MultipleInstances
@@ -2119,14 +2237,23 @@ function Test-KeeperTaskExact {
   return ([string]$Snapshot.task.path -eq [string]$Plan.task.path) -and
     ([string]$Snapshot.task.name -eq [string]$Plan.task.name) -and
     ([string]$Snapshot.task.description -eq [string]$Plan.task.description) -and
-    [string]::Equals([string]$Snapshot.principal.userId, [string]$Plan.task.principal.userId, [StringComparison]::OrdinalIgnoreCase) -and
+    (Test-KeeperAccountIdentityExact -ExpectedUserId ([string]$Plan.task.principal.userId) -ObservedUserId ([string]$Snapshot.principal.userId)) -and
     ([string]$Snapshot.principal.logonType -eq [string]$Plan.task.principal.logonType) -and
     ([string]$Snapshot.principal.runLevel -eq [string]$Plan.task.principal.runLevel) -and
+    ([int]$Snapshot.action.count -eq 1) -and
     [string]::Equals([string]$Snapshot.action.execute, [string]$Plan.action.executable, [StringComparison]::OrdinalIgnoreCase) -and
     ([string]$Snapshot.action.arguments -eq [string]$Plan.action.arguments) -and
     [string]::Equals([string]$Snapshot.action.workingDirectory, [string]$Plan.action.workingDirectory, [StringComparison]::OrdinalIgnoreCase) -and
-    [string]::Equals([string]$Snapshot.trigger.userId, [string]$Plan.task.trigger.userId, [StringComparison]::OrdinalIgnoreCase) -and
+    ([int]$Snapshot.trigger.count -eq 2) -and
+    ([int]$Snapshot.trigger.logonCount -eq 1) -and
+    ([int]$Snapshot.trigger.recoveryCount -eq 1) -and
+    (Test-KeeperAccountIdentityExact -ExpectedUserId ([string]$Plan.task.trigger.userId) -ObservedUserId ([string]$Snapshot.trigger.userId)) -and
     ([string]$Snapshot.trigger.triggerType -eq 'MSFT_TaskLogonTrigger') -and
+    ([string]$Snapshot.trigger.recoveryTriggerType -eq 'MSFT_TaskTimeTrigger') -and
+    ([string]$Snapshot.trigger.recoveryStartBoundary -eq (Get-KeeperRecoveryStartBoundaryText)) -and
+    ([string]$Snapshot.trigger.recoveryInterval -eq [string]$Plan.task.trigger.recoveryInterval) -and
+    ([string]$Snapshot.trigger.recoveryDuration -eq [string]$Plan.task.trigger.recoveryDuration) -and
+    ([bool]$Snapshot.trigger.recoveryStopAtDurationEnd -eq [bool]$Plan.task.trigger.recoveryStopAtDurationEnd) -and
     ([string]$Snapshot.settings.multipleInstances -eq [string]$Plan.task.settings.multipleInstances) -and
     ([int]$Snapshot.settings.restartCount -eq [int]$Plan.task.settings.restartCount) -and
     ([string]$Snapshot.settings.restartInterval -eq [string]$Plan.task.settings.restartInterval) -and
@@ -2154,12 +2281,12 @@ function Test-KeeperTaskSameDeploymentStale {
     ([string]$Snapshot.task.name -eq [string]$Plan.task.name) -and
     (([string]$Snapshot.task.description).StartsWith($OwnershipPrefix, [StringComparison]::Ordinal) -or
       ([string]$Snapshot.task.description).StartsWith($LegacyOwnershipPrefix, [StringComparison]::Ordinal)) -and
-    [string]::Equals([string]$Snapshot.principal.userId, [string]$Plan.task.principal.userId, [StringComparison]::OrdinalIgnoreCase) -and
+    (Test-KeeperAccountIdentityExact -ExpectedUserId ([string]$Plan.task.principal.userId) -ObservedUserId ([string]$Snapshot.principal.userId)) -and
     ([string]$Snapshot.principal.logonType -eq [string]$Plan.task.principal.logonType) -and
     ([string]$Snapshot.principal.runLevel -eq [string]$Plan.task.principal.runLevel) -and
     [string]::Equals($ObservedExecutable, $ExpectedExecutable, [StringComparison]::OrdinalIgnoreCase) -and
     $WorkingDirectoryContained -and
-    [string]::Equals([string]$Snapshot.trigger.userId, [string]$Plan.task.trigger.userId, [StringComparison]::OrdinalIgnoreCase) -and
+    (Test-KeeperAccountIdentityExact -ExpectedUserId ([string]$Plan.task.trigger.userId) -ObservedUserId ([string]$Snapshot.trigger.userId)) -and
     ([string]$Snapshot.trigger.triggerType -eq 'MSFT_TaskLogonTrigger') -and
     ([string]$Snapshot.task.state -ne 'Running')
 }
@@ -2224,11 +2351,16 @@ function New-KeeperTaskXml {
   $Command = [Security.SecurityElement]::Escape([string]$Plan.action.executable)
   $Arguments = [Security.SecurityElement]::Escape([string]$Plan.action.arguments)
   $WorkingDirectory = [Security.SecurityElement]::Escape([string]$Plan.action.workingDirectory)
+  $RecoveryStartBoundary = [Security.SecurityElement]::Escape((Get-KeeperRecoveryStartBoundaryText))
+  $RecoveryInterval = [Security.SecurityElement]::Escape([string]$Plan.task.trigger.recoveryInterval)
   return @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>$Description</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>$UserId</UserId></LogonTrigger></Triggers>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><UserId>$UserId</UserId></LogonTrigger>
+    <TimeTrigger><Repetition><Interval>$RecoveryInterval</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>$RecoveryStartBoundary</StartBoundary><Enabled>true</Enabled></TimeTrigger>
+  </Triggers>
   <Principals><Principal id="Author"><UserId>$UserId</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
@@ -2797,6 +2929,69 @@ pub fn validate_live_windows_reconcile_keeper_plan(plan: &Value) -> Result<(), S
     if plan.pointer("/task/path").and_then(Value::as_str) != Some("\\") {
         return Err("live keeper task path must be the exact root task path".to_string());
     }
+    if plan
+        .pointer("/task/principal/currentUserOnly")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || plan
+            .pointer("/task/principal/logonType")
+            .and_then(Value::as_str)
+            != Some("Interactive")
+        || plan
+            .pointer("/task/principal/runLevel")
+            .and_then(Value::as_str)
+            != Some("Limited")
+    {
+        return Err(
+            "live keeper principal must be the current interactive user at limited privilege"
+                .to_string(),
+        );
+    }
+    if plan.pointer("/task/trigger/kind").and_then(Value::as_str) != Some("AtLogOn")
+        || plan
+            .pointer("/task/trigger/recoveryKind")
+            .and_then(Value::as_str)
+            != Some(KEEPER_RECOVERY_TRIGGER_KIND)
+        || plan
+            .pointer("/task/trigger/recoveryStartBoundary")
+            .and_then(Value::as_str)
+            != Some(KEEPER_RECOVERY_START_BOUNDARY)
+        || plan
+            .pointer("/task/trigger/recoveryInterval")
+            .and_then(Value::as_str)
+            != Some(KEEPER_RECOVERY_INTERVAL)
+        || !matches!(
+            plan.pointer("/task/trigger/recoveryDuration"),
+            Some(Value::Null)
+        )
+        || plan
+            .pointer("/task/trigger/recoveryStopAtDurationEnd")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err(
+            "live keeper must have the exact same-user logon and indefinite one-minute recovery trigger contract"
+                .to_string(),
+        );
+    }
+    if plan
+        .pointer("/task/settings/multipleInstances")
+        .and_then(Value::as_str)
+        != Some("IgnoreNew")
+        || plan
+            .pointer("/task/settings/executionTimeLimit")
+            .and_then(Value::as_str)
+            != Some("PT0S")
+        || plan
+            .pointer("/task/registrationEnabled")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err(
+            "live keeper must be registered disabled with IgnoreNew and no execution limit"
+                .to_string(),
+        );
+    }
     let harness_home = canonical_value_directory(plan, "/harnessHome", "harness home")?;
     let source_home = canonical_value_directory(plan, "/sourceHome", "source home")?;
     if source_home != harness_home {
@@ -3006,6 +3201,18 @@ pub fn keeper_task_identity_matches(plan: &Value, observed: &Value) -> bool {
         ("/action/arguments", "/action/arguments"),
         ("/action/workingDirectory", "/action/workingDirectory"),
         ("/task/trigger/userId", "/trigger/userId"),
+        (
+            "/task/trigger/recoveryStartBoundary",
+            "/trigger/recoveryStartBoundary",
+        ),
+        (
+            "/task/trigger/recoveryInterval",
+            "/trigger/recoveryInterval",
+        ),
+        (
+            "/task/trigger/recoveryDuration",
+            "/trigger/recoveryDuration",
+        ),
     ] {
         if plan.pointer(planned).and_then(Value::as_str)
             != observed.pointer(actual).and_then(Value::as_str)
@@ -3013,7 +3220,30 @@ pub fn keeper_task_identity_matches(plan: &Value, observed: &Value) -> bool {
             return false;
         }
     }
-    true
+    observed.pointer("/action/count").and_then(Value::as_u64) == Some(1)
+        && observed.pointer("/trigger/count").and_then(Value::as_u64) == Some(2)
+        && observed
+            .pointer("/trigger/logonCount")
+            .and_then(Value::as_u64)
+            == Some(1)
+        && observed
+            .pointer("/trigger/recoveryCount")
+            .and_then(Value::as_u64)
+            == Some(1)
+        && observed
+            .pointer("/trigger/triggerType")
+            .and_then(Value::as_str)
+            == Some("MSFT_TaskLogonTrigger")
+        && observed
+            .pointer("/trigger/recoveryTriggerType")
+            .and_then(Value::as_str)
+            == Some("MSFT_TaskTimeTrigger")
+        && observed
+            .pointer("/trigger/recoveryStopAtDurationEnd")
+            .and_then(Value::as_bool)
+            == plan
+                .pointer("/task/trigger/recoveryStopAtDurationEnd")
+                .and_then(Value::as_bool)
 }
 
 fn canonical_value_directory(plan: &Value, pointer: &str, label: &str) -> Result<PathBuf, String> {
@@ -3095,6 +3325,17 @@ mod tests {
         );
         assert_eq!(plan.task.principal.user_id, "TEST\\keeper-user");
         assert_eq!(plan.task.trigger.user_id, plan.task.principal.user_id);
+        assert_eq!(plan.task.trigger.recovery_kind, "Time");
+        assert_eq!(
+            plan.task.trigger.recovery_start_boundary,
+            KEEPER_RECOVERY_START_BOUNDARY
+        );
+        assert_eq!(
+            plan.task.trigger.recovery_interval,
+            KEEPER_RECOVERY_INTERVAL
+        );
+        assert_eq!(plan.task.trigger.recovery_duration, None);
+        assert!(!plan.task.trigger.recovery_stop_at_duration_end);
         assert_eq!(plan.executable.sha256.len(), 64);
 
         for flag in [
@@ -3164,7 +3405,7 @@ mod tests {
     }
 
     #[test]
-    fn install_contract_is_interactive_limited_at_logon_and_registered_disabled() {
+    fn install_contract_is_interactive_limited_dual_trigger_and_registered_disabled() {
         let fixture = Fixture::new("install_contract");
         let plan = write_windows_reconcile_keeper_plan(fixture.options()).unwrap();
         let install = fixture.script(&plan, "install");
@@ -3186,6 +3427,8 @@ mod tests {
             "function New-KeeperTaskXml",
             "<LogonType>InteractiveToken</LogonType>",
             "<RunLevel>LeastPrivilege</RunLevel>",
+            "<LogonTrigger><Enabled>true</Enabled><UserId>$UserId</UserId></LogonTrigger>",
+            "<TimeTrigger><Repetition><Interval>$RecoveryInterval</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>$RecoveryStartBoundary</StartBoundary><Enabled>true</Enabled></TimeTrigger>",
             "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
             "<StartWhenAvailable>true</StartWhenAvailable>",
             "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
@@ -3297,9 +3540,20 @@ mod tests {
             "planDigest = $Plan.planDigest",
             "queryNonce = $QueryNonce",
             "principal = [ordered]@{",
+            "observedUserId = $ObservedPrincipalUserId",
+            "identityMatches = $PrincipalIdentityMatches",
+            "$Actions = @()",
+            "$Actions = @($Task.Actions)",
             "action = [ordered]@{",
+            "count = $Actions.Count",
             "settings = [ordered]@{",
+            "recoveryTriggerType",
+            "recoveryStartBoundary",
+            "recoveryInterval",
+            "recoveryDuration",
+            "recoveryStopAtDurationEnd",
             "runtime = [ordered]@{",
+            "$null -ne $TaskInfo.NextRunTime",
             "keeperStateFile = $Plan.stateFile",
             "stopFileExists",
             "observedSha256",
@@ -3322,6 +3576,100 @@ mod tests {
         assert_eq!(
             plan.observation_file,
             plan.output_dir.join("readback-latest.json")
+        );
+
+        fixture.remove();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn account_identity_helper_accepts_task_scheduler_aliases_by_sid_only() {
+        let fixture = Fixture::new("windows_account_identity");
+        let script = fixture.root.join("account-identity.ps1");
+        fs::write(
+            &script,
+            format!(
+                r#"{}
+$Expected = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$Observed = [Environment]::UserName
+$ExpectedSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+if (-not (Test-KeeperAccountIdentityExact -ExpectedUserId $Expected -ObservedUserId $Observed)) {{ throw 'short Task Scheduler alias did not resolve to the current account SID' }}
+if (-not (Test-KeeperAccountIdentityExact -ExpectedUserId $Expected -ObservedUserId $ExpectedSid)) {{ throw 'SID alias did not resolve to the current account' }}
+if (Test-KeeperAccountIdentityExact -ExpectedUserId $Expected -ObservedUserId 'S-1-0-0') {{ throw 'foreign SID was accepted' }}
+"#,
+                account_identity_function_body()
+            ),
+        )
+        .unwrap();
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let output = Command::new(&powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "account identity helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        fixture.remove();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn task_boundary_helper_preserves_iso_text_after_windows_powershell_json_parse() {
+        let fixture = Fixture::new("windows_task_boundary");
+        let plan = write_windows_reconcile_keeper_plan(fixture.options()).unwrap();
+        let script = fixture.root.join("task-boundary.ps1");
+        fs::write(
+            &script,
+            format!(
+                r#"$ErrorActionPreference = 'Stop'
+$Plan = Get-Content -LiteralPath {} -Raw | ConvertFrom-Json
+{}
+$Actual = Get-KeeperRecoveryStartBoundaryText
+if ($Actual -ne '{}') {{ throw "recovery boundary normalized to $Actual" }}
+[xml]$TaskXml = New-KeeperTaskXml
+$Namespace = New-Object Xml.XmlNamespaceManager($TaskXml.NameTable)
+$Namespace.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+$XmlBoundary = $TaskXml.SelectSingleNode('/t:Task/t:Triggers/t:TimeTrigger/t:StartBoundary', $Namespace).InnerText
+if ($XmlBoundary -ne '{}') {{ throw "task XML recovery boundary normalized to $XmlBoundary" }}
+"#,
+                ps_quote_path(&plan.plan_file),
+                task_scheduler_guard_function_body(),
+                KEEPER_RECOVERY_START_BOUNDARY,
+                KEEPER_RECOVERY_START_BOUNDARY,
+            ),
+        )
+        .unwrap();
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let output = Command::new(&powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "task recovery boundary normalization failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
 
         fixture.remove();
@@ -3511,7 +3859,7 @@ mod tests {
                 "install",
                 "same-deployment keeper upgrade requires an exact persistent global hold",
             ),
-            ("start", "Invoke-KeeperTransactionalStartRollback"),
+            ("start", "transactional keeper start rollback is partial"),
             (
                 "stop",
                 "ops-control stop did not produce exact stop-requested state",
@@ -3558,10 +3906,24 @@ mod tests {
                 !stderr.contains("live-control token is required"),
                 "{script_name} incorrectly required a live token in developer staging: {stderr}"
             );
-            assert!(
-                !effect_file.exists(),
-                "{script_name} reached the scheduled-task mutation seam"
-            );
+            if script_name == "start" {
+                let effect: Value =
+                    serde_json::from_slice(&fs::read(&effect_file).unwrap()).unwrap();
+                assert_eq!(effect["action"], "disable-task");
+                assert!(
+                    effect["effects"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|entry| entry["action"] == "disable-task"),
+                    "partial start must only reach the fail-safe rollback disable seam"
+                );
+            } else {
+                assert!(
+                    !effect_file.exists(),
+                    "{script_name} reached the scheduled-task mutation seam"
+                );
+            }
         }
 
         fixture.remove();
@@ -3714,13 +4076,29 @@ mod tests {
             },
             "principal": {"userId": plan.task.principal.user_id},
             "action": {
+                "count": 1,
                 "execute": plan.action.executable,
                 "arguments": plan.action.arguments,
                 "workingDirectory": plan.action.working_directory,
             },
-            "trigger": {"userId": plan.task.trigger.user_id},
+            "trigger": {
+                "count": 2,
+                "logonCount": 1,
+                "recoveryCount": 1,
+                "userId": plan.task.trigger.user_id,
+                "triggerType": "MSFT_TaskLogonTrigger",
+                "recoveryTriggerType": "MSFT_TaskTimeTrigger",
+                "recoveryStartBoundary": plan.task.trigger.recovery_start_boundary,
+                "recoveryInterval": plan.task.trigger.recovery_interval,
+                "recoveryDuration": plan.task.trigger.recovery_duration,
+                "recoveryStopAtDurationEnd": plan.task.trigger.recovery_stop_at_duration_end,
+            },
         });
         assert!(keeper_task_identity_matches(&plan_value, &observed));
+        observed["trigger"]["recoveryInterval"] = Value::String("PT2M".to_string());
+        assert!(!keeper_task_identity_matches(&plan_value, &observed));
+        observed["trigger"]["recoveryInterval"] =
+            Value::String(plan.task.trigger.recovery_interval.to_string());
         observed["task"]["description"] = Value::String("foreign owner".to_string());
         assert!(!keeper_task_identity_matches(&plan_value, &observed));
 
@@ -4362,6 +4740,123 @@ mod tests {
             let effect: Value = serde_json::from_slice(&fs::read(&effect_file).unwrap()).unwrap();
             assert_eq!(effect["action"], expected_effect);
         }
+
+        fs::write(
+            &task_file,
+            serde_json::to_vec(&serde_json::json!({
+                "sequence": [
+                    exact_task_snapshot(&plan, "Ready", true),
+                    exact_task_snapshot(&plan, "Ready", true),
+                    exact_task_snapshot(&plan, "Disabled", false)
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::write_json_atomic(
+            &plan.state_file,
+            &serde_json::json!({
+                "schema": KEEPER_STATE_SCHEMA,
+                "planDigest": plan.plan_digest,
+                "actionDigest": plan.action.digest,
+                "taskName": plan.task.name,
+                "generationId": "already-stopped-generation",
+                "pid": 2_000_000_000u32,
+                "processStartTimeMs": 1,
+                "lastHeartbeatAtMs": 1,
+                "status": "stopped"
+            }),
+        )
+        .unwrap();
+        fs::remove_file(&effect_file).ok();
+        let stop = plan
+            .scripts
+            .iter()
+            .find(|script| script.name == "stop")
+            .unwrap();
+        let output = Command::new(&powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&stop.path)
+            .args([
+                "-LiveControlToken",
+                "non-live-fixture-token",
+                "-TimeoutSeconds",
+                "1",
+            ])
+            .env_remove("AGENT_HARNESS_KEEPER_TEST_STOP_PROOF_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stop rejected an empty crash-path process tree: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stop_proof: Value = serde_json::from_slice(
+            &fs::read(plan.output_dir.join("stop-proof-latest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stop_proof["status"], "stopped");
+        assert_eq!(stop_proof["initialProcessTree"], serde_json::json!([]));
+        assert_eq!(stop_proof["processTreeSurvivors"], serde_json::json!([]));
+        assert_eq!(stop_proof["postRequestTerminalObserved"], false);
+        assert_eq!(stop_proof["idempotentExternalQuiescence"], true);
+        assert_eq!(stop_proof["fallbackRequested"], false);
+
+        fs::remove_file(&plan.state_file).unwrap();
+        fs::write(
+            &task_file,
+            serde_json::to_vec(&serde_json::json!({
+                "sequence": [
+                    exact_task_snapshot(&plan, "Ready", true),
+                    exact_task_snapshot(&plan, "Ready", true),
+                    exact_task_snapshot(&plan, "Disabled", false)
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&effect_file).ok();
+        let output = Command::new(&powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&stop.path)
+            .args([
+                "-LiveControlToken",
+                "non-live-fixture-token",
+                "-TimeoutSeconds",
+                "1",
+            ])
+            .env_remove("AGENT_HARNESS_KEEPER_TEST_STOP_PROOF_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stop rejected externally quiescent missing-state path: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stop_proof: Value = serde_json::from_slice(
+            &fs::read(plan.output_dir.join("stop-proof-latest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stop_proof["postRequestTerminalObserved"], false);
+        assert_eq!(stop_proof["idempotentExternalQuiescence"], true);
+        assert_eq!(stop_proof["fallbackRequested"], false);
+
         unsafe {
             for name in [
                 "AGENT_HARNESS_KEEPER_TEST_OPS_RECEIPT_FILE",
@@ -4606,13 +5101,22 @@ mod tests {
                 "runLevel": plan.task.principal.run_level,
             },
             "action": {
+                "count": 1,
                 "execute": plan.action.executable,
                 "arguments": plan.action.arguments,
                 "workingDirectory": plan.action.working_directory,
             },
             "trigger": {
+                "count": 2,
+                "logonCount": 1,
+                "recoveryCount": 1,
                 "userId": plan.task.trigger.user_id,
                 "triggerType": "MSFT_TaskLogonTrigger",
+                "recoveryTriggerType": "MSFT_TaskTimeTrigger",
+                "recoveryStartBoundary": plan.task.trigger.recovery_start_boundary,
+                "recoveryInterval": plan.task.trigger.recovery_interval,
+                "recoveryDuration": plan.task.trigger.recovery_duration,
+                "recoveryStopAtDurationEnd": plan.task.trigger.recovery_stop_at_duration_end,
             },
             "settings": {
                 "multipleInstances": plan.task.settings.multiple_instances,

@@ -184,7 +184,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I26",
-            statement: "supervisor availability has one config-derived topology authority and two explicit ownership layers: reconcile-managed mode has one deployment-owned same-user OS task owning one singleton root keeper, while scheduled-task child ownership remains the compatibility mode; the global keeper hold is committed before child stop and cleared only after validated child start, readiness binds the exact task action and live keeper instance to the current plan, reconcile-launched parents are outside the launcher console-control domain, and every configured service identity is unique",
+            statement: "supervisor availability has one config-derived topology authority and two explicit ownership layers: reconcile-managed mode has one deployment-owned same-user OS task with one SID-equivalent logon trigger, one indefinite one-minute recovery trigger, one action, and IgnoreNew owning one singleton root keeper, while scheduled-task child ownership remains the compatibility mode; periodic recovery is authoritative and restart-on-failure is defense in depth; the global keeper hold is committed before child stop and cleared only after validated child start, readiness binds the exact task action, triggers, and live keeper instance to the current plan, idempotent stop requires fresh external quiescence when the keeper is already dead, reconcile-launched parents are outside the launcher console-control domain, and every configured service identity is unique",
             owner: "activation/health/supervisor_topology/supervisor_keeper/supervisor_inventory/ops/agent-harness-cli",
         },
         InvariantEntry {
@@ -720,17 +720,22 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.windows-reconcile-keeper-plan.v1",
             owner_module: "supervisor_keeper",
-            compatibility: "immutable same-user task plan bound to canonical deployment paths, executable digest, exact action and settings, global hold/state/readback locations, ownership identity, and deterministic plan digest",
+            compatibility: "immutable same-user task plan bound to canonical deployment paths, executable digest, exactly one action, one logon plus one indefinite periodic recovery trigger, IgnoreNew settings, global hold/state/readback locations, ownership identity, and deterministic plan digest",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.windows-reconcile-keeper-observation.v1",
             owner_module: "supervisor_keeper/activation",
-            compatibility: "atomic Task Scheduler and runtime readback bound to the current plan; exact task state, ownership, action, settings, plan/action digest, singleton keeper identity, and contained live paths fail closed on drift",
+            compatibility: "atomic Task Scheduler and runtime readback bound to the current plan; exact task state, SID-equivalent ownership, one action, exact logon/recovery trigger counts and fields, settings, plan/action digest, singleton keeper identity, and contained live paths fail closed on drift",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.windows-reconcile-keeper-stop-fallback.v1",
             owner_module: "supervisor_keeper",
             compatibility: "atomic last-resort exact-task stop receipt; requested, completed, and failed phases plus bounded timeout diagnostics are additive in v1 and cannot authorize installation, start, or foreign-task mutation",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.windows-reconcile-keeper-stop-proof.v1",
+            owner_module: "supervisor_keeper",
+            compatibility: "atomic exact-task stop proof bound to deployment, plan, action, task path/name, pre-request generation/PID, post-request terminal or idempotent external-quiescence evidence, complete owner/process absence, final disabled task state, and bounded fallback diagnostics; additive diagnostics only in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.supervisor-reconcile-keeper.v1",
@@ -2056,7 +2061,9 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "one validated config-derived topology is shared by reconcile, readiness, keeper generation, and guarded operations; explicit service configuration wins and ambiguous normalized identities fail closed",
                 "stop commits the global keeper hold before best-effort union shutdown even when config is malformed or ownership mode changed, while start validates every target before clearing the global hold last",
                 "generated scripts require exact successful ops-control status and preserve or recreate the global hold after any partial start or stop",
-                "one same-user enabled and Running task has the exact owned action, settings, plan and action digests, contained deployment paths, and one fresh singleton keeper process",
+                "one same-user enabled and Running task has exactly one action, one SID-equivalent logon trigger, one indefinite one-minute recovery trigger, IgnoreNew, the exact settings/plan/action digests, contained deployment paths, and one fresh singleton keeper process",
+                "periodic trigger boundaries do not duplicate a running keeper; an incident-shaped 0xC000013A root death recovers one new generation within the periodic bound, and the recovered root remains singleton across the next boundary",
+                "guarded stop proves every exact owner and descendant absent; repeated stop/uninstall accepts an already-dead keeper only through exact disabled-task and external-quiescence evidence without a stale terminal heartbeat",
                 "installation refuses a foreign existing task and live plan generation or readiness rejects source-tree, sibling, or global executable and tool paths",
                 "the production reconcile launch seam isolates stdio and the Windows console-control domain so an unrelated launcher control break cannot terminate managed parents",
                 "scheduled-task child ownership remains compatible when reconcile-managed mode is disabled",
@@ -2078,7 +2085,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "agent-harness-cli::tests::supervisor_reconcile_all_includes_isolated_ledger_maintenance_owner",
                 "windows_process_boundary::production_reconcile_spawn_child_survives_launcher_control_break",
             ],
-            promotion_gate: "Promote only after focused contracts, full serial workspace, generated PowerShell parsing, exact stopped-state task readback, a real user-scoped task install/start/keeper-death restart/stop/uninstall lifecycle, and the production process-boundary replay pass. Post-cutover readback must show one current-plan keeper, every expected child, no source or staging paths, no global hold, no stale or conflicting owner, and no pending/retryable provider queue.",
+            promotion_gate: "Promote only after focused contracts, full serial workspace, generated Windows PowerShell parsing, exact stopped-state dual-trigger task readback, idempotent repeated install, a real user-scoped task start/periodic-boundary singleton/incident-shaped keeper-death recovery/complete stop/idempotent uninstall lifecycle, and the production process-boundary replay pass. Post-cutover readback must show one current-plan keeper, both exact triggers, one action, every expected child, no source or staging paths, no global hold, no stale or conflicting owner, and no pending/retryable provider queue.",
         },
     ]
 }
@@ -2524,6 +2531,7 @@ mod tests {
             "agent-harness.windows-reconcile-keeper-plan.v1",
             "agent-harness.windows-reconcile-keeper-observation.v1",
             "agent-harness.windows-reconcile-keeper-stop-fallback.v1",
+            "agent-harness.windows-reconcile-keeper-stop-proof.v1",
             "agent-harness.supervisor-reconcile-keeper.v1",
         ] {
             assert!(

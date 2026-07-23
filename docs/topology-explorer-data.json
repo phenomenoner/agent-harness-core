@@ -4,7 +4,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "1fb17ecb2cb182c2d62383989df7a9e5ba1a890ad3c5f7f5f1ba614046d72c06"
+      "sha256": "9b5b00264f0384909fdec7110da59481c4d4e70dcee4ae7b7995fc7e1bb25a63"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -552,9 +552,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Mode-aware supervisor readiness, configured-loop parity, and root availability",
-      "designTarget": "supervisor.manageAllLoops=true selects reconcile-managed ownership, where one shared topology derivation drives reconcile, readiness, and guarded stop/start; the exact deployment-owned desired-service inventory and service kinds are authoritative and supervisor-plan.json is not applicable. Reconcile-managed mode additionally requires one user-scoped OS task running an exact live keeper process, while each child supervisor parent is detached from the launcher's console control domain. Scheduled-task child ownership retains its generated plan checks.",
-      "currentEvidence": "Hermetic replay covers the nine-service topology plus keeper, config overrides, custom/disabled services, cron precedence, exact service kinds, keeper-first stop/keeper-last start, partial-mutation receipts, and fail-closed inventory cases. A Windows process-boundary replay sends CTRL_BREAK to the launcher group and proves the detached child survives. Generated keeper scripts parse in Windows PowerShell; an automated Windows test performs two consecutive atomic readbacks without registering a task or leaving temporary/backup debris, all persisted paths remain below the staging harness, and readiness rejects a missing/disabled task, stale keeper, or mismatched process instance. Real task registration, restart, and live soak remain pending.",
-      "promotionGate": "Promote only after a stopped-state candidate registers the generated task under the intended user, task/action/settings/digest readback passes, forced keeper-death restart converges the exact configured topology, an independent reviewer passes the patch, and guarded post-cutover readback shows the keeper and every configured owner fresh with no missing, unexpected, stale, source-tree, or launch actions.",
+      "designTarget": "supervisor.manageAllLoops=true selects reconcile-managed ownership, where one shared topology derivation drives reconcile, readiness, and guarded stop/start; the exact deployment-owned desired-service inventory and service kinds are authoritative and supervisor-plan.json is not applicable. Reconcile-managed mode additionally requires one user-scoped OS task with exactly one same-user logon trigger, one indefinite one-minute recovery trigger, one action, and IgnoreNew, running an exact live keeper process while each child supervisor parent is detached from the launcher's console control domain. Task Scheduler restart-on-failure remains defense in depth; periodic recovery owns the crash-recovery guarantee.",
+      "currentEvidence": "Hermetic replay covers the nine-service topology plus keeper, config overrides, custom/disabled services, cron precedence, exact service kinds, keeper-first stop/keeper-last start, partial-mutation receipts, and fail-closed inventory cases. Windows tests cover console-boundary isolation, PowerShell 5.1 ISO-boundary preservation, SID-equivalent account aliases, singleton action/trigger normalization, dual-trigger readback, and empty/non-empty stopped process trees. The exact release candidate then passed a real task lifecycle: two installs retained one identical exported task definition; the root remained singleton across periodic boundaries; 0xC000013A termination recovered one new generation at the next boundary; active stop closed the exact tree; and already-dead uninstall completed from external quiescence without fallback. Generated paths remained below the staging harness and the unrelated OpenClaw task was unchanged. Live deployment readback remains pending.",
+      "promotionGate": "Promote only after a fresh independent reviewer passes the exact candidate and guarded post-cutover readback shows one current-plan keeper, exactly one action and both triggers, every configured owner fresh, no missing/unexpected/stale/source-tree/conflicting owner, and no queued provider work stranded by the transition.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -1711,6 +1711,11 @@
       "label": "tracked in"
     },
     {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-supervisor-root-keeper-live-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-workers-child-execution-policy",
       "target": "gap-supervisor-root-keeper-live-gap",
       "label": "has gap"
@@ -1722,6 +1727,11 @@
     },
     {
       "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-supervisor-root-keeper-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-external-effect",
       "target": "gap-supervisor-root-keeper-live-gap",
       "label": "has gap"
     },

@@ -6,7 +6,8 @@
 
 - Added a user-scoped Windows reconcile keeper as the single operating-system-owned root for the
   live supervisor topology. Generated plans bind the exact task path, principal, executable and
-  tool digests, contained workspaces, restart settings, hold state, and fresh process identity.
+  tool digests, contained workspaces, hold state, and fresh process identity. One same-user logon
+  trigger plus one indefinite one-minute time trigger provide bounded recovery under `IgnoreNew`.
 - Added guarded keeper plan, install, start, stop, readback, and uninstall workflows with
   disabled-first task registration, atomic generation promotion, transactional stale-task restore,
   and a retained prior-generation rollback package.
@@ -30,6 +31,8 @@
   developer staging remains contained and explicit.
 - Reconcile-launched supervisor parents detach from the caller's console and process group, while
   the keeper retains exact descendant ownership and restart authority.
+- Keeper recovery no longer relies on Task Scheduler restart-on-failure semantics. The periodic
+  trigger is authoritative; restart-on-failure remains a defense-in-depth setting.
 
 ### Fixed
 
@@ -40,7 +43,15 @@
   Goal continuation. Human-input generation, current Goal projection, closure, supersession, lane,
   session, and backend authority are revalidated before enqueue and again after lease acquisition.
 - Keeper health no longer passes on an empty topology, stale cached task observation, mismatched
-  process instance, partial inventory, unexpected owner, or incomplete stopped/start transaction.
+  process instance, wrong action/trigger count, partial inventory, unexpected owner, or incomplete
+  stopped/start transaction.
+- Windows PowerShell 5.1 plan parsing no longer converts the deterministic ISO trigger boundary
+  into locale-formatted invalid XML, collapses singleton task actions into null readback, rejects
+  SID-equivalent Task Scheduler account aliases, or fails a guarded stop when the crashed keeper
+  leaves an empty initial process tree.
+- Guarded reconcile stop/start now treats only canonical `<service-id>.json` files as authoritative
+  observed topology. Same-directory atomic-write temp and lock files cannot create a false partial
+  control receipt, while malformed or identity-mismatched canonical state still fails closed.
 - Live-control validation is bound to the exact target home and action in every shell, rather than
   inheriting authority from a process environment flag or accepting a structurally incomplete
   receipt.
@@ -62,8 +73,8 @@
 - Existing Goal continuation intent statuses remain readable. New terminal revocation is recorded
   in a separate fence ledger so older readers can parse the original v1 intent records; rollback
   must still drain or quarantine open new-format work before an older binary starts.
-- The keeper uses an interactive, limited same-user logon task. It survives launcher exit and
-  restarts while the user session is available; it does not claim pre-logon or through-logoff
+- The keeper uses an interactive, limited same-user task. Its logon and periodic triggers recover
+  the root while that user session is available; it does not claim pre-logon or through-logoff
   always-on service semantics.
 
 ### Verification
@@ -72,11 +83,15 @@
   reconstruction, terminal and superseded races, post-lease fencing, malformed/colliding ledgers,
   exactly-once settlement, and same-lane human-input priority.
 - Added hermetic Windows keeper scenarios for exact task ownership, migration, atomic registration,
-  fresh readback, transaction rollback, generation promotion, descendant closure, empty-topology
-  rejection, and target-bound live-control gates.
-- Real Windows Task Scheduler lifecycle, independent review, controlled live cutover, provider-
-  visible Discord replay, and longer-duration soak remain release gates until their evidence is
-  recorded.
+  fresh dual-trigger readback, PowerShell 5.1 normalization, transaction rollback, generation
+  promotion, empty and non-empty descendant closure, empty-topology rejection, and target-bound
+  live-control gates. Control-plane replay also covers transient atomic service-state siblings and
+  identity-mismatched canonical service state.
+- A real Windows Task Scheduler lifecycle passed on the release candidate: repeated install kept
+  the task definition byte-stable, periodic firings retained one root, `0xC000013A` death recovered
+  one new generation, active-tree stop closed every descendant, and already-dead uninstall used
+  external-quiescence evidence without a fallback. Independent review, controlled live cutover,
+  provider-visible Discord replay, and longer-duration soak remain gates until recorded.
 
 ## v0.12.0 - 2026-07-22
 

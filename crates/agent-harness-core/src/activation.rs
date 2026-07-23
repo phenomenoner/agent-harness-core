@@ -1261,6 +1261,16 @@ fn check_reconcile_keeper_with_refresh(
             ),
             ("/trigger/userId", "/task/trigger/userId", "trigger user"),
             (
+                "/trigger/recoveryStartBoundary",
+                "/task/trigger/recoveryStartBoundary",
+                "recovery trigger start boundary",
+            ),
+            (
+                "/trigger/recoveryInterval",
+                "/task/trigger/recoveryInterval",
+                "recovery trigger interval",
+            ),
+            (
                 "/settings/multipleInstances",
                 "/task/settings/multipleInstances",
                 "multiple-instance policy",
@@ -1288,17 +1298,48 @@ fn check_reconcile_keeper_with_refresh(
             .pointer("/trigger/triggerType")
             .and_then(Value::as_str)
             != Some("MSFT_TaskLogonTrigger")
+            || observation
+                .pointer("/trigger/recoveryTriggerType")
+                .and_then(Value::as_str)
+                != Some("MSFT_TaskTimeTrigger")
             || plan.pointer("/task/trigger/kind").and_then(Value::as_str) != Some("AtLogOn")
+            || plan
+                .pointer("/task/trigger/recoveryKind")
+                .and_then(Value::as_str)
+                != Some("Time")
         {
-            invalid
-                .push("keeper task trigger is not the planned same-user logon trigger".to_string());
+            invalid.push(
+                "keeper task triggers are not the planned same-user logon and recovery triggers"
+                    .to_string(),
+            );
         }
-        if observation
-            .pointer("/settings/restartCount")
-            .and_then(Value::as_u64)
-            != plan
-                .pointer("/task/settings/restartCount")
+        if observation.pointer("/action/count").and_then(Value::as_u64) != Some(1)
+            || observation
+                .pointer("/trigger/count")
                 .and_then(Value::as_u64)
+                != Some(2)
+            || observation
+                .pointer("/trigger/logonCount")
+                .and_then(Value::as_u64)
+                != Some(1)
+            || observation
+                .pointer("/trigger/recoveryCount")
+                .and_then(Value::as_u64)
+                != Some(1)
+            || observation.pointer("/trigger/recoveryDuration")
+                != plan.pointer("/task/trigger/recoveryDuration")
+            || observation
+                .pointer("/trigger/recoveryStopAtDurationEnd")
+                .and_then(Value::as_bool)
+                != plan
+                    .pointer("/task/trigger/recoveryStopAtDurationEnd")
+                    .and_then(Value::as_bool)
+            || observation
+                .pointer("/settings/restartCount")
+                .and_then(Value::as_u64)
+                != plan
+                    .pointer("/task/settings/restartCount")
+                    .and_then(Value::as_u64)
             || observation
                 .pointer("/settings/startWhenAvailable")
                 .and_then(Value::as_bool)
@@ -1318,7 +1359,10 @@ fn check_reconcile_keeper_with_refresh(
                     .pointer("/task/settings/stopIfGoingOnBatteries")
                     .and_then(Value::as_bool)
         {
-            invalid.push("keeper task settings do not match the restart/battery plan".to_string());
+            invalid.push(
+                "keeper task actions, triggers, or settings do not match the recovery plan"
+                    .to_string(),
+            );
         }
     }
 
@@ -3697,13 +3741,22 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
                     "runLevel": plan.task.principal.run_level
                 },
                 "action": {
+                    "count": 1,
                     "execute": plan.action.executable,
                     "arguments": plan.action.arguments,
                     "workingDirectory": plan.action.working_directory
                 },
                 "trigger": {
+                    "count": 2,
+                    "logonCount": 1,
+                    "recoveryCount": 1,
                     "userId": plan.task.trigger.user_id,
-                    "triggerType": "MSFT_TaskLogonTrigger"
+                    "triggerType": "MSFT_TaskLogonTrigger",
+                    "recoveryTriggerType": "MSFT_TaskTimeTrigger",
+                    "recoveryStartBoundary": plan.task.trigger.recovery_start_boundary,
+                    "recoveryInterval": plan.task.trigger.recovery_interval,
+                    "recoveryDuration": plan.task.trigger.recovery_duration,
+                    "recoveryStopAtDurationEnd": plan.task.trigger.recovery_stop_at_duration_end
                 },
                 "settings": {
                     "multipleInstances": plan.task.settings.multiple_instances,
@@ -3736,6 +3789,22 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
         }));
 
         let mut observation = read_json_value(&plan.observation_file).unwrap();
+        observation["trigger"]["recoveryInterval"] = Value::String("PT2M".to_string());
+        crate::write_json_atomic(&plan.observation_file, &observation).unwrap();
+        let mut stale_recovery_trigger_checks = Vec::new();
+        check_reconcile_keeper_with_refresh(
+            &harness_home,
+            &mut stale_recovery_trigger_checks,
+            false,
+        );
+        assert!(stale_recovery_trigger_checks.iter().any(|check| {
+            check.name == "supervisor-reconcile-keeper"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("recovery trigger")
+        }));
+
+        observation["trigger"]["recoveryInterval"] =
+            Value::String(plan.task.trigger.recovery_interval.to_string());
         observation["task"]["enabled"] = Value::Bool(false);
         crate::write_json_atomic(&plan.observation_file, &observation).unwrap();
         let mut disabled_checks = Vec::new();

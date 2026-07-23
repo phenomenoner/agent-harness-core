@@ -1289,6 +1289,14 @@ fn discover_observed_reconcile_stop_files(
         if !path.is_file() {
             continue;
         }
+        // `write_json_atomic` stages service state beside the canonical file as
+        // `.<name>.json.<pid>.<time>.<sequence>.tmp` and may also leave its
+        // `.atomic.lock` visible during replacement. Only `<service-id>.json`
+        // is authoritative supervisor topology; transient siblings must never
+        // become control targets or turn a safe stop into a partial receipt.
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
         let value = match fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Value>(&text) {
                 Ok(value) => Some(value),
@@ -2349,6 +2357,129 @@ mod tests {
                 crate::loop_health::supervisor_stop_file_path(&harness_home, component).is_file()
             );
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // Contract: atomic-write staging files are not authoritative supervisor topology.
+    // Source: the Windows keeper stop replay observed a valid atomic temp file between
+    // write and rename while the canonical service state remained present.
+    // Fails on: every regular file in the services directory is parsed as canonical state.
+    // Asserts: only canonical `<service-id>.json` files influence fail-closed control.
+    #[test]
+    fn ops_control_ignores_atomic_service_state_temp_files() {
+        let root = temp_root("ops_control_ignores_atomic_service_state_temp_files");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            br#"{"supervisor":{"manageAllLoops":true}}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper")
+                .join("keeper-plan.json"),
+            b"{}",
+        )
+        .unwrap();
+        let services = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services).unwrap();
+        let canonical = br#"{"serviceId":"telegram-loop"}"#;
+        fs::write(services.join("telegram-loop.json"), canonical).unwrap();
+        fs::write(
+            services.join(".telegram-loop.json.4242.2000.1.tmp"),
+            canonical,
+        )
+        .unwrap();
+
+        let report = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "stop-requested", "{}", report.reason);
+        assert_eq!(
+            report
+                .stop_files
+                .iter()
+                .filter(|entry| entry.component == "telegram-loop")
+                .count(),
+            1
+        );
+        for component in [RECONCILE_KEEPER_STOP_COMPONENT, "telegram-loop"] {
+            assert!(
+                crate::loop_health::supervisor_stop_file_path(&harness_home, component).is_file()
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ops_control_rejects_canonical_service_state_identity_mismatch() {
+        let root = temp_root("ops_control_rejects_canonical_service_state_identity_mismatch");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            br#"{"supervisor":{"manageAllLoops":true}}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper")
+                .join("keeper-plan.json"),
+            b"{}",
+        )
+        .unwrap();
+        let services = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services).unwrap();
+        fs::write(
+            services.join("telegram-loop.json"),
+            br#"{"serviceId":"discord-gateway-loop"}"#,
+        )
+        .unwrap();
+
+        let report = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "partial-stop-request");
+        assert!(report.reason.contains(
+            "observed supervisor service identity `discord-gateway-loop` does not match state filename `telegram-loop`"
+        ));
 
         let _ = fs::remove_dir_all(root);
     }
