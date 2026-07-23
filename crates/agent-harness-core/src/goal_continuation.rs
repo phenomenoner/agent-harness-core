@@ -2274,7 +2274,6 @@ fn revalidate_current_goal_authority(
     let current = matches[0];
     let exact_identity = current.campaign_family_id == intent.campaign_family_id
         && current.goal_checksum == intent.goal_checksum
-        && current.queue_id.as_deref() == Some(intent.parent_queue_id.as_str())
         && current.source_session_key == intent.working_session_key
         && current.lane_digest.as_deref() == Some(intent.lane_digest.as_str())
         && current.virtual_session_id.as_deref() == Some(intent.virtual_session_id.as_str())
@@ -2283,6 +2282,16 @@ fn revalidate_current_goal_authority(
     if !exact_identity {
         return Err(IntentRevalidationFailure::PolicyBlocked(
             "current durable Goal lineage no longer matches the committed lineage/campaign/checksum/lane/session/backend authority"
+                .to_string(),
+        ));
+    }
+    if !goal_parent_descends_from_current_lineage(
+        harness_home,
+        intent,
+        current.queue_id.as_deref(),
+    )? {
+        return Err(IntentRevalidationFailure::PolicyBlocked(
+            "continuation parent is not an acknowledged exact-authority descendant of the current durable Goal lineage"
                 .to_string(),
         ));
     }
@@ -2335,6 +2344,124 @@ fn revalidate_current_goal_authority(
         ));
     }
     Ok(())
+}
+
+fn goal_parent_descends_from_current_lineage(
+    harness_home: &Path,
+    intent: &GoalContinuationIntentV1,
+    current_lineage_queue_id: Option<&str>,
+) -> Result<bool, IntentRevalidationFailure> {
+    let Some(current_lineage_queue_id) =
+        current_lineage_queue_id.filter(|queue_id| !queue_id.is_empty())
+    else {
+        return Ok(false);
+    };
+    if intent.parent_queue_id == current_lineage_queue_id {
+        return Ok(true);
+    }
+
+    let pending_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("pending.jsonl");
+    let pending_text =
+        fs::read_to_string(&pending_file).map_err(IntentRevalidationFailure::from_state_error)?;
+    let mut pending_by_queue: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for line in pending_text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(queue_id) = value
+            .get("queueId")
+            .and_then(Value::as_str)
+            .filter(|queue_id| !queue_id.is_empty())
+        else {
+            continue;
+        };
+        pending_by_queue
+            .entry(queue_id.to_string())
+            .or_default()
+            .push(value);
+    }
+
+    let mut descendant_queue_id = intent.parent_queue_id.clone();
+    let mut expected_slice_generation = intent.source_slice_generation;
+    let mut visited = BTreeSet::new();
+    while descendant_queue_id != current_lineage_queue_id {
+        if !visited.insert(descendant_queue_id.clone()) {
+            return Err(IntentRevalidationFailure::FailVisible(
+                "goal continuation parent chain contains a cycle".to_string(),
+            ));
+        }
+        let rows = pending_by_queue
+            .get(&descendant_queue_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if rows.len() != 1 {
+            return Err(IntentRevalidationFailure::FailVisible(format!(
+                "goal continuation parent chain has {} durable queue rows for {}",
+                rows.len(),
+                descendant_queue_id
+            )));
+        }
+        let row = &rows[0];
+        let prior_intent_key = row
+            .get("continuationIntentKey")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                IntentRevalidationFailure::PolicyBlocked(format!(
+                    "goal continuation parent {} has no prior intent authority",
+                    descendant_queue_id
+                ))
+            })?;
+        let requeued_from_queue_id = row
+            .get("requeuedFromQueueId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                IntentRevalidationFailure::PolicyBlocked(format!(
+                    "goal continuation parent {} has no durable predecessor",
+                    descendant_queue_id
+                ))
+            })?;
+        let recovered = latest_recoverable_intent_for_key(harness_home, prior_intent_key)
+            .map_err(IntentRevalidationFailure::from_state_error)?;
+        if let Some(reason) = recovered.corruption {
+            return Err(IntentRevalidationFailure::FailVisible(format!(
+                "goal continuation parent chain intent {prior_intent_key} is corrupt: {reason}"
+            )));
+        }
+        let prior = recovered.latest.ok_or_else(|| {
+            IntentRevalidationFailure::PolicyBlocked(format!(
+                "goal continuation parent chain intent {prior_intent_key} is missing"
+            ))
+        })?;
+        let exact_prior_authority = prior.status == GoalContinuationIntentStatus::Acknowledged
+            && prior.child_queue_id.as_deref() == Some(descendant_queue_id.as_str())
+            && prior.parent_queue_id == requeued_from_queue_id
+            && prior.schema == GOAL_CONTINUATION_INTENT_SCHEMA
+            && prior.working_session_key == intent.working_session_key
+            && prior.lane_digest == intent.lane_digest
+            && prior.virtual_session_id == intent.virtual_session_id
+            && prior.lineage_id == intent.lineage_id
+            && prior.goal_checksum == intent.goal_checksum
+            && prior.campaign_family_id == intent.campaign_family_id
+            && prior.backend_context_generation == intent.backend_context_generation
+            && prior.human_input_generation == intent.human_input_generation
+            && prior.campaign_slice_generation == expected_slice_generation
+            && prior.campaign_slice_generation == prior.source_slice_generation.saturating_add(1)
+            && prior.authority_version == Some(prior.source_slice_generation)
+            && prior.authority_id == intent.authority_id
+            && prior.authority_checksum == intent.authority_checksum
+            && goal_intent_has_exact_current_authority(&prior);
+        if !exact_prior_authority {
+            return Ok(false);
+        }
+        descendant_queue_id = prior.parent_queue_id;
+        expected_slice_generation = prior.source_slice_generation;
+    }
+    Ok(true)
 }
 
 fn exact_goal_closure_breaker(
@@ -3779,6 +3906,57 @@ mod tests {
             assert_visible_settlement_once(&root, &committed, "suppressed", "parked-policy-denied");
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn descendant_goal_parent_requires_acknowledged_exact_intent_chain() {
+        let root = test_root("goal-descendant-parent-exact-chain");
+        let committed = prepare_goal_intent(&root, "queue-parent", "dm-descendant-chain", "user-a");
+        let enqueued = ensure_goal_continuation_enqueued(&root, &committed.intent_key, 20).unwrap();
+        let child_queue_id = enqueued.child_queue_id.clone().unwrap();
+        let mut descendant = enqueued.clone();
+        descendant.intent_key = "descendant-intent".to_string();
+        descendant.status = GoalContinuationIntentStatus::Committed;
+        descendant.parent_queue_id = child_queue_id.clone();
+        descendant.child_queue_id = None;
+        descendant.source_slice_generation = enqueued.campaign_slice_generation;
+        descendant.campaign_slice_generation = descendant.source_slice_generation.saturating_add(1);
+        descendant.authority_version = Some(descendant.source_slice_generation);
+
+        assert!(matches!(
+            revalidate_current_goal_authority(&root, &descendant),
+            Err(IntentRevalidationFailure::PolicyBlocked(_))
+        ));
+
+        let child = continuation_gate_item(&root, &enqueued);
+        assert!(matches!(
+            gate_goal_continuation_after_lease(&root, &child, 21).unwrap(),
+            GoalContinuationLeaseGate::Acknowledged(_)
+        ));
+        revalidate_current_goal_authority(&root, &descendant).unwrap();
+
+        let pending_file = root
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl");
+        let mut forged_row = fs::read_to_string(&pending_file)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| {
+                value.get("queueId").and_then(Value::as_str) == Some(child_queue_id.as_str())
+            })
+            .unwrap();
+        let forged_queue_id = "queue-forged-same-lane";
+        forged_row["queueId"] = Value::String(forged_queue_id.to_string());
+        append_jsonl_value(&pending_file, &forged_row).unwrap();
+        let mut forged = descendant;
+        forged.parent_queue_id = forged_queue_id.to_string();
+        assert!(matches!(
+            revalidate_current_goal_authority(&root, &forged),
+            Err(IntentRevalidationFailure::PolicyBlocked(_))
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

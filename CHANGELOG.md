@@ -1,5 +1,83 @@
 # Changelog
 
+## v0.13.0 - 2026-07-23
+
+### Added
+
+- Added a user-scoped Windows reconcile keeper as the single operating-system-owned root for the
+  live supervisor topology. Generated plans bind the exact task path, principal, executable and
+  tool digests, contained workspaces, restart settings, hold state, and fresh process identity.
+- Added guarded keeper plan, install, start, stop, readback, and uninstall workflows with
+  disabled-first task registration, atomic generation promotion, transactional stale-task restore,
+  and a retained prior-generation rollback package.
+- Added durable continuation fencing and reconciliation-error overlays. Restart recovery can
+  reconstruct exact legacy Goal authority, quarantine malformed or colliding records without
+  blocking unrelated lanes, and settle every recoverably identified suppressed parent once.
+- Added public workspace and build-output boundaries: task-created worktrees stay below
+  `.worktrees/`, Cargo output stays below `target/`, scratch evidence stays below `.debug/`, and
+  ancestor Git markers or externally managed skill repositories are never used as project output.
+
+### Changed
+
+- An exact current-owned authorized Goal now receives bounded continuation when no explicit
+  `goalAutonomy` block exists. Explicit observe or disabled policy remains an opt-out and parks
+  visibly without a runnable lease.
+- Ordinary same-lane user input takes priority at the next scheduler checkpoint over an unleased
+  autonomous continuation. An already leased turn remains bounded by explicit `/steer`, `/stop`,
+  and `/new` control semantics.
+- Reconcile-managed live operation now derives reconcile, readiness, health, and guarded stop/start
+  from one canonical topology. Per-child Scheduled Task plans are rejected for the live home;
+  developer staging remains contained and explicit.
+- Reconcile-launched supervisor parents detach from the caller's console and process group, while
+  the keeper retains exact descendant ownership and restart authority.
+
+### Fixed
+
+- A successful unfinished Goal can no longer be silently parked merely because configuration omits
+  `goalAutonomy`; exact current authority either admits the bounded child or produces a durable,
+  provider-visible park/failure disposition.
+- New user messages can no longer remain indefinitely queued behind a stale committed or enqueued
+  Goal continuation. Human-input generation, current Goal projection, closure, supersession, lane,
+  session, and backend authority are revalidated before enqueue and again after lease acquisition.
+- Keeper health no longer passes on an empty topology, stale cached task observation, mismatched
+  process instance, partial inventory, unexpected owner, or incomplete stopped/start transaction.
+- Live-control validation is bound to the exact target home and action in every shell, rather than
+  inheriting authority from a process environment flag or accepting a structurally incomplete
+  receipt.
+
+### Security
+
+- Live task mutation revalidates the exact task path, task definition, same-user principal,
+  action-specific authorization, plan digest, process identity, and target home immediately before
+  every external mutation.
+- Generated keeper scripts are checksum-locked and self-checked. Stop and uninstall paths close the
+  exact keeper process tree, including pinned Node descendants, without granting authority over a
+  foreign task or unrelated process.
+- The same-user Scheduled Task boundary is an operational ownership guard, not a hostile same-user
+  security boundary. Strong isolation still requires a distinct principal, ACLs, or a privileged
+  broker.
+
+### Compatibility
+
+- Existing Goal continuation intent statuses remain readable. New terminal revocation is recorded
+  in a separate fence ledger so older readers can parse the original v1 intent records; rollback
+  must still drain or quarantine open new-format work before an older binary starts.
+- The keeper uses an interactive, limited same-user logon task. It survives launcher exit and
+  restarts while the user session is available; it does not claim pre-logon or through-logoff
+  always-on service semantics.
+
+### Verification
+
+- Added restart and authority scenarios for implicit Goal continuation, explicit opt-out, legacy
+  reconstruction, terminal and superseded races, post-lease fencing, malformed/colliding ledgers,
+  exactly-once settlement, and same-lane human-input priority.
+- Added hermetic Windows keeper scenarios for exact task ownership, migration, atomic registration,
+  fresh readback, transaction rollback, generation promotion, descendant closure, empty-topology
+  rejection, and target-bound live-control gates.
+- Real Windows Task Scheduler lifecycle, independent review, controlled live cutover, provider-
+  visible Discord replay, and longer-duration soak remain release gates until their evidence is
+  recorded.
+
 ## v0.12.0 - 2026-07-22
 
 ### Added

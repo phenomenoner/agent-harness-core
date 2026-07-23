@@ -34,7 +34,6 @@ Usage:
   harness gateway keeper-install --live-control-token <token>
   harness gateway keeper-readback
   harness gateway keeper-uninstall --live-control-token <token>
-  harness gateway stop --live-control-token <token>
 
 Components for tail:
   runtime, telegram, discord, discord-gateway, discord-outbox, progress, worker, harness, progress-events

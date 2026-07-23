@@ -704,7 +704,7 @@ fn check_runtime_loop(harness_home: &Path, checks: &mut Vec<ActivationReadinessC
                     ),
                 )),
                 Some(errors) => {
-                    if let Some(heartbeat_detail) =
+                    if let Some((heartbeat_status, heartbeat_detail)) =
                         live_loop_heartbeat_detail(harness_home, "runtime-loop")
                     {
                         let detail = if stop_reason.contains("stop file") {
@@ -720,6 +720,8 @@ fn check_runtime_loop(harness_home: &Path, checks: &mut Vec<ActivationReadinessC
                         };
                         if stop_reason.contains("stop file") {
                             checks.push(pass("runtime-loop", detail));
+                        } else if heartbeat_status == "safe-mode" {
+                            checks.push(fail("runtime-loop", detail));
                         } else {
                             checks.push(warn("runtime-loop", detail));
                         }
@@ -767,7 +769,7 @@ fn check_runtime_loop(harness_home: &Path, checks: &mut Vec<ActivationReadinessC
     }
 }
 
-fn live_loop_heartbeat_detail(harness_home: &Path, name: &str) -> Option<String> {
+fn live_loop_heartbeat_detail(harness_home: &Path, name: &str) -> Option<(String, String)> {
     let stop_file = read_supervisor_stop_file(harness_home, name).ok()?;
     if stop_file.present {
         return None;
@@ -817,9 +819,12 @@ fn live_loop_heartbeat_detail(harness_home: &Path, name: &str) -> Option<String>
     let age_detail = age_ms
         .map(|age_ms| format!("ageMs={age_ms}"))
         .unwrap_or_else(|| "ageMs=-".to_string());
-    Some(format!(
-        "{name} heartbeat is live at {}: status={status}, {age_detail}, detail={detail}",
-        path.display()
+    Some((
+        status.to_string(),
+        format!(
+            "{name} heartbeat is live at {}: status={status}, {age_detail}, detail={detail}",
+            path.display()
+        ),
     ))
 }
 
@@ -1745,7 +1750,8 @@ fn check_loop_heartbeat(
                     base_detail
                 };
                 if name == "runtime-loop"
-                    && age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS)
+                    && (status == "safe-mode"
+                        || age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS))
                 {
                     checks.push(fail(check_name, detail));
                 } else {
