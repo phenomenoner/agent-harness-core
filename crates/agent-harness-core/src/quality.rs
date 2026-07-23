@@ -184,8 +184,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I26",
-            statement: "supervisor readiness follows configured ownership: supervisor.manageAllLoops=true makes the exact deployment-owned reconcile inventory authoritative even when supervisor.enabled=false and makes a scheduled-task plan not applicable, while scheduled-task mode retains plan checks; both surfaces preserve enabled configured supervisor.telegramLoops and the isolated ledger-maintenance owner",
-            owner: "activation/supervisor/harness_config/supervisor_inventory",
+            statement: "supervisor availability has one config-derived topology authority and two explicit ownership layers: reconcile-managed mode has one deployment-owned same-user OS task owning one singleton root keeper, while scheduled-task child ownership remains the compatibility mode; the global keeper hold is committed before child stop and cleared only after validated child start, readiness binds the exact task action and live keeper instance to the current plan, reconcile-launched parents are outside the launcher console-control domain, and every configured service identity is unique",
+            owner: "activation/health/supervisor_topology/supervisor_keeper/supervisor_inventory/ops/agent-harness-cli",
         },
         InvariantEntry {
             id: "I27",
@@ -239,7 +239,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I37",
-            statement: "every goal, ordinary task, bounded-yield completion, and needs-user wait passes typed transition authority before final or progress selection; each applicable terminal receipt states one source-closure kind and reason with derived source-final expectation and outbox disposition, policy-denied goals park visibly and lease-free, and continuations commit before parent suppression then acknowledge only after child lease ownership",
+            statement: "every goal, ordinary task, bounded-yield completion, and needs-user wait passes typed transition authority before final or progress selection; each applicable terminal receipt states one source-closure kind and reason with derived source-final expectation and outbox disposition; exact current-owned goals receive bounded implicit autonomy only without an explicit policy block, while explicit opt-outs park visibly and lease-free; continuations commit before parent suppression, snapshot ordinary same-lane input generation, isolate malformed records per intent, use rollback-readable separate fencing, revalidate authority after lease and before external effects, create at most one child under concurrent reconciliation, and yield unleased scheduler priority or further chaining to newer human input before acknowledgement",
             owner: "goal_transition/task_transition/goal_continuation/runtime_pipeline/context_rollover/runtime_worker/progress/external_effect",
         },
         InvariantEntry {
@@ -465,7 +465,17 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.goal-continuation-intent.v1",
             owner_module: "goal_continuation/runtime_pipeline",
-            compatibility: "append-only commit/enqueue/ack lifecycle shared by goal, OperationPlan deadline-drain, and external-effect continuations; deterministic intent key and exact authority axes are immutable, and one intent owns at most one child",
+            compatibility: "append-only commit/enqueue/ack lifecycle shared by goal, OperationPlan deadline-drain, and external-effect continuations; deterministic intent key and exact authority axes are immutable, one intent owns at most one child, optional humanInputGeneration snapshots ordinary same-lane input at the parent boundary, and v1 status values remain readable by rollback binaries",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-continuation-fence.v1",
+            owner_module: "goal_continuation/runtime_pipeline",
+            compatibility: "separate append-only terminal authority revocation overlay; intent key, authority generation, fence reason, and optional quarantined child identity are immutable, while the goal-continuation-intent v1 enum remains unchanged for rollback compatibility",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-continuation-reconciliation-error.v1",
+            owner_module: "goal_continuation",
+            compatibility: "append-only per-record and per-intent restart diagnostics with deterministic deduplication; malformed, unsupported, colliding, or invalid records are quarantined independently and transient I/O failures remain retryable without blocking unrelated intents",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.task-continuation-checkpoint.v1",
@@ -696,6 +706,31 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.supervisor-reconcile.v1",
             owner_module: "agent-harness-cli",
             compatibility: "CLI reconcile output may add launch diagnostics in v1; apply remains explicit and never implied by dry-run",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-process-boundary.v1",
+            owner_module: "agent-harness-cli",
+            compatibility: "per-launch receipt; stdio isolation, Windows creation flags, process-group and console detachment, breakaway policy, and the external-root-keeper requirement are stable, with additive diagnostics only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.windows-reconcile-keeper-plan.v1",
+            owner_module: "supervisor_keeper",
+            compatibility: "immutable same-user task plan bound to canonical deployment paths, executable digest, exact action and settings, global hold/state/readback locations, ownership identity, and deterministic plan digest",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.windows-reconcile-keeper-observation.v1",
+            owner_module: "supervisor_keeper/activation",
+            compatibility: "atomic Task Scheduler and runtime readback bound to the current plan; exact task state, ownership, action, settings, plan/action digest, singleton keeper identity, and contained live paths fail closed on drift",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.windows-reconcile-keeper-stop-fallback.v1",
+            owner_module: "supervisor_keeper",
+            compatibility: "atomic last-resort exact-task stop receipt; requested, completed, and failed phases plus bounded timeout diagnostics are additive in v1 and cannot authorize installation, start, or foreign-task mutation",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-reconcile-keeper.v1",
+            owner_module: "agent-harness-cli/health/activation",
+            compatibility: "atomic root-keeper state bound to generation, exact process instance and start time, singleton lease, current plan and action digests, hold, apply mode, topology digest, inventory, and launch outcomes; additive diagnostics only in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.queue-shadow-compare.v1",
@@ -1328,6 +1363,44 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             promotion_gate: "Run the checksum-bound replay fixtures and focused lease/deadline/disposition/task-family tests twice against fresh isolated homes, then pass the full serial workspace and isolated shadow, authoritative, and rollback candidate gates. Live activation remains a separately observed cutover with exact-lane lease/deadline/final receipts and rollback evidence.",
         },
         ScenarioMatrixEntry {
+            id: "goal-continuation-restart-safety",
+            title: "Goal continuation restart, revocation, and exact-once admission",
+            changed_areas: vec![
+                "goal continuation intent and fence ledgers",
+                "runtime queue lease admission",
+                "ordinary same-lane input priority",
+                "restart reconciliation",
+                "malformed-ledger isolation",
+            ],
+            required_invariants: vec!["I2", "I3", "I5", "I7", "I9", "I17", "I37"],
+            required_evidence: vec![
+                "one malformed or unsupported record cannot block a valid intent in another lane or poison targeted enqueue and acknowledgement lookups",
+                "authority revocation is recorded in a separate rollback-readable fence ledger and quarantines any discovered child",
+                "a continuation revalidates its fence after lease acquisition and releases the lease before model or external effects when authority was revoked",
+                "parallel restart reconcilers create one deterministic child lifecycle and one deterministic error receipt per malformed record",
+                "absence of a goalAutonomy block grants bounded continuation only to an exact current-owned authorized Goal, while explicit observe remains an opt-out",
+                "newer ordinary same-lane input outranks an unleased autonomous continuation and fences post-lease or subsequent chaining without bypassing an active lease",
+                "a full runtime-queue replay leases, acknowledges, and completes one valid continuation while unrelated malformed evidence remains isolated",
+            ],
+            runnable_tests: vec![
+                "goal_continuation::tests::implicit_goal_autonomy_requires_exact_authority_and_explicit_observe_wins",
+                "goal_continuation::tests::new_fence_evidence_keeps_the_v1_intent_ledger_readable_by_old_readers",
+                "goal_continuation::tests::unrelated_malformed_record_does_not_block_targeted_enqueue_lookup",
+                "goal_continuation::tests::parallel_reconciliation_creates_one_deterministic_child_lifecycle",
+                "goal_continuation::tests::parallel_malformed_reconciliation_writes_one_error_receipt",
+                "goal_continuation::tests::lease_gate_never_acknowledges_an_intent_fenced_after_lease",
+                "goal_continuation::tests::crash_window_child_is_discovered_and_quarantined_before_committed_intent_is_fenced",
+                "goal_continuation::tests::newer_same_lane_human_input_fences_an_unleased_continuation",
+                "goal_continuation::tests::newer_same_lane_human_input_suppresses_a_leased_child_before_acknowledgement",
+                "goal_continuation::tests::newer_same_lane_human_input_prevents_an_acknowledged_slice_from_chaining",
+                "runtime_worker::tests::ordinary_human_input_outranks_unleased_autonomous_continuation_at_checkpoint",
+                "runtime_worker::tests::ordinary_human_input_does_not_bypass_an_active_continuation_lease",
+                "runtime_pipeline::tests::exact_active_goal_without_policy_block_continues_across_restart_and_second_slice",
+                "runtime_pipeline::tests::continuation_fenced_after_lease_is_released_and_suppressed_before_codex",
+            ],
+            promotion_gate: "Run the restart, malformed-ledger, parallel reconciliation, rollback-reader, ordinary-input priority, and post-lease fence replays twice against fresh isolated homes, then pass the full serial workspace. Live promotion additionally requires an exact-lane long-Goal replay followed by ordinary same-lane input, showing one continuation or final, no premature final, no stuck follow-up, and no duplicate provider effect.",
+        },
+        ScenarioMatrixEntry {
             id: "channel-continuity-and-safe-recovery",
             title: "Exact-lane ingress, durable retry, and typed task continuation",
             changed_areas: vec![
@@ -1939,39 +2012,44 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             promotion_gate: "Promote only after the isolated maintenance owner is present in candidate supervisor dry-run, large-history and busy-lock regressions are green, and a controlled live long-turn proves progress/final delivery ordering without compaction on the interactive path.",
         },
         ScenarioMatrixEntry {
-            id: "supervisor-plan-configured-loop-parity",
-            title: "Supervisor readiness preserves configured ownership-mode inventory",
+            id: "supervisor-root-keeper-availability",
+            title: "One exact root keeper owns config-derived supervisor availability",
             changed_areas: vec![
-                "activation readiness",
-                "reconcile-managed desired-service inventory",
-                "Windows Task Scheduler plan",
-                "configured Telegram loop inventory",
-                "ledger maintenance cutover ownership",
+                "shared supervisor topology",
+                "guarded stop and start ordering",
+                "Windows Task Scheduler root keeper",
+                "activation and health readiness",
+                "Windows process-control boundary",
+                "deployment path confinement",
             ],
-            required_invariants: vec!["I26"],
+            required_invariants: vec!["I5", "I17", "I26"],
             required_evidence: vec![
-                "the authoritative harness config validates before plan generation",
-                "reconcile-managed readiness accepts an exact deployment-owned desired-service inventory without supervisor-plan.json",
-                "reconcile-managed readiness matches reconcile mode selection, configured service derivation, and exact service kinds",
-                "reconcile-managed readiness fails closed on absent, partial, unexpected, malformed, observed-only, or wrong-owner inventory",
-                "scheduled-task readiness still warns when supervisor-plan.json is missing",
-                "a staged plan includes the main Telegram loop, every enabled configured Telegram loop, and ledger-maintenance-loop",
-                "the generated start/stop bundle contains each configured channel loop and the maintenance owner",
-                "candidate status and reconcile agree with the configured ownership mode before live promotion",
+                "one validated config-derived topology is shared by reconcile, readiness, keeper generation, and guarded operations; explicit service configuration wins and ambiguous normalized identities fail closed",
+                "stop commits the global keeper hold before best-effort union shutdown even when config is malformed or ownership mode changed, while start validates every target before clearing the global hold last",
+                "generated scripts require exact successful ops-control status and preserve or recreate the global hold after any partial start or stop",
+                "one same-user enabled and Running task has the exact owned action, settings, plan and action digests, contained deployment paths, and one fresh singleton keeper process",
+                "installation refuses a foreign existing task and live plan generation or readiness rejects source-tree, sibling, or global executable and tool paths",
+                "the production reconcile launch seam isolates stdio and the Windows console-control domain so an unrelated launcher control break cannot terminate managed parents",
+                "scheduled-task child ownership remains compatible when reconcile-managed mode is disabled",
             ],
             runnable_tests: vec![
+                "supervisor_topology::tests::explicit_service_wins_over_builtin_derivation",
+                "supervisor_topology::tests::normalized_telegram_account_collision_fails_closed",
+                "ops::tests::ops_control_stop_precommits_keeper_hold_when_config_is_malformed",
+                "ops::tests::ops_control_start_refuses_all_clears_when_topology_is_invalid",
+                "ops::tests::ops_control_start_refuses_all_clears_when_observed_identity_is_malformed",
+                "ops::tests::ops_control_preserves_old_keeper_and_observed_children_after_mode_switch",
+                "supervisor_keeper::tests::live_plan_rejects_non_deployment_executables_but_developer_staging_is_explicit",
+                "supervisor_keeper::tests::existing_task_identity_fixture_rejects_foreign_task_without_mutation",
+                "supervisor_keeper::tests::developer_script_seam_fails_closed_on_partial_ops_receipts",
+                "activation::tests::reconcile_keeper_readiness_requires_current_task_and_exact_live_process",
                 "activation::tests::readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan",
-                "activation::tests::readiness_uses_reconcile_mode_when_manage_all_loops_true_and_supervisor_disabled",
-                "activation::tests::readiness_matches_reconcile_config_overrides_and_service_kinds",
-                "activation::tests::readiness_fails_closed_for_invalid_reconcile_service_records",
-                "activation::tests::readiness_warns_when_reconcile_managed_inventory_is_absent",
-                "activation::tests::readiness_warns_when_reconcile_managed_inventory_omits_configured_service",
                 "activation::tests::readiness_keeps_missing_plan_warning_for_scheduled_task_mode",
-                "supervisor::tests::plan_includes_enabled_configured_telegram_loop_with_ledger_maintenance",
-                "supervisor_inventory::tests::inventory_accepts_isolated_ledger_maintenance_service_and_plans_owner",
+                "health::tests::reconcile_managed_health_requires_a_fresh_exact_live_keeper_process",
                 "agent-harness-cli::tests::supervisor_reconcile_all_includes_isolated_ledger_maintenance_owner",
+                "windows_process_boundary::production_reconcile_spawn_child_survives_launcher_control_break",
             ],
-            promotion_gate: "Promote only after candidate status and reconcile prove the exact configured ownership-mode inventory, scheduled-task compatibility remains green, and post-cutover readback confirms all expected owner heartbeats are fresh.",
+            promotion_gate: "Promote only after focused contracts, full serial workspace, generated PowerShell parsing, exact stopped-state task readback, a real user-scoped task install/start/keeper-death restart/stop/uninstall lifecycle, and the production process-boundary replay pass. Post-cutover readback must show one current-plan keeper, every expected child, no source or staging paths, no global hold, no stale or conflicting owner, and no pending/retryable provider queue.",
         },
     ]
 }
@@ -2030,7 +2108,8 @@ pub fn release_checklist() -> ReleaseChecklist {
             "progress source-authority changes passed non-fresh-cache defer, historical fresh-send suppression, and stop-file claim-release checks",
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
             "interactive receipt readers passed bounded-history, busy-lock, and isolated ledger-maintenance-owner scenario checks",
-            "supervisor readiness changes passed reconcile-managed exact-inventory, absent and partial inventory, scheduled-task compatibility, and candidate status/reconcile parity checks",
+            "goal continuation restart changes passed malformed-ledger isolation, rollback-reader, concurrent exact-once, post-lease fence, and full runtime-queue replay checks",
+            "root-keeper availability changes passed shared-topology identity, fail-closed guarded stop/start, exact task/process ownership, deployment path confinement, foreign-task refusal, production process-boundary, scheduled-task compatibility, and real task restart lifecycle checks",
             "cron freshness changes passed config run-cap validation, cron-canon health/status warnings, deterministic catch-up, and stale-source sender suppression checks",
             "cron/backup incident hardening passed exact-source, timezone/calendar, per-entry timeout/attempt, pre-lease exhaustion, process-tree timeout, occurrence-idempotency, verified-retention, and zero-stale-catch-up checks",
             "Codex tool-use timeout changes passed bounded recovery checks",
@@ -2403,12 +2482,19 @@ mod tests {
             "agent-harness.goal-transition.v1",
             "agent-harness.goal-slice.v1",
             "agent-harness.goal-continuation-intent.v1",
+            "agent-harness.goal-continuation-fence.v1",
+            "agent-harness.goal-continuation-reconciliation-error.v1",
             "agent-harness.goal-terminal-outbox.v1",
             "agent-harness.goal-campaign-budget.v1",
             "agent-harness.goal-campaign-status.v1",
             "agent-harness.codex-web-search-decision.v1",
             "agent-harness.codex-web-search-thread-binding.v1",
             "agent-harness.codex-web-search-action.v1",
+            "agent-harness.supervisor-process-boundary.v1",
+            "agent-harness.windows-reconcile-keeper-plan.v1",
+            "agent-harness.windows-reconcile-keeper-observation.v1",
+            "agent-harness.windows-reconcile-keeper-stop-fallback.v1",
+            "agent-harness.supervisor-reconcile-keeper.v1",
         ] {
             assert!(
                 schemas.contains(schema),
@@ -2438,25 +2524,46 @@ mod tests {
             &"ledger_maintenance::tests::maintenance_wake_coalesces_sequence_and_latest_reason"
         ));
 
-        let supervisor_plan = scenarios
+        let goal_continuation = scenarios
             .iter()
-            .find(|entry| entry.id == "supervisor-plan-configured-loop-parity")
-            .expect("supervisor plan configured loop parity scenario");
-        assert!(supervisor_plan.required_invariants.contains(&"I26"));
-        assert!(supervisor_plan.runnable_tests.contains(
+            .find(|entry| entry.id == "goal-continuation-restart-safety")
+            .expect("goal continuation restart safety scenario");
+        assert!(goal_continuation.required_invariants.contains(&"I37"));
+        assert!(goal_continuation.runnable_tests.contains(
+            &"goal_continuation::tests::new_fence_evidence_keeps_the_v1_intent_ledger_readable_by_old_readers"
+        ));
+        assert!(goal_continuation.runnable_tests.contains(
+            &"runtime_pipeline::tests::continuation_fenced_after_lease_is_released_and_suppressed_before_codex"
+        ));
+        assert!(goal_continuation.runnable_tests.contains(
+            &"runtime_worker::tests::ordinary_human_input_outranks_unleased_autonomous_continuation_at_checkpoint"
+        ));
+        assert!(goal_continuation.runnable_tests.contains(
+            &"runtime_pipeline::tests::exact_active_goal_without_policy_block_continues_across_restart_and_second_slice"
+        ));
+
+        let root_keeper = scenarios
+            .iter()
+            .find(|entry| entry.id == "supervisor-root-keeper-availability")
+            .expect("supervisor root keeper availability scenario");
+        assert!(root_keeper.required_invariants.contains(&"I26"));
+        assert!(root_keeper.runnable_tests.contains(
             &"activation::tests::readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan"
         ));
-        assert!(supervisor_plan.runnable_tests.contains(
+        assert!(root_keeper.runnable_tests.contains(
             &"activation::tests::readiness_keeps_missing_plan_warning_for_scheduled_task_mode"
         ));
-        assert!(supervisor_plan.runnable_tests.contains(
-            &"activation::tests::readiness_matches_reconcile_config_overrides_and_service_kinds"
+        assert!(root_keeper.runnable_tests.contains(
+            &"supervisor_topology::tests::explicit_service_wins_over_builtin_derivation"
         ));
-        assert!(supervisor_plan.runnable_tests.contains(
-            &"activation::tests::readiness_fails_closed_for_invalid_reconcile_service_records"
+        assert!(root_keeper.runnable_tests.contains(
+            &"ops::tests::ops_control_stop_precommits_keeper_hold_when_config_is_malformed"
         ));
-        assert!(supervisor_plan.runnable_tests.contains(
-            &"supervisor::tests::plan_includes_enabled_configured_telegram_loop_with_ledger_maintenance"
+        assert!(root_keeper.runnable_tests.contains(
+            &"supervisor_keeper::tests::developer_script_seam_fails_closed_on_partial_ops_receipts"
+        ));
+        assert!(root_keeper.runnable_tests.contains(
+            &"windows_process_boundary::production_reconcile_spawn_child_survives_launcher_control_break"
         ));
 
         let progress = scenarios
@@ -2503,7 +2610,10 @@ mod tests {
             &"GPT-5.6 and multi-agent orchestration changes passed max-only reasoning, exact-lane prompt, heterogeneous-child, master-owned mailbox, lease-safe resume, and child-final suppression scenario gates"
         ));
         assert!(release_checklist().required_items.contains(
-            &"supervisor readiness changes passed reconcile-managed exact-inventory, absent and partial inventory, scheduled-task compatibility, and candidate status/reconcile parity checks"
+            &"goal continuation restart changes passed malformed-ledger isolation, rollback-reader, concurrent exact-once, post-lease fence, and full runtime-queue replay checks"
+        ));
+        assert!(release_checklist().required_items.contains(
+            &"root-keeper availability changes passed shared-topology identity, fail-closed guarded stop/start, exact task/process ownership, deployment path confinement, foreign-task refusal, production process-boundary, scheduled-task compatibility, and real task restart lifecycle checks"
         ));
     }
 

@@ -94,6 +94,11 @@ fn discord_active_goal_observe_replay_parks_visibly_instead_of_silent_success() 
     .unwrap();
     assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
     let queue_id = receive.queue_id.expect("source queue id");
+    fs::write(
+        harness_home.join("harness-config.json"),
+        br#"{"goalAutonomy":{"mode":"observe"}}"#,
+    )
+    .unwrap();
     let codex_home = root.join("codex-home");
     fs::create_dir_all(&codex_home).unwrap();
     fs::write(codex_home.join("auth.json"), "{}").unwrap();
@@ -353,6 +358,11 @@ fn discord_active_goal_authority_conflict_parks_visibly_instead_of_silent_succes
     })
     .unwrap();
     let seed_queue_id = seed_receive.queue_id.expect("seed queue id");
+    fs::write(
+        harness_home.join("harness-config.json"),
+        br#"{"goalAutonomy":{"mode":"observe"}}"#,
+    )
+    .unwrap();
     let seed_report = run_runtime_queue_once(RuntimeRunOnceOptions {
         harness_home: harness_home.clone(),
         queue_id: Some(seed_queue_id.clone()),
@@ -526,6 +536,11 @@ fn discord_active_goal_authority_conflict_fences_shell_recovery_child() {
     })
     .unwrap();
     let seed_queue_id = seed_receive.queue_id.expect("seed queue id");
+    fs::write(
+        harness_home.join("harness-config.json"),
+        br#"{"goalAutonomy":{"mode":"observe"}}"#,
+    )
+    .unwrap();
     let seed_report = run_runtime_queue_once(RuntimeRunOnceOptions {
         harness_home: harness_home.clone(),
         queue_id: Some(seed_queue_id),
@@ -697,29 +712,33 @@ fn active_goal_policy_matrix_preserves_exact_closure_on_discord_and_telegram() {
         })
         .unwrap();
         let queue_id = receive.queue_id.expect("source queue id");
-        if policy != "observe" {
-            let mode = if policy == "disabled" {
-                "disabled"
-            } else {
-                "active"
-            };
-            let lane_digest = if admits_child {
+        let mode = if policy == "disabled" {
+            "disabled"
+        } else if policy == "observe" {
+            "observe"
+        } else {
+            "active"
+        };
+        let lane_digests = if mode == "active" {
+            vec![if admits_child {
                 exact_full_lane_digest(&harness_home, &queue_id)
             } else {
                 "0".repeat(64)
-            };
-            fs::write(
-                harness_home.join("harness-config.json"),
-                serde_json::to_vec_pretty(&serde_json::json!({
-                    "goalAutonomy": {
-                        "mode": mode,
-                        "activeLaneDigests": [lane_digest]
-                    }
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        }
+            }]
+        } else {
+            Vec::new()
+        };
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "goalAutonomy": {
+                    "mode": mode,
+                    "activeLaneDigests": lane_digests
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let codex_home = root.join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
         fs::write(codex_home.join("auth.json"), "{}").unwrap();

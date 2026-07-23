@@ -16,7 +16,19 @@ Use `--source-home` for imported prompt files, registry, skills, and legacy cont
 
 ## Supervisor Plans and Receipt Maintenance
 
-`supervisor-plan` generates the Windows Task Scheduler start/stop bundle from the authoritative harness configuration. Do not hand-edit generated runner scripts: regenerate the bundle after changing supervised loop configuration, first using `supervisor-reconcile --all --dry-run` to review ownership.
+`supervisor-plan` generates the legacy per-service Windows Task Scheduler bundle for developer staging only. It is rejected for a live `.agent-harness` target because per-service tasks would create a second launch-owner authority. Do not hand-edit generated runner scripts; production uses the single reconcile keeper described below.
+
+When `supervisor.manageAllLoops=true`, use the reconcile-managed root-keeper bundle instead of a one-shot reconcile launch. `supervisor-keeper-plan` writes one same-user Task Scheduler plan and five scripts below `state/supervisor/windows-reconcile-keeper/`. The action directly invokes the canonical deployed CLI with absolute `--harness-home`, `--source-home`, `--workspace`, `--runtime-workspace`, executable, gateway, and global `--stop-file` arguments. Generated paths are normal absolute Win32 paths (not `\\?\` extended paths), and the default task name includes a digest of the exact harness home so two deployments cannot overwrite each other's task.
+
+The generated task contract is `Interactive`/`Limited`, same-user `AtLogOn`, `IgnoreNew`, restart every minute with count 255, `StartWhenAvailable`, battery-safe, and `PT0S` execution time. This guarantees recovery while the designated desktop user is logged in and after the next logon; it is not an always-on, pre-login Windows Service contract. Registration leaves the task disabled from its first observable state. The generated control order is transactional:
+
+1. Live plan generation and `install.ps1` validate cutover authority, bind generated content digests, inventory prior exact launch owners, and register or upgrade only an exact-owned stopped task in the disabled state. A stale-upgrade failure restores the previous exact task definition.
+2. `start.ps1` revalidates the current task and legacy-owner quiescence before clearing holds. A post-clear failure restores the global and child stop state, proves partial process trees stopped or records manual recovery, and leaves the exact keeper disabled.
+3. `stop.ps1` first commits the global keeper hold and child stop markers, then requires a matching post-request keeper generation/PID terminal state and absence of every exact child process tree. Stale state and partial exit cannot report success.
+4. `readback.ps1` independently queries Task Scheduler for the exact task path/name, principal, action, trigger, settings, executable digest, global hold, and keeper runtime state. Readiness never advances freshness by timestamp-only self-attestation.
+5. `uninstall.ps1` reuses the guarded complete-stop path, re-proves exact ownership, and only then unregisters the task.
+
+`harness.ps1 gateway keeper-plan`, `keeper-install`, `keeper-readback`, and `keeper-uninstall` expose those explicit phases. `gateway start/stop/restart` consume the generated keeper scripts through an explicit Windows PowerShell process with process-scoped `ExecutionPolicy Bypass`; generated scripts use the same boundary for sibling scripts, compute executable SHA-256 through .NET rather than module auto-loading, and atomically replace JSON through same-directory temporary and backup files. Start no longer launches a one-shot reconcile process. Reconcile readiness and `healthz` compare the exact expected and observed topology and fail closed on empty, missing, unexpected, stale, wrong-kind, wrong-owner, held, disabled, or drifted state. Destructive live-home control validates an exact-action token regardless of caller environment. With a same-user writable token ledger this is an operational accident guard, not an unforgeable security boundary against a process holding that user's full shell authority.
 
 `runtime-loop` polls durable terminal control for its active queue items. `--active-task-shutdown-grace-ms` controls the bounded cooperative grace (15 seconds by default). If an exact queue stop remains active after the grace, the loop exits non-zero so `supervisor-run` restarts it and existing generation-fenced lease reconciliation can suppress the stopped item. A watched service stop uses the same grace but exits cleanly so an operator stop does not trigger restart.
 
@@ -484,7 +496,9 @@ Progress delivery modes:
 
 ## Goal Autonomy
 
-Goal transition and final-outbox gating are always observable, but autonomous child enqueue is independently activated. The safe default is observation-only:
+Goal transition and final-outbox gating are always observable. When the `goalAutonomy` block is absent, an exact current-owned Goal with a canonical lane and authorized continuation is allowed to keep running in bounded child slices. Generic callers and historical, foreign, or unproven Goal state never gain this implicit authority.
+
+Add an explicit block when the deployment needs an opt-out or a fixed allow-list. For example, this disables autonomous child enqueue while retaining transition evidence:
 
 ```json
 {
@@ -503,9 +517,11 @@ Goal transition and final-outbox gating are always observable, but autonomous ch
 }
 ```
 
-`mode` accepts `disabled`, `observe`, or `active`. Active mode is still fail-closed unless the current canonical FullLaneKey SHA-256 is explicitly listed in `activeLaneDigests`; a lane from another account, channel, user, agent, runtime class, root session, or concrete session is not a substitute. The validator requires every digest to be 64 hexadecimal characters and requires at least one digest when mode is `active`.
+`mode` accepts `disabled`, `observe`, or `active`. Explicit `disabled` and `observe` are opt-outs from the implicit product default. Explicit active mode is fail-closed unless the current canonical FullLaneKey SHA-256 is listed in `activeLaneDigests`; a lane from another account, channel, user, agent, runtime class, root session, or concrete session is not a substitute. The validator requires every digest to be 64 hexadecimal characters and requires at least one digest when mode is `active`.
 
-An active goal slice writes a unified transition before final-outbox selection. If continuation is authorized, the runtime commits a deterministic intent before enqueue, keeps `campaignSliceGeneration` separate from context-recovery `continuationIndex`, reconciles commit/enqueue interruptions on restart, and acknowledges the intent only after the child acquires the runtime lane lease. Candidate/foundation cutover must remain `observe`; activating one reviewed exact-lane C2-G cohort is a separate live operation requiring explicit approval and rollback evidence.
+An active goal slice writes a unified transition before final-outbox selection. If continuation is authorized, the runtime commits a deterministic intent before enqueue, snapshots the lane's ordinary-human-input generation, keeps `campaignSliceGeneration` separate from context-recovery `continuationIndex`, and reconciles commit/enqueue interruptions on restart. A separate rollback-readable fence revokes stale intent authority. The child is acknowledged only after it acquires the runtime lane lease and passes a second authority, fence, and human-input check.
+
+Ordinary same-lane user text remains durable queue input. At the next scheduler checkpoint it outranks an unleased autonomous continuation, and its newer input generation fences that older continuation during reconciliation, after lease, and before further child chaining. It does not preempt an already active lease; use `/steer` for explicit same-turn steering. `/new` remains an independent session boundary. Promotion still requires reviewed replay and rollback evidence for the exact lane and deployment.
 
 Goal slices are bounded to 30–45 minutes. `sliceIdleTimeoutMs` must be at least one minute and below the hard timeout. `sliceDrainWindowMs` is deliberately derived and must equal the smaller of 10% of the hard timeout or 180000 ms, matching the runtime deadline-drain guard. `wallClockBudgetMs` cannot exceed 48 hours. Slice-count, cumulative token-cost, repeated-progress-fingerprint, and recovery-count breakers are positive hard boundaries; reaching one stops continuation through the unified transition and emits at most one sanitized terminal notice. `goal-campaign-status --target-home <staging-home>` is read-only and reports the effective policy plus the latest append-only budget receipt for each campaign.
 

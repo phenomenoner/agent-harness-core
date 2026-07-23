@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -94,9 +98,10 @@ use agent_harness_core::{
     SubagentLifecycleState, SubagentPlan, SubagentPlanInput, SubagentWorkerEnqueueOptions,
     SuperviseDeployCanaryOptions, SupervisionEvaluateOptions, SupervisorChildState,
     SupervisorInventoryOptions, SupervisorInventoryServiceConfig, SupervisorLaunchCommand,
-    TaskEntityOptions, TaskStatus, TerminalControlSource, TokenEfficiencyOptions, TraceOptions,
-    TurnPlan, TurnPlanInput, VaultGetOptions, VaultPutOptions, VirtualSessionContextQuery,
-    VirtualSessionWorkingContext, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
+    SupervisorTopologyOverrides, SupervisorTopologySource, TaskEntityOptions, TaskStatus,
+    TerminalControlSource, TokenEfficiencyOptions, TraceOptions, TurnPlan, TurnPlanInput,
+    VaultGetOptions, VaultPutOptions, VirtualSessionContextQuery, VirtualSessionWorkingContext,
+    WindowsReconcileKeeperPlanOptions, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
     WorkerCancelOptions, WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind,
     WorkerReapStaleOptions, WorkerRunOnceOptions, WorkerRunOnceReport, WorkerRunOnceStatus,
     WorkerStatusOptions, acquire_budget, add_operation_plan_item, append_channel_outbox_message,
@@ -114,8 +119,8 @@ use agent_harness_core::{
     control_runtime_queue_item, create_learning_proposal, create_operation_plan,
     create_operation_plan_v2, create_ops_backup, create_skill_archive_proposal,
     create_skill_learning_proposal, current_log_time_ms, default_supervisor_child_specs,
-    delegate_operation_plan_item, doctor_backend_auth, enqueue_channel_step,
-    enqueue_controlled_coordinator_smoke, enqueue_deterministic_cron_workers,
+    delegate_operation_plan_item, derive_supervisor_topology, doctor_backend_auth,
+    enqueue_channel_step, enqueue_controlled_coordinator_smoke, enqueue_deterministic_cron_workers,
     enqueue_native_cron_workers, enqueue_subagent_workers, enqueue_worker_job,
     ensure_external_effect_continuation, ensure_memory_owner_state, evaluate_admission,
     evaluate_prompt_reduction, evaluate_supervisor_children, execute_import,
@@ -167,7 +172,8 @@ use agent_harness_core::{
     write_codex_backend_provenance_receipt, write_deterministic_cron_plan, write_json_atomic,
     write_memory_search_receipt, write_memory_vector_recall_receipt, write_native_cron_plan,
     write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
-    write_task_entity, write_turn_plan, write_windows_supervisor_plan,
+    write_task_entity, write_turn_plan, write_windows_reconcile_keeper_plan,
+    write_windows_supervisor_plan,
 };
 
 const DEFAULT_CODEX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
@@ -182,6 +188,18 @@ const DEFAULT_CHANNEL_SESSION_TRANSITION_RECONCILE_ROWS: usize = 8;
 const DISCORD_ATTACHMENT_TEXT_EXTRACT_MAX_BYTES: usize = 16 * 1024;
 const DISCORD_ATTACHMENT_DOWNLOAD_MAX_BYTES: usize =
     DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM as usize;
+
+// Keep reconcile-launched supervisor parents outside the launcher console's Ctrl+C domain.
+// This deliberately does not request CREATE_BREAKAWAY_FROM_JOB: hosts may place the launcher
+// in a non-breakaway job, where that flag would make every supervisor launch fail instead.
+#[cfg(windows)]
+const WINDOWS_DETACHED_PROCESS: u32 = 0x0000_0008;
+#[cfg(windows)]
+const WINDOWS_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
+const WINDOWS_SUPERVISOR_RECONCILE_CREATION_FLAGS: u32 =
+    WINDOWS_DETACHED_PROCESS | WINDOWS_CREATE_NEW_PROCESS_GROUP;
+const SUPERVISOR_RECONCILE_KEEPER_SCHEMA: &str = "agent-harness.supervisor-reconcile-keeper.v1";
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -273,6 +291,8 @@ fn main() {
         "supervisor-reconcile" => run_supervisor_reconcile(&rest),
         "supervisor-run" => run_supervisor_run(&rest),
         "supervisor-plan" => run_supervisor_plan(&rest),
+        "supervisor-keeper-plan" => run_supervisor_keeper_plan(&rest),
+        "__supervisor-process-boundary-test" => run_supervisor_process_boundary_test(&rest),
         "harness-skills-sync" => run_harness_skills_sync(&rest),
         "skills" => run_skills(&rest),
         "skill-view" => run_skill_view(&rest),
@@ -2387,6 +2407,63 @@ fn run_supervisor_plan(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_supervisor_keeper_plan(args: &[String]) -> Result<(), String> {
+    let args = supervisor_keeper_plan_args_from_args(args)?;
+    let actual_live_home =
+        agent_harness_core::ops::path_targets_live_harness_home(&args.target_home);
+    if actual_live_home && !args.live_deployment {
+        return Err(
+            "--developer-staging cannot target a live .agent-harness deployment".to_string(),
+        );
+    }
+    if args.live_deployment {
+        let now_ms = current_time_ms()?;
+        let validation = agent_harness_core::live_control::validate_live_control_token(
+            &args.target_home,
+            args.live_control_token.as_deref(),
+            LiveControlAction::Cutover,
+            now_ms,
+        )
+        .map_err(|error| error.to_string())?;
+        if validation.status != agent_harness_core::live_control::LiveControlTokenStatus::Valid {
+            return Err(format!(
+                "live supervisor-keeper-plan requires a valid exact-action cutover token: {}",
+                validation.reason
+            ));
+        }
+        let preflight =
+            agent_harness_core::ops::collect_ops_keeper_plan_preflight(&args.target_home);
+        if !preflight.ready {
+            return Err(format!(
+                "live supervisor-keeper-plan requires a fully held topology with no live keeper or child owners: {}",
+                preflight.reason
+            ));
+        }
+    }
+    let options = WindowsReconcileKeeperPlanOptions {
+        harness_home: args.target_home,
+        source_home: args.source_home,
+        workspace: args.workspace,
+        runtime_workspace: args.runtime_workspace,
+        harness_cli: args.harness_cli,
+        codex_executable: args.codex_exe,
+        node_executable: args.node_exe,
+        discord_gateway_script: args.gateway_script,
+        user_id: args.user_id,
+        task_name: args.task_name,
+        live_deployment: args.live_deployment,
+    };
+    let report = if options.live_deployment {
+        agent_harness_core::supervisor_keeper::write_and_promote_windows_reconcile_keeper_plan(
+            options,
+        )
+    } else {
+        write_windows_reconcile_keeper_plan(options)
+    }
+    .map_err(|error| error.to_string())?;
+    print_json(&report)
+}
+
 fn run_harness_skills_sync(args: &[String]) -> Result<(), String> {
     let args = harness_skills_sync_args_from_args(args)?;
     let report = sync_builtin_harness_skills(BuiltinHarnessSkillSyncOptions {
@@ -4495,7 +4572,8 @@ fn run_ledger_maintenance_loop(args: &[String]) -> Result<(), String> {
 }
 
 fn run_supervisor_reconcile(args: &[String]) -> Result<(), String> {
-    let args = supervisor_reconcile_args_from_args(args)?;
+    let invocation_args = args;
+    let args = supervisor_reconcile_args_from_args(invocation_args)?;
     if args.apply && args.dry_run {
         return Err("--apply and --dry-run are mutually exclusive".to_string());
     }
@@ -4506,18 +4584,90 @@ fn run_supervisor_reconcile(args: &[String]) -> Result<(), String> {
         );
     }
 
+    let keeper = SupervisorReconcileKeeperContext::new(&args, invocation_args)?;
+    if keeper.enabled {
+        write_supervisor_reconcile_keeper_state(
+            &args,
+            &keeper,
+            "starting",
+            0,
+            None,
+            None,
+            &[],
+            "reconcile keeper is starting",
+        )?;
+    }
+
+    let result = run_supervisor_reconcile_loop(&args, &keeper);
+    if let Err(error) = &result {
+        if keeper.enabled {
+            let _ = write_supervisor_reconcile_keeper_state(
+                &args,
+                &keeper,
+                "error",
+                0,
+                None,
+                None,
+                &[],
+                error,
+            );
+        }
+    }
+    result
+}
+
+fn run_supervisor_reconcile_loop(
+    args: &SupervisorReconcileArgs,
+    keeper: &SupervisorReconcileKeeperContext,
+) -> Result<(), String> {
     let mut iteration = 0usize;
     loop {
+        if stop_file_requested(Some(&args.stop_file)) {
+            if keeper.enabled {
+                write_supervisor_reconcile_keeper_state(
+                    args,
+                    keeper,
+                    "stopped",
+                    iteration,
+                    None,
+                    None,
+                    &[],
+                    "reconcile keeper hold was present before inventory reconciliation",
+                )?;
+            }
+            return Ok(());
+        }
         iteration += 1;
         let now_ms = current_time_ms()?;
         let desired_services = supervisor_reconcile_desired_services(&args)?;
         let report = reconcile_supervisor_inventory(SupervisorInventoryOptions {
             harness_home: args.target_home.clone(),
-            desired_services,
+            desired_services: desired_services.clone(),
             now_ms: Some(now_ms),
             default_heartbeat_timeout_ms: Some(args.default_heartbeat_timeout_ms),
         })
         .map_err(|err| err.to_string())?;
+        if stop_file_requested(Some(&args.stop_file)) {
+            if keeper.enabled {
+                write_supervisor_reconcile_keeper_state(
+                    args,
+                    keeper,
+                    "stopped",
+                    iteration,
+                    Some(&desired_services),
+                    Some((
+                        report.missing.len(),
+                        report.stale.len(),
+                        report.running.len(),
+                        report.disabled.len(),
+                        report.launch_commands.len(),
+                    )),
+                    &[],
+                    "reconcile keeper hold appeared before child launch",
+                )?;
+            }
+            return Ok(());
+        }
         let launches = if args.apply {
             launch_supervisor_reconcile_commands(&args, &report.launch_commands)?
         } else {
@@ -4529,16 +4679,393 @@ fn run_supervisor_reconcile(args: &[String]) -> Result<(), String> {
             "dryRun": !args.apply,
             "applied": args.apply,
             "autoReconcile": args.auto_reconcile,
+            "stopFile": args.stop_file,
+            "holdRequested": false,
             "launchBackoffMs": args.restart_delay_ms,
             "launches": launches,
             "inventory": report,
         });
-        print_json(&output)?;
+        if !args.quiet {
+            print_json(&output)?;
+        }
+        if keeper.enabled {
+            write_supervisor_reconcile_keeper_state(
+                args,
+                keeper,
+                "running",
+                iteration,
+                Some(&desired_services),
+                Some((
+                    report.missing.len(),
+                    report.stale.len(),
+                    report.running.len(),
+                    report.disabled.len(),
+                    report.launch_commands.len(),
+                )),
+                &launches,
+                "reconcile keeper completed an inventory iteration",
+            )?;
+        }
 
         if args.iterations > 0 && iteration >= args.iterations {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(args.idle_ms));
+        if wait_for_supervisor_reconcile_hold(&args.stop_file, args.idle_ms) {
+            if keeper.enabled {
+                write_supervisor_reconcile_keeper_state(
+                    args,
+                    keeper,
+                    "stopped",
+                    iteration,
+                    Some(&desired_services),
+                    None,
+                    &launches,
+                    "reconcile keeper hold interrupted the idle wait",
+                )?;
+            }
+            return Ok(());
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SupervisorReconcileKeeperContext {
+    enabled: bool,
+    state_file: PathBuf,
+    lease_file: PathBuf,
+    generation_id: String,
+    process_id: u32,
+    process_start_time_ms: i64,
+    plan_digest: String,
+    action_digest: String,
+    task_name: String,
+    _lease: Option<SupervisorReconcileKeeperLease>,
+}
+
+impl SupervisorReconcileKeeperContext {
+    fn new(args: &SupervisorReconcileArgs, invocation_args: &[String]) -> Result<Self, String> {
+        let enabled = args.apply && args.auto_reconcile && args.iterations == 0;
+        let process_id = std::process::id();
+        let state_file = args
+            .target_home
+            .join("state")
+            .join("supervisor")
+            .join("reconcile-keeper.json");
+        let lease_file = args
+            .target_home
+            .join("state")
+            .join("supervisor")
+            .join("reconcile-keeper.lock");
+        if !enabled {
+            return Ok(Self {
+                enabled,
+                state_file,
+                lease_file,
+                generation_id: String::new(),
+                process_id,
+                process_start_time_ms: 0,
+                plan_digest: String::new(),
+                action_digest: String::new(),
+                task_name: String::new(),
+                _lease: None,
+            });
+        }
+        let process_start_time_ms =
+            agent_harness_core::loop_health::process_start_time_ms_for_pid(i64::from(process_id))
+                .ok_or_else(|| {
+                format!(
+                    "cannot prove exact reconcile keeper process start time for pid {process_id}"
+                )
+            })?;
+
+        let plan_file = args
+            .target_home
+            .join("state/supervisor/windows-reconcile-keeper/keeper-plan.json");
+        let plan_text = fs::read_to_string(&plan_file).map_err(|error| {
+            format!(
+                "production reconcile keeper requires a current keeper plan at {}: {error}",
+                plan_file.display()
+            )
+        })?;
+        let plan: serde_json::Value = serde_json::from_str(&plan_text)
+            .map_err(|error| format!("keeper plan is invalid JSON: {error}"))?;
+        if plan.get("schema").and_then(serde_json::Value::as_str)
+            != Some("agent-harness.windows-reconcile-keeper-plan.v1")
+        {
+            return Err("keeper plan schema is unsupported".to_string());
+        }
+        let plan_digest = plan
+            .get("planDigest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "keeper plan digest is missing".to_string())?
+            .to_string();
+        let computed_plan_digest =
+            agent_harness_core::supervisor_keeper::windows_reconcile_keeper_plan_digest(&plan)?;
+        if plan_digest != computed_plan_digest {
+            return Err("keeper plan digest does not verify".to_string());
+        }
+        let action = plan
+            .pointer("/action")
+            .ok_or_else(|| "keeper plan action is missing".to_string())?;
+        let action_digest = action
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "keeper action digest is missing".to_string())?
+            .to_string();
+        let computed_action_digest =
+            agent_harness_core::supervisor_keeper::windows_reconcile_keeper_action_digest(action)?;
+        if action_digest != computed_action_digest {
+            return Err("keeper action digest does not verify".to_string());
+        }
+        let expected_invocation = action
+            .get("argumentVector")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "keeper action argument vector is missing".to_string())?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| "keeper action argument vector contains non-text".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut actual_invocation = vec!["supervisor-reconcile".to_string()];
+        actual_invocation.extend(invocation_args.iter().cloned());
+        if actual_invocation != expected_invocation {
+            return Err(
+                "manual or stale reconcile keeper invocation does not match current plan action"
+                    .to_string(),
+            );
+        }
+        let current_exe = normalize_windows_canonical_path(
+            fs::canonicalize(env::current_exe().map_err(|error| error.to_string())?)
+                .map_err(|error| format!("failed to canonicalize current executable: {error}"))?,
+        );
+        let planned_exe = action
+            .get("executable")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| "keeper action executable is missing".to_string())?;
+        let planned_exe = normalize_windows_canonical_path(
+            fs::canonicalize(&planned_exe)
+                .map_err(|error| format!("failed to canonicalize keeper executable: {error}"))?,
+        );
+        if current_exe != planned_exe {
+            return Err(format!(
+                "keeper process executable {} does not match planned executable {}",
+                current_exe.display(),
+                planned_exe.display()
+            ));
+        }
+        match plan
+            .get("deploymentMode")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("live") => {
+                agent_harness_core::supervisor_keeper::validate_live_windows_reconcile_keeper_plan(
+                    &plan,
+                )?;
+            }
+            Some("developer-staging") => {}
+            _ => return Err("keeper plan deployment mode is unsupported".to_string()),
+        }
+        let task_name = plan
+            .pointer("/task/name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "keeper task name is missing".to_string())?
+            .to_string();
+        let lease = SupervisorReconcileKeeperLease::acquire(
+            &lease_file,
+            process_id,
+            process_start_time_ms,
+            &plan_digest,
+            &action_digest,
+            &task_name,
+        )?;
+        Ok(Self {
+            enabled,
+            state_file,
+            lease_file,
+            generation_id: format!("supervisor-reconcile-{process_id}-{process_start_time_ms}"),
+            process_id,
+            process_start_time_ms,
+            plan_digest,
+            action_digest,
+            task_name,
+            _lease: Some(lease),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct SupervisorReconcileKeeperLease {
+    file: Option<fs::File>,
+    path: PathBuf,
+}
+
+impl SupervisorReconcileKeeperLease {
+    fn acquire(
+        path: &Path,
+        process_id: u32,
+        process_start_time_ms: i64,
+        plan_digest: &str,
+        action_digest: &str,
+        task_name: &str,
+    ) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed to create reconcile keeper lease directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        #[cfg(windows)]
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .open(path)
+            .map_err(|error| {
+                format!(
+                    "reconcile keeper singleton lease is already held or unavailable at {}: {error}",
+                    path.display()
+                )
+            })?;
+        #[cfg(not(windows))]
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| {
+                format!(
+                    "reconcile keeper singleton lease is already held or unavailable at {}: {error}",
+                    path.display()
+                )
+            })?;
+        let owner = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "agent-harness.supervisor-reconcile-keeper-lease.v1",
+            "pid": process_id,
+            "processStartTimeMs": process_start_time_ms,
+            "planDigest": plan_digest,
+            "actionDigest": action_digest,
+            "taskName": task_name,
+        }))
+        .map_err(|error| format!("failed to serialize reconcile keeper lease: {error}"))?;
+        file.set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| file.write_all(&owner))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| {
+                format!(
+                    "failed to persist reconcile keeper lease {}: {error}",
+                    path.display()
+                )
+            })?;
+        Ok(Self {
+            file: Some(file),
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for SupervisorReconcileKeeperLease {
+    fn drop(&mut self) {
+        self.file.take();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn normalize_windows_canonical_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_supervisor_reconcile_keeper_state(
+    args: &SupervisorReconcileArgs,
+    keeper: &SupervisorReconcileKeeperContext,
+    status: &str,
+    iteration: usize,
+    desired_services: Option<&[SupervisorInventoryServiceConfig]>,
+    inventory_counts: Option<(usize, usize, usize, usize, usize)>,
+    launches: &[serde_json::Value],
+    reason: &str,
+) -> Result<(), String> {
+    let desired_services_digest = desired_services
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|error| format!("failed to serialize desired services: {error}"))?
+        .map(|bytes| format!("sha256:{}", sha256_hex(&bytes)));
+    let (missing, stale, running, disabled, launch_actions) =
+        inventory_counts.unwrap_or((0, 0, 0, 0, 0));
+    let launch_statuses = launches
+        .iter()
+        .filter_map(|launch| launch.get("status").and_then(serde_json::Value::as_str))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let state = serde_json::json!({
+        "schema": SUPERVISOR_RECONCILE_KEEPER_SCHEMA,
+        "generationId": keeper.generation_id,
+        "pid": keeper.process_id,
+        "processStartTimeMs": keeper.process_start_time_ms,
+        "planDigest": keeper.plan_digest,
+        "actionDigest": keeper.action_digest,
+        "taskName": keeper.task_name,
+        "ownershipMode": "scheduled-task-plan",
+        "leaseFile": keeper.lease_file,
+        "status": status,
+        "iteration": iteration,
+        "lastHeartbeatAtMs": current_time_ms()?,
+        "stopFile": args.stop_file,
+        "holdRequested": stop_file_requested(Some(&args.stop_file)),
+        "autoReconcile": args.auto_reconcile,
+        "applied": args.apply,
+        "desiredServiceCount": desired_services.map(|services| services.len()),
+        "desiredServicesDigest": desired_services_digest,
+        "inventory": {
+            "missing": missing,
+            "stale": stale,
+            "running": running,
+            "disabled": disabled,
+            "launchActions": launch_actions,
+        },
+        "launchCount": launches.len(),
+        "launchStatuses": launch_statuses,
+        "reason": reason,
+    });
+    write_json_atomic(&keeper.state_file, &state).map_err(|error| {
+        format!(
+            "failed to write reconcile keeper state {}: {error}",
+            keeper.state_file.display()
+        )
+    })
+}
+
+fn wait_for_supervisor_reconcile_hold(stop_file: &Path, idle_ms: u64) -> bool {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(idle_ms))
+        .unwrap_or_else(Instant::now);
+    loop {
+        if stop_file_requested(Some(stop_file)) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(100)));
     }
 }
 
@@ -10250,7 +10777,7 @@ fn workspace_status_snapshot(
     workspace: &Path,
     harness_home: &Path,
 ) -> Result<WorkspaceStatusSnapshot, String> {
-    if workspace.join(".git").is_dir() {
+    if workspace_is_exact_git_worktree_root(workspace) {
         let output = Command::new("git")
             .arg("-C")
             .arg(workspace)
@@ -10285,6 +10812,32 @@ fn workspace_status_snapshot(
         }
     }
     filesystem_manifest_snapshot(workspace, &[harness_home.to_path_buf()])
+}
+
+fn workspace_is_exact_git_worktree_root(workspace: &Path) -> bool {
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+    let reported = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if reported.is_empty() {
+        return false;
+    }
+    let reported = match fs::canonicalize(PathBuf::from(reported)) {
+        Ok(path) => normalize_windows_canonical_path(path),
+        Err(_) => return false,
+    };
+    let workspace = match fs::canonicalize(workspace) {
+        Ok(path) => normalize_windows_canonical_path(path),
+        Err(_) => return false,
+    };
+    path_identity_key(&reported) == path_identity_key(&workspace)
 }
 
 fn git_status_path_from_line(line: &str) -> String {
@@ -11149,6 +11702,21 @@ struct SupervisorPlanArgs {
     telegram_outbox_limit: usize,
 }
 
+struct SupervisorKeeperPlanArgs {
+    target_home: PathBuf,
+    source_home: PathBuf,
+    workspace: Option<PathBuf>,
+    runtime_workspace: PathBuf,
+    harness_cli: PathBuf,
+    codex_exe: Option<PathBuf>,
+    node_exe: Option<PathBuf>,
+    gateway_script: Option<PathBuf>,
+    user_id: String,
+    task_name: Option<String>,
+    live_deployment: bool,
+    live_control_token: Option<String>,
+}
+
 struct HarnessSkillsSyncArgs {
     target_home: PathBuf,
     force: bool,
@@ -11784,6 +12352,8 @@ struct SupervisorReconcileArgs {
     auto_reconcile: bool,
     apply: bool,
     dry_run: bool,
+    stop_file: PathBuf,
+    quiet: bool,
     iterations: usize,
     idle_ms: u64,
     restart_delay_ms: i64,
@@ -13600,6 +14170,7 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
             "--poll-timeout-seconds",
             "--max-updates",
             "--outbox-limit",
+            "--stop-file",
         ],
         &[
             "--apply",
@@ -13620,6 +14191,7 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
             "--include-discord",
             "--no-discord",
             "--auto-reconcile",
+            "--quiet",
         ],
     )?;
     let config = read_harness_config_json(&options.target_home)?;
@@ -13737,20 +14309,16 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
         harness_cli: options
             .optional("--harness-cli")
             .map(PathBuf::from)
-            .unwrap_or_else(default_harness_cli),
+            .unwrap_or_else(|| deployed_harness_cli(&options.target_home)),
         codex_exe: options.optional("--codex-exe").map(PathBuf::from),
         node_exe: options
             .optional("--node-exe")
             .map(PathBuf::from)
-            .unwrap_or_else(default_node_exe),
+            .unwrap_or_else(|| deployed_node_exe(&options.target_home)),
         gateway_script: options
             .optional("--gateway-script")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from("tools")
-                    .join("agent-discord-gateway")
-                    .join("index.mjs")
-            }),
+            .unwrap_or_else(|| deployed_gateway_script(&options.target_home)),
         agent_id: options.optional("--agent").map(ToString::to_string),
         telegram_accounts: options.values("--telegram-account"),
         discord_account: options
@@ -13771,6 +14339,18 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
         auto_reconcile,
         apply,
         dry_run: options.has_flag("--dry-run") || !apply,
+        stop_file: options
+            .optional("--stop-file")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                options
+                    .target_home
+                    .join("state")
+                    .join("supervisor")
+                    .join("stop")
+                    .join("supervisor-reconcile.stop")
+            }),
+        quiet: options.has_flag("--quiet"),
         iterations,
         idle_ms,
         restart_delay_ms,
@@ -13793,7 +14373,7 @@ fn infer_supervisor_reconcile_workspace(
     target_home: &Path,
     source_home: &Path,
 ) -> Result<Option<PathBuf>, String> {
-    for home in [source_home, target_home] {
+    for home in [target_home, source_home] {
         let home = absolute_path(home)?;
         if home.file_name().and_then(|name| name.to_str()) == Some(".agent-harness") {
             return Ok(Some(home.join("workspace")));
@@ -13806,10 +14386,10 @@ fn infer_supervisor_reconcile_runtime_workspace(
     target_home: &Path,
     source_home: &Path,
 ) -> Result<Option<PathBuf>, String> {
-    for home in [source_home, target_home] {
+    for home in [target_home, source_home] {
         let home = absolute_path(home)?;
         if home.file_name().and_then(|name| name.to_str()) == Some(".agent-harness") {
-            return Ok(home.parent().map(Path::to_path_buf));
+            return Ok(Some(home.join("runtime-workspace").join("default")));
         }
     }
     Ok(None)
@@ -13822,115 +14402,60 @@ fn supervisor_reconcile_desired_services(
         return Ok(services.clone());
     }
     let config = read_harness_config_json(&args.target_home)?;
-    let supervisor = config.get("supervisor");
-    let mut services: BTreeMap<String, SupervisorInventoryServiceConfig> = BTreeMap::new();
+    let explicit_services = config
+        .get("supervisor")
+        .and_then(|value| value.get("services"))
+        .map(|raw| {
+            serde_json::from_value::<Vec<SupervisorInventoryServiceConfig>>(raw.clone())
+                .map_err(|error| format!("supervisor.services is invalid: {error}"))
+        })
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|service| (service.service_id.clone(), service))
+        .collect::<BTreeMap<_, _>>();
+    let topology = derive_supervisor_topology(
+        &config,
+        &SupervisorTopologyOverrides {
+            manage_all: Some(args.all),
+            include_runtime: args.include_runtime,
+            include_worker: args.include_worker,
+            include_cron_scheduler: args.include_cron_scheduler,
+            include_progress: args.include_progress,
+            include_ledger_maintenance: args.include_ledger_maintenance,
+            include_telegram: args.include_telegram,
+            include_discord: args.include_discord,
+            telegram_accounts: args.telegram_accounts.clone(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
 
-    if let Some(raw_services) = supervisor.and_then(|value| value.get("services")) {
-        let parsed =
-            serde_json::from_value::<Vec<SupervisorInventoryServiceConfig>>(raw_services.clone())
-                .map_err(|err| format!("supervisor.services is invalid: {err}"))?;
-        for service in parsed {
-            services.insert(service.service_id.clone(), service);
-        }
-    }
-
-    let all = args.all
-        || supervisor
-            .and_then(|value| bool_child(value, "manageAllLoops"))
-            .unwrap_or(false);
-    if supervisor_loop_enabled(args.include_runtime, supervisor, "runtimeLoop", all) {
-        insert_supervisor_default_service(&mut services, args, "runtime-loop", None);
-    }
-    if supervisor_loop_enabled(args.include_worker, supervisor, "workerLoop", all) {
-        insert_supervisor_default_service(&mut services, args, "worker-loop", None);
-    }
-    let cron_enabled = args.include_cron_scheduler.unwrap_or_else(|| {
-        supervisor
-            .and_then(|value| loop_object_enabled(value, "cronSchedulerLoop"))
-            .or_else(|| {
-                config
-                    .get("cronScheduler")
-                    .and_then(|value| bool_child(value, "enabled"))
-            })
-            .unwrap_or(all)
-    });
-    if cron_enabled {
-        insert_supervisor_default_service(&mut services, args, "cron-scheduler-loop", None);
-    }
-    if supervisor_loop_enabled(
-        args.include_progress,
-        supervisor,
-        "progressDeliveryLoop",
-        all,
-    ) {
-        insert_supervisor_default_service(&mut services, args, "progress-delivery-loop", None);
-    }
-    if supervisor_loop_enabled(
-        args.include_ledger_maintenance,
-        supervisor,
-        "ledgerMaintenanceLoop",
-        all,
-    ) {
-        insert_supervisor_default_service(&mut services, args, "ledger-maintenance-loop", None);
-    }
-    if supervisor_loop_enabled(args.include_telegram, supervisor, "telegramLoop", all) {
-        let accounts = if args.telegram_accounts.is_empty() {
-            vec![None]
-        } else {
-            args.telegram_accounts
-                .iter()
-                .map(|account| Some(account.as_str()))
-                .collect()
-        };
-        for account in accounts {
-            let service_id = account
-                .map(|account| format!("telegram-loop-{}", service_id_suffix(account)))
-                .unwrap_or_else(|| "telegram-loop".to_string());
-            insert_supervisor_default_service(&mut services, args, &service_id, account);
-        }
-    }
-    if let Some(telegram_loops) = supervisor
-        .and_then(|value| value.get("telegramLoops"))
-        .and_then(serde_json::Value::as_array)
-    {
-        for entry in telegram_loops {
-            if bool_child(entry, "enabled").unwrap_or(true) {
-                let account = string_child(entry, "account")
-                    .or_else(|| string_child(entry, "telegramAccount"));
-                let service_id = string_child(entry, "serviceId").unwrap_or_else(|| {
-                    account
-                        .as_deref()
-                        .map(|account| format!("telegram-loop-{}", service_id_suffix(account)))
-                        .unwrap_or_else(|| "telegram-loop".to_string())
-                });
-                let mut service = supervisor_default_service(args, &service_id, account.as_deref());
-                if let Some(agent) =
-                    string_child(entry, "agent").or_else(|| string_child(entry, "agentId"))
-                {
-                    service.args.extend(["--agent".to_string(), agent]);
-                }
-                services.insert(service.service_id.clone(), service);
+    topology
+        .into_values()
+        .map(|entry| {
+            if entry.source == SupervisorTopologySource::ExplicitService {
+                return explicit_services
+                    .get(&entry.service_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "canonical supervisor topology lost explicit service `{}`",
+                            entry.service_id
+                        )
+                    });
             }
-        }
-    }
-    if supervisor_loop_enabled(args.include_discord, supervisor, "discordOutboxLoop", all) {
-        insert_supervisor_default_service(&mut services, args, "discord-outbox-loop", None);
-    }
-    if supervisor_loop_enabled(args.include_discord, supervisor, "discordGatewayLoop", all) {
-        insert_supervisor_default_service(&mut services, args, "discord-gateway-loop", None);
-    }
-
-    Ok(services.into_values().collect())
-}
-
-fn insert_supervisor_default_service(
-    services: &mut BTreeMap<String, SupervisorInventoryServiceConfig>,
-    args: &SupervisorReconcileArgs,
-    service_id: &str,
-    account: Option<&str>,
-) {
-    let service = supervisor_default_service(args, service_id, account);
-    services.insert(service.service_id.clone(), service);
+            let mut service = supervisor_default_service(
+                args,
+                &entry.service_id,
+                entry.telegram_account.as_deref(),
+            );
+            service.service_kind = entry.service_kind;
+            if let Some(agent_id) = entry.agent_id {
+                service.args.extend(["--agent".to_string(), agent_id]);
+            }
+            Ok(service)
+        })
+        .collect()
 }
 
 fn supervisor_default_service(
@@ -14042,7 +14567,13 @@ fn launch_supervisor_reconcile_commands(
     launch_commands: &[SupervisorLaunchCommand],
 ) -> Result<Vec<serde_json::Value>, String> {
     let mut launches = Vec::new();
+    if stop_file_requested(Some(&args.stop_file)) {
+        return Ok(launches);
+    }
     for launch in launch_commands {
+        if stop_file_requested(Some(&args.stop_file)) {
+            break;
+        }
         if launch.command.len() < 2 {
             return Err(format!(
                 "launch command for {} is malformed",
@@ -14092,13 +14623,13 @@ fn launch_supervisor_reconcile_commands(
             }
         }
         let child_args = &launch.command[1..];
-        let child = match Command::new(&args.harness_cli)
-            .args(child_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+        if stop_file_requested(Some(&args.stop_file)) {
+            break;
+        }
+        let mut child_command = Command::new(&args.harness_cli);
+        child_command.args(child_args);
+        let (child_result, process_boundary) = spawn_supervisor_reconcile_child(&mut child_command);
+        let child = match child_result {
             Ok(child) => child,
             Err(err) => {
                 let record = serde_json::json!({
@@ -14107,6 +14638,7 @@ fn launch_supervisor_reconcile_commands(
                     "serviceId": launch.service_id,
                     "reason": err.to_string(),
                     "command": launch.command,
+                    "processBoundary": process_boundary,
                     "autoReconcile": args.auto_reconcile,
                     "atMs": current_time_ms()?,
                 });
@@ -14128,6 +14660,7 @@ fn launch_supervisor_reconcile_commands(
             "serviceId": launch.service_id,
             "pid": child.id(),
             "command": launch.command,
+            "processBoundary": process_boundary,
             "autoReconcile": args.auto_reconcile,
             "atMs": current_time_ms()?,
         });
@@ -14135,6 +14668,101 @@ fn launch_supervisor_reconcile_commands(
         launches.push(record);
     }
     Ok(launches)
+}
+
+fn configure_supervisor_reconcile_child(command: &mut Command) -> serde_json::Value {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        command.creation_flags(WINDOWS_SUPERVISOR_RECONCILE_CREATION_FLAGS);
+        serde_json::json!({
+            "schema": "agent-harness.supervisor-process-boundary.v1",
+            "platform": "windows",
+            "stdio": "null",
+            "detachedFromLauncherConsole": true,
+            "newProcessGroup": true,
+            "requestedCreationFlags": WINDOWS_SUPERVISOR_RECONCILE_CREATION_FLAGS,
+            "breakawayFromJobRequested": false,
+            "rootKeeper": "external-required",
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        serde_json::json!({
+            "schema": "agent-harness.supervisor-process-boundary.v1",
+            "platform": env::consts::OS,
+            "stdio": "null",
+            "detachedFromLauncherConsole": false,
+            "newProcessGroup": false,
+            "requestedCreationFlags": 0,
+            "breakawayFromJobRequested": false,
+            "rootKeeper": "external-required",
+        })
+    }
+}
+
+fn spawn_supervisor_reconcile_child(
+    command: &mut Command,
+) -> (std::io::Result<std::process::Child>, serde_json::Value) {
+    let boundary = configure_supervisor_reconcile_child(command);
+    (command.spawn(), boundary)
+}
+
+fn run_supervisor_process_boundary_test(args: &[String]) -> Result<(), String> {
+    if env::var("AGENT_HARNESS_PROCESS_BOUNDARY_TEST")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return Err(
+            "the process-boundary seam is available only to the guarded integration test"
+                .to_string(),
+        );
+    }
+    if args.len() < 4 || args[0] != "--receipt-file" || args[2] != "--" {
+        return Err(
+            "usage: __supervisor-process-boundary-test --receipt-file <path> -- <executable> [args...]"
+                .to_string(),
+        );
+    }
+    let receipt_file = PathBuf::from(&args[1]);
+    let mut command = Command::new(&args[3]);
+    command.args(&args[4..]);
+    let (child_result, process_boundary) = spawn_supervisor_reconcile_child(&mut command);
+    let mut child = child_result.map_err(|error| {
+        format!(
+            "production supervisor child spawn seam failed for {}: {error}",
+            args[3]
+        )
+    })?;
+    write_json_atomic(
+        &receipt_file,
+        &serde_json::json!({
+            "schema": "agent-harness.supervisor-process-boundary-test-receipt.v1",
+            "pid": child.id(),
+            "processBoundary": process_boundary
+        }),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to write process-boundary receipt {}: {error}",
+            receipt_file.display()
+        )
+    })?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed waiting for process-boundary child: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "process-boundary child exited unsuccessfully: {status}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -14303,23 +14931,6 @@ fn supervisor_launch_receipts_file(harness_home: &Path) -> PathBuf {
         .join("launch-receipts.jsonl")
 }
 
-fn supervisor_loop_enabled(
-    cli_value: Option<bool>,
-    supervisor: Option<&serde_json::Value>,
-    key: &str,
-    all: bool,
-) -> bool {
-    cli_value
-        .or_else(|| supervisor.and_then(|value| loop_object_enabled(value, key)))
-        .unwrap_or(all)
-}
-
-fn loop_object_enabled(value: &serde_json::Value, key: &str) -> Option<bool> {
-    value
-        .get(key)
-        .and_then(|child| bool_child(child, "enabled"))
-}
-
 fn include_bool_flag(
     options: &SimpleOptions,
     include_flag: &str,
@@ -14450,7 +15061,7 @@ fn supervisor_run_args_from_args(args: &[String]) -> Result<SupervisorRunArgs, S
             "--account",
             "--stop-file",
         ],
-        &[],
+        &["--developer-staging"],
     )?;
     let service = options.required("--service")?;
     if !supervisor_run_supported_service(&service) {
@@ -14787,6 +15398,121 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
         telegram_poll_timeout_seconds,
         telegram_max_updates,
         telegram_outbox_limit,
+    })
+}
+
+fn supervisor_keeper_plan_args_from_args(
+    args: &[String],
+) -> Result<SupervisorKeeperPlanArgs, String> {
+    let options = SimpleOptions::parse(
+        args,
+        "supervisor-keeper-plan",
+        &[
+            "--source-home",
+            "--workspace",
+            "--runtime-workspace",
+            "--harness-cli",
+            "--codex-exe",
+            "--node-exe",
+            "--gateway-script",
+            "--user-id",
+            "--task-name",
+            "--task-prefix",
+            "--live-control-token",
+        ],
+        &["--developer-staging"],
+    )?;
+    let source_home = options
+        .optional("--source-home")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| options.target_home.clone());
+    let workspace = options.optional("--workspace").map(PathBuf::from).or(
+        infer_supervisor_reconcile_workspace(&options.target_home, &source_home)?,
+    );
+    let runtime_workspace = options
+        .optional("--runtime-workspace")
+        .map(PathBuf::from)
+        .or(infer_supervisor_reconcile_runtime_workspace(
+            &options.target_home,
+            &source_home,
+        )?)
+        .ok_or_else(|| {
+            "supervisor-keeper-plan requires --runtime-workspace outside a .agent-harness deployment"
+                .to_string()
+        })?;
+    let task_name = match (
+        options.optional("--task-name"),
+        options.optional("--task-prefix"),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err("--task-name and --task-prefix are mutually exclusive".to_string());
+        }
+        (Some(name), None) => Some(name.to_string()),
+        (None, Some(prefix)) => Some(format!(
+            "{}-Supervisor-Reconcile-Keeper",
+            prefix.trim_end_matches('-')
+        )),
+        (None, None) => None,
+    };
+
+    Ok(SupervisorKeeperPlanArgs {
+        target_home: options.target_home.clone(),
+        source_home,
+        workspace,
+        runtime_workspace,
+        harness_cli: options
+            .optional("--harness-cli")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| deployed_harness_cli(&options.target_home)),
+        codex_exe: options
+            .optional("--codex-exe")
+            .map(PathBuf::from)
+            .or_else(|| {
+                (!options.has_flag("--developer-staging"))
+                    .then(|| deployed_codex_exe(&options.target_home))
+            }),
+        node_exe: options
+            .optional("--node-exe")
+            .map(PathBuf::from)
+            .or_else(|| {
+                (!options.has_flag("--developer-staging"))
+                    .then(|| deployed_node_exe(&options.target_home))
+            }),
+        gateway_script: options
+            .optional("--gateway-script")
+            .map(PathBuf::from)
+            .or_else(|| {
+                (!options.has_flag("--developer-staging"))
+                    .then(|| deployed_gateway_script(&options.target_home))
+            }),
+        user_id: options
+            .optional("--user-id")
+            .map(ToString::to_string)
+            .or_else(current_scheduled_task_user_id)
+            .ok_or_else(|| {
+                "supervisor-keeper-plan requires --user-id when the current Windows user cannot be resolved"
+                    .to_string()
+            })?,
+        task_name,
+        live_deployment: !options.has_flag("--developer-staging"),
+        live_control_token: options
+            .optional("--live-control-token")
+            .map(ToString::to_string),
+    })
+}
+
+fn current_scheduled_task_user_id() -> Option<String> {
+    let user = env::var("USERNAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let domain = env::var("USERDOMAIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Some(match domain {
+        Some(domain) => format!("{domain}\\{user}"),
+        None => user,
     })
 }
 
@@ -17501,6 +18227,52 @@ fn default_harness_cli() -> PathBuf {
         "agent-harness"
     };
     PathBuf::from("target").join("debug").join(exe)
+}
+
+fn deployed_harness_cli(harness_home: &Path) -> PathBuf {
+    let exe = if cfg!(windows) {
+        "agent-harness.exe"
+    } else {
+        "agent-harness"
+    };
+    harness_home.join("bin").join("current").join(exe)
+}
+
+fn deployed_codex_exe(harness_home: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        return harness_home
+            .join("tools")
+            .join("codex-cli")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex-win32-x64")
+            .join("vendor")
+            .join("x86_64-pc-windows-msvc")
+            .join("bin")
+            .join("codex.exe");
+    }
+
+    #[cfg(not(windows))]
+    {
+        harness_home
+            .join("tools")
+            .join("codex-cli")
+            .join("bin")
+            .join("codex")
+    }
+}
+
+fn deployed_node_exe(harness_home: &Path) -> PathBuf {
+    let exe = if cfg!(windows) { "node.exe" } else { "node" };
+    harness_home.join("tools").join("node").join(exe)
+}
+
+fn deployed_gateway_script(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("tools")
+        .join("agent-discord-gateway")
+        .join("index.mjs")
 }
 
 fn default_node_exe() -> PathBuf {
@@ -25292,7 +26064,12 @@ fn print_help() {
     println!("  ops-control     Create/clear/inspect supervisor stop files");
     println!("  supervisor-reconcile Plan or launch configured supervisor-run loop owners");
     println!("  supervisor-run  Own and restart a low-risk child service");
-    println!("  supervisor-plan Generate Windows scheduled-task scripts for harness loops");
+    println!(
+        "  supervisor-plan Generate legacy per-service Windows task scripts (developer staging only)"
+    );
+    println!(
+        "  supervisor-keeper-plan Generate one user-scoped Windows reconcile keeper task plan; live promotion requires a cutover token and a fully held topology"
+    );
     println!("  harness-skills-sync Sync bundled harness operation skills");
     println!("  skills          Build a skill-first index and optionally match a task");
     println!("  skill-view      Print a skill body or support file with traversal guards");
@@ -25417,6 +26194,8 @@ fn print_help() {
     println!("  --apply                 Apply jsonl-repair after writing backup/repaired files");
     println!("  --invalid-output <file> Invalid-line quarantine output for jsonl-repair");
     println!("  --task-prefix <name>    Windows scheduled-task name prefix for supervisor-plan");
+    println!("  --task-name <name>      Exact Windows reconcile keeper task name");
+    println!("  --user-id <domain\\user> User-scoped Windows Task Scheduler principal");
     println!("  --query <text>          Match skills or search imported memory");
     println!("  --agent <id>            Agent hint for skill matching");
     println!("  --agent-id <id>         Agent identity for lane-scoped commands");
@@ -25465,6 +26244,9 @@ fn print_help() {
     println!("  --event-json <text>     Discord Gateway event JSON text");
     println!("  --gateway-script <path> Discord Gateway Node script path");
     println!("  --harness-cli <path>    Harness CLI used by gateway loop callbacks");
+    println!(
+        "  --output-dir <path>     Legacy supervisor-plan output; must stay below staging harness home"
+    );
     println!("  --no-runtime            Exclude runtime-loop from supervisor-plan");
     println!("  --runtime-workers <n>   In-process runtime concurrency for supervisor-plan");
     println!("  --runtime-timeout-ms <n> Maximum Codex turn runtime in supervisor runtime-loop");
@@ -25486,6 +26268,7 @@ fn print_help() {
     println!(
         "  --iterations <n>        Loop iterations for telegram-loop/runtime-loop; 0 means forever"
     );
+    println!("  --quiet                 Suppress per-iteration supervisor-reconcile JSON output");
     println!(
         "  --idle-ms <n>           Loop sleep override; cron scheduler defaults to cronScheduler.intervalMs"
     );
@@ -25500,7 +26283,9 @@ fn print_help() {
     );
     println!("  --runtime-concurrency <n> Bounded in-process runtime tasks for runtime-loop");
     println!("  --stop-when-idle        Stop runtime-loop when the runtime queue is idle");
-    println!("  --stop-file <path>      Stop-file path for runtime, Telegram, or Discord loops");
+    println!(
+        "  --stop-file <path>      Stop-file path for runtime/channel loops or the reconcile keeper"
+    );
     println!("  TELEGRAM_BOT_TOKEN      Env var or harness secret used by Telegram adapters");
     println!("  AGENT_HARNESS_TELEGRAM_ACCOUNT_<ID>_BOT_TOKEN Account-specific Telegram token");
     println!("  DISCORD_BOT_TOKEN       Env var or harness secret used by Discord adapters");
@@ -25522,7 +26307,12 @@ fn print_help() {
     println!("  --test-note <text>      Test evidence for cutover request; repeatable");
     println!("  --issued-to <name>      Operator/agent recipient for live-control token");
     println!("  --ttl-seconds <n>       Live-control token lifetime for cutover approval");
-    println!("  --live-control-token <token> Token required for live gateway stop/start");
+    println!(
+        "  --live-control-token <token> Exact-action token required for live control and keeper-plan promotion"
+    );
+    println!(
+        "  --developer-staging     Keep supervisor task/keeper plans outside live .agent-harness mutation gates"
+    );
     println!("  --label <name>          Backup label for ops-backup");
     println!("  --summary-only          Print compact ops-backup receipt summary");
     println!(
@@ -25620,6 +26410,182 @@ mod tests {
             run_skill_replay_baseline(&skill_replay_cli_args(&root.join("manifest.json"), true))
                 .expect_err("fixture drift must fail on the CLI surface");
         assert!(error.contains("checksum mismatch"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_keeper_plan_cli_requires_token_held_topology_and_zero_live_owners() {
+        let root = cli_temp_root("live_keeper_plan_mutation_gate");
+        let harness_home = write_live_keeper_plan_fixture(&root);
+        let base_args = vec![
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--user-id".to_string(),
+            "TEST\\keeper".to_string(),
+        ];
+        let output_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("windows-reconcile-keeper");
+
+        let missing = run_supervisor_keeper_plan(&base_args)
+            .expect_err("live plan generation without a token must be blocked");
+        assert!(missing.contains("valid exact-action cutover token"));
+        assert!(!output_dir.exists());
+
+        let mut staging_bypass_args = base_args.clone();
+        staging_bypass_args.push("--developer-staging".to_string());
+        let staging_bypass = run_supervisor_keeper_plan(&staging_bypass_args)
+            .expect_err("developer-staging must not bypass a live home gate");
+        assert!(staging_bypass.contains("cannot target a live .agent-harness"));
+        assert!(!output_dir.exists());
+
+        let mut garbage_args = base_args.clone();
+        garbage_args.extend([
+            "--live-control-token".to_string(),
+            "not-a-cutover-token".to_string(),
+        ]);
+        let garbage = run_supervisor_keeper_plan(&garbage_args)
+            .expect_err("garbage live-control token must be blocked");
+        assert!(garbage.contains("valid exact-action cutover token"));
+        assert!(!output_dir.exists());
+
+        let stop_token =
+            issue_keeper_plan_live_control_token(&harness_home, LiveControlAction::Stop);
+        let mut wrong_action_args = base_args.clone();
+        wrong_action_args.extend(["--live-control-token".to_string(), stop_token]);
+        let wrong_action = run_supervisor_keeper_plan(&wrong_action_args)
+            .expect_err("a Stop token must not authorize keeper-plan promotion");
+        assert!(wrong_action.contains("valid exact-action cutover token"));
+        assert!(!output_dir.exists());
+
+        let token = issue_keeper_plan_live_control_token(&harness_home, LiveControlAction::Cutover);
+        let mut authorized_args = base_args.clone();
+        authorized_args.extend(["--live-control-token".to_string(), token]);
+        let unheld = run_supervisor_keeper_plan(&authorized_args)
+            .expect_err("authorized promotion still requires a fully held topology");
+        assert!(unheld.contains("fully held topology"));
+        assert!(unheld.contains("missing"));
+        assert!(!output_dir.exists());
+
+        write_keeper_plan_fixture_holds(&harness_home);
+        let keeper_state = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("reconcile-keeper.json");
+        let process_id = i64::from(std::process::id());
+        write_json_atomic(
+            &keeper_state,
+            &serde_json::json!({
+                "schema": SUPERVISOR_RECONCILE_KEEPER_SCHEMA,
+                "pid": process_id,
+                "processStartTimeMs":
+                    agent_harness_core::loop_health::process_start_time_ms_for_pid(process_id)
+                        .expect("current process start time")
+            }),
+        )
+        .unwrap();
+        let running = run_supervisor_keeper_plan(&authorized_args)
+            .expect_err("a running exact keeper owner must block promotion");
+        assert!(running.contains("no live keeper or child owners"));
+        assert!(running.contains("reconcile-keeper"));
+        assert!(!output_dir.exists());
+        fs::remove_file(&keeper_state).unwrap();
+
+        let service_state = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services")
+            .join("runtime-loop.json");
+        write_json_atomic(
+            &service_state,
+            &serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "runtime-loop",
+                "processId": process_id,
+                "processStartTimeMs":
+                    agent_harness_core::loop_health::process_start_time_ms_for_pid(process_id)
+                        .expect("current process start time")
+            }),
+        )
+        .unwrap();
+        let running_child = run_supervisor_keeper_plan(&authorized_args)
+            .expect_err("a running exact child owner must block promotion");
+        assert!(running_child.contains("no live keeper or child owners"));
+        assert!(running_child.contains("service-owner"));
+        assert!(!output_dir.exists());
+        fs::remove_file(&service_state).unwrap();
+
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::write(output_dir.join("prior-generation.txt"), b"preserve me").unwrap();
+        run_supervisor_keeper_plan(&authorized_args)
+            .expect("valid cutover token plus held/owner-free topology should promote");
+        assert!(output_dir.join("keeper-plan.json").is_file());
+        assert!(output_dir.join("scripts").join("install.ps1").is_file());
+        let supervisor_dir = output_dir.parent().unwrap();
+        let retained_prior = fs::read_dir(supervisor_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".windows-reconcile-keeper.previous."))
+            })
+            .expect("prior canonical keeper generation must be retained");
+        assert_eq!(
+            fs::read(retained_prior.join("prior-generation.txt")).unwrap(),
+            b"preserve me"
+        );
+        assert!(
+            fs::read_dir(supervisor_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .all(|name| !name.starts_with(".windows-reconcile-keeper.candidate."))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn developer_staging_keeper_plan_is_tokenless_and_contained() {
+        let root = cli_temp_root("developer_staging_keeper_plan");
+        let harness_home = root.join("harness-staging");
+        let workspace = harness_home.join("workspace");
+        let runtime_workspace = harness_home.join("runtime-workspace").join("default");
+        let harness_cli = harness_home.join(if cfg!(windows) {
+            "agent-harness.exe"
+        } else {
+            "agent-harness"
+        });
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&runtime_workspace).unwrap();
+        fs::write(&harness_cli, b"fixture harness CLI").unwrap();
+
+        run_supervisor_keeper_plan(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--source-home".to_string(),
+            harness_home.display().to_string(),
+            "--workspace".to_string(),
+            workspace.display().to_string(),
+            "--runtime-workspace".to_string(),
+            runtime_workspace.display().to_string(),
+            "--harness-cli".to_string(),
+            harness_cli.display().to_string(),
+            "--user-id".to_string(),
+            "TEST\\keeper".to_string(),
+            "--developer-staging".to_string(),
+        ])
+        .expect("developer-staging plan generation must remain tokenless");
+
+        let output_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("windows-reconcile-keeper");
+        assert!(output_dir.join("keeper-plan.json").is_file());
+        assert!(output_dir.starts_with(&harness_home));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -26214,6 +27180,28 @@ mod tests {
                 .entries
                 .keys()
                 .any(|path| path.contains(".agent-harness/state/ignored.txt")),
+            "{:?}",
+            snapshot.entries
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_status_snapshot_ignores_an_unproven_git_marker() {
+        let root = cli_temp_root("workspace_status_snapshot_ignores_an_unproven_git_marker");
+        let workspace = root.join("workspace");
+        let harness_home = workspace.join(".agent-harness");
+        fs::create_dir_all(workspace.join(".git")).unwrap();
+        fs::write(workspace.join("visible.txt"), "workspace").unwrap();
+
+        let snapshot = workspace_status_snapshot(&workspace, &harness_home).unwrap();
+
+        assert_eq!(snapshot.method, "filesystem-manifest");
+        assert!(
+            snapshot
+                .entries
+                .keys()
+                .any(|path| path.ends_with("visible.txt")),
             "{:?}",
             snapshot.entries
         );
@@ -26818,6 +27806,126 @@ mod tests {
         path
     }
 
+    fn write_live_keeper_plan_fixture(root: &Path) -> PathBuf {
+        let harness_home = root.join(".agent-harness");
+        let workspace = harness_home.join("workspace");
+        let runtime_workspace = harness_home.join("runtime-workspace").join("default");
+        let harness_cli = deployed_harness_cli(&harness_home);
+        let codex = deployed_codex_exe(&harness_home);
+        let node = deployed_node_exe(&harness_home);
+        let gateway = deployed_gateway_script(&harness_home);
+        for directory in [
+            workspace.as_path(),
+            runtime_workspace.as_path(),
+            harness_cli.parent().unwrap(),
+            codex.parent().unwrap(),
+            node.parent().unwrap(),
+            gateway.parent().unwrap(),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(&harness_cli, b"fixture harness CLI").unwrap();
+        fs::write(&codex, b"fixture Codex executable").unwrap();
+        fs::write(&node, b"fixture Node executable").unwrap();
+        fs::write(&gateway, b"export default {};\n").unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "supervisor": {
+                    "manageAllLoops": true,
+                    "runtimeLoop": { "enabled": true },
+                    "workerLoop": { "enabled": false },
+                    "cronSchedulerLoop": { "enabled": false },
+                    "progressDeliveryLoop": { "enabled": false },
+                    "ledgerMaintenanceLoop": { "enabled": false },
+                    "telegramLoop": { "enabled": false },
+                    "discordOutboxLoop": { "enabled": false },
+                    "discordGatewayLoop": { "enabled": false }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        harness_home
+    }
+
+    fn write_keeper_plan_fixture_holds(harness_home: &Path) {
+        let stop_dir = harness_home.join("state").join("supervisor").join("stop");
+        fs::create_dir_all(&stop_dir).unwrap();
+        for component in ["supervisor-reconcile", "runtime-loop"] {
+            write_json_atomic(
+                &stop_dir.join(format!("{component}.stop")),
+                &serde_json::json!({
+                    "schema": "agent-harness.supervisor-stop-file.v1",
+                    "serviceId": component,
+                    "reason": "keeper plan CLI fixture hold",
+                    "createdBy": "test",
+                    "createdAtMs": current_time_ms().unwrap(),
+                    "persistent": true
+                }),
+            )
+            .unwrap();
+        }
+    }
+
+    fn issue_keeper_plan_live_control_token(
+        harness_home: &Path,
+        action: LiveControlAction,
+    ) -> String {
+        let now_ms = current_time_ms().unwrap();
+        let request = record_ops_cutover_request(OpsCutoverRequestOptions {
+            harness_home: harness_home.to_path_buf(),
+            action,
+            summary: Some("keeper plan CLI fixture".to_string()),
+            candidate_binary: None,
+            staging_home: None,
+            test_notes: vec!["hermetic CLI scenario".to_string()],
+            now_ms,
+        })
+        .unwrap();
+        record_ops_cutover_approval(OpsCutoverApproveOptions {
+            harness_home: harness_home.to_path_buf(),
+            ticket_id: request.ticket_id,
+            action,
+            issued_to: Some("test".to_string()),
+            ttl_seconds: Some(300),
+            reason: Some("keeper plan CLI fixture".to_string()),
+            now_ms: now_ms + 1,
+        })
+        .unwrap()
+        .token
+        .expect("cutover approval token")
+    }
+
+    fn write_developer_reconcile_keeper_plan(
+        harness_home: &Path,
+    ) -> agent_harness_core::WindowsReconcileKeeperPlan {
+        let workspace = harness_home.join("workspace");
+        let runtime_workspace = harness_home.join("runtime-workspace").join("default");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&runtime_workspace).unwrap();
+        write_windows_reconcile_keeper_plan(WindowsReconcileKeeperPlanOptions {
+            harness_home: harness_home.to_path_buf(),
+            source_home: harness_home.to_path_buf(),
+            workspace: Some(workspace),
+            runtime_workspace,
+            harness_cli: env::current_exe().unwrap(),
+            codex_executable: None,
+            node_executable: None,
+            discord_gateway_script: None,
+            user_id: "TEST\\keeper".to_string(),
+            task_name: None,
+            live_deployment: false,
+        })
+        .unwrap()
+    }
+
+    fn reconcile_args_from_keeper_plan(
+        plan: &agent_harness_core::WindowsReconcileKeeperPlan,
+    ) -> Vec<String> {
+        plan.action.argument_vector[1..].to_vec()
+    }
+
     fn write_cli_channel_source(root: &Path) -> AgentSource {
         let home = root.join(".openclaw");
         let workspace = home.join("workspace");
@@ -26866,8 +27974,10 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_reconcile_defaults_live_workspace_to_harness_parent() {
-        let root = cli_temp_root("supervisor_reconcile_defaults_live_workspace_to_harness_parent");
+    fn supervisor_reconcile_confines_live_runtime_workspace_below_harness_home() {
+        let root = cli_temp_root(
+            "supervisor_reconcile_confines_live_runtime_workspace_below_harness_home",
+        );
         let harness_home = root.join(".agent-harness");
         fs::create_dir_all(&harness_home).unwrap();
         fs::write(
@@ -26896,10 +28006,14 @@ mod tests {
         .unwrap();
 
         let harness_workspace = harness_home.join("workspace");
+        let live_runtime_workspace = harness_home.join("runtime-workspace").join("default");
         assert_eq!(args.workspace.as_deref(), Some(harness_workspace.as_path()));
-        assert_eq!(args.runtime_workspace.as_deref(), Some(root.as_path()));
+        assert_eq!(
+            args.runtime_workspace.as_deref(),
+            Some(live_runtime_workspace.as_path())
+        );
 
-        let root_text = root.to_string_lossy().to_string();
+        let runtime_workspace_text = live_runtime_workspace.to_string_lossy().to_string();
         let harness_workspace_text = harness_workspace.to_string_lossy().to_string();
         let services = supervisor_reconcile_desired_services(&args).unwrap();
         let runtime = services
@@ -26909,7 +28023,10 @@ mod tests {
         let runtime_workspace = arg_value(&runtime.args, "--runtime-workspace");
         let workspace = arg_value(&runtime.args, "--workspace");
         assert_eq!(workspace.as_deref(), Some(harness_workspace_text.as_str()));
-        assert_eq!(runtime_workspace.as_deref(), Some(root_text.as_str()));
+        assert_eq!(
+            runtime_workspace.as_deref(),
+            Some(runtime_workspace_text.as_str())
+        );
 
         let xiaoxiaoli = services
             .iter()
@@ -26917,7 +28034,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             arg_value(&xiaoxiaoli.args, "--runtime-workspace").as_deref(),
-            Some(root_text.as_str())
+            Some(runtime_workspace_text.as_str())
         );
         assert_eq!(
             arg_value(&xiaoxiaoli.args, "--agent").as_deref(),
@@ -27033,6 +28150,189 @@ mod tests {
         assert!(dry_run_args.auto_reconcile);
         assert!(!dry_run_args.apply);
         assert!(dry_run_args.dry_run);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_reconcile_keeper_uses_global_hold_and_quiet_contract() {
+        let root = cli_temp_root("supervisor_reconcile_keeper_uses_global_hold_and_quiet_contract");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        let plan = write_developer_reconcile_keeper_plan(&harness_home);
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::json!({
+                "supervisor": {
+                    "enabled": true,
+                    "manageAllLoops": true
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let invocation_args = reconcile_args_from_keeper_plan(&plan);
+        let args = supervisor_reconcile_args_from_args(&invocation_args).unwrap();
+        assert!(args.apply);
+        assert!(args.auto_reconcile);
+        assert_eq!(args.iterations, 0);
+        assert!(args.quiet);
+        assert_eq!(
+            args.stop_file,
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("stop")
+                .join("supervisor-reconcile.stop")
+        );
+        let mut manual_invocation = invocation_args.clone();
+        manual_invocation.extend(["--idle-ms".to_string(), "1001".to_string()]);
+        let manual_args = supervisor_reconcile_args_from_args(&manual_invocation).unwrap();
+        let manual_error =
+            SupervisorReconcileKeeperContext::new(&manual_args, &manual_invocation).unwrap_err();
+        assert!(manual_error.contains("manual or stale reconcile keeper invocation"));
+
+        let keeper = SupervisorReconcileKeeperContext::new(&args, &invocation_args).unwrap();
+        assert!(keeper.enabled);
+        let duplicate = SupervisorReconcileKeeperContext::new(&args, &invocation_args).unwrap_err();
+        assert!(duplicate.contains("singleton lease is already held"));
+        drop(keeper);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_keeper_plan_defaults_to_confined_runtime_workspace() {
+        let root = cli_temp_root("supervisor_keeper_plan_defaults_to_confined_runtime_workspace");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+
+        let args = supervisor_keeper_plan_args_from_args(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--user-id".to_string(),
+            "TEST\\keeper".to_string(),
+            "--task-prefix".to_string(),
+            "Example".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.source_home, harness_home);
+        assert_eq!(args.workspace, Some(args.target_home.join("workspace")));
+        assert_eq!(
+            args.runtime_workspace,
+            args.target_home.join("runtime-workspace").join("default")
+        );
+        assert_eq!(
+            args.task_name.as_deref(),
+            Some("Example-Supervisor-Reconcile-Keeper")
+        );
+        assert!(args.live_deployment);
+        assert_eq!(args.harness_cli, deployed_harness_cli(&args.target_home));
+        assert_eq!(args.codex_exe, Some(deployed_codex_exe(&args.target_home)));
+        assert_eq!(args.node_exe, Some(deployed_node_exe(&args.target_home)));
+        assert_eq!(
+            args.gateway_script,
+            Some(deployed_gateway_script(&args.target_home))
+        );
+
+        let developer = supervisor_keeper_plan_args_from_args(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--user-id".to_string(),
+            "TEST\\keeper".to_string(),
+            "--developer-staging".to_string(),
+        ])
+        .unwrap();
+        assert!(!developer.live_deployment);
+        assert!(developer.codex_exe.is_none());
+        assert!(developer.node_exe.is_none());
+        assert!(developer.gateway_script.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_reconcile_hold_prevents_any_child_launch_receipt() {
+        let root = cli_temp_root("supervisor_reconcile_hold_prevents_any_child_launch_receipt");
+        let harness_home = root.join(".agent-harness");
+        let stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("supervisor-reconcile.stop");
+        fs::create_dir_all(stop_file.parent().unwrap()).unwrap();
+        fs::write(&stop_file, b"hold").unwrap();
+        let args = supervisor_reconcile_args_from_args(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--all".to_string(),
+            "--auto-reconcile".to_string(),
+            "--harness-cli".to_string(),
+            "where.exe".to_string(),
+        ])
+        .unwrap();
+        let command = SupervisorLaunchCommand {
+            service_id: "worker-loop".to_string(),
+            command: vec![
+                "agent-harness".to_string(),
+                "supervisor-run".to_string(),
+                "--service".to_string(),
+                "worker-loop".to_string(),
+            ],
+        };
+
+        let launches = launch_supervisor_reconcile_commands(&args, &[command]).unwrap();
+        assert!(launches.is_empty());
+        assert!(!supervisor_launch_receipts_file(&harness_home).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_reconcile_keeper_exits_cleanly_when_hold_preexists() {
+        let root = cli_temp_root("supervisor_reconcile_keeper_exits_cleanly_when_hold_preexists");
+        let harness_home = root.join(".agent-harness");
+        let plan = write_developer_reconcile_keeper_plan(&harness_home);
+        let invocation_args = reconcile_args_from_keeper_plan(&plan);
+        let stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("supervisor-reconcile.stop");
+        fs::create_dir_all(stop_file.parent().unwrap()).unwrap();
+        fs::write(&stop_file, b"hold").unwrap();
+
+        run_supervisor_reconcile(&invocation_args).unwrap();
+
+        let state: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                harness_home
+                    .join("state")
+                    .join("supervisor")
+                    .join("reconcile-keeper.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["schema"], SUPERVISOR_RECONCILE_KEEPER_SCHEMA);
+        assert_eq!(state["status"], "stopped");
+        assert_eq!(state["holdRequested"], true);
+        assert_eq!(state["iteration"], 0);
+        assert_eq!(state["stopFile"], stop_file.display().to_string());
+        assert!(!supervisor_launch_receipts_file(&harness_home).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_reconcile_idle_wait_is_interruptible_by_hold() {
+        let root = cli_temp_root("supervisor_reconcile_idle_wait_is_interruptible_by_hold");
+        let stop_file = root.join("supervisor-reconcile.stop");
+        fs::create_dir_all(&stop_file).unwrap();
+
+        assert!(wait_for_supervisor_reconcile_hold(&stop_file, 10_000));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -27540,6 +28840,26 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn supervisor_reconcile_windows_boundary_detaches_console_and_process_group() {
+        let mut command = Command::new("where.exe");
+        let boundary = configure_supervisor_reconcile_child(&mut command);
+
+        assert_eq!(
+            WINDOWS_SUPERVISOR_RECONCILE_CREATION_FLAGS,
+            WINDOWS_DETACHED_PROCESS | WINDOWS_CREATE_NEW_PROCESS_GROUP
+        );
+        assert_eq!(
+            boundary["requestedCreationFlags"].as_u64(),
+            Some(u64::from(WINDOWS_SUPERVISOR_RECONCILE_CREATION_FLAGS))
+        );
+        assert_eq!(boundary["detachedFromLauncherConsole"], true);
+        assert_eq!(boundary["newProcessGroup"], true);
+        assert_eq!(boundary["breakawayFromJobRequested"], false);
+        assert_eq!(boundary["rootKeeper"], "external-required");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn supervisor_launch_guard_ignores_reused_pid_from_stale_generation() {
         let root = cli_temp_root("supervisor_launch_guard_ignores_reused_pid");
         let harness_home = root.join(".agent-harness");
@@ -27679,6 +28999,27 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(first[0]["status"], "launched");
         assert_eq!(first[0]["autoReconcile"], true);
+        assert_eq!(
+            first[0]["processBoundary"]["schema"],
+            "agent-harness.supervisor-process-boundary.v1"
+        );
+        assert_eq!(first[0]["processBoundary"]["stdio"], "null");
+        assert_eq!(
+            first[0]["processBoundary"]["rootKeeper"],
+            "external-required"
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                first[0]["processBoundary"]["requestedCreationFlags"].as_u64(),
+                Some(u64::from(WINDOWS_SUPERVISOR_RECONCILE_CREATION_FLAGS))
+            );
+            assert_eq!(
+                first[0]["processBoundary"]["detachedFromLauncherConsole"],
+                true
+            );
+            assert_eq!(first[0]["processBoundary"]["newProcessGroup"], true);
+        }
 
         let second = launch_supervisor_reconcile_commands(&args, &[command]).unwrap();
         assert_eq!(second.len(), 1);

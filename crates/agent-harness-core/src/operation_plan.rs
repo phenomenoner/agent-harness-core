@@ -618,6 +618,18 @@ pub fn add_operation_plan_item(
             format!("item {} already exists", options.item_id),
         ));
     }
+    if let Some(max_open_items) = plan.max_open_items {
+        let open_items = items
+            .values()
+            .filter(|item| !item.status.is_terminal())
+            .count();
+        if open_items >= max_open_items {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("maxOpenItems limit of {max_open_items} would be exceeded"),
+            ));
+        }
+    }
     validate_dependency_ids(&options.depends_on, &items)?;
     let item = OperationPlanItem {
         schema: OPERATION_PLAN_ITEM_SCHEMA.to_string(),
@@ -731,6 +743,9 @@ pub fn update_operation_plan_item(
     if let Some(depends_on) = options.depends_on {
         validate_dependency_ids(&depends_on, &items)?;
         current.depends_on = depends_on;
+        let mut candidate_items = items.clone();
+        candidate_items.insert(current.item_id.clone(), current.clone());
+        validate_dependency_acyclicity(&candidate_items)?;
     }
     if let Some(assignee) = options.assignee {
         current.assignee = Some(assignee);
@@ -1258,6 +1273,39 @@ fn validate_dependency_ids(
     Ok(())
 }
 
+fn validate_dependency_acyclicity(items: &HashMap<String, OperationPlanItem>) -> io::Result<()> {
+    fn visit(
+        item_id: &str,
+        items: &HashMap<String, OperationPlanItem>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+    ) -> io::Result<()> {
+        if visited.contains(item_id) {
+            return Ok(());
+        }
+        if !visiting.insert(item_id.to_string()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("dependency cycle detected at item {item_id}"),
+            ));
+        }
+        if let Some(item) = items.get(item_id) {
+            for dependency_id in &item.depends_on {
+                visit(dependency_id, items, visiting, visited)?;
+            }
+        }
+        visiting.remove(item_id);
+        visited.insert(item_id.to_string());
+        Ok(())
+    }
+
+    let mut visited = HashSet::new();
+    for item_id in items.keys() {
+        visit(item_id, items, &mut HashSet::new(), &mut visited)?;
+    }
+    Ok(())
+}
+
 fn operation_plan_dir(harness_home: &Path, plan_id: &str) -> PathBuf {
     harness_home
         .join("state")
@@ -1727,6 +1775,174 @@ mod tests {
     }
 
     #[test]
+    fn operation_plan_rejects_items_beyond_stored_open_item_limit() {
+        let root = temp_root("operation_plan_rejects_items_beyond_stored_open_item_limit");
+        let harness_home = root.join(".agent-harness");
+        create_operation_plan(CreateOperationPlanOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-open-limit".to_string(),
+            origin_queue_id: None,
+            session_key: "session-limit".to_string(),
+            agent_id: "agent-main".to_string(),
+            goal: "enforce stored limits".to_string(),
+            acceptance_criteria: None,
+            constraints: None,
+            max_open_items: Some(1),
+            max_fanout: None,
+            now_ms: 4500,
+        })
+        .unwrap();
+
+        add_operation_plan_item(OperationPlanAddItemOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-open-limit".to_string(),
+            item_id: "first".to_string(),
+            title: "first".to_string(),
+            body: "first open item".to_string(),
+            depends_on: Vec::new(),
+            acceptance_criteria: None,
+            risk: None,
+            now_ms: 4501,
+        })
+        .unwrap();
+
+        let plan_dir = operation_plan_dir(&harness_home, "plan-open-limit");
+        let durable_line_counts = [
+            line_count(&plan_dir.join(ITEMS_FILE)),
+            line_count(&plan_dir.join(EVENTS_FILE)),
+            line_count(&plan_dir.join(RECEIPTS_FILE)),
+        ];
+
+        let second = add_operation_plan_item(OperationPlanAddItemOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-open-limit".to_string(),
+            item_id: "second".to_string(),
+            title: "second".to_string(),
+            body: "must be rejected".to_string(),
+            depends_on: Vec::new(),
+            acceptance_criteria: None,
+            risk: None,
+            now_ms: 4502,
+        });
+        let error = second.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("maxOpenItems"));
+        assert_eq!(
+            [
+                line_count(&plan_dir.join(ITEMS_FILE)),
+                line_count(&plan_dir.join(EVENTS_FILE)),
+                line_count(&plan_dir.join(RECEIPTS_FILE)),
+            ],
+            durable_line_counts
+        );
+
+        let show = show_operation_plan(OperationPlanShowOptions {
+            harness_home,
+            plan_id: "plan-open-limit".to_string(),
+        })
+        .unwrap();
+        assert_eq!(show.items.len(), 1);
+        assert_eq!(show.plan.version, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operation_plan_rejects_dependency_cycle_atomically() {
+        let root = temp_root("operation_plan_rejects_dependency_cycle_atomically");
+        let harness_home = root.join(".agent-harness");
+        create_operation_plan(CreateOperationPlanOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-cycle".to_string(),
+            origin_queue_id: None,
+            session_key: "session-cycle".to_string(),
+            agent_id: "agent-main".to_string(),
+            goal: "reject cycles".to_string(),
+            acceptance_criteria: None,
+            constraints: None,
+            max_open_items: None,
+            max_fanout: None,
+            now_ms: 4600,
+        })
+        .unwrap();
+        let first = add_operation_plan_item(OperationPlanAddItemOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-cycle".to_string(),
+            item_id: "first".to_string(),
+            title: "first".to_string(),
+            body: "first".to_string(),
+            depends_on: Vec::new(),
+            acceptance_criteria: None,
+            risk: None,
+            now_ms: 4601,
+        })
+        .unwrap();
+        add_operation_plan_item(OperationPlanAddItemOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-cycle".to_string(),
+            item_id: "second".to_string(),
+            title: "second".to_string(),
+            body: "second".to_string(),
+            depends_on: vec!["first".to_string()],
+            acceptance_criteria: None,
+            risk: None,
+            now_ms: 4602,
+        })
+        .unwrap();
+
+        let plan_dir = operation_plan_dir(&harness_home, "plan-cycle");
+        let durable_line_counts = [
+            line_count(&plan_dir.join(ITEMS_FILE)),
+            line_count(&plan_dir.join(EVENTS_FILE)),
+            line_count(&plan_dir.join(RECEIPTS_FILE)),
+        ];
+
+        let cycle = update_operation_plan_item(OperationPlanUpdateItemOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-cycle".to_string(),
+            item_id: "first".to_string(),
+            expected_item_version: Some(first.item.version),
+            status: None,
+            title: None,
+            body: None,
+            depends_on: Some(vec!["second".to_string()]),
+            assignee: None,
+            worker_job_id: None,
+            queue_id: None,
+            risk: None,
+            evidence: None,
+            replace_evidence: false,
+            add_evidence: Vec::new(),
+            now_ms: 4603,
+        });
+        let error = cycle.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("cycle"));
+        assert_eq!(
+            [
+                line_count(&plan_dir.join(ITEMS_FILE)),
+                line_count(&plan_dir.join(EVENTS_FILE)),
+                line_count(&plan_dir.join(RECEIPTS_FILE)),
+            ],
+            durable_line_counts
+        );
+
+        let show = show_operation_plan(OperationPlanShowOptions {
+            harness_home,
+            plan_id: "plan-cycle".to_string(),
+        })
+        .unwrap();
+        let first_after = show
+            .items
+            .iter()
+            .find(|item| item.item_id == "first")
+            .unwrap();
+        assert!(first_after.depends_on.is_empty());
+        assert_eq!(first_after.version, first.item.version);
+        assert_eq!(show.plan.version, 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn operation_plan_show_exposes_blocked_terminal_items_separately() {
         let root = temp_root("operation_plan_show_exposes_blocked_terminal_items");
         let harness_home = root.join(".agent-harness");
@@ -2057,5 +2273,9 @@ mod tests {
             "agent-harness-operation-plan-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn line_count(path: &Path) -> usize {
+        fs::read_to_string(path).unwrap().lines().count()
     }
 }

@@ -1,457 +1,601 @@
 <!doctype html>
-<html lang="zh-Hant">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Agent Harness Feature Parity</title>
+  <meta name="description" content="Public capability map for Agent Harness Core, including durable channel operations, virtual sessions, evidence boundaries, and the Adaptive Skill Intelligence design direction.">
+  <title>Agent Harness Core · Capability Map</title>
   <style>
     :root {
       color-scheme: light;
-      --bg: #f7f8fb;
       --ink: #172033;
-      --muted: #596579;
-      --line: #d9deea;
-      --panel: #ffffff;
-      --panel-2: #eef3f8;
+      --muted: #5a687d;
+      --navy: #132238;
+      --navy-2: #1c3553;
+      --blue: #2c6eaa;
+      --blue-soft: #eaf3fb;
       --green: #147a4f;
-      --amber: #925500;
-      --red: #a33131;
-      --blue: #2563a8;
-      --shadow: 0 16px 42px rgba(18, 32, 55, 0.11);
+      --green-soft: #e9f7f0;
+      --amber: #9a6011;
+      --amber-soft: #fff4df;
+      --paper: #f5f7fa;
+      --panel: #ffffff;
+      --line: #d9e1eb;
+      --shadow: 0 18px 50px rgba(18, 34, 56, 0.10);
+      --radius: 16px;
     }
 
     * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
 
     body {
       margin: 0;
-      font-family: "Segoe UI", "Noto Sans TC", Arial, sans-serif;
-      background: var(--bg);
       color: var(--ink);
-      line-height: 1.55;
+      background: var(--paper);
+      font-family: "Segoe UI", "Noto Sans", Arial, sans-serif;
+      line-height: 1.62;
     }
 
-    header {
-      background: #172033;
-      color: #fff;
-      padding: 42px 32px 34px;
-    }
+    a { color: var(--blue); }
+    a:hover { color: var(--navy-2); }
 
     .wrap {
-      max-width: 1180px;
+      width: min(1180px, calc(100% - 40px));
       margin: 0 auto;
     }
 
-    .eyebrow {
-      color: #b8c5d8;
-      font-size: 13px;
-      letter-spacing: 0;
-      text-transform: uppercase;
-      margin: 0 0 10px;
-    }
-
-    h1 {
-      font-size: clamp(30px, 4vw, 48px);
-      line-height: 1.08;
-      margin: 0 0 14px;
-      letter-spacing: 0;
-      max-width: 980px;
-    }
-
-    .lead {
-      font-size: 18px;
-      color: #e2e8f0;
-      max-width: 960px;
-      margin: 0;
-    }
-
-    main {
-      padding: 28px 32px 48px;
-    }
-
-    .status-grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
-      margin: -44px auto 26px;
-      max-width: 1180px;
-    }
-
-    .metric,
-    .panel,
-    .step {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-    }
-
-    .metric {
-      box-shadow: var(--shadow);
-      padding: 16px;
-      min-height: 112px;
-    }
-
-    .metric .label {
-      display: block;
-      color: var(--muted);
-      font-size: 13px;
-      margin-bottom: 8px;
-    }
-
-    .metric .value {
-      display: block;
-      font-weight: 700;
-      font-size: 24px;
-      margin-bottom: 4px;
-    }
-
-    .metric .note {
-      color: var(--muted);
-      font-size: 13px;
-    }
-
-    section { margin: 24px 0; }
-    h2 { font-size: 24px; margin: 0 0 12px; letter-spacing: 0; }
-    h3 { font-size: 18px; margin: 0 0 8px; letter-spacing: 0; }
-    .panel { padding: 20px; }
-
-    .summary {
-      display: grid;
-      grid-template-columns: 1.15fr 0.85fr;
-      gap: 16px;
-    }
-
-    .callout {
-      background: var(--panel-2);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
-    }
-
-    .callout ul,
-    .panel ul,
-    .step ol {
-      margin: 8px 0 0;
-      padding-left: 20px;
-    }
-
-    .legend {
+    .topbar {
       display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin: 12px 0 16px;
-    }
-
-    .pill {
-      display: inline-flex;
       align-items: center;
-      min-height: 28px;
-      padding: 3px 10px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      font-size: 13px;
-      font-weight: 650;
-      background: #fff;
-      white-space: nowrap;
-    }
-
-    .done { color: var(--green); border-color: rgba(20, 122, 79, 0.25); background: #ecf8f2; }
-    .blocked { color: var(--red); border-color: rgba(163, 49, 49, 0.25); background: #fff0f0; }
-    .action { color: var(--amber); border-color: rgba(146, 85, 0, 0.25); background: #fff6e8; }
-    .deferred { color: var(--blue); border-color: rgba(37, 99, 168, 0.25); background: #edf5ff; }
-
-    .matrix-wrap {
-      overflow-x: auto;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-    }
-
-    table {
-      width: 100%;
-      min-width: 960px;
-      border-collapse: collapse;
-    }
-
-    th, td {
-      text-align: left;
-      vertical-align: top;
-      padding: 13px 14px;
-      border-bottom: 1px solid var(--line);
+      justify-content: space-between;
+      gap: 20px;
+      padding: 22px 0;
+      color: #d9e7f4;
       font-size: 14px;
     }
 
-    th {
-      font-size: 13px;
-      color: #40506a;
-      background: #f0f4f8;
+    .brand {
+      color: #fff;
+      font-weight: 800;
+      text-decoration: none;
     }
 
-    tr:last-child td { border-bottom: 0; }
-    .feature { font-weight: 700; min-width: 190px; }
+    .topnav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+    }
 
-    .roadmap {
+    .topnav a { color: #c2d3e4; text-decoration: none; }
+
+    .hero-shell {
+      overflow: hidden;
+      color: #fff;
+      background:
+        radial-gradient(circle at 84% 22%, rgba(72, 151, 210, 0.28), transparent 26rem),
+        radial-gradient(circle at 16% 100%, rgba(46, 163, 107, 0.18), transparent 30rem),
+        var(--navy);
+    }
+
+    .hero {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 50px;
+      align-items: center;
+      padding: 66px 0 92px;
+    }
+
+    .eyebrow {
+      margin: 0 0 14px;
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 850;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+    }
+
+    .hero .eyebrow { color: #8fc8f1; }
+
+    h1, h2, h3 {
+      line-height: 1.14;
+      letter-spacing: -0.025em;
+    }
+
+    h1 {
+      max-width: 760px;
+      margin: 0;
+      font-size: clamp(42px, 6vw, 72px);
+    }
+
+    .hero .lead {
+      max-width: 760px;
+      margin: 24px 0 0;
+      color: #d7e3ef;
+      font-size: clamp(18px, 2vw, 23px);
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 28px;
+    }
+
+    .badge {
+      padding: 7px 11px;
+      border: 1px solid rgba(255, 255, 255, 0.19);
+      border-radius: 999px;
+      color: #e8f2fa;
+      background: rgba(255, 255, 255, 0.07);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .boundary-card {
+      padding: 30px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.08);
+      box-shadow: 0 24px 70px rgba(4, 17, 32, 0.30);
+      backdrop-filter: blur(8px);
+    }
+
+    .boundary-row {
+      display: grid;
+      grid-template-columns: 112px 1fr;
       gap: 14px;
+      padding: 14px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.12);
     }
 
-    .step { padding: 16px; }
-    .step .rank { color: var(--blue); font-weight: 800; font-size: 13px; margin-bottom: 6px; }
+    .boundary-row:last-child { border-bottom: 0; }
+    .boundary-row strong { color: #9ed1f4; }
+    .boundary-row span { color: #e2ebf3; }
 
-    code {
-      font-family: Consolas, "Cascadia Mono", monospace;
-      font-size: 0.95em;
-      background: #eef2f7;
-      padding: 1px 5px;
-      border-radius: 5px;
+    main { padding-bottom: 72px; }
+    section { padding: 72px 0; }
+
+    .status-strip {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      overflow: hidden;
+      margin-top: -42px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
     }
+
+    .status-item { padding: 24px; }
+    .status-item + .status-item { border-left: 1px solid var(--line); }
+    .status-item strong { display: block; margin-bottom: 6px; }
+    .status-item p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: 0.72fr 1.28fr;
+      gap: 52px;
+      align-items: start;
+      margin-bottom: 36px;
+    }
+
+    h2 { margin: 0; font-size: clamp(31px, 4vw, 50px); }
+    .section-intro { margin: 5px 0 0; color: var(--muted); font-size: 18px; }
+
+    .spotlight {
+      display: grid;
+      grid-template-columns: 1.22fr 0.78fr;
+      gap: 34px;
+      padding: 38px;
+      border: 1px solid rgba(20, 122, 79, 0.25);
+      border-radius: 22px;
+      background: linear-gradient(135deg, var(--green-soft), #f8fcfa);
+      box-shadow: var(--shadow);
+    }
+
+    .spotlight h2 { font-size: clamp(31px, 4vw, 46px); }
+    .spotlight p { color: #435b52; }
+
+    .article-link {
+      display: inline-block;
+      margin-top: 12px;
+      padding: 11px 15px;
+      border-radius: 9px;
+      color: #fff;
+      background: var(--green);
+      font-weight: 750;
+      text-decoration: none;
+    }
+
+    .direction-list {
+      margin: 0;
+      padding: 24px;
+      border-radius: 15px;
+      background: #fff;
+    }
+
+    .direction-list strong { display: block; margin-bottom: 11px; color: var(--green); }
+    .direction-list ul { margin: 0; padding-left: 20px; color: var(--muted); }
+
+    .capability-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .capability-card {
+      min-height: 250px;
+      padding: 25px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      transition: transform 160ms ease, box-shadow 160ms ease;
+    }
+
+    .capability-card:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
+    .capability-card .tag { color: var(--blue); font-size: 12px; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
+    .capability-card h3 { margin: 16px 0 10px; font-size: 21px; }
+    .capability-card p { margin: 0 0 12px; color: var(--muted); font-size: 15px; }
+    .capability-card .evidence { padding-top: 12px; border-top: 1px solid var(--line); color: var(--amber); font-size: 13px; font-weight: 700; }
+
+    .architecture {
+      color: #fff;
+      background: var(--navy);
+    }
+
+    .architecture .eyebrow { color: #8fc8f1; }
+    .architecture .section-intro { color: #c9d8e6; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      margin-top: 36px;
+    }
+
+    .flow-step {
+      position: relative;
+      min-height: 160px;
+      padding: 20px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 13px;
+      background: rgba(255, 255, 255, 0.07);
+    }
+
+    .flow-step:not(:last-child)::after {
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      right: -18px;
+      color: #8fc8f1;
+      content: "→";
+      font-size: 24px;
+      transform: translateY(-50%);
+    }
+
+    .flow-step span { display: block; margin-bottom: 22px; color: #8fc8f1; font-size: 13px; font-weight: 850; }
+    .flow-step strong { display: block; margin-bottom: 7px; }
+    .flow-step p { margin: 0; color: #c9d8e6; font-size: 14px; }
+
+    .ownership {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      margin-top: 30px;
+    }
+
+    .owner-card {
+      padding: 26px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .owner-card h3 { margin: 0 0 12px; color: #fff; }
+    .owner-card ul { margin: 0; padding-left: 20px; color: #c9d8e6; }
+
+    .evidence-ladder {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 10px;
+      margin-top: 34px;
+    }
+
+    .evidence-level {
+      min-height: 205px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel);
+    }
+
+    .evidence-level b { display: block; margin-bottom: 12px; color: var(--blue); }
+    .evidence-level p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    .score-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-top: 34px;
+    }
+
+    .score-card {
+      padding: 22px;
+      border-left: 4px solid var(--green);
+      border-radius: 0 12px 12px 0;
+      background: var(--panel);
+    }
+
+    .score-card strong { display: block; margin-bottom: 7px; }
+    .score-card span { color: var(--muted); font-size: 14px; }
+
+    .delivery {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      counter-reset: stage;
+      margin-top: 34px;
+    }
+
+    .delivery-card {
+      min-height: 190px;
+      padding: 26px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .delivery-card::before {
+      counter-increment: stage;
+      display: block;
+      margin-bottom: 22px;
+      color: var(--amber);
+      content: "0" counter(stage);
+      font-size: 13px;
+      font-weight: 900;
+      letter-spacing: 0.12em;
+    }
+
+    .delivery-card h3 { margin: 0 0 9px; }
+    .delivery-card p { margin: 0; color: var(--muted); }
+
+    .docs-panel {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px 28px;
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .doc-link {
+      padding: 14px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .doc-link a { font-weight: 750; text-decoration: none; }
+    .doc-link span { display: block; margin-top: 3px; color: var(--muted); font-size: 13px; }
 
     footer {
+      padding: 34px 0 48px;
       color: var(--muted);
       font-size: 13px;
-      margin-top: 28px;
-      padding-top: 18px;
-      border-top: 1px solid var(--line);
     }
 
-    @media (max-width: 860px) {
-      header { padding: 32px 20px 58px; }
-      main { padding: 20px; }
-      .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: -48px; }
-      .summary,
-      .roadmap { grid-template-columns: 1fr; }
+    @media (max-width: 980px) {
+      .hero, .spotlight { grid-template-columns: 1fr; }
+      .capability-grid, .score-grid, .delivery { grid-template-columns: repeat(2, 1fr); }
+      .flow, .evidence-ladder { grid-template-columns: repeat(2, 1fr); }
+      .flow-step:not(:last-child)::after { display: none; }
     }
 
-    @media (max-width: 520px) {
-      .status-grid { grid-template-columns: 1fr; }
-      h1 { font-size: 30px; }
+    @media (max-width: 720px) {
+      .wrap { width: min(100% - 28px, 1180px); }
+      .topbar, .section-head { display: block; }
+      .topnav { margin-top: 12px; }
+      .hero { grid-template-columns: 1fr; padding: 46px 0 82px; }
+      .status-strip, .capability-grid, .ownership, .score-grid, .delivery, .docs-panel { grid-template-columns: 1fr; }
+      .status-item + .status-item { border-top: 1px solid var(--line); border-left: 0; }
+      .flow, .evidence-ladder { grid-template-columns: 1fr; }
+      .section-head { margin-bottom: 24px; }
+      .section-intro { margin-top: 16px; }
+      .spotlight { padding: 28px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .capability-card { transition: none; }
     }
   </style>
 </head>
 <body>
-  <header>
+  <div class="hero-shell">
     <div class="wrap">
-      <p class="eyebrow">Rust Windows Agent Harness</p>
-      <h1>Agent Harness 功能對照與升級狀態</h1>
-      <p class="lead">以 2026-06-15 repo-local <code>.agent-harness</code>、round3/round3-2 runtime fixes、public-facing hygiene export、OpenRouter provider route、per-agent memory namespace、provider-isolation hotfix、ledger hygiene、round4 reconnect recovery、default-off response tone policy、channel identity binding、delivery intent、runtime backoff hints、cron scheduler lint/tick/loop、以及 Round4-3 runtime-loop safe-mode/bounded status hardening 為準。<code>.openclaw</code>、Docker/container gateway 名稱、import snapshots、以及 Linux container 路徑只作為 retired import/rollback labels。此頁不再使用中間狀態：harness 端可完成的項目標為 Implemented，需要外部決策或憑證的項目標為 Blocked 或 Action Required，使用者明確延後的項目標為 Deferred。後續 roadmap/backlog 以 <code>docs/agent-harness-core-roadmap-backlog.md</code> 為權威。</p>
+      <nav class="topbar" aria-label="Capability map navigation">
+        <a class="brand" href="../README.md">Agent Harness Core</a>
+        <div class="topnav">
+          <a href="#capabilities">Capabilities</a>
+          <a href="#architecture">Architecture</a>
+          <a href="#evidence">Evidence</a>
+          <a href="adaptive-skill-intelligence.html">Adaptive skills</a>
+          <a href="agent-harness-feature-parity.md">Markdown source</a>
+        </div>
+      </nav>
+
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Public source overview</p>
+          <h1>Durable operations for self-hosted AI agents</h1>
+          <p class="lead">Exact channel identity, bounded work, virtual-session continuity, auditable receipts, and recoverable delivery around Codex-backed agents.</p>
+          <div class="badges">
+            <span class="badge">Pre-release</span>
+            <span class="badge">Rust</span>
+            <span class="badge">Windows-first</span>
+            <span class="badge">Telegram + Discord</span>
+            <span class="badge">Codex backend</span>
+          </div>
+        </div>
+        <div class="boundary-card">
+          <div class="boundary-row"><strong>Harness</strong><span>Identity, authority, durable state, queues, schedules, effects, evidence, and delivery.</span></div>
+          <div class="boundary-row"><strong>Backend</strong><span>Model reasoning, native tools, sandbox behavior, and concrete model sessions.</span></div>
+          <div class="boundary-row"><strong>Rule</strong><span>One semantic owner per decision—no double selection, learning, continuation, or delivery.</span></div>
+        </div>
+      </header>
     </div>
-  </header>
+  </div>
 
   <main>
-    <div class="status-grid">
-      <div class="metric">
-        <span class="label">Readiness</span>
-        <span class="value">Ready: yes</span>
-        <span class="note">59 pass / 0 warn / 0 fail</span>
-      </div>
-      <div class="metric">
-        <span class="label">Provider Route</span>
-        <span class="value">OpenRouter</span>
-        <span class="note">isolated Codex home + env preflight</span>
-      </div>
-      <div class="metric">
-        <span class="label">Multi-Agent</span>
-        <span class="value">Isolated</span>
-        <span class="note">config, sessions, memory roots</span>
-      </div>
-      <div class="metric">
-        <span class="label">Channels</span>
-        <span class="value">TG + Discord</span>
-        <span class="note">allow-list + identity gated</span>
-      </div>
-    </div>
-
     <div class="wrap">
-      <section class="summary">
-        <div class="panel">
-          <h2>Summary</h2>
-          <p>Agent Harness 已可做受控 live Telegram/Discord handoff 測試，也能透過 Codex backend 跑基本 agent turns。這次升級補上 OpenRouter provider path，之後可讓像 <code>小小梨</code> 這類 agent 使用 OpenRouter 模型，同時保有各自的設定、session transcript、memory/canvas 空間，以及 provider-specific Codex home；先前 deferred 的 channel identity、delivery intent、runtime backoff、cron scheduler 項目也已進入 implemented scope。</p>
-          <p>OpenRouter route 由 harness 產生 provider-specific Codex config：<code>codex-home-providers/openrouter</code>、<code>model_provider = "openrouter"</code>、<code>base_url = "https://openrouter.ai/api/v1"</code>、<code>env_key = "OPENROUTER_API_KEY"</code>、<code>wire_api = "responses"</code>。密鑰不會寫入 config；preflight 會檢查 process env 或 harness secret env files，runtime/probe 會把必要 provider secret 注入 app-server child environment。</p>
-          <p>2026-06-12 hotfix triage 確認，新 agent/OpenRouter 設定曾把 <code>model_provider = "openrouter"</code> 寫入 shared Codex home，使 Telegram/Discord 的 default <code>main</code> turns 被錯路由到 OpenRouter 並因缺少 <code>OPENROUTER_API_KEY</code> 失敗。修復後，default Codex/OAuth route 會清掉 stale generated OpenRouter override；app-server <code>method=error</code> 或 <code>turn/completed status=failed</code> 會成為 <code>ProtocolError</code> receipt，不再產生 <code>(no assistant text captured...)</code> placeholder 回覆。Round4 之後，已知 app-server stream disconnect 會先 retry，再於耗盡嘗試後 dead-letter；其他 protocol/config failures 仍 terminal。</p>
-          <p>2026-06-12 ledger hygiene 將 JSONL append 集中到 serialized sidecar-lock writer，並讓 <code>jsonl-repair</code> 可拆回 <code>}{</code> 這類同一行黏住的多筆 JSON value。Live repair 後 <code>execution-receipts.jsonl</code>、<code>run-once-receipts.jsonl</code>、<code>harness.jsonl</code> 均為 <code>invalidLines=0</code>，且原本黏住的紀錄被 recovered 而不是 dropped。</p>
-          <p>Response UX 現在分成兩層：<code>assistantNarrationMode=progress_panel</code> 只處理 Codex intermediate narration，<code>emojiAccentMode=off</code> 是預設；<code>subtle</code> 只在 explicit opt-in 且 successful final <code>agent-reply</code> outbox 寫入時加一個 guarded accent。Command replies、<code>/status</code>、error/failure replies、progress/status panels、code-heavy/fenced-code、risk/security/status-style replies、以及已經以 emoji 結尾的文字都不會被後處理污染；agent 與 channel 可以分別 override。Final Telegram/Discord replies 不再機械性加上 <code>◆ Agent</code> header。</p>
-          <p>Channel identity 現在是 allow-list 之後的第二道 fail-closed gate：Telegram/Discord ingress 必須解析 platform/account/channel/thread binding，且 account selector 會一路保留到 queue/outbox/delivery。Provider reply target 由 harness 從 inbound provider ids 建立 <code>deliveryIntent</code>，不信任模型自己寫出的 quote/reply metadata。</p>
-          <p>Cron scheduler 現在由 <code>cron-scheduler-lint</code>、<code>cron-scheduler-run-once</code> 與 <code>cron-scheduler-loop</code> 負責 preflight 與 repeated due check：native 與 deterministic cron 來源會寫入 <code>state/cron-scheduler</code> 的 durable watermarks/receipts，並 idempotently enqueue WorkerStore jobs；worker-loop 仍然是唯一執行者。</p>
-          <p>Multi-agent isolation 現在涵蓋 registry/model override、runtime transcript 路徑，以及 prompt/lifecycle/canvas memory artifacts。檔案路徑會正規化 agent id，但 receipt 仍保留原始 Unicode 名稱，例如 <code>小小梨</code>。剩餘缺口標為 <code>multi-agent-full-matrix-gap</code> 與 <code>per-agent-memory-recall-compartment-gap</code>：每個 configured agent 仍需一個可重跑矩陣，且 public/non-main agents 需要 recall-policy proof，避免 global imported/private context 在未明確允許時進入 prompt context。</p>
-          <p>Virtual session continuity 已由 context rollover 實作：compact counters、virtual-session records、bounded working-set memory、continuation session index、prompt working-set injection、rollover episodes、guarded requeue receipts 都存在。2026-06-30 已在 live Discord/main lane 記錄到首次真實 rollover：門檻達到（<code>successfulCompactCount=2</code>）、applied receipt 把 cont-1 re-key 成 cont-2（同一 virtual session），並寫出 virtual-session、episode-index 與 <code>continuation-rollover</code> working-set receipts。剩餘的 <code>virtual-session-continuity-gap</code> 收斂為：一個 end-to-end scenario 證明 continuation turn 的 working-set prompt injection 一路到 final delivery，並把最終回覆 trace 回 continuation queue item。</p>
-          <p>OpenClawMem 現在以 harness-side service adapter 完成：CLI 與 sidecar 均支援 status、recall、reviewed propose、approved store、per-agent writeback 與 receipts。實際匯入內容確認是 Qdrant edge preserved snapshot、SQLite、JSONL 與 engine state；若 <code>openclaw-mem-engine</code> bridge/sidecar 缺席，正確回報是 explicit read-only <code>migration-fallback</code>，不是 full graph autonomous matching。新 source builds 可透過 <code>memory-owner-local-prepare</code> 加 operator-approved promotion 走本機 in-process owner 路徑，promotion 後報告 <code>local-in-process</code>；完整 parity 仍需 bridge envelope、native/Qdrant proof、routeAuto/autonomous matching fixtures、provenance/freshness receipts 全綠。</p>
-          <p>未能以 code-only 完成的項目已移到 live/soak gates：real plugin invocation、Windows service-wrapper registration/reboot proof、repo-local encrypted vault live migration，以及需要 operator 發送的 Telegram/Discord/OpenRouter live smoke。Native non-OpenAI provider adapters 已依 2026-06-12 使用者決策移到 Deferred backlog，短期不阻塞 OpenRouter-centered provider path。若未來要升級到 remote <code>openclaw-mem</code> service，需補 endpoint、API/wire contract、credentials 與 fixtures。</p>
-          <p>2026-06-12 外部 roadmap 已整合進 <code>docs/agent-harness-core-roadmap-backlog.md</code>：P0-P7、Track T、Track M、Icebox 全部都有實作步驟、驗收標準、staging implementation status 與 pending live gates。staging pass 已補上 fail-closed config、retry/dead-letter、log rotation、queue retry/skip、supervision evaluation、health/trace/metrics、canary receipts、queue shadow、background registry、token gates、learning proposals、MCP request handling、repo-local encrypted vault、security scans、invariants、schema registry、release docs 與 operator CLI gates。</p>
-          <p>驗收標準已對齊外部 comparative review 的十個面向：concurrency、persistence、error recovery、supervision、security、observability、token efficiency、extensibility、testing quality、maturity。Deterministic code paths 以 tests/fixtures 為證據；queue shadow parity、live channel smoke、reboot recovery、canary deploy、advisory audit、30-day SLO 這類項目必須等 live/soak receipts，不能只靠本機測試宣稱完成。</p>
-          <p>Round4 reconnect/tone 驗證已通過 <code>cargo fmt</code>、<code>cargo test -p agent-harness-core</code>（core 219）、<code>cargo test -p agent-harness-cli</code>（CLI 17）、staging/canonical <code>cargo build -p agent-harness-cli</code>、<code>git diff --check</code>、tracked-file public export <code>public-hygiene</code>（<code>forbiddenHits=[]</code>）、live <code>config-validate</code>、live <code>harness-skills-sync</code>、live <code>healthz</code> 與 live <code>status --json</code>。Channel identity / delivery intent / cron scheduler pass 已通過 <code>cargo fmt</code>、<code>cargo check</code>、<code>cargo test</code>（core 229、CLI 18、doctests 0）、<code>git diff --check</code>、以及 tracked-file <code>public-hygiene</code>（<code>forbiddenHits=[]</code>）。Round4-2 live-control/native cron pass 已通過 <code>cargo fmt --all --check</code>、staged workspace check、core 239、CLI 18、staged build、public export hygiene，以及 non-live cutover CLI smoke。Round4-3 robustness pass 補上 runtime-loop safe-mode/no-silent-failure、cron scheduler lint/interval hardening、bounded status/readiness scans；最終驗證記錄在 operations handbook。</p>
-        </div>
-        <div class="callout">
-          <h3>Immediate Gates</h3>
-          <ul>
-            <li><span class="pill done">Implemented</span> OpenRouter route parsing and provider-specific Codex home generation.</li>
-            <li><span class="pill done">Implemented</span> per-agent memory prompt/lifecycle/canvas roots.</li>
-            <li><span class="pill done">Implemented</span> OpenClawMem snapshot/service adapter and sidecar writeback contract.</li>
-            <li><span class="pill done">Implemented</span> slash model id preservation for explicit providers.</li>
-            <li><span class="pill done">Implemented</span> channel identity binding, delivery intent, runtimeBackoff hints, cron scheduler lint/watermarks, and runtime-loop safe-mode.</li>
-            <li><span class="pill action">Action Required</span> Run OpenRouter live smoke through the live/main-agent operator path using legacy OpenClaw key and <code>小小梨</code> settings.</li>
-            <li><span class="pill done">Implemented</span> Repo-local encrypted vault primitives and CLI gates; live secret migration/rotation remains pending.</li>
-          </ul>
-        </div>
-      </section>
-
-      <section>
-        <div class="panel">
-          <h2>Roadmap Staging Status</h2>
-          <p>詳細逐項 coverage matrix 以 <code>docs/agent-harness-core-roadmap-backlog.md</code> 為權威。此表只列 feature-parity/review 視角的目前狀態。</p>
-          <div class="matrix-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Area</th>
-                  <th>Current Staging Status</th>
-                  <th>Evidence Now</th>
-                  <th>Pending Gate</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr><td class="feature">P0 Foundation</td><td><span class="pill done">Implemented</span></td><td>Config validation, retry/dead-letter, log rotation, queue retry/skip, atomic-write audit, CLI gates.</td><td>Live invalid-config, rotation, and dead-letter notification drills.</td></tr>
-                <tr><td class="feature">P1 Supervision</td><td><span class="pill action">Mechanism Ready</span></td><td>Supervision evaluator, healthz, trace, metrics, deploy canary receipts.</td><td>WinSW/service-wrapper child management, reboot proof, kill/restart transcript.</td></tr>
-                <tr><td class="feature">P2 Queue</td><td><span class="pill action">Shadow Ready</span></td><td>SQLite queue shadow record/compare and divergence receipts.</td><td>Seven-day zero-divergence shadow summary and explicit cutover.</td></tr>
-                <tr><td class="feature">P3 Semantics</td><td><span class="pill done">Core Implemented</span></td><td>Scoped stop, admission control, background registry, long-task model.</td><td>Collect/interrupt replay fixtures and live long-task/cancel receipts.</td></tr>
-                <tr><td class="feature">P4 Tokens</td><td><span class="pill done">Implemented</span></td><td>Token aggregation and prompt-reduction/stable-prefix gate.</td><td>Golden traffic proof of >=30% same-session reduction.</td></tr>
-                <tr><td class="feature">P5 Autonomy</td><td><span class="pill action">Safe Foundations</span></td><td>Task entities, budget counters, drift detection, learning proposals, MCP request handling.</td><td>Long-running stdio MCP server, bounded chaining, operator apply/archive receipts.</td></tr>
-                <tr><td class="feature">Track T</td><td><span class="pill action">Catalog Ready</span></td><td><code>docs/invariants.md</code>, invariant CLI, race/unit tests.</td><td>Seeded crash simulation, replay corpus, restore drill receipt.</td></tr>
-                <tr><td class="feature">Track M</td><td><span class="pill action">Contracts Ready</span></td><td>ContextPack parser, ingest idempotency, MCP hash pinning.</td><td>External openclaw-mem fixtures and direct memory MCP proof.</td></tr>
-                <tr><td class="feature">P6 Security</td><td><span class="pill done">Implemented</span></td><td>Encrypted vault, security scan, trust-boundary doc, SECURITY.md, local duplicate dependency check.</td><td>Live secret migration/rotation and network-backed advisory audit.</td></tr>
-                <tr><td class="feature">P7 Quality</td><td><span class="pill action">Scaffold Ready</span></td><td>Schema registry, release checklist, changelog, public hygiene scanner, local workspace tests.</td><td>CI runner, Codex wire fixtures, tagged release checklist execution.</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <section>
-        <h2>Feature Matrix</h2>
-        <div class="legend">
-          <span class="pill done">Implemented</span>
-          <span class="pill blocked">Blocked</span>
-          <span class="pill action">Action Required</span>
-          <span class="pill deferred">Deferred</span>
-        </div>
-        <div class="matrix-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Feature Family</th>
-                <th>Status</th>
-                <th>Implemented</th>
-                <th>Blocker / Required Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr><td class="feature">State import / migration</td><td><span class="pill done">Implemented</span></td><td>Imports core files, registry, channels, memory snapshots, sessions, plugin catalog inputs, non-secret ops backups, redacted cutover receipts, and now has repo-local encrypted vault primitives for future secret migration.</td><td><span class="pill action">Action</span> Run live vault migration/rotation/backup receipts before retiring old plaintext env-file stores.</td></tr>
-              <tr><td class="feature">Multi-agent registry / isolation</td><td><span class="pill done">Implemented + gaps</span></td><td>Preserves 25 enabled agents, source dirs, sessions, auth/model hints, per-agent overrides, per-agent runtime transcripts, and per-agent memory/canvas namespaces. Xiaoxiaoli regression now covers cross-agent final-outbox freshness, but live recall still uses <code>agent-plus-global-imported</code> through migration fallback when the mem-engine bridge is absent.</td><td><span class="pill action">Action</span> Close <code>multi-agent-full-matrix-gap</code> plus <code>per-agent-memory-recall-compartment-gap</code> with a configured-agent matrix and recall-policy regression excluding <code>main</code> private/global imported context unless explicitly allowed.</td></tr>
-              <tr><td class="feature">Telegram</td><td><span class="pill done">Implemented</span></td><td>Poll loop, allow-list, channel identity binding, account-specific token/offset state, commands, queueing, validated reply delivery intent, typing path, native image/document delivery, receipts, and offset persistence.</td><td><span class="pill action">Action</span> Operator sends allowed-user smoke after deployment windows.</td></tr>
-              <tr><td class="feature">Discord</td><td><span class="pill done">Implemented</span></td><td>REST outbox, multipart attachments, gateway loop, DM probe, allow-list, channel identity binding, account-specific token/outbox/gateway selectors, event normalization, validated reply delivery intent, reply context, receipts, and live inbound evidence.</td><td><span class="pill action">Action</span> Operator sends allowed-user smoke; add reconnect/backoff monitoring for unattended gateway use.</td></tr>
-              <tr><td class="feature">Commands</td><td><span class="pill done">Implemented</span></td><td><code>/status</code>, <code>/model</code>, <code>/think</code>, <code>/new</code>, <code>/stop</code>, <code>/steer</code>, and <code>/btw</code> persist across Telegram/Discord/local state.</td><td><span class="pill action">Action</span> Add provider-native cancel/typing affordances only where provider APIs support them.</td></tr>
-              <tr><td class="feature">Codex runtime</td><td><span class="pill done">Implemented</span></td><td>Plan/preflight/run/resume, transcript/trajectory/binding, cancel-marker polling, token usage capture, assistant phase split, guarded final-reply emoji accent, isolated workspace, adaptive idle timeout, hard max-turn timeout, runtime leases, configurable <code>runtimeBackoff</code> retry hints, completed-stdout recovery, and terminal handling for app-server error/failed-turn events.</td><td><span class="pill action">Action</span> Broaden live cancel/backoff smoke under real provider load.</td></tr>
-              <tr><td class="feature">Provider/model routing</td><td><span class="pill done">Implemented</span></td><td><code>/model provider/model</code>, per-agent defaults, explicit-provider slash model ids, provider-specific Codex homes, and OpenRouter routing work. OpenRouter requires <code>OPENROUTER_API_KEY</code>, can read it from harness secret env files for the child process, and writes no secrets.</td><td><span class="pill deferred">Deferred</span> Native non-OpenAI-compatible adapters are needed later, but are not a current delivery blocker while OpenRouter is the multi-provider gateway.</td></tr>
-              <tr><td class="feature">Prompt files / continuity</td><td><span class="pill done">Implemented + gate</span></td><td>Prompt fallback to imported workspace, role headers for imported prompt files, injection ledger for stable same-session context, and context-rollover working-set injection for continuation sessions.</td><td><span class="pill action">Action</span> <code>virtual-session-continuity-gap</code> narrowed — fresh-session re-key under the same virtual session is live-evidenced (2026-06-30); remaining is an end-to-end scenario proving working-set prompt injection and final delivery traced back to the continuation queue item.</td></tr>
-              <tr><td class="feature">Skill-first guidance</td><td><span class="pill done">Implemented</span></td><td>Imports source skills, syncs bundled harness operation skills, indexes both <code>skills\legacy-imports</code> and <code>skills\openclaw-imports</code>, and selects relevant <code>SKILL.md</code> bodies at runtime.</td><td><span class="pill deferred">Decision</span> Learning defaults on in propose-only mode; bundled/imported/agent-created skills can all receive patch/archive proposals with backups and receipts.</td></tr>
-              <tr><td class="feature">Memory inventory / recall</td><td><span class="pill done">Implemented + gap</span></td><td>Detects Qdrant edge, SQLite, memory files, receipts; promoted mem-engine recall reports bridge reachability, backend, fallback, write posture, and policy source. SQLite vector/text/service-writeback remains an explicit read-only <code>migration-fallback</code> when the bridge is absent or invalid.</td><td><span class="pill action">Action</span> Close <code>openclaw-mem-full-parity-gap</code>: bridge/sidecar stable recall envelope, native/Qdrant proof without fallback for the proof query, routeAuto/autonomous matching fixtures, and green provenance/freshness receipts.</td></tr>
-              <tr><td class="feature">Memory lifecycle / canvas</td><td><span class="pill done">Implemented</span></td><td>Lifecycle adapter records episodes and capture candidates; compact canvas JSON/Markdown exists; memory hooks and <code>memory-service-*</code> commands record OpenClaw-compatible receipts; reviewed proposals and approved per-agent writeback are implemented; <code>memory-owner-local-prepare</code> supports governed local in-process mem-engine ownership.</td><td><span class="pill action">Action</span> Future graph/canvas parity beyond the local adapter needs additional remote/native <code>openclaw-mem</code>/<code>openclaw-mem-engine</code> contract fixtures or implementation.</td></tr>
-              <tr><td class="feature">Plugin bridge</td><td><span class="pill done">Implemented</span></td><td>Node sidecar manifest/catalog bridge, JSON-RPC status/list/probe, <code>hooks.invoke</code>, <code>memory.slot</code>, and native context-budget behavior.</td><td><span class="pill blocked">Blocked</span> Real tool invocation needs plugin trust policy, allow-list, timeout policy, per-agent/channel permissions, and fixtures.</td></tr>
-              <tr><td class="feature">Cron/subagent import</td><td><span class="pill done">Implemented</span></td><td>Native agent-turn cron, deterministic crontab/Supercronic-style cron, and subagent ledgers import into durable worker jobs with cutover safety; <code>cron-scheduler-lint</code>/<code>cron-scheduler-run-once</code>/<code>cron-scheduler-loop</code> add preflight, repeated due checks, watermarks, receipts, and idempotent worker enqueue.</td><td><span class="pill action">Action</span> Active resume/cancel policy and broader cron-to-agent smoke paths.</td></tr>
-              <tr><td class="feature">Worker dispatch</td><td><span class="pill done">Implemented</span></td><td>SQLite store, idempotent enqueue, lease/run/reap/cancel/status, shell audit, LLM runtime-queue handoff, concurrency limits, rate leases, child groups, watchdogs, wakeups, scheduler watermark enqueue, and artifact pointers.</td><td><span class="pill action">Action</span> Add cascading timeout/cancel, per-provider rate profiles, fairness, multi-host store abstraction, and broader fan-out smoke.</td></tr>
-              <tr><td class="feature">Operations</td><td><span class="pill done">Implemented</span></td><td>Status/readiness with cron scheduler readback, bounded tail-sampled status/log scans, serialized JSONL logs/receipts, recovered-value repair, heartbeats, supervisor scripts, optional cron scheduler supervisor task, stop files, compact progress delivery with longer current-step cap, default-off response tone configuration, session-preserving reconnect retry/dead-letter handling, runtime-loop safe-mode restart/no-silent-failure behavior, timeout reconciliation, provider protocol-failure receipts, direct-start fallback, log retention, atomic state writes, backup, cutover, ops control, healthz, trace, metrics, supervision evaluation, and canary receipts.</td><td><span class="pill action">Action</span> WinSW/service-wrapper restart/reboot proof remains pending; Task Scheduler remains fallback/compatibility.</td></tr>
-              <tr><td class="feature">Credentials / secrets</td><td><span class="pill done">Implemented</span></td><td>Telegram/Discord tokens, OpenRouter key requirements, and memory embedding secrets are represented as env vars or redacted env files; local harness keys use <code>AGENT_HARNESS_*</code>. Repo-local encrypted vault primitives and CLI gates are implemented.</td><td><span class="pill action">Action</span> Live migration, rotation, backup/restore, and redacted receipts remain pending.</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="summary">
-        <div class="panel">
-          <h2>Blocked Items</h2>
-          <ul>
-            <li>Plugin real invocation: implement the approved conservative trust model: allow-list, timeout policy, per-agent/channel permissions, receipts, and fixtures.</li>
-            <li>Vaulted secrets live migration: repo-local encrypted vault primitives are implemented; existing long-lived keys still need migration/rotation/backup receipts.</li>
-            <li>Remote openclaw-mem beyond snapshot adapter: provide runnable endpoint, API/wire contract, credentials, and fixtures if this becomes required.</li>
-          </ul>
-        </div>
-        <div class="panel">
-          <h2>Operator Actions</h2>
-          <ul>
-            <li>Run the OpenRouter live smoke through the live/main-agent operator path using the legacy OpenClaw API key and <code>小小梨</code> settings, then record trace/receipt evidence. Harness-side provider isolation, route parsing, secret-env handoff, and protocol-failure handling are implemented.</li>
-            <li>Send controlled Telegram, Discord, and OpenRouter-backed live smoke turns after deployment.</li>
-            <li>Implement WinSW/service-wrapper style supervision for unattended production; keep Task Scheduler scripts as fallback.</li>
-            <li>Record smoke transcript and receipt paths in the readiness docs after the live tests.</li>
-          </ul>
-        </div>
-      </section>
-
-      <section>
-        <div class="panel">
-          <h2>Forward Roadmap Backlog</h2>
-          <p>詳細實作步驟與驗收標準見 <code>docs/agent-harness-core-roadmap-backlog.md</code>。下表只保留 feature-parity 視角的覆蓋摘要。</p>
-          <div class="matrix-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Roadmap Area</th>
-                  <th>Adopted Coverage</th>
-                  <th>Verification Gate</th>
-                  <th>Review Dimensions</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr><td class="feature">P0 Foundation</td><td>Atomic write audit, transient error classes, 3-attempt backoff, dead-letter notification, receipt/log rotation, queue retry/skip, and fail-closed config validation.</td><td>Mutable state survives write faults; transient failures dead-letter with user notification; invalid config fails preflight loudly.</td><td>Persistence, error recovery, observability, testing</td></tr>
-                <tr><td class="feature">P1 Supervision / Observability</td><td>First-class <code>supervise</code>, child tree, restart backoff, crash-loop breaker, stale heartbeat detection, alerts, ordered shutdown, OS persistence choice, <code>/healthz</code>, end-to-end <code>traceId</code>, <code>trace --queue-id &lt;id&gt;</code>, canary deploy/rollback, metrics, and <code>status --watch</code>.</td><td>Reboot restores loops within 60 seconds; killed loops restart; bad deploy rolls back; message traces reconstruct causality.</td><td>Supervision, observability, recovery, maturity</td></tr>
-                <tr><td class="feature">P2 Queue Unification</td><td><code>channel_turn</code> lane in WorkerStore, shadow dual-write, divergence receipts, JSONL-to-SQLite cutover, old lease/lock retirement, compaction, WAL/backup, sequence cursors, and wake-file/event-driven queue wakeups.</td><td>Seven live days with zero shadow divergence; large ledgers stay fast; concurrent loops cannot duplicate execution.</td><td>Persistence, concurrency, recovery, testing</td></tr>
-                <tr><td class="feature">P3 Semantics / Background Work</td><td>Scoped <code>/stop</code>, steer/followup/collect/interrupt semantics, per-session serial lanes, measured warm pool, inbound rate limit, queue-depth admission, SQLite-backed background registry, and long-task receipts.</td><td>Scoped stop tests pass; flood tests refuse instead of piling up; services and long tasks are visible, stoppable, and bounded in status.</td><td>Concurrency, operations, observability</td></tr>
-                <tr><td class="feature">P4 Token Efficiency</td><td>Token aggregation, identity/runtime dedup, prompt-cache prefix stability, memory-recall ledger, progressive skill disclosure, job-kind routing, session rotation, handoff summaries, and golden prompt bundles.</td><td>Same-session input tokens drop at least 30% in golden scenarios; stable prefix order and token reports are receipt-backed.</td><td>Token efficiency, observability, testing</td></tr>
-                <tr><td class="feature">P5 Autonomy / Learning</td><td>Task files, deterministic heartbeat, SQLite budgets, native MCP request handling with future <code>agent-harness mcp-serve</code>, bounded chaining, drift detection, skill proposal/apply, skill usage receipts, FTS session search, memory nudge, signal-gated review, curator, and local user-model proposals.</td><td>Learning defaults on in propose-only mode; auto-apply is config opt-in; budget checks precede tools; proposals are scanned and receipted; MCP protocol fixtures and latency gates pass.</td><td>Extensibility, safety, maturity</td></tr>
-                <tr><td class="feature">Track T Testing Spine</td><td>Invariants document, seeded deterministic simulation, scenario replay evals, and restore drills.</td><td>Invariants cover queue/terminal/cancel/budget/trace; failed simulations print replayable seeds; restore drill receipts prove backup works.</td><td>Testing, persistence, recovery</td></tr>
-                <tr><td class="feature">Track M openclaw-mem</td><td>ContextPack v1, consumer-driven fixtures, receipt ingest, fail-open MCP memory path, tool-description hash pinning, provenance chain, and dogfooding flows.</td><td>Invalid memory packs fail open; MCP recall degrades safely; hash drift is caught; recall/proposal/writeback provenance is traceable.</td><td>Extensibility, security, observability</td></tr>
-                <tr><td class="feature">P6 Security</td><td>Repo-local encrypted vault migration, prompt fence hardening, adversarial tests, shell canonicalization/hash pinning/env scrubbing, dependency audit, <code>SECURITY.md</code>, and trust-boundary docs.</td><td>No long-lived plaintext secret store after migration; vault backup/restore is documented; shell escape tests fail closed; MCP descriptions are semi-trusted and pinned.</td><td>Security, maturity</td></tr>
-                <tr><td class="feature">P7 Quality / Publication</td><td>CI, large-module split, Codex version pin, real wire fixtures, release checklist, <code>CHANGELOG.md</code>, and schema registry.</td><td>CI blocks schema/golden/simulation/hygiene failures; protocol drift is detected; every receipt/state schema has owner and version.</td><td>Testing, maturity, extensibility</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <section class="summary">
-        <div class="panel">
-          <h2>Roadmap Notes</h2>
-          <ul>
-            <li>Accepted correction: round3-2 B1 background lifecycle state goes into SQLite WorkerStore; JSONL remains audit/receipt only.</li>
-            <li>Native MCP is adopted, but the first pass should target initialize/list/call fixtures rather than every optional MCP feature.</li>
-            <li>Warm app-server pooling is gated by measurement and must prove no session, cwd, auth, or agent-context contamination.</li>
-            <li>Canary deploy must support fake-only canary when live provider credentials are unavailable.</li>
-            <li><code>/healthz</code> must be local/admin-gated by default and never expose secrets or raw prompt/memory content.</li>
-          </ul>
-        </div>
-        <div class="panel">
-          <h2>Deferred / Icebox</h2>
-          <ul>
-            <li>Native provider adapters beyond Codex/OpenAI/OpenRouter-compatible routing: user confirmed on 2026-06-12 that this is needed, but should be done later. When resumed, provide provider list, SDK/API contract, credentials, model naming rules, cancellation/streaming expectations, and test fixtures.</li>
-            <li>Icebox: full Tokio/async rewrite, new channels, TypeScript plugin SDK rewrite, web dashboard, multi-user/multi-tenant mode, cloud deployment, in-house vector/rerank/memory governance, and benchmark leaderboard chasing.</li>
-          </ul>
-        </div>
-      </section>
-
-      <section>
-        <h2>Recommended Development Order</h2>
-        <div class="roadmap">
-          <div class="step"><div class="rank">P0 + T</div><h3>Foundation First</h3><ol><li>Close atomic write, retry/dead-letter, config, queue operator commands, and log-bound gaps.</li><li>Start invariants and deterministic simulation before the queue migration.</li></ol></div>
-          <div class="step"><div class="rank">P1</div><h3>Supervise / Trace</h3><ol><li>Implement <code>supervise</code>, restart policy, heartbeat, alerts, ordered shutdown, and OS persistence.</li><li>Add <code>/healthz</code>, metrics, end-to-end trace ids, <code>trace --queue-id &lt;id&gt;</code>, canary deploy, and rollback.</li></ol></div>
-          <div class="step"><div class="rank">P2</div><h3>Queue Shadow Cutover</h3><ol><li>Dual-write JSONL and SQLite channel turns.</li><li>Require seven days zero divergence before SQLite becomes execution source.</li><li>Drain and retire JSONL execution writes after one audit-only release.</li></ol></div>
-          <div class="step"><div class="rank">P3</div><h3>Jobs / Semantics</h3><ol><li>Add scoped stop, collect/interrupt, per-session serial lanes, rate/admission control, and long-task contract.</li><li>Store background lifecycle state in WorkerStore, not a new JSONL execution registry.</li></ol></div>
-          <div class="step"><div class="rank">P4</div><h3>Token Efficiency</h3><ol><li>Aggregate token telemetry and prove stable-context dedup.</li><li>Add recall ledger, progressive skill disclosure, job-kind routing, session rotation, and golden prompt bundles.</li></ol></div>
-          <div class="step"><div class="rank">P5 + M/P6/P7</div><h3>Autonomy With Gates</h3><ol><li>Add tasks, heartbeat, budgets, native MCP request handling, future stdio serve, chaining, drift, and learning-loop proposals with learning default-on in propose-only mode.</li><li>Run memory contracts, security hardening, CI, schema registry, release, and public hygiene tracks in parallel where gated.</li></ol></div>
-        </div>
-      </section>
-
-      <footer>
-        Markdown source: <code>docs/agent-harness-feature-parity.md</code>. Refreshed for public review on 2026-07-17.
-      </footer>
+      <div class="status-strip">
+        <div class="status-item"><strong>Implemented foundation</strong><p>The source contains the mechanism and public contract; release evidence must still match its blast radius.</p></div>
+        <div class="status-item"><strong>Evidence boundary</strong><p>Source behavior may still need joined replay, provider-visible checks, operating-system proof, or controlled soak.</p></div>
+        <div class="status-item"><strong>Design direction</strong><p>Documented architecture is presented as future work until the complete behavior is implemented and activated.</p></div>
+      </div>
     </div>
+
+    <section>
+      <div class="wrap">
+        <div class="spotlight">
+          <div>
+            <p class="eyebrow">Major product direction</p>
+            <h2>Adaptive Skill Intelligence</h2>
+            <p>Skills can become more than matched runbooks. The target system combines external knowledge with verified task experience, reflects on what worked under which conditions, and accumulates a reusable individual capability asset for future comparable tasks.</p>
+            <p>It resolves task-local competence roles, discloses the smallest useful procedure, joins use with real outcomes, maintains contextual beliefs with uncertainty, and promotes only independently evaluated, reversible changes.</p>
+            <a class="article-link" href="adaptive-skill-intelligence.html">Read the feature article</a>
+          </div>
+          <div class="direction-list">
+            <strong>Honest status boundary</strong>
+            <ul>
+              <li>Scoped discovery, receipts, proposal-mediated mutation, guards, lifecycle tooling, and virtual-session foundations exist.</li>
+              <li>Outcome attribution, contextual beliefs, relationship-first consolidation, evaluator routing, and progressive promotion remain design and implementation work.</li>
+              <li>Broad autonomous self-improvement is not claimed implemented or active.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="capabilities">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Capability map</p>
+            <h2>What the harness owns</h2>
+          </div>
+          <p class="section-intro">Each card separates the public source contract from the evidence that still matters. A mechanism can be implemented without being proven under every provider, restart window, operating-system boundary, or long-horizon workload.</p>
+        </div>
+
+        <div class="capability-grid">
+          <article class="capability-card"><span class="tag">Ingress</span><h3>Exact channel identity</h3><p>Telegram and Discord inputs pass allow-list and exact platform, account, channel, and user resolution before durable admission.</p><div class="evidence">Needs per-account and per-channel provider-visible smoke evidence.</div></article>
+          <article class="capability-card"><span class="tag">Runtime</span><h3>Durable bounded work</h3><p>Queue leases, retries, stale recovery, admission controls, and global, agent, channel, and lane bounds isolate interactive and background work.</p><div class="evidence">Needs joined crash, overload, fairness, and soak evidence.</div></article>
+          <article class="capability-card"><span class="tag">Backend</span><h3>Codex execution boundary</h3><p>Plans, preflight, app-server execution, terminal state, concrete session continuity, and provider-scoped homes are explicit and receipted.</p><div class="evidence">Backend upgrades require protocol and provenance proof.</div></article>
+          <article class="capability-card"><span class="tag">Continuity</span><h3>Virtual sessions</h3><p>A stable task identity can span compact, resume, and concrete-session rollover while carrying a bounded working set.</p><div class="evidence">Needs end-to-end rollover and restart through final delivery.</div></article>
+          <article class="capability-card"><span class="tag">Channels</span><h3>Replies, progress, and actions</h3><p>Commands, normal replies, bounded progress, media delivery, and guarded connector-approval actions share identity and delivery contracts.</p><div class="evidence">Rendering and interaction behavior remains channel-specific.</div></article>
+          <article class="capability-card"><span class="tag">Background work</span><h3>Workers, cron, and delegation</h3><p>Durable jobs, cron evaluation, watchdogs, exact subagent ownership, bounded mailboxes, and master-only final synthesis are explicit surfaces.</p><div class="evidence">Needs reboot, real-effect, and heterogeneous-provider evidence.</div></article>
+          <article class="capability-card"><span class="tag">Memory</span><h3>Adapter-owned recall</h3><p>Recall, lifecycle capture, proposals, approved writeback, imported snapshots, and per-agent compartments are receipt-backed adapters.</p><div class="evidence">Fallback behavior is not full graph-memory parity.</div></article>
+          <article class="capability-card"><span class="tag">Procedural memory</span><h3>Skill runtime foundations</h3><p>Skills are scoped, indexed, revisioned, selected with receipts, guarded before controlled mutation, and managed reversibly.</p><div class="evidence">Adaptive outcome-linked learning remains a design direction.</div></article>
+          <article class="capability-card"><span class="tag">Planning</span><h3>Layered task authority</h3><p>Codex owns in-turn decomposition; optional durable plans own milestones and evidence; the runtime owns budgets, effects, continuation, fairness, and finals.</p><div class="evidence">Needs joined scope, replan, budget, and terminal scenarios.</div></article>
+          <article class="capability-card"><span class="tag">Operations</span><h3>Audit and recovery</h3><p>Receipts, trace reconstruction, health, repair, backup, canary, rollback, and migration controls make decisions inspectable.</p><div class="evidence">Receipts do not substitute for restore or provider recovery drills.</div></article>
+          <article class="capability-card"><span class="tag">Security</span><h3>Fail-closed trust boundaries</h3><p>Bounded untrusted context, secret isolation, external-effect gates, encrypted-vault primitives, and public-hygiene checks constrain exposure.</p><div class="evidence">Live credential and network review stays operator-controlled.</div></article>
+          <article class="capability-card"><span class="tag">Compatibility</span><h3>Dry-run migration</h3><p>Legacy agents, prompts, skills, sessions, memory snapshots, and compatible state can be planned and imported with conflict policies and receipts.</p><div class="evidence">Every real source still needs its own dry run and rollback boundary.</div></article>
+        </div>
+      </div>
+    </section>
+
+    <section id="architecture" class="architecture">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Architecture boundary</p>
+            <h2>One durable path from message to evidence</h2>
+          </div>
+          <p class="section-intro">The harness does not replace the model. It gives model work an exact identity, bounded authority, recoverable lifecycle, and traceable terminal result.</p>
+        </div>
+        <div class="flow">
+          <div class="flow-step"><span>01</span><strong>Ingress</strong><p>Allow-list and exact identity before admission.</p></div>
+          <div class="flow-step"><span>02</span><strong>Durable queue</strong><p>Lease, retry, fairness, and bounded concurrency.</p></div>
+          <div class="flow-step"><span>03</span><strong>Virtual session</strong><p>Task continuity, plans, memory, and skill manifest.</p></div>
+          <div class="flow-step"><span>04</span><strong>Codex backend</strong><p>Reasoning, tools, sandbox, and concrete session.</p></div>
+          <div class="flow-step"><span>05</span><strong>Delivery</strong><p>Outbox, progress, provider result, and receipts.</p></div>
+        </div>
+        <div class="ownership">
+          <div class="owner-card"><h3>Harness authority</h3><ul><li>identity and eligibility</li><li>durable state, budgets, and scheduling</li><li>external-effect admission</li><li>evidence, promotion, rollback, and delivery</li></ul></div>
+          <div class="owner-card"><h3>Backend authority</h3><ul><li>in-turn reasoning and decomposition</li><li>native tool sequencing</li><li>model-session and sandbox semantics</li><li>semantic drafts and advisory proposals</li></ul></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="evidence">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Verification</p>
+            <h2>Claims stop where evidence stops</h2>
+          </div>
+          <p class="section-intro">The right verification level follows the blast radius. Cross-cutting changes to identity, routing, skills, memory, planning, continuation, effects, or final delivery need whole-task evidence before promotion.</p>
+        </div>
+        <div class="evidence-ladder">
+          <div class="evidence-level"><b>Contracts</b><p>Schemas, configuration, identity derivation, compatibility, and deterministic decision tables.</p></div>
+          <div class="evidence-level"><b>Focused tests</b><p>Local state transitions, validation, matching, serialization, and error handling.</p></div>
+          <div class="evidence-level"><b>Integration</b><p>Immediate producer/consumer boundaries such as queue-to-runtime or effect-to-receipt.</p></div>
+          <div class="evidence-level"><b>Scenario / replay</b><p>Exact identity, virtual session, backend, effects, restart, outbox, and terminal behavior in one joined task.</p></div>
+          <div class="evidence-level"><b>Controlled live</b><p>Provider presentation, real routing, service persistence, resource use, and bounded cohort soak.</p></div>
+        </div>
+
+        <div class="score-grid">
+          <div class="score-card"><strong>Outcome</strong><span>Acceptance, verifier pass, corrections, failures, and time to terminal.</span></div>
+          <div class="score-card"><strong>Coverage</strong><span>Required roles, calibrated abstention, and critical-case non-inferiority.</span></div>
+          <div class="score-card"><strong>Disclosure</strong><span>Relevant procedure per token, repeat loads, latency, tools, and interference.</span></div>
+          <div class="score-card"><strong>Learning quality</strong><span>Attribution, calibration, drift, held-out regression, and false promotion.</span></div>
+          <div class="score-card"><strong>Total cost</strong><span>Backend, evaluator, maintenance, operator attention, and opportunity cost.</span></div>
+          <div class="score-card"><strong>Hard gates</strong><span>Zero cross-scope exposure, unauthorized effect, policy bypass, secret leak, or failed rollback.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Delivery path</p>
+            <h2>From source foundations to earned autonomy</h2>
+          </div>
+          <p class="section-intro">Every expansion of behavior or authority is a versioned deployment. Observation and proposals may become increasingly automatic; broad, privileged, or cross-agent change requires stronger independent evidence.</p>
+        </div>
+        <div class="delivery">
+          <div class="delivery-card"><h3>Correct and observe</h3><p>Remove unsafe attribution, compile exact contracts, and compare new policies without changing prompts, effects, learning, or delivery.</p></div>
+          <div class="delivery-card"><h3>Join and evaluate</h3><p>Connect effects and outcomes, calibrate contextual beliefs and evaluator cost, and test held-out behavior plus downgrade.</p></div>
+          <div class="delivery-card"><h3>Promote narrowly</h3><p>Activate one reversible low-risk cohort with explicit authority and provider-visible evidence before any widening.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Explore</p>
+            <h2>Public documentation</h2>
+          </div>
+          <p class="section-intro">Private deployment receipts, operator-only runbooks, real identifiers, and machine-specific evidence are intentionally excluded from these public surfaces.</p>
+        </div>
+        <div class="docs-panel">
+          <div class="doc-link"><a href="../README.md">README</a><span>Project definition, quick start, architecture, and documentation index.</span></div>
+          <div class="doc-link"><a href="adaptive-skill-intelligence.html">Adaptive Skill Intelligence</a><span>Product rationale, learning loop, decision science, and status boundary.</span></div>
+          <div class="doc-link"><a href="skill-ecosystem.md">Skill Ecosystem</a><span>Current implemented discovery, selection, learning gates, lifecycle, and compatibility.</span></div>
+          <div class="doc-link"><a href="agent-harness-topology-contract.md">Topology Contract</a><span>Identity axes, component ownership, invariants, and scenario impact.</span></div>
+          <div class="doc-link"><a href="configuration.md">Configuration</a><span>Public configuration reference.</span></div>
+          <div class="doc-link"><a href="trust-boundaries.md">Trust Boundaries</a><span>Untrusted input, secret, effect, and publication boundaries.</span></div>
+          <div class="doc-link"><a href="schema-registry.md">Schema Registry</a><span>Receipt and durable-state compatibility contracts.</span></div>
+          <div class="doc-link"><a href="invariants.md">Invariants</a><span>Behavioral truths and their required verification surfaces.</span></div>
+        </div>
+      </div>
+    </section>
   </main>
+
+  <footer>
+    <div class="wrap">Agent Harness Core capability map · Public source overview · Updated 2026-07-21</div>
+  </footer>
 </body>
 </html>

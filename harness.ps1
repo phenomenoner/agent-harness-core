@@ -12,7 +12,10 @@ $AgentWorkspace = Join-Path $HarnessHome 'workspace'
 $RuntimeWorkspace = Join-Path $HarnessHome 'runtime-workspace\default'
 $CodexExe = Join-Path $HarnessHome 'tools\codex-cli\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
 $DiscordGateway = Join-Path $HarnessHome 'tools\agent-discord-gateway\index.mjs'
-$NodeExe = 'C:\Program Files\nodejs\node.exe'
+$NodeExe = Join-Path $HarnessHome 'tools\node\node.exe'
+$KeeperRoot = Join-Path $HarnessHome 'state\supervisor\windows-reconcile-keeper'
+$KeeperPlan = Join-Path $KeeperRoot 'keeper-plan.json'
+$KeeperScripts = Join-Path $KeeperRoot 'scripts'
 $SupervisorLogs = Join-Path $HarnessHome 'state\logs\supervisor'
 $HarnessLog = Join-Path $HarnessHome 'state\logs\harness.jsonl'
 $ProgressLog = Join-Path $HarnessHome 'state\runtime-queue\progress-events.jsonl'
@@ -20,20 +23,24 @@ $ProgressLog = Join-Path $HarnessHome 'state\runtime-queue\progress-events.jsonl
 function Show-Help {
     @"
 Usage:
-  harness gateway start
-  harness gateway stop
-  harness gateway restart
+  harness gateway start --live-control-token <token>
+  harness gateway stop --live-control-token <token>
+  harness gateway restart --live-control-token <token>
   harness gateway status
   harness gateway ps
   harness gateway logs
   harness gateway tail <component> [lines]
+  harness gateway keeper-plan --live-control-token <token>
+  harness gateway keeper-install --live-control-token <token>
+  harness gateway keeper-readback
+  harness gateway keeper-uninstall --live-control-token <token>
   harness gateway stop --live-control-token <token>
 
 Components for tail:
   runtime, telegram, discord, discord-gateway, discord-outbox, progress, worker, harness, progress-events
 
 Examples:
-  harness gateway restart
+  harness gateway restart --live-control-token <token>
   harness gateway status
   harness gateway tail runtime 200
   harness gateway tail harness 300
@@ -56,14 +63,77 @@ function Invoke-LiveOpsControl {
         [string] $Action,
         [string] $LiveControlToken
     )
+    Assert-LiveGatewayControlAllowed $Action $LiveControlToken
     $args = @('ops-control', '--harness-home', $HarnessHome, '--action', $Action,
         '--reason', "harness.ps1 gateway $Action")
     if (-not [string]::IsNullOrWhiteSpace($LiveControlToken)) {
         $args += @('--live-control-token', $LiveControlToken)
     }
-    & $HarnessExe @args
+    $output = & $HarnessExe @args 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "ops-control $Action failed with exit code ${exitCode}: $($output -join [Environment]::NewLine)"
+    }
+    try {
+        $receipt = ($output -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "ops-control $Action returned invalid JSON: $($_.Exception.Message)"
+    }
+    $expectedStatus = if ($Action -eq 'start') { 'start-ready' } else { 'stop-requested' }
+    if ([string]$receipt.schema -ne 'agent-harness.ops-control-receipt.v1' -or
+        [string]$receipt.action -ne $Action -or
+        [string]$receipt.status -ne $expectedStatus) {
+        throw "ops-control $Action did not reach exact $expectedStatus state"
+    }
+    if ($Action -eq 'stop' -and @($receipt.stopFiles | Where-Object { $_.present -ne $true }).Count -ne 0) {
+        throw 'ops-control stop receipt contains an unheld supervisor'
+    }
+    if ($Action -eq 'start' -and @($receipt.stopFiles | Where-Object { $_.present -eq $true }).Count -ne 0) {
+        throw 'ops-control start receipt contains a remaining supervisor hold'
+    }
+    $receipt | ConvertTo-Json -Depth 16
+}
+
+function Write-LiveKeeperPlan {
+    param([string] $LiveControlToken)
+    Assert-LiveGatewayControlAllowed 'cutover' $LiveControlToken
+    Require-File $HarnessExe "Deploy .agent-harness\bin\current\agent-harness.exe first."
+    Require-File $CodexExe "Deploy the Codex CLI below .agent-harness\tools first."
+    Require-File $NodeExe "Install or deploy the pinned Node executable first."
+    Require-File $DiscordGateway "Deploy the Discord gateway below .agent-harness\tools first."
+    if (-not (Test-Path -LiteralPath $AgentWorkspace -PathType Container)) {
+        throw "Missing agent workspace: $AgentWorkspace"
+    }
+    if (-not (Test-Path -LiteralPath $RuntimeWorkspace -PathType Container)) {
+        throw "Missing confined runtime workspace: $RuntimeWorkspace"
+    }
+    & $HarnessExe supervisor-keeper-plan --harness-home $HarnessHome --source-home $HarnessHome `
+        --workspace $AgentWorkspace --runtime-workspace $RuntimeWorkspace --harness-cli $HarnessExe `
+        --codex-exe $CodexExe --node-exe $NodeExe --gateway-script $DiscordGateway `
+        --live-control-token $LiveControlToken
     if ($LASTEXITCODE -ne 0) {
-        throw "ops-control $Action failed with exit code $LASTEXITCODE"
+        throw "supervisor-keeper-plan failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Invoke-LiveKeeperScript {
+    param(
+        [ValidateSet('install', 'start', 'stop', 'uninstall', 'readback')]
+        [string] $Name,
+        [string] $LiveControlToken
+    )
+    Require-File $KeeperPlan "Run 'harness gateway keeper-plan' with the deployed candidate first."
+    $script = Join-Path $KeeperScripts "$Name.ps1"
+    Require-File $script "Regenerate the reconcile keeper plan before live control."
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Require-File $windowsPowerShell 'Windows PowerShell is required for Scheduled Tasks control.'
+    $scriptArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $script)
+    if ($Name -in @('install', 'start', 'stop', 'uninstall')) {
+        $scriptArgs += @('-LiveControlToken', $LiveControlToken)
+    }
+    & $windowsPowerShell @scriptArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "keeper $Name failed with exit code $LASTEXITCODE"
     }
 }
 
@@ -71,13 +141,22 @@ function Start-LiveSupervisors {
     param([string] $LiveControlToken)
     Require-File $HarnessExe "Deploy .agent-harness\bin\current\agent-harness.exe first."
     Require-File $CodexExe "Deploy the Codex CLI below .agent-harness\tools first."
+    Require-File $NodeExe "Install or deploy the pinned Node executable first."
     Require-File $DiscordGateway "Deploy the Discord gateway below .agent-harness\tools first."
-    Invoke-LiveOpsControl 'start' $LiveControlToken
-    & $HarnessExe supervisor-reconcile --harness-home $HarnessHome --source-home $HarnessHome `
-        --workspace $AgentWorkspace --runtime-workspace $RuntimeWorkspace --harness-cli $HarnessExe `
-        --codex-exe $CodexExe --node-exe $NodeExe --gateway-script $DiscordGateway --all --apply
-    if ($LASTEXITCODE -ne 0) {
-        throw "supervisor-reconcile --apply failed with exit code $LASTEXITCODE"
+    Require-File $KeeperPlan "Generate and install the reconcile keeper before starting live supervisors."
+    Require-File (Join-Path $KeeperScripts 'start.ps1') "Regenerate the reconcile keeper plan before starting live supervisors."
+    Invoke-LiveKeeperScript 'start' $LiveControlToken
+}
+
+function Stop-LiveSupervisors {
+    param([string] $LiveControlToken)
+    $stopScript = Join-Path $KeeperScripts 'stop.ps1'
+    if ((Test-Path -LiteralPath $KeeperPlan -PathType Leaf) -and
+        (Test-Path -LiteralPath $stopScript -PathType Leaf)) {
+        Invoke-LiveKeeperScript 'stop' $LiveControlToken
+    } else {
+        Write-Warning 'Reconcile keeper plan is not installed; applying the guarded global hold and child stop directly.'
+        Invoke-LiveOpsControl 'stop' $LiveControlToken
     }
 }
 
@@ -92,14 +171,6 @@ function Wait-LiveSupervisorsStopped {
         Start-Sleep -Seconds 1
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for live Agent Harness processes to stop"
-}
-
-function Test-LiveFlag {
-    param([string] $Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return $false
-    }
-    return @('1', 'true', 'yes', 'on', 'live') -contains $Value.Trim().ToLowerInvariant()
 }
 
 function Get-LiveControlTokenArg {
@@ -122,15 +193,26 @@ function Assert-LiveGatewayControlAllowed {
         [string] $Action,
         [string] $LiveControlToken
     )
-    if (-not (Test-LiveFlag $env:AGENT_HARNESS_LIVE_SESSION)) {
-        return
-    }
     if ([string]::IsNullOrWhiteSpace($LiveControlToken)) {
         throw "live-control token is required for live gateway $Action"
     }
     Require-File $HarnessExe "Deploy .agent-harness\bin\current\agent-harness.exe first. Cargo target\ is source/staging output only."
-    $status = & $HarnessExe ops-cutover-status --harness-home $HarnessHome --action $Action --live-control-token $LiveControlToken | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0 -or $status.status -ne 'ready') {
+    $output = & $HarnessExe ops-cutover-status --harness-home $HarnessHome --action $Action --live-control-token $LiveControlToken 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "live-control token validation failed for live gateway $Action with exit code $exitCode"
+    }
+    try {
+        $status = ($output -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "live-control token validation returned invalid JSON for live gateway ${Action}: $($_.Exception.Message)"
+    }
+    $exact = ([string]$status.schema -eq 'agent-harness.ops-cutover-status.v1') -and
+        ([string]$status.status -eq 'ready') -and
+        ([string]$status.action -eq $Action) -and
+        ([string]$status.liveControl.status -eq 'valid') -and
+        [string]::Equals([string]$status.harnessHome, [string]$HarnessHome, [StringComparison]::OrdinalIgnoreCase)
+    if (-not $exact) {
         throw "live-control token validation failed for live gateway $Action"
     }
 }
@@ -234,13 +316,37 @@ switch ($action) {
     }
     'stop' {
         Assert-LiveGatewayControlAllowed 'stop' $liveControlToken
-        Invoke-LiveOpsControl 'stop' $liveControlToken
+        Stop-LiveSupervisors $liveControlToken
     }
     'restart' {
-        Assert-LiveGatewayControlAllowed 'restart' $liveControlToken
-        Invoke-LiveOpsControl 'stop' $liveControlToken
+        # Prove both action-specific grants and every start prerequisite before
+        # stopping anything, so a missing candidate cannot strand the live set.
+        Assert-LiveGatewayControlAllowed 'stop' $liveControlToken
+        Assert-LiveGatewayControlAllowed 'start' $liveControlToken
+        Require-File $HarnessExe "Deploy .agent-harness\bin\current\agent-harness.exe first."
+        Require-File $CodexExe "Deploy the Codex CLI below .agent-harness\tools first."
+        Require-File $NodeExe "Install or deploy the pinned Node executable first."
+        Require-File $DiscordGateway "Deploy the Discord gateway below .agent-harness\tools first."
+        Require-File $KeeperPlan "Generate and install the reconcile keeper before restarting live supervisors."
+        Require-File (Join-Path $KeeperScripts 'start.ps1') "Regenerate the reconcile keeper plan before restarting live supervisors."
+        Require-File (Join-Path $KeeperScripts 'stop.ps1') "Regenerate the reconcile keeper plan before restarting live supervisors."
+        Stop-LiveSupervisors $liveControlToken
         Wait-LiveSupervisorsStopped
         Start-LiveSupervisors $liveControlToken
+    }
+    'keeper-plan' {
+        Write-LiveKeeperPlan $liveControlToken
+    }
+    'keeper-install' {
+        Assert-LiveGatewayControlAllowed 'cutover' $liveControlToken
+        Invoke-LiveKeeperScript 'install' $liveControlToken
+    }
+    'keeper-readback' {
+        Invoke-LiveKeeperScript 'readback' $null
+    }
+    'keeper-uninstall' {
+        Assert-LiveGatewayControlAllowed 'uninstall' $liveControlToken
+        Invoke-LiveKeeperScript 'uninstall' $liveControlToken
     }
     'status' {
         Show-Status

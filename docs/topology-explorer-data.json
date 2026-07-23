@@ -4,7 +4,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "46b359001fa82a2133a60a1539e56257049242f7a9b6a44271b37b6dac576b43"
+      "sha256": "1fb17ecb2cb182c2d62383989df7a9e5ba1a890ad3c5f7f5f1ba614046d72c06"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -134,6 +134,19 @@
       ]
     },
     {
+      "id": "component-operation-plan",
+      "label": "operation_plan",
+      "group": "component",
+      "state": "implemented",
+      "summary": "durable plan/item admission, dependency ordering, optimistic concurrency, and atomic mutation rejection",
+      "reads": "stored plan limits, current materialized items, expected item version, proposed dependencies and status",
+      "writes": "append-only item/event/receipt records plus atomic plan snapshot updates; invalid over-limit or cyclic mutations write nothing",
+      "invariants": "I6, I39",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
       "id": "component-cron-scheduler-deterministic-cron",
       "label": "cron_scheduler / deterministic_cron",
       "group": "component",
@@ -216,9 +229,9 @@
       "label": "runtime_pipeline / task_transition / task_budget",
       "group": "component",
       "state": "implemented",
-      "summary": "run-once orchestration, mutation-aware retry/dead-letter, typed source-final disposition, final-outbox repair, approval parking, harness-owned task families and primary outcomes, bounded recovery, exact authority revalidation, interruption classification, media resolution, and terminal skill evidence",
+      "summary": "run-once orchestration, mutation-aware retry/dead-letter, one typed source-closure resolver, final-outbox repair, visible policy parking, harness-owned task families and primary outcomes, bounded recovery, exact authority revalidation, interruption classification, media resolution, and terminal skill evidence",
       "reads": "queue item, Codex and lease receipts, exact-lane Goal/OperationPlan/task-family state, external-effect authority, budgets, channel state, media policy, prepared virtual evidence",
-      "writes": "exactly one ordinary/campaign final, continuation, parked approval notice, or explicit non-delivery; source-final receipt; task budget; terminal review",
+      "writes": "exactly one ordinary/campaign final, committed continuation, visible parked notice, or explicit non-delivery; closure kind/reason and derived source-final receipt fields; task budget; terminal review",
       "invariants": "I2, I3, I5, I7, I8, I9, I10, I13, I17, I22, I31, I35, I37",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -242,9 +255,9 @@
       "label": "progress",
       "group": "component",
       "state": "implemented",
-      "summary": "source-authoritative progress narration delivery, separate from final replies, with terminal release bound to the exact source-final expectation",
+      "summary": "source-authoritative progress narration delivery, separate from final replies, with terminal release bound to exact source-closure evidence and the derived source-final expectation",
       "reads": "progress events/index, runtime receipt, exact-source outbox/delivery state, channel policy, watched stop file",
-      "writes": "progress outbox/delivery state, source cursor/cache, surface claims and fail-closed warnings",
+      "writes": "progress outbox/delivery state, source cursor/cache, surface claims and fail-closed warnings; unexplained new-format non-delivery cannot release progress",
       "invariants": "I2, I4, I9, I17, I25, I27, I37",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -268,9 +281,9 @@
       "label": "supervisor plan/reconcile",
       "group": "component",
       "state": "implemented",
-      "summary": "derive durable Windows Task Scheduler and reconcile ownership from the authoritative harness supervisor config",
-      "reads": "enabled supervisor.telegramLoops, loop/service identities, maintenance-owner selection",
-      "writes": "generated start/stop scripts, scheduled-task plan receipt, reconcile inventory/launch plan",
+      "summary": "derive mode-aware Windows Task Scheduler or reconcile ownership from one authoritative harness topology, isolate every reconcile-launched parent from the launcher console, and keep reconcile-managed ownership under one OS-owned root keeper",
+      "reads": "supervisor.manageAllLoops, enabled supervisor.telegramLoops, explicit services, loop/service identities, maintenance-owner selection, global keeper hold, keeper plan/task readback, exact keeper process identity",
+      "writes": "generated start/stop scripts and scheduled-task plan receipt in scheduled-task mode; deployment-owned desired-service inventory, process-boundary launch receipt, user-scoped keeper plan/readback, and fresh keeper state in reconcile-managed mode",
       "invariants": "I26",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -426,7 +439,7 @@
       "label": "Codex runtime, final outbox, delivery, or progress",
       "group": "gate",
       "state": "release-gate",
-      "summary": "completion/protocol-error terminality; duplicate and stale-owner suppression; progress/final separation; provider delivery and terminal receipt precedence; source-index freshness/defer; historical fresh-send suppression; watched-stop claim release; bounded interruption evidence",
+      "summary": "completion/protocol-error terminality; evidence-based shell-start classification; one exact-authorized fresh-runtime shell recovery; bounded structural parent/subagent lifecycle evidence without raw content or identifiers; parent-only final ownership; duplicate and stale-owner suppression; progress/final separation; provider delivery and terminal receipt precedence; source-index freshness/defer; historical fresh-send suppression; watched-stop claim release; bounded interruption evidence",
       "reviewDocs": "docs/invariants.md, docs/schema-registry.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -514,7 +527,7 @@
       "label": "Supervisor, Task Scheduler, or cutover ownership",
       "group": "gate",
       "state": "release-gate",
-      "summary": "configured loop plan/reconcile parity; generated start/stop bundle preserves enabled channel loops; dedicated maintenance owner and fresh post-cutover heartbeats",
+      "summary": "configured ownership mode and loop plan/reconcile parity; supervisor.manageAllLoops=true makes deployment-owned reconcile inventory authoritative and scheduled-task plan absence not applicable; generated scheduled-task bundles preserve enabled channel loops; dedicated maintenance owner and fresh post-cutover heartbeats",
       "reviewDocs": "docs/invariants.md, docs/configuration.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -534,14 +547,14 @@
       ]
     },
     {
-      "id": "gap-supervisor-plan-configured-loop-parity-live-gap",
-      "label": "supervisor-plan-configured-loop-parity-live-gap",
+      "id": "gap-supervisor-root-keeper-live-gap",
+      "label": "supervisor-root-keeper-live-gap",
       "group": "gap",
       "state": "open-gap",
-      "summary": "Task Scheduler plan/reconcile configured-loop parity",
-      "designTarget": "Regenerating the Windows Task Scheduler bundle preserves every enabled configured supervisor.telegramLoops runner while adding the isolated maintenance owner.",
-      "currentEvidence": "Fail-first/green plan regression and a staged nine-owner plan show the configured Telegram loop and ledger-maintenance-loop together. Live plan regeneration and fresh heartbeat readback remain pending.",
-      "promotionGate": "Promote only after the guarded cutover regenerates the authoritative plan, all configured channel and maintenance owners are fresh, and reconcile reports no missing/stale/launch actions.",
+      "summary": "Mode-aware supervisor readiness, configured-loop parity, and root availability",
+      "designTarget": "supervisor.manageAllLoops=true selects reconcile-managed ownership, where one shared topology derivation drives reconcile, readiness, and guarded stop/start; the exact deployment-owned desired-service inventory and service kinds are authoritative and supervisor-plan.json is not applicable. Reconcile-managed mode additionally requires one user-scoped OS task running an exact live keeper process, while each child supervisor parent is detached from the launcher's console control domain. Scheduled-task child ownership retains its generated plan checks.",
+      "currentEvidence": "Hermetic replay covers the nine-service topology plus keeper, config overrides, custom/disabled services, cron precedence, exact service kinds, keeper-first stop/keeper-last start, partial-mutation receipts, and fail-closed inventory cases. A Windows process-boundary replay sends CTRL_BREAK to the launcher group and proves the detached child survives. Generated keeper scripts parse in Windows PowerShell; an automated Windows test performs two consecutive atomic readbacks without registering a task or leaving temporary/backup debris, all persisted paths remain below the staging harness, and readiness rejects a missing/disabled task, stale keeper, or mismatched process instance. Real task registration, restart, and live soak remain pending.",
+      "promotionGate": "Promote only after a stopped-state candidate registers the generated task under the intended user, task/action/settings/digest readback passes, forced keeper-death restart converges the exact configured topology, an independent reviewer passes the patch, and guarded post-cutover readback shows the keeper and every configured owner fresh with no missing, unexpected, stale, source-tree, or launch actions.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -807,14 +820,14 @@
       ]
     },
     {
-      "id": "gap-goal-autonomy-activation-gap",
-      "label": "goal-autonomy-activation-gap",
+      "id": "gap-goal-continuation-live-evidence-gap",
+      "label": "goal-continuation-live-evidence-gap",
       "group": "gap",
       "state": "open-gap",
       "summary": "Unified goal transition and exactly-once continuation",
-      "designTarget": "Every normal completion, deadline drain, timeout, compact rollover, auth defer, restart, operator stop, newer steer, older-lineage completion, and runtime failure is classified before final-outbox selection. Active goal slices are progress-only unless the authoritative goal state is terminal.",
-      "currentEvidence": "goal-transition.v1 and goal-slice.v1 bind the decision to exact lineage/lane/virtual-session/backend generation and a campaign slice generation independent from context recovery depth. In active mode, goal-continuation-intent.v1 commits a deterministic key before enqueue, revalidates the parent FullLaneKey and virtual session, reconciles commit/enqueue crashes, and acknowledges only after the child owns the runtime lane lease. Terminal goal state commits goal-terminal-outbox.v1 before append; one exact campaign/lane/virtual-session decision owns one canonical message and deterministic v2 delivery ID, so a restart or competing slice repairs the append-before-receipt window without duplicate or late final. Parent-channel ownership and current exact-session checks keep worker/child and wrong-session evidence internal. goal-campaign-budget.v1 bounds each slice to 30–45 minutes and accumulates wall-clock, slice-count, token-cost, repeated-progress-fingerprint, and recovery-count breakers; reaching any boundary prevents the next child and uses the same sanitized terminal gate. goal-campaign-status is read-only. Configuration defaults to goalAutonomy.mode=observe; active mode additionally requires an exact activeLaneDigests cohort.",
-      "promotionGate": "Keep candidate/foundation behavior observe-only. Before C2-G, replay restart/compact and the full wrong-lane/worker matrix at T3, select exactly one reviewed lane digest with one runnable lineage, and retain activation/rollback receipts.",
+      "designTarget": "Every normal completion, deadline drain, timeout, compact rollover, auth defer, restart, operator stop, newer same-lane input, older-lineage completion, and runtime failure is classified before final-outbox selection. Active Goal slices are progress-only unless the authoritative Goal state is terminal.",
+      "currentEvidence": "goal-transition.v1 and goal-slice.v1 bind the decision to exact lineage/lane/virtual-session/backend generation and a campaign slice generation independent from context recovery depth. With no goalAutonomy block, only an exact current-owned Goal with a canonical lane and authorized continuation receives bounded implicit autonomy; explicit observe or disabled remains an opt-out, and explicit active remains bound to activeLaneDigests. goal-continuation-intent.v1 commits a deterministic key and human-input generation before enqueue. A separate rollback-readable fence isolates malformed records and revokes stale authority. Restart and concurrent reconciliation create at most one child; post-lease and pre-effect gates revalidate the exact lane, virtual session, fence, and newer human input before acknowledgement or chaining. Ordinary same-lane text outranks an unleased autonomous continuation at the next scheduler checkpoint without bypassing an active lease; /steer remains the explicit same-turn control. A failed command start is eligible for one fresh-runtime recovery only when exact executable-drift evidence agrees. Terminal Goal state commits goal-terminal-outbox.v1 before append, and campaign budgets bound wall clock, slices, tokens, repeated progress, and recoveries.",
+      "promotionGate": "Keep the restart/concurrency, wrong-lane, worker, malformed-ledger, ordinary-input, and post-lease replay suite green. Before broader promotion, retain reviewed candidate and live evidence for one exact-lane long Goal followed by ordinary same-lane input, proving one continuation or final, no duplicate effect, no premature campaign final, and no stuck queued message.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -1024,6 +1037,11 @@
     },
     {
       "source": "canon-topology-contract",
+      "target": "component-operation-plan",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
       "target": "component-cron-scheduler-deterministic-cron",
       "label": "owns boundary"
     },
@@ -1224,6 +1242,11 @@
     },
     {
       "source": "axis-agentid",
+      "target": "component-operation-plan",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
       "target": "component-codex-runtime-goal-closure",
       "label": "must survive through"
     },
@@ -1289,6 +1312,11 @@
     },
     {
       "source": "axis-sessionkey",
+      "target": "component-operation-plan",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
       "target": "component-codex-runtime-goal-closure",
       "label": "must survive through"
     },
@@ -1330,6 +1358,11 @@
     {
       "source": "axis-virtualsessionid",
       "target": "component-workers-child-execution-policy",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-operation-plan",
       "label": "must survive through"
     },
     {
@@ -1633,6 +1666,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-operation-plan",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-codex-runtime-goal-closure",
       "target": "gap-bounded-ledger-maintenance-live-gap",
       "label": "has gap"
@@ -1668,28 +1706,33 @@
       "label": "has gap"
     },
     {
-      "source": "gap-supervisor-plan-configured-loop-parity-live-gap",
+      "source": "gap-supervisor-root-keeper-live-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
     },
     {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-supervisor-root-keeper-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-operation-plan",
+      "target": "gap-supervisor-root-keeper-live-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-cron-scheduler-deterministic-cron",
-      "target": "gap-supervisor-plan-configured-loop-parity-live-gap",
+      "target": "gap-supervisor-root-keeper-live-gap",
       "label": "has gap"
     },
     {
       "source": "component-runtime-pipeline-task-transition-task-budget",
-      "target": "gap-supervisor-plan-configured-loop-parity-live-gap",
-      "label": "has gap"
-    },
-    {
-      "source": "component-ledger-maintenance",
-      "target": "gap-supervisor-plan-configured-loop-parity-live-gap",
+      "target": "gap-supervisor-root-keeper-live-gap",
       "label": "has gap"
     },
     {
       "source": "component-supervisor-plan-reconcile",
-      "target": "gap-supervisor-plan-configured-loop-parity-live-gap",
+      "target": "gap-supervisor-root-keeper-live-gap",
       "label": "has gap"
     },
     {
@@ -1831,6 +1874,11 @@
       "source": "gap-openclaw-mem-full-parity-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
+    },
+    {
+      "source": "component-operation-plan",
+      "target": "gap-openclaw-mem-full-parity-gap",
+      "label": "has gap"
     },
     {
       "source": "component-provider-request-policy",
@@ -2144,6 +2192,11 @@
     },
     {
       "source": "component-workers-child-execution-policy",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-operation-plan",
       "target": "gap-progress-delivery-volume-gap",
       "label": "has gap"
     },
@@ -2673,78 +2726,63 @@
       "label": "has gap"
     },
     {
-      "source": "gap-goal-autonomy-activation-gap",
+      "source": "gap-goal-continuation-live-evidence-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
     },
     {
-      "source": "component-channel-identity",
-      "target": "gap-goal-autonomy-activation-gap",
-      "label": "has gap"
-    },
-    {
       "source": "component-channel-state-channel-session-transition",
-      "target": "gap-goal-autonomy-activation-gap",
+      "target": "gap-goal-continuation-live-evidence-gap",
       "label": "has gap"
     },
     {
       "source": "component-channel-ingress-channel-runtime-channel-action",
-      "target": "gap-goal-autonomy-activation-gap",
+      "target": "gap-goal-continuation-live-evidence-gap",
       "label": "has gap"
     },
     {
       "source": "component-runtime-queue-runtime-worker",
-      "target": "gap-goal-autonomy-activation-gap",
+      "target": "gap-goal-continuation-live-evidence-gap",
       "label": "has gap"
     },
     {
       "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
-      "target": "gap-goal-autonomy-activation-gap",
+      "target": "gap-goal-continuation-live-evidence-gap",
       "label": "has gap"
     },
     {
       "source": "component-workers-child-execution-policy",
-      "target": "gap-goal-autonomy-activation-gap",
+      "target": "gap-goal-continuation-live-evidence-gap",
       "label": "has gap"
     },
     {
       "source": "component-cron-scheduler-deterministic-cron",
-      "target": "gap-goal-autonomy-activation-gap",
-      "label": "has gap"
-    },
-    {
-      "source": "component-worker-result-mailbox-coordinator-resume",
-      "target": "gap-goal-autonomy-activation-gap",
+      "target": "gap-goal-continuation-live-evidence-gap",
       "label": "has gap"
     },
     {
       "source": "component-codex-runtime-goal-closure",
-      "target": "gap-goal-autonomy-activation-gap",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-external-effect",
+      "target": "gap-goal-continuation-live-evidence-gap",
       "label": "has gap"
     },
     {
       "source": "component-runtime-pipeline-task-transition-task-budget",
-      "target": "gap-goal-autonomy-activation-gap",
-      "label": "has gap"
-    },
-    {
-      "source": "component-channel-delivery",
-      "target": "gap-goal-autonomy-activation-gap",
+      "target": "gap-goal-continuation-live-evidence-gap",
       "label": "has gap"
     },
     {
       "source": "component-progress",
-      "target": "gap-goal-autonomy-activation-gap",
-      "label": "has gap"
-    },
-    {
-      "source": "component-supervisor-plan-reconcile",
-      "target": "gap-goal-autonomy-activation-gap",
+      "target": "gap-goal-continuation-live-evidence-gap",
       "label": "has gap"
     },
     {
       "source": "component-memory-session-history-retrieval",
-      "target": "gap-goal-autonomy-activation-gap",
+      "target": "gap-goal-continuation-live-evidence-gap",
       "label": "has gap"
     },
     {
@@ -2784,6 +2822,11 @@
     },
     {
       "source": "component-workers-child-execution-policy",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-operation-plan",
       "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
@@ -3099,6 +3142,11 @@
     },
     {
       "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-repo-code-graph-support-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-operation-plan",
       "target": "gap-repo-code-graph-support-gap",
       "label": "has gap"
     },

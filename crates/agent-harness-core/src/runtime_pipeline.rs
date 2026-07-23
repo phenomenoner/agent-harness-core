@@ -21,9 +21,10 @@ use crate::goal_budget::{
     load_goal_campaign_policy,
 };
 use crate::goal_continuation::{
-    GoalAutonomyActivation, GoalAutonomyMode, acknowledge_goal_continuation_after_lease,
+    GoalAutonomyActivation, GoalAutonomyMode, GoalContinuationLeaseGate,
     commit_goal_continuation_intent, ensure_goal_continuation_enqueued,
-    load_goal_autonomy_activation, reconcile_goal_continuation_intents,
+    gate_goal_continuation_after_lease, load_goal_autonomy_activation_for_exact_goal,
+    reconcile_goal_continuation_intents,
 };
 use crate::goal_lineage::{
     GoalLineageDisposition, GoalLineageDoctorOptions, GoalLineageDoctorStatus, GoalProjectionHint,
@@ -780,6 +781,13 @@ fn runtime_run_metadata(prepare: &RuntimeQueuePrepareReport) -> RuntimeRunMetada
 }
 
 pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<RuntimeRunOnceReport> {
+    run_runtime_queue_once_after_prepare(options, |_| Ok(()))
+}
+
+fn run_runtime_queue_once_after_prepare(
+    options: RuntimeRunOnceOptions,
+    after_prepare: impl FnOnce(&RuntimeQueuePrepareReport) -> io::Result<()>,
+) -> io::Result<RuntimeRunOnceReport> {
     let queue_dir = options.harness_home.join("state").join("runtime-queue");
     let report_file = queue_dir.join("run-once-last.json");
     let receipts_file = queue_dir.join("run-once-receipts.jsonl");
@@ -956,17 +964,117 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         );
     }
 
-    if let Some(item) = prepare.item.as_ref()
-        && let Some(acknowledged) = acknowledge_goal_continuation_after_lease(
-            &options.harness_home,
-            item,
-            current_log_time_ms()?,
-        )?
-    {
-        warnings.push(format!(
-            "goal continuation intent {} acknowledged after child lane lease acquisition",
-            acknowledged.intent_key
-        ));
+    after_prepare(&prepare)?;
+    if let Some(item) = prepare.item.as_ref() {
+        let gate =
+            gate_goal_continuation_after_lease(&options.harness_home, item, current_log_time_ms()?);
+        let gate = match gate {
+            Ok(gate) => gate,
+            Err(error) => {
+                let _ = release_runtime_queue_lease(&options.harness_home, &item.queue_id);
+                return Err(error);
+            }
+        };
+        match gate {
+            GoalContinuationLeaseGate::NotContinuation => {}
+            GoalContinuationLeaseGate::Acknowledged(acknowledged) => {
+                warnings.push(format!(
+                    "goal continuation intent {} acknowledged after lease-to-execution revalidation",
+                    acknowledged.intent_key
+                ));
+            }
+            GoalContinuationLeaseGate::Suppressed(fence) => {
+                let queue_id = item.queue_id.clone();
+                let metadata = runtime_run_metadata(&prepare);
+                release_runtime_queue_lease(&options.harness_home, &queue_id)?;
+                let terminal_control = resolve_queue_terminal_control(
+                    &options.harness_home,
+                    &queue_id,
+                    Some(item.session_key.as_str()),
+                )?;
+                let terminal_control_source =
+                    if let QueueTerminalControl::Terminal(control) = &terminal_control {
+                        let _ = record_terminal_control_suppression(
+                            &options.harness_home,
+                            &queue_id,
+                            metadata.runtime_class.as_deref(),
+                            metadata.origin.as_deref(),
+                            metadata.cron_run_id.as_deref(),
+                            metadata.scheduled_for_ms,
+                            &metadata.continuation,
+                            control,
+                        )?;
+                        Some(control.source.as_str().to_string())
+                    } else {
+                        Some("continuation-fence".to_string())
+                    };
+                let reason = format!(
+                    "continuation child suppressed after lease and before execution by durable intent fence {}: {}",
+                    fence.fence_key, fence.reason
+                );
+                let receipt = RuntimeRunOnceReceipt {
+                    queue_id: Some(queue_id.clone()),
+                    status: RuntimeRunOnceStatus::Suppressed,
+                    runtime_class: metadata.runtime_class,
+                    origin: metadata.origin,
+                    cron_run_id: metadata.cron_run_id,
+                    scheduled_for_ms: metadata.scheduled_for_ms,
+                    execution_dir: None,
+                    transcript_file: None,
+                    outbox_file: None,
+                    continuation: metadata.continuation,
+                    child_queue_id: None,
+                    child_session_key: None,
+                    terminal_disposition: Some(
+                        crate::RuntimeTerminalDispositionV1::TerminalSuppression,
+                    ),
+                    continuation_link: None,
+                    protocol_failure: None,
+                    mutation_evidence: None,
+                    retry_schedule: None,
+                    task_drain_evaluation: None,
+                    external_effect: None,
+                    terminal_control_matched: Some(true),
+                    terminal_control_source,
+                    suppressed_run_once_reason: Some(
+                        "continuation-intent-fenced-after-lease".to_string(),
+                    ),
+                    prepared_execution_terminalization_reason: None,
+                    source_final_expectation: Some(SourceFinalExpectationV1::NotApplicable),
+                    source_closure_kind: None,
+                    source_closure_reason: None,
+                    final_outbox_disposition: Some(FinalOutboxDispositionV1::NotApplicable),
+                    canonical_source_queue_id: None,
+                    final_delivery_id: None,
+                    source_final_lane_digest: None,
+                    reason,
+                };
+                append_suppressed_runtime_progress(
+                    &options.harness_home,
+                    &prepare,
+                    None,
+                    &queue_id,
+                    &receipt.reason,
+                    &mut warnings,
+                )?;
+                return write_runtime_run_once_report(
+                    RuntimeRunOnceReport {
+                        schema: RUNTIME_RUN_ONCE_SCHEMA,
+                        harness_home: options.harness_home,
+                        report_file,
+                        receipts_file,
+                        receipt,
+                        prepare: Some(prepare),
+                        plan: None,
+                        run: None,
+                        outbox_file: None,
+                        outbound_message: None,
+                        warnings,
+                    },
+                    false,
+                );
+            }
+        }
     }
 
     let plan = plan_codex_runtime(CodexRuntimePlanOptions {
@@ -1673,9 +1781,10 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             .unwrap_or(0);
         let shell_recovery_budget_exhausted =
             eligible_shell_drift && source_shell_recovery_depth >= 1;
-        let mut activation = load_goal_autonomy_activation(
+        let mut activation = load_goal_autonomy_activation_for_exact_goal(
             &options.harness_home,
             goal_transition.lane_digest.as_deref(),
+            continuation_authorized,
         )?;
         if shell_recovery_effect_fenced && activation.mode == GoalAutonomyMode::Active {
             activation.reason =
@@ -7914,11 +8023,17 @@ mod tests {
     }
 
     #[test]
-    fn active_goal_completed_slice_is_transitioned_before_final_outbox() {
+    fn explicit_observe_goal_parks_after_transition_before_final_outbox() {
         let _guard = env_lock();
         let root = temp_root("active-goal-pre-outbox-transition");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            br#"{"goalAutonomy":{"mode":"observe"}}"#,
+        )
+        .unwrap();
         let skills = build_source_skill_index(&source).unwrap();
         let receive = receive_channel_message(ChannelReceiveOptions {
             source,
@@ -8286,7 +8401,7 @@ mod tests {
     }
 
     #[test]
-    fn active_goal_continuation_is_exactly_once_and_acknowledged_after_child_lease() {
+    fn exact_active_goal_without_policy_block_continues_across_restart_and_second_slice() {
         let _guard = env_lock();
         let root = temp_root("active-goal-exactly-once-continuation");
         let source = write_pipeline_source(&root);
@@ -8326,33 +8441,6 @@ mod tests {
             .find(|value| value.get("queueId").and_then(Value::as_str) == Some(&parent_queue_id))
             .unwrap();
         let session_key = pending.get("sessionKey").and_then(Value::as_str).unwrap();
-        let lane = crate::lane::FullLaneKeyV1::new(
-            pending.get("platform").and_then(Value::as_str).unwrap(),
-            pending
-                .get("accountId")
-                .and_then(Value::as_str)
-                .unwrap_or("default"),
-            pending.get("channelId").and_then(Value::as_str).unwrap(),
-            pending.get("userId").and_then(Value::as_str).unwrap(),
-            pending.get("agentId").and_then(Value::as_str).unwrap(),
-            pending.get("runtimeClass").and_then(Value::as_str).unwrap(),
-            root_working_session_key(session_key),
-            session_key,
-        )
-        .unwrap();
-        let lane_digest = lane.identity_hash().unwrap();
-        fs::create_dir_all(&harness_home).unwrap();
-        fs::write(
-            harness_home.join("harness-config.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "goalAutonomy": {
-                    "mode": "active",
-                    "activeLaneDigests": [lane_digest]
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
         let codex_home = root.join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
         fs::write(codex_home.join("auth.json"), "{}").unwrap();
@@ -8429,6 +8517,9 @@ mod tests {
             1,
             "replay and reconciliation must retain one logical child"
         );
+        let mut intent_ledger = fs::read_to_string(&intents_file).unwrap();
+        intent_ledger.push_str("{unrelated-malformed-intent-record}\n");
+        fs::write(&intents_file, intent_ledger).unwrap();
         let second = run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: harness_home.clone(),
             queue_id: Some(first_child.clone()),
@@ -8461,6 +8552,206 @@ mod tests {
             Some(1)
         );
         assert_eq!(second.receipt.continuation.continuation_index, Some(0));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn continuation_fenced_after_lease_is_released_and_suppressed_before_codex() {
+        let _guard = env_lock();
+        let root = temp_root("active-goal-fenced-after-lease");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: Some("acct-goal".to_string()),
+            channel_id: "dm-fence".to_string(),
+            user_id: "user-fence".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "continue until the lease boundary".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let parent_queue_id = receive.queue_id.unwrap();
+        let pending_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        let pending: Value = pending_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value.get("queueId").and_then(Value::as_str) == Some(&parent_queue_id))
+            .unwrap();
+        let session_key = pending.get("sessionKey").and_then(Value::as_str).unwrap();
+        let lane = crate::lane::FullLaneKeyV1::new(
+            pending.get("platform").and_then(Value::as_str).unwrap(),
+            pending.get("accountId").and_then(Value::as_str).unwrap(),
+            pending.get("channelId").and_then(Value::as_str).unwrap(),
+            pending.get("userId").and_then(Value::as_str).unwrap(),
+            pending.get("agentId").and_then(Value::as_str).unwrap(),
+            pending.get("runtimeClass").and_then(Value::as_str).unwrap(),
+            root_working_session_key(session_key),
+            session_key,
+        )
+        .unwrap();
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "goalAutonomy": {
+                    "mode": "active",
+                    "activeLaneDigests": [lane.identity_hash().unwrap()]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+        let first = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(parent_queue_id),
+            codex_executable: Some(fake_active_goal_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        let child_queue_id = first.receipt.child_queue_id.unwrap();
+        let continuation_intent_key = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value.get("queueId").and_then(Value::as_str) == Some(child_queue_id.as_str()))
+        .and_then(|value| {
+            value
+                .get("continuationIntentKey")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap();
+        let hook_home = harness_home.clone();
+        let hook_child_queue_id = child_queue_id.clone();
+        let report = run_runtime_queue_once_after_prepare(
+            RuntimeRunOnceOptions {
+                harness_home: harness_home.clone(),
+                queue_id: Some(child_queue_id.clone()),
+                codex_executable: Some(root.join("codex-must-not-run.exe")),
+                timeout_ms: 30_000,
+                idle_timeout_ms: 30_000,
+                prompt_options: PromptAssemblyOptions {
+                    harness_home: Some(harness_home.clone()),
+                    ..PromptAssemblyOptions::default()
+                },
+            },
+            move |prepare| {
+                assert_eq!(
+                    prepare.item.as_ref().map(|item| item.queue_id.as_str()),
+                    Some(hook_child_queue_id.as_str())
+                );
+                fs::write(
+                    hook_home.join("harness-config.json"),
+                    br#"{"goalAutonomy":{"mode":"active","activeLaneDigests":[]}}"#,
+                )?;
+                crate::goal_continuation::reconcile_goal_continuation_intents(
+                    &hook_home,
+                    current_log_time_ms()?,
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Suppressed);
+        assert!(
+            report.run.is_none(),
+            "Codex must not be planned or executed"
+        );
+        assert_eq!(
+            report.receipt.suppressed_run_once_reason.as_deref(),
+            Some("continuation-intent-fenced-after-lease")
+        );
+        assert_eq!(
+            report.receipt.terminal_control_source.as_deref(),
+            Some("quarantine")
+        );
+        let leases: Value = serde_json::from_str(
+            &fs::read_to_string(
+                harness_home
+                    .join("state")
+                    .join("runtime-queue")
+                    .join("classes")
+                    .join("interactive")
+                    .join("runtime-leases.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            leases
+                .get("leases")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .all(|(_, lease)| {
+                    lease.get("queueId").and_then(Value::as_str)
+                        != Some(report.receipt.queue_id.as_deref().unwrap())
+                }),
+            "suppression must release the child lease before returning"
+        );
+        let post = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: report.receipt.queue_id.clone(),
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            post.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert_eq!(post.receipt.terminal_control_matched, Some(true));
+        let latest = crate::goal_continuation::latest_goal_continuation_intent(
+            &harness_home,
+            &continuation_intent_key,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            latest.status,
+            crate::goal_continuation::GoalContinuationIntentStatus::Enqueued
+        );
+        assert!(
+            crate::goal_continuation::is_goal_continuation_intent_fenced(
+                &harness_home,
+                &continuation_intent_key
+            )
+            .unwrap()
+        );
         let _ = fs::remove_dir_all(root);
     }
 

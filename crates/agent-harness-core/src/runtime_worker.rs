@@ -776,6 +776,7 @@ pub fn prepare_runtime_queue_item(
         .map(|item| (item.queue_id.clone(), item))
         .collect::<HashMap<_, _>>();
     let prepared_receipts = prepared_execution_receipts_from_index(&queue_dir, &mut warnings)?;
+    let prepared_ids = prepared_receipts.keys().cloned().collect::<HashSet<_>>();
     let run_once_index = refresh_runtime_queue_state_index(&queue_dir, &mut warnings)?;
     let mut terminal_run_ids = terminal_run_once_ids_from_index(&run_once_index);
     terminal_run_ids.extend(pending_terminal_control_ids(
@@ -1257,6 +1258,7 @@ pub fn prepare_runtime_queue_item(
             if let Some(blocker) = same_session_fifo_blocker(
                 &pending_items,
                 pending,
+                &prepared_ids,
                 &terminal_run_ids,
                 &parked_run_ids,
                 &load_runtime_dispatch_config(&options.harness_home)?,
@@ -1413,6 +1415,7 @@ pub fn prepare_runtime_queue_item(
                     if let Some(blocker) = same_session_fifo_blocker(
                         &pending_items,
                         pending,
+                        &prepared_ids,
                         &terminal_run_ids,
                         &parked_run_ids,
                         &load_runtime_dispatch_config(&options.harness_home)?,
@@ -2073,6 +2076,7 @@ pub fn inspect_runtime_queue_capacity(
     let mut warnings = Vec::new();
     let now_ms = current_log_time_ms()?;
     let prepared_receipts = prepared_execution_receipts_from_index(&queue_dir, &mut warnings)?;
+    let prepared_ids = prepared_receipts.keys().cloned().collect::<HashSet<_>>();
     let run_once_index = refresh_runtime_queue_state_index(&queue_dir, &mut warnings)?;
     let terminal_run_ids = terminal_run_once_ids_from_index(&run_once_index);
     let terminal_queue_ids = terminal_run_ids.iter().cloned().collect::<BTreeSet<_>>();
@@ -2154,6 +2158,7 @@ pub fn inspect_runtime_queue_capacity(
             if let Some(blocker) = same_session_fifo_blocker(
                 &pending_items,
                 pending,
+                &prepared_ids,
                 &terminal_run_ids,
                 &parked_run_ids,
                 &config,
@@ -2185,7 +2190,6 @@ pub fn inspect_runtime_queue_capacity(
             lease_runtime_queue_item(&mut simulated, pending, &capacity_owner, now_ms);
         }
 
-        let prepared_ids = prepared_receipts.keys().cloned().collect::<HashSet<_>>();
         for pending in pending_items
             .iter()
             .filter(|pending| pending.runtime_class == runtime_class)
@@ -2210,6 +2214,7 @@ pub fn inspect_runtime_queue_capacity(
             if let Some(blocker) = same_session_fifo_blocker(
                 &pending_items,
                 pending,
+                &prepared_ids,
                 &terminal_run_ids,
                 &parked_run_ids,
                 &config,
@@ -6200,6 +6205,7 @@ fn lease_session_lane_key(
 fn same_session_fifo_blocker(
     pending_items: &[PendingQueueItem],
     item: &PendingQueueItem,
+    prepared_ids: &HashSet<String>,
     terminal_run_ids: &HashSet<String>,
     parked_run_ids: &HashSet<String>,
     config: &RuntimeDispatchConfig,
@@ -6209,11 +6215,38 @@ fn same_session_fifo_blocker(
         return None;
     }
     let lane_key = item_session_lane_key(item, class_config)?;
+    if is_autonomous_continuation_item(item)
+        && let Some(human) = pending_items
+            .iter()
+            .filter(|candidate| candidate.queue_id != item.queue_id)
+            .filter(|candidate| !terminal_run_ids.contains(&candidate.queue_id))
+            .filter(|candidate| !parked_run_ids.contains(&candidate.queue_id))
+            .filter(|candidate| is_ordinary_human_ingress_item(candidate))
+            .find(|candidate| {
+                config
+                    .classes
+                    .get(&candidate.runtime_class)
+                    .and_then(|candidate_config| item_session_lane_key(candidate, candidate_config))
+                    .as_deref()
+                    == Some(lane_key.as_str())
+            })
+    {
+        return Some(format!(
+            "human-input priority for `{lane_key}` waiting on ordinary queue item `{}`",
+            human.queue_id
+        ));
+    }
+    let human_input = is_ordinary_human_ingress_item(item);
     pending_items
         .iter()
         .filter(|candidate| candidate.queue_id != item.queue_id)
         .filter(|candidate| !terminal_run_ids.contains(&candidate.queue_id))
         .filter(|candidate| !parked_run_ids.contains(&candidate.queue_id))
+        .filter(|candidate| {
+            !human_input
+                || !is_autonomous_continuation_item(candidate)
+                || prepared_ids.contains(&candidate.queue_id)
+        })
         .filter(|candidate| {
             candidate.created_at_ms < item.created_at_ms
                 || (candidate.created_at_ms == item.created_at_ms
@@ -6233,6 +6266,20 @@ fn same_session_fifo_blocker(
                 candidate.queue_id
             )
         })
+}
+
+fn is_autonomous_continuation_item(item: &PendingQueueItem) -> bool {
+    item.continuation
+        .continuation_intent_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+}
+
+fn is_ordinary_human_ingress_item(item: &PendingQueueItem) -> bool {
+    item.runtime_class == "interactive"
+        && item.origin == "channel"
+        && item.cron_run_id.is_none()
+        && !is_autonomous_continuation_item(item)
 }
 
 fn retry_schedule_dispatch_blocker(
@@ -6391,6 +6438,7 @@ fn select_pending_item(
         if let Some(blocker) = same_session_fifo_blocker(
             &pending_items,
             item,
+            prepared_ids,
             terminal_run_ids,
             parked_run_ids,
             &config,
@@ -10479,6 +10527,122 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_human_input_outranks_unleased_autonomous_continuation_at_checkpoint() {
+        let root = temp_root(
+            "ordinary_human_input_outranks_unleased_autonomous_continuation_at_checkpoint",
+        );
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let session_key = "telegram:dm-42:user-7:main";
+
+        enqueue_fixture_turn_with_session(
+            &source,
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+            session_key,
+            "autonomous continuation",
+            1_000,
+        );
+        enqueue_fixture_turn_with_session(
+            &source,
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+            session_key,
+            "new human direction",
+            1_000,
+        );
+        mark_pending_message_as_autonomous_continuation(
+            &harness_home,
+            "autonomous continuation",
+            "goal-intent-a",
+        );
+
+        let selected = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            selected
+                .item
+                .as_ref()
+                .map(|item| item.message_text.as_str()),
+            Some("new human direction")
+        );
+        assert!(
+            selected
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("human-input priority") })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ordinary_human_input_does_not_bypass_an_active_continuation_lease() {
+        let root = temp_root("ordinary_human_input_does_not_bypass_an_active_continuation_lease");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let session_key = "telegram:dm-42:user-7:main";
+
+        enqueue_fixture_turn_with_session(
+            &source,
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+            session_key,
+            "leased autonomous continuation",
+            2_000,
+        );
+        mark_pending_message_as_autonomous_continuation(
+            &harness_home,
+            "leased autonomous continuation",
+            "goal-intent-b",
+        );
+        let leased = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            leased.item.as_ref().map(|item| item.message_text.as_str()),
+            Some("leased autonomous continuation")
+        );
+
+        enqueue_fixture_turn_with_session(
+            &source,
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+            session_key,
+            "human waits for safe checkpoint",
+            2_001,
+        );
+        let blocked = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert!(blocked.item.is_none());
+        assert!(blocked.warnings.iter().any(|warning| {
+            warning.contains("active runtime lease") || warning.contains("session-active")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn canonical_continuation_followup_cannot_bypass_active_limit_or_fifo() {
         let root = temp_root("canonical_continuation_followup_cannot_bypass_active_limit_or_fifo");
         let source = write_worker_source(&root);
@@ -13018,6 +13182,30 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    fn mark_pending_message_as_autonomous_continuation(
+        harness_home: &Path,
+        message_text: &str,
+        intent_key: &str,
+    ) {
+        let pending_file = queue_dir(harness_home).join("pending.jsonl");
+        let text = fs::read_to_string(&pending_file).unwrap();
+        let mut found = false;
+        let rows = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(line).unwrap();
+                if value.get("messageText").and_then(Value::as_str) == Some(message_text) {
+                    value["continuationIntentKey"] = Value::String(intent_key.to_string());
+                    found = true;
+                }
+                serde_json::to_string(&value).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(found, "pending fixture message was not found");
+        fs::write(&pending_file, format!("{}\n", rows.join("\n"))).unwrap();
     }
 
     fn append_worker_pending_runtime_item(
