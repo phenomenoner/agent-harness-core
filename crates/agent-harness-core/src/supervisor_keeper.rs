@@ -395,7 +395,7 @@ fn build_windows_reconcile_keeper_plan(
         (
             "uninstall",
             uninstall_script.clone(),
-            uninstall_script_body(&plan.plan_file),
+            uninstall_script_body(&plan.plan_file, options.live_deployment),
         ),
         (
             "rollback",
@@ -600,7 +600,7 @@ fn verify_materialized_keeper_bundle(
 }
 
 fn install_script_body(plan_file: &Path, live_deployment: bool) -> String {
-    let mut body = script_live_control_header(plan_file);
+    let mut body = script_control_header(plan_file, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
     body.push_str(task_scheduler_guard_function_body());
@@ -781,7 +781,7 @@ if (-not $KeeperFixtureMode) {
 }
 
 fn start_script_body(plan_file: &Path, live_deployment: bool) -> String {
-    let mut body = script_live_control_header(plan_file);
+    let mut body = script_control_header(plan_file, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
     body.push_str(task_scheduler_guard_function_body());
@@ -902,7 +902,7 @@ if (-not $StartReady) {
 }
 
 fn stop_script_body(plan_file: &Path, live_deployment: bool) -> String {
-    let mut body = script_live_control_header(plan_file);
+    let mut body = script_control_header(plan_file, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
     body.push_str(task_scheduler_guard_function_body());
@@ -1246,8 +1246,8 @@ if (-not $KeeperFixtureMode) {
     body
 }
 
-fn uninstall_script_body(plan_file: &Path) -> String {
-    let mut body = script_live_control_header(plan_file);
+fn uninstall_script_body(plan_file: &Path, live_deployment: bool) -> String {
+    let mut body = script_control_header(plan_file, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
     body.push_str(task_scheduler_guard_function_body());
@@ -1255,7 +1255,19 @@ fn uninstall_script_body(plan_file: &Path) -> String {
         r#"$KeeperFixtureMode = ($Plan.deploymentMode -eq 'developer-staging') -and (-not [string]::IsNullOrWhiteSpace($env:AGENT_HARNESS_KEEPER_TEST_TASK_OBSERVATION_FILE))
 Assert-KeeperLiveControlAuthorization -Action 'uninstall'
 $StopScript = ($Plan.scripts | Where-Object { $_.name -eq 'stop' }).path
-Invoke-KeeperScript -Path $StopScript -Arguments @('-LiveControlToken', $ResolvedLiveControlToken, '-TimeoutSeconds', [string]$TimeoutSeconds)
+"#,
+    );
+    if live_deployment {
+        body.push_str(
+            "Invoke-KeeperScript -Path $StopScript -Arguments @('-LiveControlToken', $ResolvedLiveControlToken, '-TimeoutSeconds', [string]$TimeoutSeconds)\n",
+        );
+    } else {
+        body.push_str(
+            "Invoke-KeeperScript -Path $StopScript -Arguments @('-TimeoutSeconds', [string]$TimeoutSeconds)\n",
+        );
+    }
+    body.push_str(
+        r#"
 $StopProofFile = Join-Path ([string]$Plan.outputDir) 'stop-proof-latest.json'
 if (-not (Test-Path -LiteralPath $StopProofFile -PathType Leaf)) {
   throw 'keeper uninstall refuses to unregister without a durable stop proof'
@@ -1643,13 +1655,29 @@ if ([string]::IsNullOrWhiteSpace([string]$ScriptManifestEntry.sha256) -or
     body
 }
 
-fn script_live_control_header(plan_file: &Path) -> String {
+fn script_control_header(plan_file: &Path, live_deployment: bool) -> String {
     let mut body = String::from(
         "param([string] $LiveControlToken, [ValidateRange(1, 300)][int] $TimeoutSeconds = 30)\n",
     );
     body.push_str(&script_plan_header(plan_file));
-    body.push_str(live_control_token_body());
+    if live_deployment {
+        body.push_str(live_control_token_body());
+    } else {
+        body.push_str(developer_staging_control_body());
+    }
     body
+}
+
+fn developer_staging_control_body() -> &'static str {
+    r#"$ResolvedLiveControlToken = $null
+function Assert-KeeperLiveControlAuthorization {
+  param([Parameter(Mandatory = $true)][ValidateSet('start', 'stop', 'uninstall', 'cutover')][string] $Action)
+  if ([string]$Plan.deploymentMode -ne 'developer-staging') {
+    throw 'developer-staging keeper control script refuses a non-staging plan'
+  }
+  return [pscustomobject]@{ status = 'developer-staging'; action = $Action }
+}
+"#
 }
 
 fn live_control_token_body() -> &'static str {
@@ -1697,9 +1725,15 @@ fn ops_control_invocation_body(
     action: &str,
     live_deployment: bool,
 ) -> String {
-    let native = format!(
-        "$Ops{variable_suffix}Output = & $Plan.executable.path 'ops-control' '{action}' '--harness-home' $Plan.harnessHome '--reason' 'windows reconcile keeper {action}' '--live-control-token' $ResolvedLiveControlToken 2>&1\n$Ops{variable_suffix}ExitCode = $LASTEXITCODE\n"
-    );
+    let native = if live_deployment {
+        format!(
+            "$Ops{variable_suffix}Output = & $Plan.executable.path 'ops-control' '{action}' '--harness-home' $Plan.harnessHome '--reason' 'windows reconcile keeper {action}' '--live-control-token' $ResolvedLiveControlToken 2>&1\n$Ops{variable_suffix}ExitCode = $LASTEXITCODE\n"
+        )
+    } else {
+        format!(
+            "$Ops{variable_suffix}Output = & $Plan.executable.path 'ops-control' '{action}' '--harness-home' $Plan.harnessHome '--reason' 'windows reconcile keeper {action}' 2>&1\n$Ops{variable_suffix}ExitCode = $LASTEXITCODE\n"
+        )
+    };
     if live_deployment {
         return format!("$KeeperFixtureMode = $false\n{native}");
     }
@@ -1729,7 +1763,7 @@ fn start_rollback_function_body(live_deployment: bool) -> String {
   }
   $RollbackStopExitCode = 0
 } else {
-  $RollbackStopOutput = & $Plan.executable.path 'ops-control' 'stop' '--harness-home' $Plan.harnessHome '--reason' 'windows reconcile keeper transactional start rollback' '--live-control-token' $ResolvedLiveControlToken 2>&1
+  $RollbackStopOutput = & $Plan.executable.path 'ops-control' 'stop' '--harness-home' $Plan.harnessHome '--reason' 'windows reconcile keeper transactional start rollback' 2>&1
   $RollbackStopExitCode = $LASTEXITCODE
 }
 "#.to_string()
@@ -3192,7 +3226,10 @@ mod tests {
             .find("Invoke-ExactKeeperTaskMutation -Mutation 'Start'")
             .unwrap();
         assert!(ops_start < enable && enable < scheduled_start);
-        assert!(start.contains("--live-control-token' $ResolvedLiveControlToken"));
+        assert!(
+            !start.contains("--live-control-token' $ResolvedLiveControlToken"),
+            "developer-staging control must not forward a live token"
+        );
 
         let ops_stop = stop.find("'ops-control' 'stop'").unwrap();
         let deadline = stop.find("$Deadline =").unwrap();
@@ -3216,16 +3253,33 @@ mod tests {
             assert!(script.contains("-ExecutionPolicy Bypass -File $Path @Arguments"));
         }
 
-        let authorize_uninstall = uninstall.find("'ops-cutover-status'").unwrap();
-        let reuse_stop = uninstall
+        let live_plan = write_windows_reconcile_keeper_plan(fixture.live_options()).unwrap();
+        for name in ["install", "start", "stop", "uninstall"] {
+            let live_script = fixture.script(&live_plan, name);
+            assert!(
+                live_script.contains("live-control token is required"),
+                "live {name} must retain the token gate"
+            );
+        }
+        assert!(
+            fixture
+                .script(&live_plan, "start")
+                .contains("--live-control-token' $ResolvedLiveControlToken")
+        );
+
+        let live_uninstall = fixture.script(&live_plan, "uninstall");
+        let authorize_uninstall = live_uninstall.find("'ops-cutover-status'").unwrap();
+        let reuse_stop = live_uninstall
             .find("Invoke-KeeperScript -Path $StopScript")
             .unwrap();
-        let unregister = uninstall
+        let unregister = live_uninstall
             .find("Invoke-ExactKeeperTaskMutation -Mutation 'Unregister' -AllowMissing")
             .unwrap();
         assert!(authorize_uninstall < reuse_stop && reuse_stop < unregister);
-        assert!(uninstall.contains("Assert-KeeperLiveControlAuthorization -Action 'uninstall'"));
-        assert!(uninstall.contains("stop-proof-latest.json"));
+        assert!(
+            live_uninstall.contains("Assert-KeeperLiveControlAuthorization -Action 'uninstall'")
+        );
+        assert!(live_uninstall.contains("stop-proof-latest.json"));
 
         fixture.remove();
     }
@@ -3416,42 +3470,64 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn install_rejects_missing_or_invalid_live_control_authorization_before_mutation() {
+    fn developer_control_scripts_reach_post_authorization_guards_without_live_token() {
         let _guard = KEEPER_SCRIPT_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let fixture = Fixture::new("install_auth");
+        let fixture = Fixture::new("developer_tokenless_control");
         let plan = write_windows_reconcile_keeper_plan(fixture.options()).unwrap();
-        let install = plan
-            .scripts
-            .iter()
-            .find(|script| script.name == "install")
-            .unwrap();
         let task_file = fixture.root.join("task.json");
-        let auth_file = fixture.root.join("auth.json");
+        let ops_file = fixture.root.join("ops.json");
         let effect_file = fixture.root.join("effect.json");
         fs::write(
             &task_file,
-            serde_json::to_vec(&missing_task_snapshot(&plan)).unwrap(),
+            serde_json::to_vec(&exact_task_snapshot(&plan, "Ready", true)).unwrap(),
         )
         .unwrap();
         fs::write(
-            &auth_file,
+            &ops_file,
             serde_json::to_vec(&serde_json::json!({
-                "schema": "agent-harness.ops-cutover-status.v1",
-                "harnessHome": plan.harness_home,
-                "status": "blocked",
-                "action": "cutover",
-                "liveControl": {"status": "invalid"}
+                "start": {
+                    "schema": "agent-harness.ops-control-receipt.v1",
+                    "action": "start",
+                    "status": "partial-start-ready",
+                    "stopFiles": []
+                },
+                "stop": {
+                    "schema": "agent-harness.ops-control-receipt.v1",
+                    "action": "stop",
+                    "status": "partial-stop-request",
+                    "stopFiles": []
+                }
             }))
             .unwrap(),
         )
         .unwrap();
         let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        let base = || {
-            let mut command = Command::new(&powershell);
-            command
+
+        for (script_name, post_authorization_guard) in [
+            (
+                "install",
+                "same-deployment keeper upgrade requires an exact persistent global hold",
+            ),
+            ("start", "Invoke-KeeperTransactionalStartRollback"),
+            (
+                "stop",
+                "ops-control stop did not produce exact stop-requested state",
+            ),
+            (
+                "uninstall",
+                "ops-control stop did not produce exact stop-requested state",
+            ),
+        ] {
+            fs::remove_file(&effect_file).ok();
+            let script = plan
+                .scripts
+                .iter()
+                .find(|script| script.name == script_name)
+                .unwrap();
+            let output = Command::new(&powershell)
                 .args([
                     "-NoLogo",
                     "-NoProfile",
@@ -3460,25 +3536,105 @@ mod tests {
                     "Bypass",
                     "-File",
                 ])
-                .arg(&install.path)
+                .arg(&script.path)
                 .env(
                     "AGENT_HARNESS_KEEPER_TEST_TASK_OBSERVATION_FILE",
                     &task_file,
                 )
+                .env("AGENT_HARNESS_KEEPER_TEST_OPS_RECEIPT_FILE", &ops_file)
                 .env("AGENT_HARNESS_KEEPER_TEST_EFFECT_FILE", &effect_file)
-                .env("AGENT_HARNESS_KEEPER_TEST_AUTH_RECEIPT_FILE", &auth_file);
-            command
-        };
-        let missing = base().output().unwrap();
-        assert!(!missing.status.success());
-        assert!(String::from_utf8_lossy(&missing.stderr).contains("token is required"));
-        let invalid = base()
-            .args(["-LiveControlToken", "garbage-token"])
-            .output()
-            .unwrap();
-        assert!(!invalid.status.success());
-        assert!(String::from_utf8_lossy(&invalid.stderr).contains("missing, invalid, stale"));
-        assert!(!effect_file.exists());
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{script_name} unexpectedly passed its deliberate post-authorization guard"
+            );
+            assert!(
+                stderr.contains(post_authorization_guard),
+                "{script_name} did not reach its post-authorization guard: {stderr}"
+            );
+            assert!(
+                !stderr.contains("live-control token is required"),
+                "{script_name} incorrectly required a live token in developer staging: {stderr}"
+            );
+            assert!(
+                !effect_file.exists(),
+                "{script_name} reached the scheduled-task mutation seam"
+            );
+        }
+
+        fixture.remove();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_control_scripts_require_action_bound_token_before_mutation() {
+        let _guard = KEEPER_SCRIPT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture = Fixture::new("live_control_auth");
+        let plan = write_windows_reconcile_keeper_plan(fixture.live_options()).unwrap();
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+
+        for (script_name, action, mutation) in [
+            ("install", "cutover", "Register-ScheduledTask"),
+            (
+                "start",
+                "start",
+                "Invoke-ExactKeeperTaskMutation -Mutation 'Enable'",
+            ),
+            (
+                "stop",
+                "stop",
+                "Invoke-ExactKeeperTaskMutation -Mutation 'Disable'",
+            ),
+            (
+                "uninstall",
+                "uninstall",
+                "Invoke-ExactKeeperTaskMutation -Mutation 'Unregister'",
+            ),
+        ] {
+            let script = plan
+                .scripts
+                .iter()
+                .find(|script| script.name == script_name)
+                .unwrap();
+            let output = Command::new(&powershell)
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ])
+                .arg(&script.path)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("token is required"),
+                "{script_name} did not fail closed on a missing live token"
+            );
+
+            let generated = fs::read_to_string(&script.path).unwrap();
+            let action_check = generated
+                .find("([string]$Authorization.action -eq $Action)")
+                .unwrap();
+            let action_call = generated
+                .find(&format!(
+                    "Assert-KeeperLiveControlAuthorization -Action '{action}'"
+                ))
+                .unwrap();
+            let mutation = generated.rfind(mutation).unwrap();
+            assert!(
+                action_check < action_call && action_call < mutation,
+                "{script_name} must validate the exact action before its first scheduler mutation"
+            );
+        }
+        assert!(!plan.stop_file.exists());
         fixture.remove();
     }
 
