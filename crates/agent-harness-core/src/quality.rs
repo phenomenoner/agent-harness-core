@@ -247,6 +247,11 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             statement: "Codex built-in web search is selected by explicit harness intent and exact-lane policy, never sandbox mode: ordinary turns request cached, authorized freshness requests live, and sensitive/offline/replay turns force disabled; the same-connection provider capability gates the effective mode, mode/provider/lane drift rolls over the thread, limitations are model-visible, and receipts hash queries while keeping unadmitted search content out of memory, skills, and dream artifacts",
             owner: "codex_web_search/codex_runtime/config/memory/skill_episode/skill_learning",
         },
+        InvariantEntry {
+            id: "I39",
+            statement: "OperationPlan mutations enforce stored open-item limits and dependency-graph acyclicity before any durable write; rejected over-limit or cyclic mutations leave item, event, receipt, item-version, and plan-version state unchanged",
+            owner: "operation_plan",
+        },
     ]
 }
 
@@ -1444,6 +1449,30 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             promotion_gate: "Run the sanitized continuity/effect fixture integrity test, focused identity/FIFO/progress/retry packs, and the real app-server deadline-drain replay twice with restart and compaction evidence before candidate promotion.",
         },
         ScenarioMatrixEntry {
+            id: "operation-plan-atomic-mutation",
+            title: "OperationPlan limits and dependency changes are atomic",
+            changed_areas: vec![
+                "OperationPlan item admission",
+                "dependency graph validation",
+                "optimistic versioning",
+                "durable plan receipts",
+            ],
+            required_invariants: vec!["I6", "I17", "I39"],
+            required_evidence: vec![
+                "adding an item beyond the stored maxOpenItems limit is rejected before any item, event, receipt, item-version, or plan-version write",
+                "changing dependencies to create a direct or transitive cycle is rejected atomically",
+                "valid dependency and status changes preserve optimistic item and plan version ordering",
+                "typed rejection remains terminal for the attempted mutation and does not duplicate downstream continuation work",
+            ],
+            runnable_tests: vec![
+                "operation_plan::tests::operation_plan_rejects_items_beyond_stored_open_item_limit",
+                "operation_plan::tests::operation_plan_rejects_dependency_cycle_atomically",
+                "operation_plan::tests::operation_plan_valid_and_invalid_item_transitions",
+                "runtime_pipeline::tests::deadline_drain_operation_plan_replay_creates_one_child_and_one_eventual_final",
+            ],
+            promotion_gate: "Promote only after the focused atomic-mutation tests and the joined plan-to-continuation replay pass with unchanged durable state on rejection and no retry-side duplication.",
+        },
+        ScenarioMatrixEntry {
             id: "external-effect-approval",
             title: "MCP elicitation authority and exactly-once external effects",
             changed_areas: vec![
@@ -2109,6 +2138,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
             "interactive receipt readers passed bounded-history, busy-lock, and isolated ledger-maintenance-owner scenario checks",
             "goal continuation restart changes passed malformed-ledger isolation, rollback-reader, concurrent exact-once, post-lease fence, and full runtime-queue replay checks",
+            "OperationPlan mutation changes passed stored open-item limits, dependency-cycle rejection, optimistic versioning, atomic no-write rejection, and joined continuation replay checks",
             "root-keeper availability changes passed shared-topology identity, fail-closed guarded stop/start, exact task/process ownership, deployment path confinement, foreign-task refusal, production process-boundary, scheduled-task compatibility, and real task restart lifecycle checks",
             "cron freshness changes passed config run-cap validation, cron-canon health/status warnings, deterministic catch-up, and stale-source sender suppression checks",
             "cron/backup incident hardening passed exact-source, timezone/calendar, per-entry timeout/attempt, pre-lease exhaustion, process-tree timeout, occurrence-idempotency, verified-retention, and zero-stale-catch-up checks",
@@ -2454,7 +2484,7 @@ mod tests {
             .map(|entry| entry.id)
             .collect::<std::collections::HashSet<_>>();
         for invariant in [
-            "I21", "I22", "I23", "I24", "I25", "I26", "I27", "I37", "I38",
+            "I21", "I22", "I23", "I24", "I25", "I26", "I27", "I37", "I38", "I39",
         ] {
             assert!(
                 invariant_ids.contains(invariant),
@@ -2565,6 +2595,19 @@ mod tests {
         assert!(root_keeper.runnable_tests.contains(
             &"windows_process_boundary::production_reconcile_spawn_child_survives_launcher_control_break"
         ));
+
+        let operation_plan = scenarios
+            .iter()
+            .find(|entry| entry.id == "operation-plan-atomic-mutation")
+            .expect("OperationPlan atomic mutation scenario");
+        assert!(operation_plan.required_invariants.contains(&"I39"));
+        assert!(operation_plan.runnable_tests.contains(
+            &"operation_plan::tests::operation_plan_rejects_items_beyond_stored_open_item_limit"
+        ));
+        assert!(operation_plan.runnable_tests.contains(
+            &"operation_plan::tests::operation_plan_rejects_dependency_cycle_atomically"
+        ));
+        assert!(release_checklist().required_items.contains(&"OperationPlan mutation changes passed stored open-item limits, dependency-cycle rejection, optimistic versioning, atomic no-write rejection, and joined continuation replay checks"));
 
         let progress = scenarios
             .iter()
