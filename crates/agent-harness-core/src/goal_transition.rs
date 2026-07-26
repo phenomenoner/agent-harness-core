@@ -18,6 +18,7 @@ pub enum GoalTransitionEventKind {
     ToolTimeout,
     CompactRollover,
     AuthDeferred,
+    AuthorityBoundary,
     ProcessRestart,
     OperatorStop,
     NewerSteer,
@@ -151,12 +152,43 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
         normalized_goal_status.as_str(),
         "active" | "running" | "inprogress"
     );
-    let campaign_authorized = input.authority == GoalTransitionAuthority::Ready
-        && matches!(
-            input.relation,
-            GoalTransitionRelation::CurrentGoalSlice
-                | GoalTransitionRelation::AuthorizedCampaignContinuation
-        );
+    let goal_status_is_complete = matches!(
+        normalized_goal_status.as_str(),
+        "completed" | "complete" | "succeeded" | "achieved"
+    );
+    let goal_status_is_paused = matches!(normalized_goal_status.as_str(), "paused" | "pause");
+    let goal_status_is_blocked = normalized_goal_status == "blocked";
+    let goal_status_is_stopped = matches!(
+        normalized_goal_status.as_str(),
+        "stopped" | "stop" | "canceled" | "cancelled"
+    );
+    let goal_status_needs_user = matches!(
+        normalized_goal_status.as_str(),
+        "needsuser" | "needsinput" | "needsapproval"
+    );
+    let goal_status_needs_authority = matches!(
+        normalized_goal_status.as_str(),
+        "needsauthority" | "needsauthorization" | "needsauthorisation"
+    );
+    let goal_status_needs_operator_auth = matches!(
+        normalized_goal_status.as_str(),
+        "needsoperatorauth" | "operatorauthrequired" | "authenticationrequired"
+    );
+    let goal_status_is_recognized = goal_status_is_active
+        || goal_status_is_complete
+        || goal_status_is_paused
+        || goal_status_is_blocked
+        || goal_status_is_stopped
+        || goal_status_needs_user
+        || goal_status_needs_authority
+        || goal_status_needs_operator_auth;
+    let campaign_relation = matches!(
+        input.relation,
+        GoalTransitionRelation::CurrentGoalSlice
+            | GoalTransitionRelation::AuthorizedCampaignContinuation
+    );
+    let campaign_authorized =
+        input.authority == GoalTransitionAuthority::Ready && campaign_relation;
     let active_goal = goal_status_is_active && campaign_authorized;
     let (decision, surface, schedule_continuation, terminal, reason) = if matches!(
         input.event,
@@ -192,12 +224,61 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             "backend auth is not ready; defer without a normal-channel credential or final surface"
                 .to_string(),
         )
-    } else if campaign_authorized
-        && matches!(
-            normalized_goal_status.as_str(),
-            "completed" | "complete" | "succeeded" | "achieved"
+    } else if input.event == GoalTransitionEventKind::AuthorityBoundary {
+        (
+            GoalTransitionDecision::NeedsAuthority,
+            GoalTransitionSurface::ProgressOnly,
+            false,
+            false,
+            "native Goal continuation crossed a turn boundary without exact current-turn authority"
+                .to_string(),
         )
+    } else if campaign_relation && input.authority != GoalTransitionAuthority::Ready {
+        (
+            GoalTransitionDecision::NeedsAuthority,
+            GoalTransitionSurface::ProgressOnly,
+            false,
+            false,
+            format!(
+                "goal-correlated work cannot transition because exact authority is {:?}",
+                input.authority
+            ),
+        )
+    } else if campaign_authorized && !goal_status_is_recognized {
+        (
+            GoalTransitionDecision::NeedsAuthority,
+            GoalTransitionSurface::ProgressOnly,
+            false,
+            false,
+            if input.goal_status.is_some() {
+                format!(
+                    "goal-correlated work has an unrecognized authoritative status `{}`",
+                    normalized_goal_status
+                )
+            } else {
+                "goal-correlated work has no authoritative goal status".to_string()
+            },
+        )
+    } else if input.goal_status.is_some()
+        && input.relation != GoalTransitionRelation::FreshUnrelatedTurn
+        && !campaign_authorized
     {
+        (
+            GoalTransitionDecision::NeedsAuthority,
+            GoalTransitionSurface::ProgressOnly,
+            false,
+            false,
+            "present goal state is not proven to belong to this exact campaign slice".to_string(),
+        )
+    } else if input.relation != GoalTransitionRelation::FreshUnrelatedTurn && !campaign_authorized {
+        (
+            GoalTransitionDecision::NeedsAuthority,
+            GoalTransitionSurface::ProgressOnly,
+            false,
+            false,
+            "non-fresh goal lineage has no authoritative current-slice status".to_string(),
+        )
+    } else if campaign_authorized && goal_status_is_complete {
         (
             GoalTransitionDecision::Complete,
             GoalTransitionSurface::CampaignFinal,
@@ -205,7 +286,7 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status is complete".to_string(),
         )
-    } else if campaign_authorized && matches!(normalized_goal_status.as_str(), "paused" | "pause") {
+    } else if campaign_authorized && goal_status_is_paused {
         (
             GoalTransitionDecision::Pause,
             GoalTransitionSurface::TerminalNotice,
@@ -213,12 +294,15 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status is paused".to_string(),
         )
-    } else if campaign_authorized
-        && matches!(
-            normalized_goal_status.as_str(),
-            "stopped" | "stop" | "canceled" | "cancelled"
+    } else if campaign_authorized && goal_status_is_blocked {
+        (
+            GoalTransitionDecision::Pause,
+            GoalTransitionSurface::TerminalNotice,
+            false,
+            true,
+            "authoritative goal status is blocked; park without claiming completion".to_string(),
         )
-    {
+    } else if campaign_authorized && goal_status_is_stopped {
         (
             GoalTransitionDecision::Stop,
             GoalTransitionSurface::TerminalNotice,
@@ -226,12 +310,7 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status is stopped".to_string(),
         )
-    } else if campaign_authorized
-        && matches!(
-            normalized_goal_status.as_str(),
-            "needsuser" | "needsinput" | "needsapproval"
-        )
-    {
+    } else if campaign_authorized && goal_status_needs_user {
         (
             GoalTransitionDecision::NeedsUser,
             GoalTransitionSurface::TerminalNotice,
@@ -239,12 +318,7 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status requires user input or authority".to_string(),
         )
-    } else if campaign_authorized
-        && matches!(
-            normalized_goal_status.as_str(),
-            "needsauthority" | "needsauthorization" | "needsauthorisation"
-        )
-    {
+    } else if campaign_authorized && goal_status_needs_authority {
         (
             GoalTransitionDecision::NeedsAuthority,
             GoalTransitionSurface::TerminalNotice,
@@ -252,12 +326,7 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status requires additional authority".to_string(),
         )
-    } else if campaign_authorized
-        && matches!(
-            normalized_goal_status.as_str(),
-            "needsoperatorauth" | "operatorauthrequired" | "authenticationrequired"
-        )
-    {
+    } else if campaign_authorized && goal_status_needs_operator_auth {
         (
             GoalTransitionDecision::NeedsOperatorAuth,
             GoalTransitionSurface::TerminalNotice,
@@ -265,7 +334,10 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
             true,
             "authoritative goal status requires operator authentication".to_string(),
         )
-    } else if goal_status_is_active && !campaign_authorized {
+    } else if goal_status_is_active
+        && input.relation != GoalTransitionRelation::FreshUnrelatedTurn
+        && !campaign_authorized
+    {
         (
             GoalTransitionDecision::NeedsAuthority,
             GoalTransitionSurface::ProgressOnly,
@@ -549,6 +621,112 @@ mod tests {
 
         assert_ne!(historical.surface, GoalTransitionSurface::CampaignFinal);
         assert!(!historical.allow_campaign_final);
+    }
+
+    #[test]
+    fn authoritative_blocked_goal_parks_without_claiming_completion_or_auto_wake() {
+        let blocked = evaluate_goal_transition(input(
+            GoalTransitionEventKind::NormalCompletion,
+            Some("blocked"),
+            false,
+        ));
+
+        assert_eq!(blocked.goal_status.as_deref(), Some("blocked"));
+        assert_eq!(blocked.decision, GoalTransitionDecision::Pause);
+        assert_ne!(blocked.decision, GoalTransitionDecision::Complete);
+        assert_eq!(blocked.surface, GoalTransitionSurface::TerminalNotice);
+        assert!(!blocked.schedule_continuation);
+        assert!(!blocked.allow_campaign_final);
+        assert!(blocked.terminal);
+        assert!(blocked.reason.contains("park without claiming completion"));
+    }
+
+    #[test]
+    fn goal_correlated_unknown_or_unauthorized_status_never_falls_through_to_ordinary_final() {
+        for (label, authority, status) in [
+            ("unknown", GoalTransitionAuthority::Ready, "unknown"),
+            (
+                "future-status",
+                GoalTransitionAuthority::Ready,
+                "awaiting-future-capability",
+            ),
+            (
+                "invalid-blocked",
+                GoalTransitionAuthority::Invalid,
+                "blocked",
+            ),
+            (
+                "missing-completed",
+                GoalTransitionAuthority::Missing,
+                "completed",
+            ),
+        ] {
+            let receipt = evaluate_goal_transition(GoalTransitionInput {
+                authority,
+                ..input(
+                    GoalTransitionEventKind::NormalCompletion,
+                    Some(status),
+                    false,
+                )
+            });
+            assert_eq!(
+                receipt.decision,
+                GoalTransitionDecision::NeedsAuthority,
+                "{label}"
+            );
+            assert_eq!(
+                receipt.surface,
+                GoalTransitionSurface::ProgressOnly,
+                "{label}"
+            );
+            assert!(!receipt.schedule_continuation, "{label}");
+            assert!(!receipt.allow_campaign_final, "{label}");
+            assert!(!receipt.terminal, "{label}");
+        }
+
+        for (label, relation, authority) in [
+            (
+                "historical-without-status",
+                GoalTransitionRelation::HistoricalState,
+                GoalTransitionAuthority::Missing,
+            ),
+            (
+                "unproven-without-status",
+                GoalTransitionRelation::Unproven,
+                GoalTransitionAuthority::Invalid,
+            ),
+        ] {
+            let receipt = evaluate_goal_transition(GoalTransitionInput {
+                authority,
+                relation,
+                ..input(GoalTransitionEventKind::NormalCompletion, None, false)
+            });
+            assert_eq!(
+                receipt.decision,
+                GoalTransitionDecision::NeedsAuthority,
+                "{label}"
+            );
+            assert_eq!(
+                receipt.surface,
+                GoalTransitionSurface::ProgressOnly,
+                "{label}"
+            );
+            assert!(!receipt.schedule_continuation, "{label}");
+            assert!(!receipt.allow_campaign_final, "{label}");
+            assert!(!receipt.terminal, "{label}");
+        }
+
+        let ordinary = evaluate_goal_transition(GoalTransitionInput {
+            authority: GoalTransitionAuthority::NotApplicable,
+            relation: GoalTransitionRelation::FreshUnrelatedTurn,
+            lineage_id: None,
+            campaign_family_id: None,
+            goal_checksum: None,
+            ..input(GoalTransitionEventKind::NormalCompletion, None, false)
+        });
+        assert_eq!(ordinary.decision, GoalTransitionDecision::Complete);
+        assert_eq!(ordinary.surface, GoalTransitionSurface::OrdinaryFinal);
+        assert!(ordinary.terminal);
     }
 
     fn input(

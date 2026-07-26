@@ -977,7 +977,7 @@ fn install_script_body(tasks: &[WindowsSupervisorTask], description: &str) -> St
     body.push_str(
         ")\n\
          foreach ($Task in $Tasks) {\n\
-           $Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (\"-NoProfile -ExecutionPolicy Bypass -File `\"{0}`\"\" -f $Task.Script)\n\
+           $Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (\"-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `\"{0}`\"\" -f $Task.Script)\n\
            $Trigger = New-ScheduledTaskTrigger -AtLogOn\n\
            $Settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries\n\
            Register-ScheduledTask -TaskName $Task.Name -Action $Action -Trigger $Trigger -Settings $Settings -Description $Task.Description -Force | Out-Null\n\
@@ -1653,6 +1653,7 @@ mod tests {
             .join("codex.exe");
         fs::create_dir_all(codex_exe.parent().unwrap()).unwrap();
         fs::write(&codex_exe, "").unwrap();
+        let expected_codex_exe = fs::canonicalize(&codex_exe).unwrap();
 
         let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
             harness_home: harness_home.clone(),
@@ -1700,7 +1701,7 @@ mod tests {
             let script = fs::read_to_string(output_dir.join("scripts").join(script_name)).unwrap();
             assert!(script.contains("--codex-exe"), "{script_name}: {script}");
             assert!(
-                script.contains(&codex_exe.display().to_string()),
+                script.contains(&expected_codex_exe.display().to_string()),
                 "{script_name}: {script}"
             );
         }

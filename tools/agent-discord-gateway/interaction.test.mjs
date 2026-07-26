@@ -1,14 +1,60 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
+  harnessChildProcessOptions,
   interactionAcknowledgementPayload,
   interactionToMessageText,
   normalizeDiscordComponentAction,
+  writeLoopHeartbeat,
 } from "./index.mjs";
 
 const PUBLIC_ACTION_ID = `ahpa1_${"a".repeat(32)}`;
 const PRIVATE_BEARER_PREFIX = ["ahx1", "_"].join("");
+
+test("harness child processes suppress Windows console windows", () => {
+  assert.deepEqual(harnessChildProcessOptions(), {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+});
+
+test("wrapped gateway does not overwrite the Rust owner's canonical heartbeat", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-discord-heartbeat-"));
+  try {
+    const heartbeatFile = path.join(
+      root,
+      "state",
+      "supervisor",
+      "loop-heartbeats",
+      "discord-gateway-loop.json",
+    );
+    assert.equal(
+      writeLoopHeartbeat(
+        { harnessHome: root, suppressLoopHeartbeat: true },
+        "connected",
+        "suppressed writer",
+      ),
+      false,
+    );
+    assert.equal(fs.existsSync(heartbeatFile), false);
+    assert.equal(
+      writeLoopHeartbeat(
+        { harnessHome: root, suppressLoopHeartbeat: false },
+        "connected",
+        "standalone writer",
+      ),
+      true,
+    );
+    assert.equal(JSON.parse(fs.readFileSync(heartbeatFile, "utf8")).processId, process.pid);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function componentInteraction(overrides = {}) {
   return {

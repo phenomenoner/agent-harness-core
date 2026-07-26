@@ -4,6 +4,8 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::thread;
+#[cfg(not(windows))]
+use std::time::SystemTime;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +23,10 @@ use crate::execution_mode::{
 };
 use crate::lane::FullLaneKeyV1;
 use crate::logging::{try_with_jsonl_append_lock, with_jsonl_append_lock};
-use crate::loop_health::process_alive_for_pid;
+use crate::loop_health::{
+    ExactProcessGenerationState, exact_process_generation_state, process_alive_for_pid,
+    process_start_time_ms_for_pid,
+};
 use crate::runtime_execution_receipt_index::prepared_execution_receipts_from_index;
 use crate::runtime_pending_index::{
     prune_terminal_queue_ids_from_pending_index, read_queued_pending_values_from_index,
@@ -53,6 +58,8 @@ const RUNTIME_QUEUE_LEASE_RECONCILIATION_SCHEMA: &str =
 const RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA: &str =
     "agent-harness.runtime-queue-lease-observation.v1";
 const RUNTIME_QUEUE_LEASE_RENEWAL_SCHEMA: &str = "agent-harness.runtime-queue-lease-renewal.v1";
+const RUNTIME_QUEUE_CHILD_CLEANUP_FENCE_SCHEMA: &str =
+    "agent-harness.runtime-queue-child-cleanup-fence.v1";
 const RUNTIME_QUEUE_STATE_INDEX_SCHEMA: &str = "agent-harness.runtime-queue-state-index.v1";
 const RUNTIME_QUEUE_STATE_INDEX_REVISION: u32 = 6;
 const RUNTIME_QUEUE_RECEIPT_COMPACTION_SCHEMA: &str =
@@ -211,6 +218,14 @@ pub struct RuntimeQueuePrepareReport {
     pub item: Option<RuntimeQueuePreparedItem>,
     pub receipt: RuntimeExecutionReceipt,
     pub warnings: Vec<String>,
+    #[serde(skip)]
+    lease_release_authority: Option<RuntimeQueueLeaseReleaseAuthority>,
+}
+
+impl RuntimeQueuePrepareReport {
+    pub(crate) fn lease_release_authority(&self) -> Option<RuntimeQueueLeaseReleaseAuthority> {
+        self.lease_release_authority.clone()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -272,6 +287,11 @@ pub struct RuntimeExecutionReceipt {
     pub channel_lane: Option<crate::ChannelStateLane>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_class: Option<String>,
+    /// SHA-256 identity of the exact lease acquisition that authorized this
+    /// prepared execution. Queue-backed runtimes must prove this digest still
+    /// matches before starting a model process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_lease_owner_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -413,6 +433,10 @@ pub(crate) struct RuntimeQueueStateIndexEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_disposition: Option<crate::RuntimeTerminalDispositionV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_source_closure_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_source_closure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     continuation_link: Option<crate::RuntimeContinuationLinkV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retry_schedule: Option<crate::RuntimeRetryScheduleV1>,
@@ -428,6 +452,7 @@ pub(crate) struct RuntimeQueueHotReceiptRecord {
     pub(crate) queue_id: String,
     pub(crate) status: String,
     pub(crate) reason: Option<String>,
+    pub(crate) terminal_control_source: Option<String>,
     pub(crate) runtime_class: Option<String>,
     pub(crate) origin: Option<String>,
     pub(crate) transcript_file: Option<PathBuf>,
@@ -562,7 +587,18 @@ struct RuntimeQueueLeaseOwnerEnvelope {
     pid: i64,
     #[serde(alias = "processStartTime")]
     process_start_time_ms: i64,
+    #[serde(default)]
+    process_start_time_os_proven: bool,
     acquired_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeQueueChildCleanupLeaseAuthority {
+    queue_id: String,
+    runtime_class: String,
+    canonical_lane_digest: String,
+    lease_owner_digest: String,
+    lease_acquired_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -578,6 +614,16 @@ pub(crate) struct RuntimeQueueLeaseGuard {
 }
 
 impl RuntimeQueueLeaseGuard {
+    pub(crate) fn child_cleanup_lease_authority(&self) -> RuntimeQueueChildCleanupLeaseAuthority {
+        RuntimeQueueChildCleanupLeaseAuthority {
+            queue_id: self.queue_id.clone(),
+            runtime_class: self.runtime_class.clone(),
+            canonical_lane_digest: self.canonical_lane_digest.clone(),
+            lease_owner_digest: runtime_queue_lease_owner_digest(&self.owner),
+            lease_acquired_at_ms: self.owner.acquired_at_ms,
+        }
+    }
+
     pub(crate) fn safety_margin_ms(&self) -> i64 {
         RUNTIME_LEASE_SAFETY_MARGIN_MS
     }
@@ -605,18 +651,60 @@ impl RuntimeQueueLeaseGuard {
         }
         let parked_run_ids = parked_run_once_ids_from_index(&index);
         for value in values {
-            let Ok(item) = parse_pending_item(&value) else {
-                continue;
-            };
+            let item = parse_pending_item(&value).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pending exact-lane work could not be proven because an indexed queue row is malformed",
+                )
+            })?;
             if item.queue_id == self.queue_id || parked_run_ids.contains(&item.queue_id) {
                 continue;
             }
-            let Some(class_config) = default_runtime_class_config_for_item(&item) else {
-                continue;
-            };
-            let Some(lane_key) = item_session_lane_key(&item, &class_config) else {
-                continue;
-            };
+            let class_config = default_runtime_class_config_for_item(&item).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "pending exact-lane work could not be proven because queue `{}` has no dispatch-class authority",
+                        item.queue_id
+                    ),
+                )
+            })?;
+            let (account_id, canonical_session_key) =
+                canonical_pending_lane_identity(&item).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "pending exact-lane work could not be proven because queue `{}` has an invalid canonical session identity: {error}",
+                            item.queue_id
+                        ),
+                    )
+                })?;
+            let lane_key = is_interactive_channel_main_lane(
+                &item.runtime_class,
+                &item.origin,
+                item.cron_run_id.as_deref(),
+                &class_config,
+            )
+            .then(|| {
+                runtime_session_lane_key(
+                    &item.runtime_class,
+                    &item.agent_id,
+                    &item.platform,
+                    Some(&account_id),
+                    &item.channel_id,
+                    &item.user_id,
+                    &canonical_session_key,
+                )
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "pending exact-lane work could not be proven because queue `{}` has no canonical session lane",
+                        item.queue_id
+                    ),
+                )
+            })?;
             let digest = format!("{:016x}", runtime_queue_bytes_digest(lane_key.as_bytes()));
             if digest == self.canonical_lane_digest {
                 return Ok(true);
@@ -746,6 +834,102 @@ impl Drop for RuntimeQueueLeaseLock {
     }
 }
 
+struct RuntimeQueuePrepareLeaseGuard {
+    harness_home: PathBuf,
+    queue_id: Option<String>,
+    authority: RuntimeQueueLeaseReleaseAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeQueueLeaseReleaseAuthority {
+    runtime_class: String,
+    owner: RuntimeQueueLeaseOwner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeQueueLeaseReleaseStatus {
+    Released,
+    AlreadyAbsent,
+    OwnershipLost,
+    Fenced,
+}
+
+impl RuntimeQueueLeaseReleaseAuthority {
+    fn new(runtime_class: &str, owner: &RuntimeQueueLeaseOwner) -> Self {
+        Self {
+            runtime_class: runtime_class.to_string(),
+            owner: owner.clone(),
+        }
+    }
+
+    fn owner_digest(&self) -> Option<String> {
+        let RuntimeQueueLeaseOwner::Envelope(owner) = &self.owner else {
+            return None;
+        };
+        Some(runtime_queue_lease_owner_digest(owner))
+    }
+}
+
+impl RuntimeQueuePrepareLeaseGuard {
+    fn new(
+        harness_home: &Path,
+        queue_id: &str,
+        authority: RuntimeQueueLeaseReleaseAuthority,
+    ) -> Self {
+        Self {
+            harness_home: harness_home.to_path_buf(),
+            queue_id: Some(queue_id.to_string()),
+            authority,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.queue_id = None;
+    }
+}
+
+impl Drop for RuntimeQueuePrepareLeaseGuard {
+    fn drop(&mut self) {
+        let Some(queue_id) = self.queue_id.clone() else {
+            return;
+        };
+        // The owning class is known at acquisition time. Retry only that
+        // metadata lock for one bounded two-second window instead of scanning
+        // every class (and multiplying the wait) while unwinding a prepare
+        // error.
+        if release_runtime_queue_lease_if_owned_with_retry(
+            &self.harness_home,
+            &queue_id,
+            &self.authority,
+            Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+        )
+        .is_ok()
+        {
+            self.queue_id = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn runtime_queue_prepare_failpoint_file(harness_home: &Path, name: &str) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("test-failpoints")
+        .join(name)
+}
+
+#[cfg(test)]
+fn fail_runtime_queue_prepare_at(harness_home: &Path, name: &str) -> io::Result<()> {
+    let marker = runtime_queue_prepare_failpoint_file(harness_home, name);
+    if marker.is_file() {
+        return Err(io::Error::other(format!(
+            "injected runtime queue prepare failure at `{name}`"
+        )));
+    }
+    Ok(())
+}
+
 pub fn prepare_runtime_queue_item(
     options: RuntimeQueuePrepareOptions,
 ) -> io::Result<RuntimeQueuePrepareReport> {
@@ -818,6 +1002,7 @@ pub fn prepare_runtime_queue_item(
                 status: RuntimeExecutionReceiptStatus::LeaseBusy,
                 channel_lane: None,
                 runtime_class: Some(lock_runtime_class.clone()),
+                runtime_lease_owner_digest: None,
                 origin: None,
                 cron_run_id: None,
                 scheduled_for_ms: None,
@@ -843,12 +1028,14 @@ pub fn prepare_runtime_queue_item(
                 item: None,
                 receipt,
                 warnings,
+                lease_release_authority: None,
             });
         }
     };
     let mut lease_state =
         read_runtime_queue_leases(&queue_dir, &lock_runtime_class, &mut warnings)?;
     purge_runtime_queue_leases(
+        &queue_dir,
         &mut lease_state,
         now_ms,
         &terminal_run_ids,
@@ -910,6 +1097,7 @@ pub fn prepare_runtime_queue_item(
                     item: None,
                     receipt,
                     warnings,
+                    lease_release_authority: None,
                 });
             }
             if let Some(prepared) = prepared_receipts.get(requested_queue_id) {
@@ -942,6 +1130,7 @@ pub fn prepare_runtime_queue_item(
                     item: None,
                     receipt,
                     warnings,
+                    lease_release_authority: None,
                 });
             }
         }
@@ -958,6 +1147,7 @@ pub fn prepare_runtime_queue_item(
             status: RuntimeExecutionReceiptStatus::NoPendingItem,
             channel_lane: None,
             runtime_class: pending.map(|item| item.runtime_class.clone()),
+            runtime_lease_owner_digest: None,
             origin: pending.map(|item| item.origin.clone()),
             cron_run_id: pending.and_then(|item| item.cron_run_id.clone()),
             scheduled_for_ms: pending.and_then(|item| item.scheduled_for_ms),
@@ -983,6 +1173,7 @@ pub fn prepare_runtime_queue_item(
             item: None,
             receipt,
             warnings,
+            lease_release_authority: None,
         });
     }
     if let Some(requested_queue_id) = options.queue_id.as_deref()
@@ -997,6 +1188,7 @@ pub fn prepare_runtime_queue_item(
             status: RuntimeExecutionReceiptStatus::NoPendingItem,
             channel_lane: None,
             runtime_class: pending.map(|item| item.runtime_class.clone()),
+            runtime_lease_owner_digest: None,
             origin: pending.map(|item| item.origin.clone()),
             cron_run_id: pending.and_then(|item| item.cron_run_id.clone()),
             scheduled_for_ms: pending.and_then(|item| item.scheduled_for_ms),
@@ -1023,6 +1215,7 @@ pub fn prepare_runtime_queue_item(
             item: None,
             receipt,
             warnings,
+            lease_release_authority: None,
         });
     }
     if let Some(requested_queue_id) = options.queue_id.as_deref()
@@ -1037,6 +1230,7 @@ pub fn prepare_runtime_queue_item(
             status: RuntimeExecutionReceiptStatus::NoPendingItem,
             channel_lane: None,
             runtime_class: pending.map(|item| item.runtime_class.clone()),
+            runtime_lease_owner_digest: None,
             origin: pending.map(|item| item.origin.clone()),
             cron_run_id: pending.and_then(|item| item.cron_run_id.clone()),
             scheduled_for_ms: pending.and_then(|item| item.scheduled_for_ms),
@@ -1062,6 +1256,7 @@ pub fn prepare_runtime_queue_item(
             item: None,
             receipt,
             warnings,
+            lease_release_authority: None,
         });
     }
     if let Some(requested_queue_id) = options.queue_id.as_deref()
@@ -1116,6 +1311,7 @@ pub fn prepare_runtime_queue_item(
                 item: None,
                 receipt,
                 warnings,
+                lease_release_authority: None,
             });
         }
         if lease_state.leases.contains_key(requested_queue_id) {
@@ -1124,6 +1320,7 @@ pub fn prepare_runtime_queue_item(
                 status: RuntimeExecutionReceiptStatus::NoPendingItem,
                 channel_lane: None,
                 runtime_class: prepared.runtime_class.clone(),
+                runtime_lease_owner_digest: None,
                 origin: prepared.origin.clone(),
                 cron_run_id: prepared.cron_run_id.clone(),
                 scheduled_for_ms: prepared.scheduled_for_ms,
@@ -1148,6 +1345,7 @@ pub fn prepare_runtime_queue_item(
                 item: None,
                 receipt,
                 warnings,
+                lease_release_authority: None,
             });
         }
         let mut acquired_prepared_lease = None;
@@ -1160,6 +1358,7 @@ pub fn prepare_runtime_queue_item(
                     status: RuntimeExecutionReceiptStatus::NoPendingItem,
                     channel_lane: None,
                     runtime_class: Some(pending.runtime_class.clone()),
+                    runtime_lease_owner_digest: None,
                     origin: Some(pending.origin.clone()),
                     cron_run_id: pending.cron_run_id.clone(),
                     scheduled_for_ms: pending.scheduled_for_ms,
@@ -1184,6 +1383,7 @@ pub fn prepare_runtime_queue_item(
                     item: None,
                     receipt,
                     warnings,
+                    lease_release_authority: None,
                 });
             }
             if let Some(blocker) =
@@ -1195,6 +1395,7 @@ pub fn prepare_runtime_queue_item(
                     status: RuntimeExecutionReceiptStatus::NoPendingItem,
                     channel_lane: None,
                     runtime_class: Some(pending.runtime_class.clone()),
+                    runtime_lease_owner_digest: None,
                     origin: Some(pending.origin.clone()),
                     cron_run_id: pending.cron_run_id.clone(),
                     scheduled_for_ms: pending.scheduled_for_ms,
@@ -1219,6 +1420,7 @@ pub fn prepare_runtime_queue_item(
                     item: None,
                     receipt,
                     warnings,
+                    lease_release_authority: None,
                 });
             }
             if let Some(blocker) =
@@ -1229,6 +1431,7 @@ pub fn prepare_runtime_queue_item(
                     status: RuntimeExecutionReceiptStatus::NoPendingItem,
                     channel_lane: None,
                     runtime_class: Some(pending.runtime_class.clone()),
+                    runtime_lease_owner_digest: None,
                     origin: Some(pending.origin.clone()),
                     cron_run_id: pending.cron_run_id.clone(),
                     scheduled_for_ms: pending.scheduled_for_ms,
@@ -1253,6 +1456,7 @@ pub fn prepare_runtime_queue_item(
                     item: None,
                     receipt,
                     warnings,
+                    lease_release_authority: None,
                 });
             }
             if let Some(blocker) = same_session_fifo_blocker(
@@ -1268,6 +1472,7 @@ pub fn prepare_runtime_queue_item(
                     status: RuntimeExecutionReceiptStatus::NoPendingItem,
                     channel_lane: None,
                     runtime_class: Some(pending.runtime_class.clone()),
+                    runtime_lease_owner_digest: None,
                     origin: Some(pending.origin.clone()),
                     cron_run_id: pending.cron_run_id.clone(),
                     scheduled_for_ms: pending.scheduled_for_ms,
@@ -1292,24 +1497,49 @@ pub fn prepare_runtime_queue_item(
                     item: None,
                     receipt,
                     warnings,
+                    lease_release_authority: None,
                 });
             }
             lease_runtime_queue_item(&mut lease_state, pending, &lease_owner, now_ms);
             acquired_prepared_lease = Some(pending.clone());
         }
         write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+        let requested_resume_authority = acquired_prepared_lease.as_ref().map(|pending| {
+            RuntimeQueueLeaseReleaseAuthority::new(&pending.runtime_class, &lease_owner)
+        });
+        let mut requested_resume_lease_guard = acquired_prepared_lease
+            .as_ref()
+            .zip(requested_resume_authority.as_ref())
+            .map(|(pending, authority)| {
+                RuntimeQueuePrepareLeaseGuard::new(
+                    &options.harness_home,
+                    &pending.queue_id,
+                    authority.clone(),
+                )
+            });
+        // A durable exact-lane lease now owns exclusion. Do not retain the
+        // runtime-class metadata lock across resume bookkeeping, receipts, or
+        // logs.
+        drop(_lease_lock);
         if let Some(pending) = acquired_prepared_lease.as_ref() {
-            if let Err(error) =
-                consume_coordinator_resume_after_lease(&options.harness_home, pending, now_ms)
-            {
-                lease_state.leases.remove(&pending.queue_id);
-                write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
-                return Err(error);
-            }
+            let requested_resume_authority =
+                requested_resume_authority.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "requested prepared resume acquired a lease without retaining its exact authority",
+                    )
+                })?;
+            consume_coordinator_resume_after_lease(&options.harness_home, pending, now_ms)?;
+            #[cfg(test)]
+            fail_runtime_queue_prepare_at(
+                &options.harness_home,
+                "requested-prepared-resume-after-lease",
+            )?;
             append_json_line(
                 &execution_receipts_file,
                 &lease_acquired_receipt(
                     pending,
+                    requested_resume_authority,
                     "runtime queue lease acquired for requested prepared item resume",
                 ),
             )?;
@@ -1317,8 +1547,11 @@ pub fn prepare_runtime_queue_item(
         let receipt = RuntimeExecutionReceipt {
             queue_id: Some(requested_queue_id.to_string()),
             status: RuntimeExecutionReceiptStatus::AlreadyPrepared,
-            channel_lane: None,
+            channel_lane: prepared.channel_lane.clone(),
             runtime_class: prepared.runtime_class.clone(),
+            runtime_lease_owner_digest: requested_resume_authority
+                .as_ref()
+                .and_then(RuntimeQueueLeaseReleaseAuthority::owner_digest),
             origin: prepared.origin.clone(),
             cron_run_id: prepared.cron_run_id.clone(),
             scheduled_for_ms: prepared.scheduled_for_ms,
@@ -1333,6 +1566,9 @@ pub fn prepare_runtime_queue_item(
             suppressed_run_once_reason: None,
             reason: "requested runtime queue item was already prepared".to_string(),
         };
+        if let Some(execution_dir) = receipt.execution_dir.as_ref() {
+            write_json_atomic(&execution_dir.join("execution-receipt.json"), &receipt)?;
+        }
         append_json_line(&execution_receipts_file, &receipt)?;
         append_harness_log(
             &options.harness_home,
@@ -1346,6 +1582,9 @@ pub fn prepare_runtime_queue_item(
             .queue_id(receipt.queue_id.clone())
             .path(receipt.execution_dir.clone()),
         )?;
+        if let Some(guard) = requested_resume_lease_guard.as_mut() {
+            guard.disarm();
+        }
         return Ok(RuntimeQueuePrepareReport {
             schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
             harness_home: options.harness_home,
@@ -1354,6 +1593,7 @@ pub fn prepare_runtime_queue_item(
             item: None,
             receipt,
             warnings,
+            lease_release_authority: requested_resume_authority,
         });
     }
     if options.queue_id.is_none() {
@@ -1427,27 +1667,39 @@ pub fn prepare_runtime_queue_item(
                     }
                     lease_runtime_queue_item(&mut lease_state, pending, &lease_owner, now_ms);
                     write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
-                    if let Err(error) = consume_coordinator_resume_after_lease(
+                    let automatic_resume_authority = RuntimeQueueLeaseReleaseAuthority::new(
+                        &pending.runtime_class,
+                        &lease_owner,
+                    );
+                    let mut automatic_resume_lease_guard = RuntimeQueuePrepareLeaseGuard::new(
                         &options.harness_home,
-                        pending,
-                        now_ms,
-                    ) {
-                        lease_state.leases.remove(&pending.queue_id);
-                        write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
-                        return Err(error);
-                    }
+                        &pending.queue_id,
+                        automatic_resume_authority.clone(),
+                    );
+                    // This branch always returns or propagates an error after
+                    // acquisition, so the class lock can be released before
+                    // any fallible resume work.
+                    drop(_lease_lock);
+                    consume_coordinator_resume_after_lease(&options.harness_home, pending, now_ms)?;
+                    #[cfg(test)]
+                    fail_runtime_queue_prepare_at(
+                        &options.harness_home,
+                        "automatic-prepared-resume-after-lease",
+                    )?;
                     append_json_line(
                         &execution_receipts_file,
                         &lease_acquired_receipt(
                             pending,
+                            &automatic_resume_authority,
                             "runtime queue lease acquired for prepared item resume",
                         ),
                     )?;
                     let receipt = RuntimeExecutionReceipt {
                     queue_id: Some(queue_id.clone()),
                     status: RuntimeExecutionReceiptStatus::AlreadyPrepared,
-                    channel_lane: None,
+                    channel_lane: prepared.channel_lane.clone(),
                     runtime_class: prepared.runtime_class.clone(),
+                    runtime_lease_owner_digest: automatic_resume_authority.owner_digest(),
                     origin: prepared.origin.clone(),
                     cron_run_id: prepared.cron_run_id.clone(),
                     scheduled_for_ms: prepared.scheduled_for_ms,
@@ -1464,6 +1716,9 @@ pub fn prepare_runtime_queue_item(
                         "resuming previously prepared runtime queue item without terminal run receipt"
                             .to_string(),
                 };
+                    if let Some(execution_dir) = receipt.execution_dir.as_ref() {
+                        write_json_atomic(&execution_dir.join("execution-receipt.json"), &receipt)?;
+                    }
                     append_json_line(&execution_receipts_file, &receipt)?;
                     append_harness_log(
                         &options.harness_home,
@@ -1477,6 +1732,7 @@ pub fn prepare_runtime_queue_item(
                         .queue_id(receipt.queue_id.clone())
                         .path(receipt.execution_dir.clone()),
                     )?;
+                    automatic_resume_lease_guard.disarm();
                     return Ok(RuntimeQueuePrepareReport {
                         schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
                         harness_home: options.harness_home,
@@ -1485,6 +1741,7 @@ pub fn prepare_runtime_queue_item(
                         item: None,
                         receipt,
                         warnings,
+                        lease_release_authority: Some(automatic_resume_authority),
                     });
                 }
             } else {
@@ -1553,6 +1810,7 @@ pub fn prepare_runtime_queue_item(
                         item: None,
                         receipt,
                         warnings,
+                        lease_release_authority: None,
                     });
                 }
             }
@@ -1562,6 +1820,7 @@ pub fn prepare_runtime_queue_item(
             status: RuntimeExecutionReceiptStatus::NoPendingItem,
             channel_lane: None,
             runtime_class: None,
+            runtime_lease_owner_digest: None,
             origin: None,
             cron_run_id: None,
             scheduled_for_ms: None,
@@ -1596,6 +1855,7 @@ pub fn prepare_runtime_queue_item(
             item: None,
             receipt,
             warnings,
+            lease_release_authority: None,
         });
     };
     if let Err(reason) = revalidate_pending_reasoning_snapshot(&options.harness_home, &pending) {
@@ -1647,6 +1907,7 @@ pub fn prepare_runtime_queue_item(
             item: None,
             receipt,
             warnings,
+            lease_release_authority: None,
         });
     }
     let pending = maybe_apply_context_rollover_before_turn(
@@ -1658,17 +1919,22 @@ pub fn prepare_runtime_queue_item(
     )?;
     lease_runtime_queue_item(&mut lease_state, &pending, &lease_owner, now_ms);
     write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
-    if let Err(error) =
-        consume_coordinator_resume_after_lease(&options.harness_home, &pending, now_ms)
-    {
-        lease_state.leases.remove(&pending.queue_id);
-        write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
-        return Err(error);
-    }
+    let prepare_release_authority =
+        RuntimeQueueLeaseReleaseAuthority::new(&pending.runtime_class, &lease_owner);
+    let mut prepare_lease_guard = RuntimeQueuePrepareLeaseGuard::new(
+        &options.harness_home,
+        &pending.queue_id,
+        prepare_release_authority.clone(),
+    );
+    // The durable exact-lane lease now owns exclusion and capacity. Arm its
+    // unwind guard before every fallible post-persistence operation.
+    drop(_lease_lock);
+    consume_coordinator_resume_after_lease(&options.harness_home, &pending, now_ms)?;
     append_json_line(
         &execution_receipts_file,
         &lease_acquired_receipt(
             &pending,
+            &prepare_release_authority,
             "runtime queue lease acquired before prompt bundle preparation",
         ),
     )?;
@@ -1895,6 +2161,7 @@ pub fn prepare_runtime_queue_item(
         status: RuntimeExecutionReceiptStatus::Prepared,
         channel_lane,
         runtime_class: Some(receipt_runtime_class),
+        runtime_lease_owner_digest: prepare_release_authority.owner_digest(),
         origin: Some(receipt_origin),
         cron_run_id: receipt_cron_run_id,
         scheduled_for_ms: receipt_scheduled_for_ms,
@@ -1926,6 +2193,7 @@ pub fn prepare_runtime_queue_item(
         .path(Some(item.execution_dir.clone())),
     )?;
 
+    prepare_lease_guard.disarm();
     Ok(RuntimeQueuePrepareReport {
         schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
         harness_home: options.harness_home,
@@ -1934,6 +2202,7 @@ pub fn prepare_runtime_queue_item(
         item: Some(item),
         receipt,
         warnings,
+        lease_release_authority: Some(prepare_release_authority),
     })
 }
 
@@ -2125,6 +2394,7 @@ pub fn inspect_runtime_queue_capacity(
         };
         let mut lease_state = read_runtime_queue_leases(&queue_dir, &runtime_class, &mut warnings)?;
         purge_runtime_queue_leases(
+            &queue_dir,
             &mut lease_state,
             now_ms,
             &terminal_run_ids,
@@ -2570,6 +2840,685 @@ fn runtime_queue_lease_lock_file(queue_dir: &Path, runtime_class: &str) -> PathB
     runtime_class_state_dir(queue_dir, runtime_class).join("runtime-leases.lock")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeQueueChildCleanupFenceV1 {
+    schema: String,
+    phase: String,
+    queue_id: String,
+    runtime_class: String,
+    canonical_lane_digest: String,
+    lease_owner_digest: String,
+    lease_acquired_at_ms: i64,
+    child_process_id: Option<u32>,
+    child_process_start_time_ms: Option<i64>,
+    job_containment_assigned: bool,
+    reason: String,
+    fenced_at_ms: i64,
+    #[serde(default)]
+    cleanup_proven_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeQueueChildCleanupFenceAuthority {
+    record: RuntimeQueueChildCleanupFenceV1,
+}
+
+#[derive(Debug)]
+struct RuntimeQueueChildCleanupAuthoritySuperseded;
+
+impl std::fmt::Display for RuntimeQueueChildCleanupAuthoritySuperseded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stale child-cleanup authority cannot mutate a successor generation")
+    }
+}
+
+impl std::error::Error for RuntimeQueueChildCleanupAuthoritySuperseded {}
+
+fn runtime_queue_child_cleanup_authority_superseded_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        RuntimeQueueChildCleanupAuthoritySuperseded,
+    )
+}
+
+pub(crate) fn runtime_queue_child_cleanup_authority_is_superseded(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<RuntimeQueueChildCleanupAuthoritySuperseded>())
+}
+
+impl RuntimeQueueChildCleanupFenceAuthority {
+    pub(crate) fn monotonic_cleanup_proof_time(&self, candidate_ms: i64) -> i64 {
+        candidate_ms.max(self.record.fenced_at_ms)
+    }
+}
+
+fn runtime_queue_child_cleanup_fence_file_from_queue_dir(
+    queue_dir: &Path,
+    canonical_lane_digest: &str,
+) -> PathBuf {
+    queue_dir
+        .join("child-cleanup-fences")
+        .join(format!("{canonical_lane_digest}.json"))
+}
+
+pub(crate) fn runtime_queue_child_cleanup_fence_file(
+    harness_home: &Path,
+    canonical_lane_digest: &str,
+) -> PathBuf {
+    runtime_queue_child_cleanup_fence_file_from_queue_dir(
+        &harness_home.join("state").join("runtime-queue"),
+        canonical_lane_digest,
+    )
+}
+
+fn runtime_queue_child_cleanup_is_fenced_for_lane_digest(
+    queue_dir: &Path,
+    canonical_lane_digest: &str,
+) -> bool {
+    runtime_queue_child_cleanup_fence_file_from_queue_dir(queue_dir, canonical_lane_digest)
+        .is_file()
+}
+
+fn runtime_queue_child_cleanup_is_fenced_for_lease(
+    queue_dir: &Path,
+    lease: &RuntimeQueueLease,
+) -> bool {
+    runtime_queue_lease_canonical_lane_digest(lease).is_some_and(|digest| {
+        runtime_queue_child_cleanup_is_fenced_for_lane_digest(queue_dir, &digest)
+    })
+}
+
+pub(crate) fn prearm_runtime_queue_child_cleanup_fence(
+    harness_home: &Path,
+    lease_authority: &RuntimeQueueChildCleanupLeaseAuthority,
+    fenced_at_ms: i64,
+) -> io::Result<RuntimeQueueChildCleanupFenceAuthority> {
+    if lease_authority.queue_id.trim().is_empty()
+        || lease_authority.runtime_class.trim().is_empty()
+        || lease_authority.canonical_lane_digest.len() != 16
+        || !lease_authority
+            .canonical_lane_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || lease_authority.lease_owner_digest.len() != 64
+        || !lease_authority
+            .lease_owner_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || lease_authority.lease_acquired_at_ms < 0
+        || fenced_at_ms < 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "child-cleanup fence requires exact queue, class, lane, and lease-acquisition authority",
+        ));
+    }
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
+        &queue_dir,
+        &lease_authority.runtime_class,
+        Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+    )?
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "runtime queue lease lock stayed busy for class `{}` while persisting child-cleanup authority",
+                lease_authority.runtime_class
+            ),
+        ));
+    };
+    let state = read_runtime_queue_leases_strict(&queue_dir, &lease_authority.runtime_class)?;
+    let lease = state.leases.get(&lease_authority.queue_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "child-cleanup fence lease disappeared before child execution",
+        )
+    })?;
+    let lease_owner_matches = matches!(
+        &lease.owner,
+        RuntimeQueueLeaseOwner::Envelope(owner)
+            if owner.acquired_at_ms == lease_authority.lease_acquired_at_ms
+                && runtime_queue_lease_owner_digest(owner)
+                    .eq_ignore_ascii_case(&lease_authority.lease_owner_digest)
+    );
+    if lease.runtime_class != lease_authority.runtime_class
+        || runtime_queue_lease_canonical_lane_digest(lease).as_deref()
+            != Some(lease_authority.canonical_lane_digest.as_str())
+        || !lease_owner_matches
+        || lease.lease_expires_at_ms <= fenced_at_ms
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "child-cleanup fence authority no longer matches a live exact acquired runtime lease",
+        ));
+    }
+    let fence = RuntimeQueueChildCleanupFenceV1 {
+        schema: RUNTIME_QUEUE_CHILD_CLEANUP_FENCE_SCHEMA.to_string(),
+        phase: "spawn-in-progress".to_string(),
+        queue_id: lease_authority.queue_id.clone(),
+        runtime_class: lease_authority.runtime_class.clone(),
+        canonical_lane_digest: lease_authority.canonical_lane_digest.clone(),
+        lease_owner_digest: lease_authority.lease_owner_digest.clone(),
+        lease_acquired_at_ms: lease_authority.lease_acquired_at_ms,
+        child_process_id: None,
+        child_process_start_time_ms: None,
+        job_containment_assigned: false,
+        reason: "Codex app-server spawn is fenced before process creation".to_string(),
+        fenced_at_ms,
+        cleanup_proven_at_ms: None,
+    };
+    let path = runtime_queue_child_cleanup_fence_file(
+        harness_home,
+        &lease_authority.canonical_lane_digest,
+    );
+    if path.is_file() {
+        let existing: RuntimeQueueChildCleanupFenceV1 =
+            serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "existing child-cleanup fence at {} is unreadable and cannot be replaced: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+        if existing == fence {
+            return Ok(RuntimeQueueChildCleanupFenceAuthority { record: existing });
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "exact runtime lane `{}` is already protected by a different child-cleanup authority",
+                lease_authority.canonical_lane_digest
+            ),
+        ));
+    }
+    #[cfg(test)]
+    if queue_dir
+        .join("test-failpoints")
+        .join("codex-child-cleanup-fence-persist")
+        .is_file()
+    {
+        return Err(io::Error::other(
+            "injected child-cleanup fence persistence failure",
+        ));
+    }
+    if let Err(error) = write_json_atomic(&path, &fence) {
+        let committed = fs::read(&path)
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<RuntimeQueueChildCleanupFenceV1>(&bytes).ok()
+            })
+            .is_some_and(|current| current == fence);
+        if !committed {
+            return Err(error);
+        }
+    }
+    Ok(RuntimeQueueChildCleanupFenceAuthority { record: fence })
+}
+
+pub(crate) fn bind_runtime_queue_child_cleanup_fence(
+    harness_home: &Path,
+    authority: &RuntimeQueueChildCleanupFenceAuthority,
+    child_process_id: u32,
+    child_process_start_time_ms: Option<i64>,
+    job_containment_assigned: bool,
+) -> io::Result<RuntimeQueueChildCleanupFenceAuthority> {
+    let child_start_is_exact = child_process_start_time_ms.is_some_and(|value| value >= 0);
+    if authority.record.phase != "spawn-in-progress"
+        || authority.record.child_process_id.is_some()
+        || child_process_id == 0
+        || !child_start_is_exact
+        || !job_containment_assigned
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "child-cleanup fence binding requires exact unbound spawn authority, PID/start generation, and assigned Job containment",
+        ));
+    }
+    let mut bound = authority.record.clone();
+    bound.phase = "child-bound".to_string();
+    bound.child_process_id = Some(child_process_id);
+    bound.child_process_start_time_ms = child_process_start_time_ms;
+    bound.job_containment_assigned = job_containment_assigned;
+    bound.reason =
+        "Codex app-server child tree is executing under exact lease authority".to_string();
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
+        &queue_dir,
+        &authority.record.runtime_class,
+        Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+    )?
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "runtime queue lease lock stayed busy for class `{}` while binding child-cleanup authority",
+                authority.record.runtime_class
+            ),
+        ));
+    };
+    let path = runtime_queue_child_cleanup_fence_file(
+        harness_home,
+        &authority.record.canonical_lane_digest,
+    );
+    let current: RuntimeQueueChildCleanupFenceV1 =
+        serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "prearmed child-cleanup fence at {} is unreadable and remains fail-closed: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+    if current == bound {
+        return Ok(RuntimeQueueChildCleanupFenceAuthority { record: current });
+    }
+    if current != authority.record {
+        return Err(runtime_queue_child_cleanup_authority_superseded_error());
+    }
+    #[cfg(test)]
+    if queue_dir
+        .join("test-failpoints")
+        .join("codex-child-cleanup-fence-bind")
+        .is_file()
+    {
+        return Err(io::Error::other(
+            "injected child-cleanup fence binding failure",
+        ));
+    }
+    if let Err(error) = write_json_atomic(&path, &bound) {
+        let committed = fs::read(&path)
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<RuntimeQueueChildCleanupFenceV1>(&bytes).ok()
+            })
+            .is_some_and(|current| current == bound);
+        if !committed {
+            return Err(error);
+        }
+    }
+    Ok(RuntimeQueueChildCleanupFenceAuthority { record: bound })
+}
+
+pub(crate) fn mark_runtime_queue_child_cleanup_proven(
+    harness_home: &Path,
+    authority: &RuntimeQueueChildCleanupFenceAuthority,
+    cleanup_proven_at_ms: i64,
+) -> io::Result<RuntimeQueueChildCleanupFenceAuthority> {
+    let valid_prearm = authority.record.phase == "spawn-in-progress"
+        && authority.record.child_process_id.is_none()
+        && authority.record.child_process_start_time_ms.is_none()
+        && !authority.record.job_containment_assigned;
+    let valid_bound = authority.record.phase == "child-bound"
+        && authority.record.child_process_id.is_some()
+        && authority.record.child_process_start_time_ms.is_some()
+        && authority.record.job_containment_assigned;
+    if (!valid_prearm && !valid_bound) || cleanup_proven_at_ms < authority.record.fenced_at_ms {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cleanup-proven transition requires exact pre-execution or bound-child authority and monotonic proof time",
+        ));
+    }
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
+        &queue_dir,
+        &authority.record.runtime_class,
+        Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+    )?
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "runtime queue lease lock stayed busy for class `{}` while recording child cleanup proof",
+                authority.record.runtime_class
+            ),
+        ));
+    };
+    let path = runtime_queue_child_cleanup_fence_file(
+        harness_home,
+        &authority.record.canonical_lane_digest,
+    );
+    let current: RuntimeQueueChildCleanupFenceV1 =
+        serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bound child-cleanup fence at {} is unreadable and remains fail-closed: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+    if current != authority.record {
+        if runtime_queue_child_cleanup_proof_derives_from(&current, &authority.record) {
+            return Ok(RuntimeQueueChildCleanupFenceAuthority { record: current });
+        }
+        return Err(runtime_queue_child_cleanup_authority_superseded_error());
+    }
+    #[cfg(test)]
+    if queue_dir
+        .join("test-failpoints")
+        .join("codex-child-cleanup-fence-proof")
+        .is_file()
+    {
+        return Err(io::Error::other(
+            "injected child-cleanup proof persistence failure",
+        ));
+    }
+    let mut proven = current;
+    proven.phase = "cleanup-proven".to_string();
+    proven.cleanup_proven_at_ms = Some(cleanup_proven_at_ms);
+    proven.reason = if valid_bound {
+        "kill-on-close Job became empty and root process was reaped".to_string()
+    } else {
+        "pre-execution child absence or suspended-root cleanup was proven".to_string()
+    };
+    write_json_atomic(&path, &proven)?;
+    Ok(RuntimeQueueChildCleanupFenceAuthority { record: proven })
+}
+
+fn runtime_queue_child_cleanup_proof_derives_from(
+    current: &RuntimeQueueChildCleanupFenceV1,
+    authority: &RuntimeQueueChildCleanupFenceV1,
+) -> bool {
+    current.phase == "cleanup-proven"
+        && current.schema == authority.schema
+        && current.queue_id == authority.queue_id
+        && current.runtime_class == authority.runtime_class
+        && current.canonical_lane_digest == authority.canonical_lane_digest
+        && current.lease_owner_digest == authority.lease_owner_digest
+        && current.lease_acquired_at_ms == authority.lease_acquired_at_ms
+        && current.child_process_id == authority.child_process_id
+        && current.child_process_start_time_ms == authority.child_process_start_time_ms
+        && current.job_containment_assigned == authority.job_containment_assigned
+        && current.fenced_at_ms == authority.fenced_at_ms
+        && current
+            .cleanup_proven_at_ms
+            .is_some_and(|proof_time| proof_time >= current.fenced_at_ms)
+        && match (
+            current.child_process_id,
+            current.child_process_start_time_ms,
+            current.job_containment_assigned,
+        ) {
+            (None, None, false) => true,
+            (Some(process_id), Some(process_start_time_ms), true) => {
+                process_id > 0 && process_start_time_ms >= 0
+            }
+            _ => false,
+        }
+}
+
+pub(crate) fn clear_runtime_queue_child_cleanup_fence(
+    harness_home: &Path,
+    authority: &RuntimeQueueChildCleanupFenceAuthority,
+) -> io::Result<bool> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
+        &queue_dir,
+        &authority.record.runtime_class,
+        Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+    )?
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "runtime queue lease lock stayed busy for class `{}` while clearing child-cleanup authority",
+                authority.record.runtime_class
+            ),
+        ));
+    };
+    let path = runtime_queue_child_cleanup_fence_file(
+        harness_home,
+        &authority.record.canonical_lane_digest,
+    );
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let current: RuntimeQueueChildCleanupFenceV1 =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "child-cleanup fence at {} is unreadable and remains fail-closed: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+    if current != authority.record {
+        return Err(runtime_queue_child_cleanup_authority_superseded_error());
+    }
+    #[cfg(test)]
+    if queue_dir
+        .join("test-failpoints")
+        .join("codex-child-cleanup-fence-clear")
+        .is_file()
+    {
+        return Err(io::Error::other(
+            "injected child-cleanup fence clear failure",
+        ));
+    }
+    fs::remove_file(path)?;
+    Ok(true)
+}
+
+pub(crate) fn finalize_runtime_queue_child_cleanup_fence(
+    harness_home: &Path,
+    authority: &RuntimeQueueChildCleanupFenceAuthority,
+    cleanup_proven_at_ms: i64,
+) -> io::Result<bool> {
+    let proven = match mark_runtime_queue_child_cleanup_proven(
+        harness_home,
+        authority,
+        cleanup_proven_at_ms,
+    ) {
+        Ok(proven) => proven,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    clear_runtime_queue_child_cleanup_fence(harness_home, &proven)
+}
+
+fn reconcile_orphaned_runtime_queue_child_cleanup_fences_locked(
+    queue_dir: &Path,
+    runtime_class: &str,
+    state: &RuntimeQueueLeaseState,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let fences_dir = queue_dir.join("child-cleanup-fences");
+    let entries = match fs::read_dir(&fences_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let fence: RuntimeQueueChildCleanupFenceV1 = match fs::read(&path).and_then(|bytes| {
+            serde_json::from_slice(&bytes).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid child-cleanup fence JSON: {error}"),
+                )
+            })
+        }) {
+            Ok(fence) => fence,
+            Err(error) => {
+                warnings.push(format!(
+                    "child-cleanup fence {} remains fail-closed because it is unreadable: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if fence.runtime_class != runtime_class {
+            continue;
+        }
+        if fence.schema != RUNTIME_QUEUE_CHILD_CLEANUP_FENCE_SCHEMA
+            || runtime_queue_child_cleanup_fence_file_from_queue_dir(
+                queue_dir,
+                &fence.canonical_lane_digest,
+            ) != path
+        {
+            warnings.push(format!(
+                "child-cleanup fence {} remains fail-closed because its schema or canonical lane filename is invalid",
+                path.display()
+            ));
+            continue;
+        }
+        let Some(lease) = state.leases.get(&fence.queue_id) else {
+            warnings.push(format!(
+                "child-cleanup fence {} remains fail-closed because exact queue `{}` has no retained lease authority",
+                path.display(),
+                fence.queue_id
+            ));
+            continue;
+        };
+        let RuntimeQueueLeaseOwner::Envelope(owner) = &lease.owner else {
+            warnings.push(format!(
+                "child-cleanup fence {} remains fail-closed because its retained lease has legacy owner authority",
+                path.display()
+            ));
+            continue;
+        };
+        let exact_authority_matches = lease.runtime_class == fence.runtime_class
+            && runtime_queue_lease_canonical_lane_digest(lease).as_deref()
+                == Some(fence.canonical_lane_digest.as_str())
+            && owner.acquired_at_ms == fence.lease_acquired_at_ms
+            && runtime_queue_lease_owner_digest(owner)
+                .eq_ignore_ascii_case(&fence.lease_owner_digest);
+        if !exact_authority_matches {
+            warnings.push(format!(
+                "child-cleanup fence {} remains fail-closed because its exact lease/lane/acquisition authority no longer matches",
+                path.display()
+            ));
+            continue;
+        }
+        if fence.phase != "cleanup-proven" && !owner.process_start_time_os_proven {
+            warnings.push(format!(
+                "child-cleanup fence {} remains fail-closed because owner pid={} start={} was not captured from OS process-generation evidence",
+                path.display(),
+                owner.pid,
+                owner.process_start_time_ms
+            ));
+            continue;
+        }
+        if fence.phase == "cleanup-proven" {
+            let structurally_proven = fence.fenced_at_ms >= 0
+                && fence
+                    .cleanup_proven_at_ms
+                    .is_some_and(|proof_time| proof_time >= fence.fenced_at_ms)
+                && match (
+                    fence.child_process_id,
+                    fence.child_process_start_time_ms,
+                    fence.job_containment_assigned,
+                ) {
+                    (None, None, false) => true,
+                    (Some(process_id), Some(process_start_time_ms), true) => {
+                        process_id > 0 && process_start_time_ms >= 0
+                    }
+                    _ => false,
+                };
+            if structurally_proven {
+                fs::remove_file(&path)?;
+                warnings.push(format!(
+                    "child-cleanup fence {} reconciled from durable cleanup proof",
+                    path.display()
+                ));
+            } else {
+                warnings.push(format!(
+                    "child-cleanup fence {} remains fail-closed because cleanup-proven evidence is incomplete",
+                    path.display()
+                ));
+            }
+            continue;
+        }
+        match exact_process_generation_state(owner.pid, owner.process_start_time_ms) {
+            ExactProcessGenerationState::Alive => continue,
+            ExactProcessGenerationState::Unknown => {
+                warnings.push(format!(
+                    "child-cleanup fence {} remains fail-closed because owner pid={} start={} generation liveness is ambiguous",
+                    path.display(),
+                    owner.pid,
+                    owner.process_start_time_ms
+                ));
+                continue;
+            }
+            ExactProcessGenerationState::DeadOrReused => {}
+        }
+        let recoverable = match fence.phase.as_str() {
+            "spawn-in-progress"
+                if fence.child_process_id.is_none()
+                    && fence.child_process_start_time_ms.is_none()
+                    && !fence.job_containment_assigned =>
+            {
+                // Windows app-server children are created suspended. The
+                // non-inheritable kill-on-close Job handle is assigned before
+                // this record can advance to child-bound, so a dead owner
+                // generation proves an unbound child could never execute.
+                cfg!(windows)
+            }
+            "child-bound" if fence.job_containment_assigned => {
+                match (fence.child_process_id, fence.child_process_start_time_ms) {
+                    (Some(process_id), Some(process_start_time_ms)) => {
+                        match exact_process_generation_state(
+                            i64::from(process_id),
+                            process_start_time_ms,
+                        ) {
+                            ExactProcessGenerationState::DeadOrReused => true,
+                            ExactProcessGenerationState::Alive => {
+                                warnings.push(format!(
+                                    "child-cleanup fence {} remains fail-closed because exact child pid={process_id} start={process_start_time_ms} is still alive",
+                                    path.display()
+                                ));
+                                false
+                            }
+                            ExactProcessGenerationState::Unknown => {
+                                warnings.push(format!(
+                                    "child-cleanup fence {} remains fail-closed because exact child pid={process_id} start={process_start_time_ms} liveness is ambiguous",
+                                    path.display()
+                                ));
+                                false
+                            }
+                        }
+                    }
+                    _ => {
+                        warnings.push(format!(
+                            "child-cleanup fence {} remains fail-closed because child-bound identity is incomplete",
+                            path.display()
+                        ));
+                        false
+                    }
+                }
+            }
+            _ => {
+                warnings.push(format!(
+                    "child-cleanup fence {} remains fail-closed because phase `{}` or containment evidence is invalid",
+                    path.display(),
+                    fence.phase
+                ));
+                false
+            }
+        };
+        if recoverable {
+            fs::remove_file(&path)?;
+            warnings.push(format!(
+                "child-cleanup fence {} reconciled after exact owner and child generation death proof",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn acquire_runtime_queue_lease_lock(
     queue_dir: &Path,
     runtime_class: &str,
@@ -2865,6 +3814,7 @@ fn write_runtime_queue_leases(
 }
 
 fn purge_runtime_queue_leases(
+    queue_dir: &Path,
     state: &mut RuntimeQueueLeaseState,
     now_ms: i64,
     terminal_run_ids: &HashSet<String>,
@@ -2873,9 +3823,27 @@ fn purge_runtime_queue_leases(
     receipts_file: Option<&Path>,
     warnings: &mut Vec<String>,
 ) -> io::Result<()> {
+    let runtime_class = state
+        .leases
+        .values()
+        .next()
+        .map(|lease| lease.runtime_class.as_str())
+        .unwrap_or("interactive");
+    reconcile_orphaned_runtime_queue_child_cleanup_fences_locked(
+        queue_dir,
+        runtime_class,
+        state,
+        warnings,
+    )?;
     let mut remove_silently = Vec::new();
     let mut reap_dead_owner = Vec::new();
     for (queue_id, lease) in &state.leases {
+        if runtime_queue_child_cleanup_is_fenced_for_lease(queue_dir, lease) {
+            warnings.push(format!(
+                "runtime queue lease `{queue_id}` retained behind a child-cleanup safety fence"
+            ));
+            continue;
+        }
         if terminal_run_ids.contains(queue_id)
             || retry_pending_run_ids.contains(queue_id)
             || parked_run_ids.contains(queue_id)
@@ -2919,11 +3887,12 @@ fn purge_runtime_queue_leases(
             )?;
         }
     }
-    reconcile_canonical_lease_collisions(state, now_ms, receipts_file, warnings)?;
+    reconcile_canonical_lease_collisions(queue_dir, state, now_ms, receipts_file, warnings)?;
     Ok(())
 }
 
 fn reconcile_canonical_lease_collisions(
+    queue_dir: &Path,
     state: &mut RuntimeQueueLeaseState,
     now_ms: i64,
     receipts_file: Option<&Path>,
@@ -2932,6 +3901,9 @@ fn reconcile_canonical_lease_collisions(
     let mut groups = BTreeMap::<String, Vec<String>>::new();
     let mut invalid = Vec::<(String, String)>::new();
     for (queue_id, lease) in &state.leases {
+        if runtime_queue_child_cleanup_is_fenced_for_lease(queue_dir, lease) {
+            continue;
+        }
         let lane = if let Some(account_id) = lease.account_id.as_deref() {
             match crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
                 &lease.session_key,
@@ -2999,9 +3971,17 @@ fn reconcile_canonical_lease_collisions(
             continue;
         }
         queue_ids.sort_by(|left, right| {
-            state.leases[left]
-                .started_at_ms
-                .cmp(&state.leases[right].started_at_ms)
+            runtime_queue_child_cleanup_is_fenced_for_lease(queue_dir, &state.leases[left])
+                .cmp(&runtime_queue_child_cleanup_is_fenced_for_lease(
+                    queue_dir,
+                    &state.leases[right],
+                ))
+                .reverse()
+                .then_with(|| {
+                    state.leases[left]
+                        .started_at_ms
+                        .cmp(&state.leases[right].started_at_ms)
+                })
                 .then_with(|| left.cmp(right))
         });
         let retained_queue_id = queue_ids.remove(0);
@@ -3055,6 +4035,18 @@ pub fn release_runtime_queue_lease(
         };
         let mut warnings = Vec::new();
         let mut state = read_runtime_queue_leases(&queue_dir, &runtime_class, &mut warnings)?;
+        if state
+            .leases
+            .get(queue_id)
+            .is_some_and(|lease| runtime_queue_child_cleanup_is_fenced_for_lease(&queue_dir, lease))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "runtime queue lease `{queue_id}` is retained behind an exact-lane child-cleanup safety fence"
+                ),
+            ));
+        }
         if state.leases.remove(queue_id).is_some() {
             write_runtime_queue_leases(&queue_dir, &runtime_class, &state)?;
             return Ok(());
@@ -3069,6 +4061,54 @@ pub fn release_runtime_queue_lease(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn release_runtime_queue_lease_if_owned(
+    harness_home: &Path,
+    queue_id: &str,
+    authority: &RuntimeQueueLeaseReleaseAuthority,
+) -> io::Result<RuntimeQueueLeaseReleaseStatus> {
+    release_runtime_queue_lease_if_owned_with_retry(
+        harness_home,
+        queue_id,
+        authority,
+        Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+    )
+}
+
+fn release_runtime_queue_lease_if_owned_with_retry(
+    harness_home: &Path,
+    queue_id: &str,
+    authority: &RuntimeQueueLeaseReleaseAuthority,
+    timeout: Duration,
+) -> io::Result<RuntimeQueueLeaseReleaseStatus> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    fs::create_dir_all(&queue_dir)?;
+    let Some(_lease_lock) =
+        acquire_runtime_queue_lease_lock_with_retry(&queue_dir, &authority.runtime_class, timeout)?
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "runtime queue lease lock stayed busy for owning class `{}` while releasing queue lease `{queue_id}`",
+                authority.runtime_class
+            ),
+        ));
+    };
+    let mut warnings = Vec::new();
+    let mut state = read_runtime_queue_leases(&queue_dir, &authority.runtime_class, &mut warnings)?;
+    let Some(current) = state.leases.get(queue_id) else {
+        return Ok(RuntimeQueueLeaseReleaseStatus::AlreadyAbsent);
+    };
+    if current.runtime_class != authority.runtime_class || current.owner != authority.owner {
+        return Ok(RuntimeQueueLeaseReleaseStatus::OwnershipLost);
+    }
+    if runtime_queue_child_cleanup_is_fenced_for_lease(&queue_dir, current) {
+        return Ok(RuntimeQueueLeaseReleaseStatus::Fenced);
+    }
+    state.leases.remove(queue_id);
+    write_runtime_queue_leases(&queue_dir, &authority.runtime_class, &state)?;
+    Ok(RuntimeQueueLeaseReleaseStatus::Released)
 }
 
 pub(crate) fn renew_runtime_queue_lease(
@@ -3257,78 +4297,112 @@ fn append_runtime_queue_lease_renewal_receipt(
     )
 }
 
-pub(crate) fn capture_runtime_queue_lease_guard(
+pub(crate) fn capture_runtime_queue_lease_guard_for_authority(
     harness_home: &Path,
     queue_id: &str,
+    runtime_class: &str,
+    expected_owner_digest: &str,
     observed_at_ms: i64,
 ) -> io::Result<Option<RuntimeQueueLeaseGuard>> {
-    if queue_id.trim().is_empty() || observed_at_ms < 0 {
-        return Ok(None);
+    if queue_id.trim().is_empty()
+        || runtime_class.trim().is_empty()
+        || observed_at_ms < 0
+        || expected_owner_digest.len() != 64
+        || !expected_owner_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "exact runtime queue lease capture requires a queue id, runtime class, valid owner digest, and nonnegative observation time",
+        ));
     }
     let queue_dir = harness_home.join("state").join("runtime-queue");
-    let mut found = None;
-    for runtime_class in runtime_classes_for_observation(&queue_dir)? {
-        let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
-            &queue_dir,
-            &runtime_class,
-            Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
-        )?
-        else {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!("runtime queue lease lock is busy for class `{runtime_class}`"),
-            ));
-        };
-        let state = read_runtime_queue_leases_strict(&queue_dir, &runtime_class)?;
-        let Some(lease) = state.leases.get(queue_id) else {
-            continue;
-        };
-        if found.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "queue lease appears in more than one runtime class",
-            ));
-        }
-        if lease.lease_expires_at_ms <= observed_at_ms {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "runtime queue lease expired before guard capture",
-            ));
-        }
-        let RuntimeQueueLeaseOwner::Envelope(owner) = &lease.owner else {
-            return Ok(None);
-        };
-        let RuntimeQueueLeaseOwner::Envelope(current_owner) =
-            runtime_queue_lease_owner_from_env(observed_at_ms)
-        else {
-            return Ok(None);
-        };
-        if !runtime_queue_lease_owner_process_matches(owner, &current_owner) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "runtime queue lease belongs to a different process generation",
-            ));
-        }
-        let Some(canonical_lane_digest) = runtime_queue_lease_canonical_lane_digest(lease) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "runtime queue lease has no canonical lane identity",
-            ));
-        };
-        found = Some(RuntimeQueueLeaseGuard {
-            harness_home: harness_home.to_path_buf(),
-            queue_id: queue_id.to_string(),
-            runtime_class: runtime_class.clone(),
-            canonical_lane_digest,
-            owner: owner.clone(),
-            proven_expires_at_ms: lease.lease_expires_at_ms,
-            next_renewal_check_at_ms: lease
-                .lease_expires_at_ms
-                .saturating_sub(RUNTIME_LEASE_RENEW_AHEAD_MS),
-            lost: false,
-        });
+    let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
+        &queue_dir,
+        runtime_class,
+        Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+    )?
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("runtime queue lease lock is busy for owning class `{runtime_class}`"),
+        ));
+    };
+    let state = read_runtime_queue_leases_strict(&queue_dir, runtime_class)?;
+    let Some(lease) = state.leases.get(queue_id) else {
+        return Ok(None);
+    };
+    if lease.runtime_class != runtime_class {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime queue lease runtime class does not match its owning state partition",
+        ));
     }
-    Ok(found)
+    runtime_queue_lease_guard_from_exact_lease(
+        harness_home,
+        queue_id,
+        runtime_class,
+        lease,
+        Some(expected_owner_digest),
+        observed_at_ms,
+    )
+}
+
+fn runtime_queue_lease_guard_from_exact_lease(
+    harness_home: &Path,
+    queue_id: &str,
+    runtime_class: &str,
+    lease: &RuntimeQueueLease,
+    expected_owner_digest: Option<&str>,
+    observed_at_ms: i64,
+) -> io::Result<Option<RuntimeQueueLeaseGuard>> {
+    if lease.lease_expires_at_ms <= observed_at_ms {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "runtime queue lease expired before guard capture",
+        ));
+    }
+    let RuntimeQueueLeaseOwner::Envelope(owner) = &lease.owner else {
+        return Ok(None);
+    };
+    let RuntimeQueueLeaseOwner::Envelope(current_owner) =
+        runtime_queue_lease_owner_from_env(observed_at_ms)
+    else {
+        return Ok(None);
+    };
+    if !runtime_queue_lease_owner_process_matches(owner, &current_owner) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime queue lease belongs to a different process generation",
+        ));
+    }
+    if expected_owner_digest.is_some_and(|expected| {
+        !runtime_queue_lease_owner_digest(owner).eq_ignore_ascii_case(expected)
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime queue lease acquisition authority changed before model start",
+        ));
+    }
+    let Some(canonical_lane_digest) = runtime_queue_lease_canonical_lane_digest(lease) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime queue lease has no canonical lane identity",
+        ));
+    };
+    Ok(Some(RuntimeQueueLeaseGuard {
+        harness_home: harness_home.to_path_buf(),
+        queue_id: queue_id.to_string(),
+        runtime_class: runtime_class.to_string(),
+        canonical_lane_digest,
+        owner: owner.clone(),
+        proven_expires_at_ms: lease.lease_expires_at_ms,
+        next_renewal_check_at_ms: lease
+            .lease_expires_at_ms
+            .saturating_sub(RUNTIME_LEASE_RENEW_AHEAD_MS),
+        lost: false,
+    }))
 }
 
 fn runtime_queue_lease_owner_process_matches(
@@ -3383,6 +4457,7 @@ fn runtime_queue_lease_owner_digest(owner: &RuntimeQueueLeaseOwnerEnvelope) -> S
         owner.generation_id.as_str(),
         owner.pid,
         owner.process_start_time_ms,
+        owner.process_start_time_os_proven,
         owner.acquired_at_ms,
     ))
     .unwrap_or_default();
@@ -3701,9 +4776,18 @@ pub fn reconcile_runtime_queue_leases_for_generation(
         let mut warnings = Vec::new();
         let mut state = read_runtime_queue_leases(&queue_dir, &runtime_class, &mut warnings)?;
         report.warnings.extend(warnings);
+        reconcile_orphaned_runtime_queue_child_cleanup_fences_locked(
+            &queue_dir,
+            &runtime_class,
+            &state,
+            &mut report.warnings,
+        )?;
         let matching_queue_ids = state
             .leases
             .iter()
+            .filter(|(_, lease)| {
+                !runtime_queue_child_cleanup_is_fenced_for_lease(&queue_dir, lease)
+            })
             .filter(|(_, lease)| lease.owner.matches_generation(service_id, generation_id))
             .map(|(queue_id, _)| queue_id.clone())
             .collect::<Vec<_>>();
@@ -4159,6 +5243,7 @@ fn terminal_control_no_pending_receipt(
         status: RuntimeExecutionReceiptStatus::NoPendingItem,
         channel_lane: None,
         runtime_class,
+        runtime_lease_owner_digest: None,
         origin,
         cron_run_id,
         scheduled_for_ms,
@@ -4691,6 +5776,16 @@ fn apply_runtime_queue_receipt_to_index(index: &mut RuntimeQueueStateIndex, valu
     *status_count = status_count.saturating_add(1);
     if status == "needs-user" {
         entry.parked = true;
+        // `needs-user` remains the v1-compatible parked carrier rather than a
+        // terminal-control status. Preserve its typed closure metadata anyway
+        // so restarts and diagnostics do not collapse Goal pause/park states
+        // into an indistinguishable connector approval.
+        entry.terminal_source_closure_kind =
+            string_field(value, &["sourceClosureKind", "source_closure_kind"])
+                .map(ToString::to_string);
+        entry.terminal_source_closure_reason =
+            string_field(value, &["sourceClosureReason", "source_closure_reason"])
+                .map(ToString::to_string);
     } else if !matches!(status, "no-work" | "lease-busy") {
         entry.parked = false;
     }
@@ -4737,6 +5832,12 @@ fn apply_runtime_queue_receipt_to_index(index: &mut RuntimeQueueStateIndex, valu
             .get("terminalDisposition")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok());
+        entry.terminal_source_closure_kind =
+            string_field(value, &["sourceClosureKind", "source_closure_kind"])
+                .map(ToString::to_string);
+        entry.terminal_source_closure_reason =
+            string_field(value, &["sourceClosureReason", "source_closure_reason"])
+                .map(ToString::to_string);
         entry.continuation_link = value
             .get("continuationLink")
             .cloned()
@@ -5720,6 +6821,28 @@ fn runtime_capacity_blocker(
     item: &PendingQueueItem,
 ) -> io::Result<Option<String>> {
     let config = load_runtime_dispatch_config(harness_home)?;
+    let class_config =
+        config
+            .classes
+            .get(&item.runtime_class)
+            .cloned()
+            .unwrap_or(RuntimeDispatchClassConfig {
+                max_active: config.global_concurrency_limit,
+                per_agent_max_active: config.global_concurrency_limit,
+                per_channel_max_active: config.global_concurrency_limit,
+                per_session_max_active: usize::MAX,
+                session_fifo: false,
+                same_session_main_agent_serialization: false,
+                per_job_max_active: usize::MAX,
+                max_queued_per_agent: usize::MAX,
+            });
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let lane_digest = runtime_queue_item_canonical_lane_digest(item);
+    if runtime_queue_child_cleanup_is_fenced_for_lane_digest(&queue_dir, &lane_digest) {
+        return Ok(Some(format!(
+            "exact-lane child-cleanup fence `{lane_digest}`"
+        )));
+    }
     let all_leases =
         read_all_runtime_queue_leases_with_override(harness_home, state, &item.runtime_class)?;
     if all_leases
@@ -5743,22 +6866,6 @@ fn runtime_capacity_blocker(
             return Ok(Some("interactive reserve".to_string()));
         }
     }
-
-    let class_config =
-        config
-            .classes
-            .get(&item.runtime_class)
-            .cloned()
-            .unwrap_or(RuntimeDispatchClassConfig {
-                max_active: config.global_concurrency_limit,
-                per_agent_max_active: config.global_concurrency_limit,
-                per_channel_max_active: config.global_concurrency_limit,
-                per_session_max_active: usize::MAX,
-                session_fifo: false,
-                same_session_main_agent_serialization: false,
-                per_job_max_active: usize::MAX,
-                max_queued_per_agent: usize::MAX,
-            });
 
     let executing_class = all_leases
         .iter()
@@ -5843,8 +6950,9 @@ fn read_all_runtime_queue_leases_with_override(
                     .leases
                     .values()
                     .filter(|lease| {
-                        lease.lease_expires_at_ms > now_ms
-                            && dead_runtime_queue_lease_owner(&lease.owner).is_none()
+                        (lease.lease_expires_at_ms > now_ms
+                            && dead_runtime_queue_lease_owner(&lease.owner).is_none())
+                            || runtime_queue_child_cleanup_is_fenced_for_lease(&queue_dir, lease)
                     })
                     .cloned(),
             );
@@ -5852,8 +6960,9 @@ fn read_all_runtime_queue_leases_with_override(
         }
         let state = read_runtime_queue_leases(&queue_dir, &runtime_class, &mut warnings)?;
         leases.extend(state.leases.values().filter_map(|lease| {
-            (lease.lease_expires_at_ms > now_ms
+            ((lease.lease_expires_at_ms > now_ms
                 && dead_runtime_queue_lease_owner(&lease.owner).is_none())
+                || runtime_queue_child_cleanup_is_fenced_for_lease(&queue_dir, lease))
             .then_some(lease.clone())
         }));
     }
@@ -5898,13 +7007,18 @@ impl RuntimeQueueLeaseOwner {
 
 fn runtime_queue_lease_owner_from_env(now_ms: i64) -> RuntimeQueueLeaseOwner {
     let generation_id = nonempty_env("AGENT_HARNESS_SERVICE_GENERATION_ID");
-    let process_start_time_ms = env_i64("AGENT_HARNESS_SERVICE_STARTED_AT_MS")
-        .or_else(|| Some(*RUNTIME_LOOP_PROCESS_STARTED_AT_MS.get_or_init(|| now_ms.max(1))));
+    let os_process_start_time_ms =
+        process_start_time_ms_for_pid(i64::from(std::process::id())).filter(|value| *value > 0);
+    let process_start_time_ms = os_process_start_time_ms.or_else(|| {
+        env_i64("AGENT_HARNESS_SERVICE_STARTED_AT_MS")
+            .or_else(|| Some(*RUNTIME_LOOP_PROCESS_STARTED_AT_MS.get_or_init(|| now_ms.max(1))))
+    });
     let launch_owner = nonempty_env("AGENT_HARNESS_SUPERVISOR_LAUNCH_OWNER");
     runtime_queue_lease_owner_from_metadata(
         now_ms,
         generation_id,
         process_start_time_ms,
+        os_process_start_time_ms.is_some(),
         launch_owner,
     )
 }
@@ -5913,6 +7027,7 @@ fn runtime_queue_lease_owner_from_metadata(
     now_ms: i64,
     generation_id: Option<String>,
     process_start_time_ms: Option<i64>,
+    process_start_time_os_proven: bool,
     launch_owner: Option<String>,
 ) -> RuntimeQueueLeaseOwner {
     let pid = i64::from(std::process::id());
@@ -5932,6 +7047,7 @@ fn runtime_queue_lease_owner_from_metadata(
         generation_id,
         pid,
         process_start_time_ms,
+        process_start_time_os_proven,
         acquired_at_ms: now_ms,
     })
 }
@@ -5956,12 +7072,17 @@ fn dead_runtime_queue_lease_owner(owner: &RuntimeQueueLeaseOwner) -> Option<i64>
     (process_alive_for_pid(process_id) == Some(false)).then_some(process_id)
 }
 
-fn lease_acquired_receipt(item: &PendingQueueItem, reason: &str) -> RuntimeExecutionReceipt {
+fn lease_acquired_receipt(
+    item: &PendingQueueItem,
+    authority: &RuntimeQueueLeaseReleaseAuthority,
+    reason: &str,
+) -> RuntimeExecutionReceipt {
     RuntimeExecutionReceipt {
         queue_id: Some(item.queue_id.clone()),
         status: RuntimeExecutionReceiptStatus::LeaseAcquired,
         channel_lane: None,
         runtime_class: Some(item.runtime_class.clone()),
+        runtime_lease_owner_digest: authority.owner_digest(),
         origin: Some(item.origin.clone()),
         cron_run_id: item.cron_run_id.clone(),
         scheduled_for_ms: item.scheduled_for_ms,
@@ -6099,6 +7220,40 @@ fn runtime_session_lane_key(
         normalize_key_part(&canonical_session_key),
     ]
     .join(":")
+}
+
+fn canonical_pending_lane_identity(item: &PendingQueueItem) -> Result<(String, String), String> {
+    let account_id = item
+        .account_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("default")
+        .to_string();
+    let canonical_session_key =
+        crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            &item.session_key,
+            &item.platform,
+            &account_id,
+            &item.channel_id,
+            &item.user_id,
+            &item.agent_id,
+        )
+        .map_err(|error| error.to_string())?
+        .canonical_string();
+    Ok((account_id, canonical_session_key))
+}
+
+fn runtime_queue_item_canonical_lane_digest(item: &PendingQueueItem) -> String {
+    let lane_key = runtime_session_lane_key(
+        &item.runtime_class,
+        &item.agent_id,
+        &item.platform,
+        item.account_id.as_deref(),
+        &item.channel_id,
+        &item.user_id,
+        &item.session_key,
+    );
+    format!("{:016x}", runtime_queue_bytes_digest(lane_key.as_bytes()))
 }
 
 fn default_runtime_class_config_for_item(
@@ -6517,22 +7672,8 @@ fn canonicalize_pending_items_for_dispatch(
 ) -> io::Result<()> {
     let mut canonical = Vec::with_capacity(items.len());
     for mut item in items.drain(..) {
-        let account_id = item
-            .account_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("default")
-            .to_string();
-        match crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
-            &item.session_key,
-            &item.platform,
-            &account_id,
-            &item.channel_id,
-            &item.user_id,
-            &item.agent_id,
-        ) {
-            Ok(parsed) => {
-                let canonical_session_key = parsed.canonical_string();
+        match canonical_pending_lane_identity(&item) {
+            Ok((account_id, canonical_session_key)) => {
                 let changed = canonical_session_key != item.session_key
                     || item.account_id.as_deref() != Some(account_id.as_str());
                 item.session_key = canonical_session_key.clone();
@@ -6862,6 +8003,9 @@ pub(crate) fn latest_runtime_queue_hot_receipt_from_index(
         queue_id: queue_id.to_string(),
         status,
         reason: entry.latest_reason.clone(),
+        terminal_control_source: (entry.latest_status.as_deref() == Some("suppressed"))
+            .then(|| entry.terminal_control_source.clone())
+            .flatten(),
         runtime_class: entry.latest_runtime_class.clone(),
         origin: entry.latest_origin.clone(),
         transcript_file: entry.latest_transcript_file.clone(),
@@ -6869,24 +8013,41 @@ pub(crate) fn latest_runtime_queue_hot_receipt_from_index(
     })
 }
 
-/// Returns the latest actual terminal receipt materialized for one exact queue
-/// ID. Suppression receipts retain their existing terminal-control semantics
-/// and are not promoted into worker completion records here.
+/// Returns the latest terminal evidence materialized for one exact queue ID.
+/// Suppression keeps its terminal-control semantics in the shared runtime
+/// index, but is also returned here so its originating durable worker can
+/// reconcile according to the exact control source instead of remaining
+/// `runtime-queued` forever. An earlier concrete terminal result wins over a
+/// later `run-once-terminal` suppression carrier.
 pub(crate) fn terminal_runtime_queue_hot_receipt_from_index(
     index: &RuntimeQueueStateIndex,
     queue_id: &str,
 ) -> Option<RuntimeQueueHotReceiptRecord> {
     let entry = index.queues.get(queue_id)?;
-    let status = entry.terminal_status.clone()?;
-    Some(RuntimeQueueHotReceiptRecord {
-        queue_id: queue_id.to_string(),
-        status,
-        reason: entry.terminal_reason.clone(),
-        runtime_class: entry.terminal_runtime_class.clone(),
-        origin: entry.terminal_origin.clone(),
-        transcript_file: entry.terminal_transcript_file.clone(),
-        occurred_at_ms: entry.terminal_occurred_at_ms,
-    })
+    if let Some(status) = entry.terminal_status.clone() {
+        return Some(RuntimeQueueHotReceiptRecord {
+            queue_id: queue_id.to_string(),
+            status,
+            reason: entry.terminal_reason.clone(),
+            terminal_control_source: None,
+            runtime_class: entry.terminal_runtime_class.clone(),
+            origin: entry.terminal_origin.clone(),
+            transcript_file: entry.terminal_transcript_file.clone(),
+            occurred_at_ms: entry.terminal_occurred_at_ms,
+        });
+    }
+    (entry.suppression_recorded && entry.latest_status.as_deref() == Some("suppressed")).then(
+        || RuntimeQueueHotReceiptRecord {
+            queue_id: queue_id.to_string(),
+            status: "suppressed".to_string(),
+            reason: entry.latest_reason.clone(),
+            terminal_control_source: entry.terminal_control_source.clone(),
+            runtime_class: entry.latest_runtime_class.clone(),
+            origin: entry.latest_origin.clone(),
+            transcript_file: entry.latest_transcript_file.clone(),
+            occurred_at_ms: entry.latest_occurred_at_ms,
+        },
+    )
 }
 
 /// Returns the latest materialized hot receipt for each requested queue ID.
@@ -7820,6 +8981,62 @@ mod tests {
         let restarted_after_append =
             refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
         assert!(restarted_after_append.queues["turn:appended"].terminal_ever);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_queue_state_index_preserves_terminal_source_closure_metadata() {
+        let root = temp_root("runtime_queue_state_index_preserves_source_closure_metadata");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": "turn:goal-paused",
+                "status": "needs-user",
+                "reason": "authoritative Goal is paused",
+                "terminalDisposition": "needs-user",
+                "sourceClosureKind": "terminal-goal-surface",
+                "sourceClosureReason":
+                    "goal-transition-pause: authoritative Goal is paused"
+            }),
+        )
+        .unwrap();
+
+        let rebuilt = rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        let rebuilt_entry = &rebuilt.queues["turn:goal-paused"];
+        assert_eq!(
+            rebuilt_entry.terminal_source_closure_kind.as_deref(),
+            Some("terminal-goal-surface")
+        );
+        assert_eq!(
+            rebuilt_entry.terminal_source_closure_reason.as_deref(),
+            Some("goal-transition-pause: authoritative Goal is paused")
+        );
+
+        let persisted: Value =
+            serde_json::from_slice(&fs::read(runtime_queue_state_index_file(&queue_dir)).unwrap())
+                .unwrap();
+        assert_eq!(
+            persisted["queues"]["turn:goal-paused"]["terminalSourceClosureKind"],
+            "terminal-goal-surface"
+        );
+        assert_eq!(
+            persisted["queues"]["turn:goal-paused"]["terminalSourceClosureReason"],
+            "goal-transition-pause: authoritative Goal is paused"
+        );
+
+        let restarted = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        let restarted_entry = &restarted.queues["turn:goal-paused"];
+        assert_eq!(
+            restarted_entry.terminal_source_closure_kind,
+            rebuilt_entry.terminal_source_closure_kind
+        );
+        assert_eq!(
+            restarted_entry.terminal_source_closure_reason,
+            rebuilt_entry.terminal_source_closure_reason
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9154,6 +10371,7 @@ mod tests {
             acquired_at_ms,
             Some(generation_id.clone()),
             Some(process_start_time_ms),
+            true,
             Some("rust-supervisor-run".to_string()),
         );
 
@@ -9187,6 +10405,7 @@ mod tests {
             generation_id: "generation-a".to_string(),
             pid: i64::from(std::process::id()),
             process_start_time_ms: 900_000,
+            process_start_time_os_proven: false,
             acquired_at_ms: observed_at_ms,
         };
         let session_lane_key =
@@ -9245,8 +10464,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_queue_lease_guard_captures_non_interactive_exact_lane_identity() {
-        let root = temp_root("runtime_queue_lease_guard_non_interactive");
+    fn runtime_queue_lease_guard_exact_class_capture_ignores_unrelated_class_lock() {
+        let root = temp_root("runtime_queue_lease_guard_exact_class");
         let queue_dir = root.join("state").join("runtime-queue");
         fs::create_dir_all(&queue_dir).unwrap();
         let observed_at_ms = current_log_time_ms().unwrap();
@@ -9267,7 +10486,7 @@ mod tests {
             session_key: "discord:channel:user:worker-7".to_string(),
             virtual_session_id: Some("virtual-worker".to_string()),
             session_lane_key: None,
-            owner: RuntimeQueueLeaseOwner::Envelope(owner),
+            owner: RuntimeQueueLeaseOwner::Envelope(owner.clone()),
             started_at_ms: observed_at_ms,
             lease_expires_at_ms: observed_at_ms + DEFAULT_RUNTIME_LEASE_MS,
         };
@@ -9280,10 +10499,21 @@ mod tests {
             },
         )
         .unwrap();
+        let _unrelated_class_lock = create_runtime_queue_lease_lock(
+            &runtime_queue_lease_lock_file(&queue_dir, "cron"),
+            observed_at_ms,
+        )
+        .unwrap();
 
-        let guard = capture_runtime_queue_lease_guard(&root, "queue-worker", observed_at_ms)
-            .unwrap()
-            .expect("all leased runtime classes need an exact renewal identity");
+        let guard = capture_runtime_queue_lease_guard_for_authority(
+            &root,
+            "queue-worker",
+            "agent",
+            &runtime_queue_lease_owner_digest(&owner),
+            observed_at_ms,
+        )
+        .unwrap()
+        .expect("the owning class must be captured without scanning a locked unrelated class");
         let expected_lane = runtime_session_lane_key(
             &lease.runtime_class,
             &lease.agent_id,
@@ -9300,6 +10530,453 @@ mod tests {
                 runtime_queue_bytes_digest(expected_lane.as_bytes())
             )
         );
+
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            "{\"queueId\":\"corrupt-human-row\",\"status\":\"queued\"}\n",
+        )
+        .unwrap();
+        let mut refresh_warnings = Vec::new();
+        let _ = refresh_runtime_queue_state_index(&queue_dir, &mut refresh_warnings).unwrap();
+        let error = guard.has_pending_exact_lane_work().unwrap_err();
+        assert!(
+            error.to_string().contains("could not be proven"),
+            "malformed durable pending state must fence native continuation: {error}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_queue_lease_guard_matches_legacy_pending_identity_after_canonicalization() {
+        let root = temp_root("runtime_queue_lease_guard_legacy_pending_identity");
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let observed_at_ms = current_log_time_ms().unwrap();
+        let raw_value = queued_item_value("queue-human");
+        let raw_item = parse_pending_item(&raw_value).unwrap();
+        assert!(
+            raw_item.account_id.is_none(),
+            "the regression fixture must retain the legacy missing-account shape"
+        );
+        let (account_id, canonical_session_key) =
+            canonical_pending_lane_identity(&raw_item).unwrap();
+        let lane_key = runtime_session_lane_key(
+            &raw_item.runtime_class,
+            &raw_item.agent_id,
+            &raw_item.platform,
+            Some(&account_id),
+            &raw_item.channel_id,
+            &raw_item.user_id,
+            &canonical_session_key,
+        );
+        let owner = match runtime_queue_lease_owner_from_env(observed_at_ms) {
+            RuntimeQueueLeaseOwner::Envelope(owner) => owner,
+            RuntimeQueueLeaseOwner::Legacy(_) => unreachable!("current owner must be enveloped"),
+        };
+        let guard = RuntimeQueueLeaseGuard {
+            harness_home: root.clone(),
+            queue_id: "queue-running".to_string(),
+            runtime_class: "interactive".to_string(),
+            canonical_lane_digest: format!(
+                "{:016x}",
+                runtime_queue_bytes_digest(lane_key.as_bytes())
+            ),
+            owner,
+            proven_expires_at_ms: observed_at_ms + DEFAULT_RUNTIME_LEASE_MS,
+            next_renewal_check_at_ms: observed_at_ms,
+            lost: false,
+        };
+        append_json_line(&queue_dir.join("pending.jsonl"), &raw_value).unwrap();
+
+        assert!(
+            guard.has_pending_exact_lane_work().unwrap(),
+            "a legacy row that dispatch normalizes onto the running exact lane must keep human FIFO priority"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn child_cleanup_fence_blocks_release_expiry_and_terminal_reaping() {
+        let root = temp_root("child_cleanup_fence_blocks_lease_reaping");
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let observed_at_ms = current_log_time_ms().unwrap();
+        let owner = runtime_queue_lease_owner_from_env(observed_at_ms);
+        let mut lease = RuntimeQueueLease {
+            queue_id: "queue-fenced-child".to_string(),
+            agent_id: "main".to_string(),
+            runtime_class: "interactive".to_string(),
+            origin: "channel".to_string(),
+            cron_run_id: None,
+            platform: "discord".to_string(),
+            account_id: Some("default".to_string()),
+            channel_id: "channel".to_string(),
+            user_id: Some("user".to_string()),
+            session_key: "discord:channel:user:main".to_string(),
+            virtual_session_id: Some("virtual-fenced-child".to_string()),
+            session_lane_key: None,
+            owner: owner.clone(),
+            started_at_ms: observed_at_ms - 10_000,
+            lease_expires_at_ms: observed_at_ms + 60_000,
+        };
+        let mut state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::from([(lease.queue_id.clone(), lease.clone())]),
+        };
+        write_runtime_queue_leases(&queue_dir, &lease.runtime_class, &state).unwrap();
+        let RuntimeQueueLeaseOwner::Envelope(owner_envelope) = &owner else {
+            panic!("test owner must use exact process-generation authority");
+        };
+        let lease_authority = RuntimeQueueChildCleanupLeaseAuthority {
+            queue_id: lease.queue_id.clone(),
+            runtime_class: lease.runtime_class.clone(),
+            canonical_lane_digest: runtime_queue_lease_canonical_lane_digest(&lease).unwrap(),
+            lease_owner_digest: runtime_queue_lease_owner_digest(owner_envelope),
+            lease_acquired_at_ms: owner_envelope.acquired_at_ms,
+        };
+        let spawn_authority =
+            prearm_runtime_queue_child_cleanup_fence(&root, &lease_authority, observed_at_ms)
+                .unwrap();
+        bind_runtime_queue_child_cleanup_fence(&root, &spawn_authority, 42, Some(1), true).unwrap();
+        lease.lease_expires_at_ms = observed_at_ms - 1;
+        state.leases.insert(lease.queue_id.clone(), lease.clone());
+        write_runtime_queue_leases(&queue_dir, &lease.runtime_class, &state).unwrap();
+
+        purge_runtime_queue_leases(
+            &queue_dir,
+            &mut state,
+            observed_at_ms,
+            &HashSet::from([lease.queue_id.clone()]),
+            &HashSet::new(),
+            &HashSet::new(),
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            state.leases.contains_key(&lease.queue_id),
+            "fenced lease must survive terminal and expiry reconciliation"
+        );
+        write_runtime_queue_leases(&queue_dir, &lease.runtime_class, &state).unwrap();
+        let authority = RuntimeQueueLeaseReleaseAuthority::new(&lease.runtime_class, &owner);
+        assert_eq!(
+            release_runtime_queue_lease_if_owned(&root, &lease.queue_id, &authority).unwrap(),
+            RuntimeQueueLeaseReleaseStatus::Fenced
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn child_cleanup_fence_blocks_only_the_exact_noninteractive_lane_after_expiry() {
+        let root = temp_root("child_cleanup_fence_exact_noninteractive_lane");
+        fs::create_dir_all(root.join("state").join("runtime-queue")).unwrap();
+        fs::write(
+            root.join("harness-config.json"),
+            r#"{"workerDispatch":{"globalConcurrencyLimit":3,"groupConcurrencyLimit":3,"channelConcurrencyLimit":3,"laneConcurrencyLimits":{"llm":3}},"runtimeDispatch":{"interactiveReserve":0}}"#,
+        )
+        .unwrap();
+        let observed_at_ms = current_log_time_ms().unwrap();
+        let mut same_lane = pending_cron_item("queue-successor", "worker-7", observed_at_ms);
+        same_lane.runtime_class = "agent".to_string();
+        same_lane.origin = "agent".to_string();
+        same_lane.platform = "discord".to_string();
+        same_lane.account_id = Some("default".to_string());
+        same_lane.channel_id = "channel-a".to_string();
+        same_lane.user_id = "user-a".to_string();
+        same_lane.session_key = "discord:channel-a:user-a:worker-7".to_string();
+        let lease = child_cleanup_test_lease(
+            &same_lane,
+            "queue-original",
+            runtime_queue_lease_owner_from_env(observed_at_ms),
+            observed_at_ms,
+        );
+        let mut state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::from([(lease.queue_id.clone(), lease.clone())]),
+        };
+        let queue_dir = root.join("state").join("runtime-queue");
+        write_runtime_queue_leases(&queue_dir, "agent", &state).unwrap();
+        let lease_authority = child_cleanup_test_authority(&lease);
+        prearm_runtime_queue_child_cleanup_fence(&root, &lease_authority, observed_at_ms).unwrap();
+
+        let blocker = runtime_capacity_blocker(&root, &state, &same_lane)
+            .unwrap()
+            .expect("the exact noninteractive lane must be fenced");
+        assert!(blocker.contains("exact-lane child-cleanup fence"));
+
+        let mut unrelated_lane = same_lane.clone();
+        unrelated_lane.queue_id = "queue-unrelated".to_string();
+        unrelated_lane.channel_id = "channel-b".to_string();
+        unrelated_lane.session_key = "discord:channel-b:user-a:worker-7".to_string();
+        assert_eq!(
+            runtime_capacity_blocker(&root, &state, &unrelated_lane).unwrap(),
+            None,
+            "a child fence is lane-scoped, not agent- or runtime-class-scoped"
+        );
+
+        state
+            .leases
+            .get_mut("queue-original")
+            .unwrap()
+            .lease_expires_at_ms = observed_at_ms - 1;
+        write_runtime_queue_leases(&queue_dir, "agent", &state).unwrap();
+        let expired_blocker = runtime_capacity_blocker(&root, &state, &same_lane)
+            .unwrap()
+            .expect("lease expiry must not bypass the exact-lane child fence");
+        assert!(expired_blocker.contains("exact-lane child-cleanup fence"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn orphaned_child_fences_reconcile_only_from_exact_process_generation_evidence() {
+        let observed_at_ms = current_log_time_ms().unwrap();
+        let dead_pid = 4_000_000_000_i64;
+
+        for (case, owner, bind_child, expect_reconciled) in [
+            (
+                "dead-prearm",
+                RuntimeQueueLeaseOwnerEnvelope {
+                    kind: "process".to_string(),
+                    service_id: RUNTIME_LOOP_SERVICE_ID.to_string(),
+                    generation_id: "dead-prearm".to_string(),
+                    pid: dead_pid,
+                    process_start_time_ms: 1,
+                    process_start_time_os_proven: true,
+                    acquired_at_ms: observed_at_ms,
+                },
+                false,
+                true,
+            ),
+            (
+                "dead-bound",
+                RuntimeQueueLeaseOwnerEnvelope {
+                    kind: "process".to_string(),
+                    service_id: RUNTIME_LOOP_SERVICE_ID.to_string(),
+                    generation_id: "dead-bound".to_string(),
+                    pid: dead_pid,
+                    process_start_time_ms: 1,
+                    process_start_time_os_proven: true,
+                    acquired_at_ms: observed_at_ms,
+                },
+                true,
+                true,
+            ),
+            (
+                "logical-start-unproven",
+                RuntimeQueueLeaseOwnerEnvelope {
+                    kind: "process".to_string(),
+                    service_id: RUNTIME_LOOP_SERVICE_ID.to_string(),
+                    generation_id: "logical-start-unproven".to_string(),
+                    pid: i64::from(std::process::id()),
+                    process_start_time_ms: observed_at_ms.saturating_sub(10_000),
+                    process_start_time_os_proven: false,
+                    acquired_at_ms: observed_at_ms,
+                },
+                false,
+                false,
+            ),
+        ] {
+            let root = temp_root(&format!("orphan_child_fence_{case}"));
+            let queue_dir = root.join("state").join("runtime-queue");
+            fs::create_dir_all(&queue_dir).unwrap();
+            let mut item = pending_cron_item("queue-successor", "main", observed_at_ms);
+            item.runtime_class = "interactive".to_string();
+            item.origin = "channel".to_string();
+            item.platform = "discord".to_string();
+            item.account_id = Some("default".to_string());
+            item.channel_id = "channel".to_string();
+            item.user_id = "user".to_string();
+            item.session_key = "discord:channel:user:main".to_string();
+            let lease = child_cleanup_test_lease(
+                &item,
+                "queue-original",
+                RuntimeQueueLeaseOwner::Envelope(owner),
+                observed_at_ms,
+            );
+            let state = RuntimeQueueLeaseState {
+                schema: runtime_queue_leases_schema(),
+                leases: BTreeMap::from([(lease.queue_id.clone(), lease.clone())]),
+            };
+            write_runtime_queue_leases(&queue_dir, "interactive", &state).unwrap();
+            let lease_authority = child_cleanup_test_authority(&lease);
+            let spawn_authority =
+                prearm_runtime_queue_child_cleanup_fence(&root, &lease_authority, observed_at_ms)
+                    .unwrap();
+            if bind_child {
+                bind_runtime_queue_child_cleanup_fence(
+                    &root,
+                    &spawn_authority,
+                    u32::try_from(dead_pid).unwrap(),
+                    Some(1),
+                    true,
+                )
+                .unwrap();
+            }
+
+            let mut warnings = Vec::new();
+            reconcile_orphaned_runtime_queue_child_cleanup_fences_locked(
+                &queue_dir,
+                "interactive",
+                &state,
+                &mut warnings,
+            )
+            .unwrap();
+            let fence_path = runtime_queue_child_cleanup_fence_file(
+                &root,
+                &lease_authority.canonical_lane_digest,
+            );
+            assert_eq!(
+                !fence_path.exists(),
+                expect_reconciled,
+                "{case}: warnings={warnings:?}"
+            );
+
+            let _ = fs::remove_dir_all(root);
+        }
+
+        let root = temp_root("orphan_child_fence_live_owner");
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let mut item = pending_cron_item("queue-successor", "main", observed_at_ms);
+        item.runtime_class = "interactive".to_string();
+        item.origin = "channel".to_string();
+        item.platform = "discord".to_string();
+        item.account_id = Some("default".to_string());
+        item.channel_id = "channel".to_string();
+        item.user_id = "user".to_string();
+        item.session_key = "discord:channel:user:main".to_string();
+        let owner = runtime_queue_lease_owner_from_env(observed_at_ms);
+        let RuntimeQueueLeaseOwner::Envelope(owner_envelope) = &owner else {
+            unreachable!();
+        };
+        assert!(
+            owner_envelope.process_start_time_os_proven,
+            "Windows replay requires actual OS process-generation evidence"
+        );
+        let lease = child_cleanup_test_lease(&item, "queue-original", owner, observed_at_ms);
+        let state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::from([(lease.queue_id.clone(), lease.clone())]),
+        };
+        write_runtime_queue_leases(&queue_dir, "interactive", &state).unwrap();
+        let lease_authority = child_cleanup_test_authority(&lease);
+        prearm_runtime_queue_child_cleanup_fence(&root, &lease_authority, observed_at_ms).unwrap();
+        let mut warnings = Vec::new();
+        reconcile_orphaned_runtime_queue_child_cleanup_fences_locked(
+            &queue_dir,
+            "interactive",
+            &state,
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(
+            runtime_queue_child_cleanup_fence_file(&root, &lease_authority.canonical_lane_digest)
+                .exists(),
+            "the live exact owner generation must remain fenced"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_proven_reconciliation_is_monotonic_and_aba_safe() {
+        let root = temp_root("cleanup_proven_monotonic_aba");
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let observed_at_ms = current_log_time_ms().unwrap();
+        let mut item = pending_cron_item("queue-successor", "main", observed_at_ms);
+        item.runtime_class = "interactive".to_string();
+        item.origin = "channel".to_string();
+        item.platform = "discord".to_string();
+        item.account_id = Some("default".to_string());
+        item.channel_id = "channel".to_string();
+        item.user_id = "user".to_string();
+        item.session_key = "discord:channel:user:main".to_string();
+        let lease_a = child_cleanup_test_lease(
+            &item,
+            "queue-a",
+            runtime_queue_lease_owner_from_env(observed_at_ms),
+            observed_at_ms,
+        );
+        let authority_a = child_cleanup_test_authority(&lease_a);
+        let mut state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::from([(lease_a.queue_id.clone(), lease_a.clone())]),
+        };
+        write_runtime_queue_leases(&queue_dir, "interactive", &state).unwrap();
+        let spawn_a =
+            prearm_runtime_queue_child_cleanup_fence(&root, &authority_a, observed_at_ms).unwrap();
+        let proven_a = mark_runtime_queue_child_cleanup_proven(
+            &root,
+            &spawn_a,
+            observed_at_ms.saturating_add(1),
+        )
+        .unwrap();
+        let fence_path =
+            runtime_queue_child_cleanup_fence_file(&root, &authority_a.canonical_lane_digest);
+        let mut malformed: Value = serde_json::from_slice(&fs::read(&fence_path).unwrap()).unwrap();
+        malformed["cleanupProvenAtMs"] = Value::from(observed_at_ms.saturating_sub(1));
+        fs::write(&fence_path, serde_json::to_vec_pretty(&malformed).unwrap()).unwrap();
+        let mut warnings = Vec::new();
+        reconcile_orphaned_runtime_queue_child_cleanup_fences_locked(
+            &queue_dir,
+            "interactive",
+            &state,
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(
+            fence_path.exists(),
+            "non-monotonic cleanup proof must remain fail-closed"
+        );
+
+        fs::write(
+            &fence_path,
+            serde_json::to_vec_pretty(&proven_a.record).unwrap(),
+        )
+        .unwrap();
+        warnings.clear();
+        reconcile_orphaned_runtime_queue_child_cleanup_fences_locked(
+            &queue_dir,
+            "interactive",
+            &state,
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(
+            !fence_path.exists(),
+            "durable monotonic cleanup proof must reconcile even while its owner is alive"
+        );
+        let owner_b = match runtime_queue_lease_owner_from_env(observed_at_ms.saturating_add(10)) {
+            RuntimeQueueLeaseOwner::Envelope(mut owner) => {
+                owner.generation_id = format!("{}-successor", owner.generation_id);
+                owner.acquired_at_ms = observed_at_ms.saturating_add(10);
+                RuntimeQueueLeaseOwner::Envelope(owner)
+            }
+            RuntimeQueueLeaseOwner::Legacy(_) => unreachable!(),
+        };
+        let lease_b =
+            child_cleanup_test_lease(&item, "queue-b", owner_b, observed_at_ms.saturating_add(10));
+        let authority_b = child_cleanup_test_authority(&lease_b);
+        state.leases.clear();
+        state
+            .leases
+            .insert(lease_b.queue_id.clone(), lease_b.clone());
+        write_runtime_queue_leases(&queue_dir, "interactive", &state).unwrap();
+        let spawn_b = prearm_runtime_queue_child_cleanup_fence(
+            &root,
+            &authority_b,
+            observed_at_ms.saturating_add(10),
+        )
+        .unwrap();
+        let stale_error = clear_runtime_queue_child_cleanup_fence(&root, &proven_a).unwrap_err();
+        assert_eq!(stale_error.kind(), io::ErrorKind::AlreadyExists);
+        let current: RuntimeQueueChildCleanupFenceV1 =
+            serde_json::from_slice(&fs::read(&fence_path).unwrap()).unwrap();
+        assert_eq!(current, spawn_b.record);
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9320,6 +10997,7 @@ mod tests {
                 generation_id: "generation-a".to_string(),
                 pid: i64::from(std::process::id()),
                 process_start_time_ms: 900_000,
+                process_start_time_os_proven: false,
                 acquired_at_ms: 990_000,
             };
             let session_lane_key =
@@ -9989,6 +11667,205 @@ mod tests {
             1
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_failure_after_durable_acquire_releases_exact_queue_lease() {
+        let root = temp_root("prepare_failure_after_durable_acquire_releases_exact_queue_lease");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn(&source, &harness_home);
+        let pending: Value = serde_json::from_str(
+            fs::read_to_string(queue_dir(&harness_home).join("pending.jsonl"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let queue_id = pending["queueId"].as_str().unwrap().to_string();
+
+        // The per-queue execution directory is created only after the durable
+        // lease and prompt assembly. Replacing its parent with a file injects
+        // a deterministic post-acquire prepare failure.
+        fs::write(
+            queue_dir(&harness_home).join("executions"),
+            "not-a-directory",
+        )
+        .unwrap();
+        let error = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::NotADirectory
+            ),
+            "fixture did not fail at the post-acquire execution-directory seam: {error}"
+        );
+        let execution_receipts =
+            fs::read_to_string(queue_dir(&harness_home).join("execution-receipts.jsonl")).unwrap();
+        assert!(
+            execution_receipts.contains("\"status\":\"lease-acquired\""),
+            "failure injection occurred before durable lease acquisition"
+        );
+
+        let lease = observe_runtime_queue_lease(RuntimeQueueLeaseObservationOptions {
+            harness_home: harness_home.clone(),
+            queue_id: queue_id.clone(),
+            observed_at_ms: current_log_time_ms().unwrap(),
+        });
+        assert_eq!(
+            lease.status,
+            RuntimeQueueLeaseObservationStatus::Released,
+            "post-acquire prepare failure leaked exact lease {queue_id}: {}",
+            lease.reason
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn assert_prepared_resume_failpoint_releases_exact_queue_lease(
+        test_name: &str,
+        failpoint: &str,
+        requested_resume: bool,
+    ) {
+        let root = temp_root(test_name);
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn(&source, &harness_home);
+        let pending: Value = serde_json::from_str(
+            fs::read_to_string(queue_dir(&harness_home).join("pending.jsonl"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let queue_id = pending["queueId"].as_str().unwrap().to_string();
+
+        let first = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            first.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        assert!(first.item.is_some());
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+
+        let failpoint_file = runtime_queue_prepare_failpoint_file(&harness_home, failpoint);
+        fs::create_dir_all(failpoint_file.parent().unwrap()).unwrap();
+        fs::write(&failpoint_file, "fail").unwrap();
+        let error = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: requested_resume.then_some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(failpoint),
+            "prepared-resume failure did not reach the post-lease failpoint: {error}"
+        );
+
+        let lease = observe_runtime_queue_lease(RuntimeQueueLeaseObservationOptions {
+            harness_home: harness_home.clone(),
+            queue_id: queue_id.clone(),
+            observed_at_ms: current_log_time_ms().unwrap(),
+        });
+        assert_eq!(
+            lease.status,
+            RuntimeQueueLeaseObservationStatus::Released,
+            "prepared-resume failure leaked exact lease {queue_id}: {}",
+            lease.reason
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn requested_prepared_resume_failure_after_durable_lease_releases_exact_queue_lease() {
+        assert_prepared_resume_failpoint_releases_exact_queue_lease(
+            "requested_prepared_resume_failure_releases_lease",
+            "requested-prepared-resume-after-lease",
+            true,
+        );
+    }
+
+    #[test]
+    fn automatic_prepared_resume_failure_after_durable_lease_releases_exact_queue_lease() {
+        assert_prepared_resume_failpoint_releases_exact_queue_lease(
+            "automatic_prepared_resume_failure_releases_lease",
+            "automatic-prepared-resume-after-lease",
+            false,
+        );
+    }
+
+    #[test]
+    fn prepare_unwind_guard_does_not_remove_successor_acquisition_for_same_queue() {
+        let root = temp_root("prepare_unwind_guard_preserves_successor_acquisition");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn(&source, &harness_home);
+        let pending: Value = serde_json::from_str(
+            fs::read_to_string(queue_dir(&harness_home).join("pending.jsonl"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let queue_id = pending["queueId"].as_str().unwrap().to_string();
+
+        let first = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        let first_authority = first
+            .lease_release_authority()
+            .expect("first exact acquisition authority");
+        let stale_unwind_guard =
+            RuntimeQueuePrepareLeaseGuard::new(&harness_home, &queue_id, first_authority.clone());
+
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        let successor = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        let successor_authority = successor
+            .lease_release_authority()
+            .expect("successor exact acquisition authority");
+        assert_ne!(
+            first_authority, successor_authority,
+            "fixture must replace the acquisition identity, including acquiredAtMs"
+        );
+
+        drop(stale_unwind_guard);
+        let lease = observe_runtime_queue_lease(RuntimeQueueLeaseObservationOptions {
+            harness_home: harness_home.clone(),
+            queue_id: queue_id.clone(),
+            observed_at_ms: current_log_time_ms().unwrap(),
+        });
+        assert_eq!(
+            lease.status,
+            RuntimeQueueLeaseObservationStatus::Active,
+            "stale prepare unwind removed successor lease: {}",
+            lease.reason
+        );
+
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -10815,6 +12692,7 @@ mod tests {
 
         let mut warnings = Vec::new();
         purge_runtime_queue_leases(
+            &queue_dir,
             &mut state,
             2_000,
             &HashSet::new(),
@@ -11556,6 +13434,7 @@ mod tests {
                     generation_id: generation_id.to_string(),
                     pid: 12_345,
                     process_start_time_ms: now_ms.saturating_sub(1_000),
+                    process_start_time_os_proven: false,
                     acquired_at_ms: now_ms,
                 }),
                 started_at_ms: now_ms,
@@ -12227,6 +14106,7 @@ mod tests {
                     generation_id: generation_id.to_string(),
                     pid: 12_345,
                     process_start_time_ms: now_ms.saturating_sub(1_000),
+                    process_start_time_os_proven: false,
                     acquired_at_ms: now_ms,
                 }),
                 started_at_ms: now_ms,
@@ -12254,6 +14134,7 @@ mod tests {
                     generation_id: "different-generation".to_string(),
                     pid: 12_346,
                     process_start_time_ms: now_ms.saturating_sub(1_000),
+                    process_start_time_os_proven: false,
                     acquired_at_ms: now_ms,
                 }),
                 started_at_ms: now_ms,
@@ -13329,6 +15210,46 @@ mod tests {
             selected_skill_ids: Vec::new(),
             continuation: RuntimeContinuationMetadata::legacy(),
             coordinator_resume: None,
+        }
+    }
+
+    fn child_cleanup_test_lease(
+        item: &PendingQueueItem,
+        queue_id: &str,
+        owner: RuntimeQueueLeaseOwner,
+        observed_at_ms: i64,
+    ) -> RuntimeQueueLease {
+        RuntimeQueueLease {
+            queue_id: queue_id.to_string(),
+            agent_id: item.agent_id.clone(),
+            runtime_class: item.runtime_class.clone(),
+            origin: item.origin.clone(),
+            cron_run_id: item.cron_run_id.clone(),
+            platform: item.platform.clone(),
+            account_id: item.account_id.clone(),
+            channel_id: item.channel_id.clone(),
+            user_id: Some(item.user_id.clone()),
+            session_key: item.session_key.clone(),
+            virtual_session_id: Some(format!("virtual-{queue_id}")),
+            session_lane_key: None,
+            owner,
+            started_at_ms: observed_at_ms,
+            lease_expires_at_ms: observed_at_ms.saturating_add(60_000),
+        }
+    }
+
+    fn child_cleanup_test_authority(
+        lease: &RuntimeQueueLease,
+    ) -> RuntimeQueueChildCleanupLeaseAuthority {
+        let RuntimeQueueLeaseOwner::Envelope(owner) = &lease.owner else {
+            panic!("child cleanup test lease must use an owner envelope");
+        };
+        RuntimeQueueChildCleanupLeaseAuthority {
+            queue_id: lease.queue_id.clone(),
+            runtime_class: lease.runtime_class.clone(),
+            canonical_lane_digest: runtime_queue_lease_canonical_lane_digest(lease).unwrap(),
+            lease_owner_digest: runtime_queue_lease_owner_digest(owner),
+            lease_acquired_at_ms: owner.acquired_at_ms,
         }
     }
 

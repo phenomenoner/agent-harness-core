@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::loop_health::process_alive_for_pid;
+use crate::process_launch::configure_noninteractive_command;
 use crate::{
     append_jsonl_value, append_jsonl_value_once_by_event_key, current_log_time_ms,
     write_json_atomic,
@@ -654,14 +655,16 @@ fn probe_backend_account_under_lease(
         options.executable_provenance_receipt.as_deref(),
         &executable,
     )?;
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("app-server")
         .arg("--stdio")
         .env("CODEX_HOME", &codex_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    configure_noninteractive_command(&mut command);
+    let mut child = command.spawn()?;
     let mut stdin = child.stdin.take().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::BrokenPipe,
@@ -1754,12 +1757,14 @@ fn terminate_backend_auth_child_process_tree(
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let mut command = Command::new("taskkill");
+        command
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        configure_noninteractive_command(&mut command);
+        let _ = command.status();
     }
     let _ = child.kill();
     child.wait()
@@ -2281,10 +2286,12 @@ mod tests {
         assert!(!marker_text.contains(operation_id));
 
         #[cfg(windows)]
-        let mut child = Command::new("powershell")
-            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
-            .spawn()
-            .unwrap();
+        let mut child = {
+            let mut command = Command::new("powershell");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+            configure_noninteractive_command(&mut command);
+            command.spawn().unwrap()
+        };
         #[cfg(not(windows))]
         let mut child = Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap();
         let (_, cancelled) = wait_for_backend_auth_child(

@@ -1,12 +1,16 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
+#[cfg(windows)]
+use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
+use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +51,7 @@ use crate::goal_closure::{
     goal_closure_receipts_for_id, record_goal_closure_intent, record_goal_closure_phase,
 };
 use crate::goal_lineage::{GoalProjectionObservationPhaseV1, GoalProjectionTurnRelationV1};
+use crate::process_launch::configure_noninteractive_command;
 use crate::runtime_execution_receipt_index::latest_prepared_execution_dir_from_index;
 use crate::virtual_session_runtime_index::latest_codex_runtime_usage as latest_codex_runtime_usage_from_index;
 use crate::{
@@ -89,6 +94,8 @@ const CODEX_TURN_STEER_RECEIPT_SCHEMA: &str = "agent-harness.codex-turn-steer-re
 const RUNTIME_CANCEL_CONSUMPTION_SCHEMA: &str = "agent-harness.runtime-cancel-consumption.v1";
 pub(crate) const NO_FINAL_ANSWER_WITH_NARRATION_MARKER: &str =
     "codex app-server completed without final_answer while progress-panel narration was active";
+pub(crate) const GOAL_CONTINUATION_AUTHORITY_BOUNDARY_MARKER: &str =
+    "goal-continuation-authority-boundary";
 const CODEX_APP_SERVER_DEVELOPER_INSTRUCTIONS: &str = "\
 This Codex app-server thread backs an imported agent harness session. Codex owns \
 the backend system prompt, tool schemas, MCP/tool inventory, sandbox, approvals, \
@@ -552,6 +559,10 @@ pub struct CodexRuntimeCompletionReport {
 #[serde(rename_all = "camelCase")]
 pub struct CodexRuntimePlan {
     pub queue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_lease_owner_digest: Option<String>,
     pub agent_id: Option<String>,
     pub session_key: String,
     /// Exact durable channel lane propagated from the prepared queue receipt.
@@ -1856,6 +1867,49 @@ struct CodexGoalProjectionObserver {
     latest_by_thread: BTreeMap<String, CodexGoalProjectionV1>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexOwnedGoalState {
+    Active,
+    Terminal(String),
+    Other(String),
+}
+
+fn classify_owned_goal_state(status: &str) -> CodexOwnedGoalState {
+    let normalized = status
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_', ' '], "");
+    if matches!(normalized.as_str(), "active" | "running" | "inprogress") {
+        CodexOwnedGoalState::Active
+    } else if matches!(
+        normalized.as_str(),
+        "completed"
+            | "complete"
+            | "succeeded"
+            | "achieved"
+            | "paused"
+            | "pause"
+            | "blocked"
+            | "stopped"
+            | "stop"
+            | "canceled"
+            | "cancelled"
+            | "needsuser"
+            | "needsinput"
+            | "needsapproval"
+            | "needsauthority"
+            | "needsauthorization"
+            | "needsauthorisation"
+            | "needsoperatorauth"
+            | "operatorauthrequired"
+            | "authenticationrequired"
+    ) {
+        CodexOwnedGoalState::Terminal(normalized)
+    } else {
+        CodexOwnedGoalState::Other(normalized)
+    }
+}
+
 impl CodexGoalProjectionObserver {
     fn new(harness_home: &Path, plan: &CodexRuntimePlanFile) -> io::Result<Self> {
         let receipts_file = harness_home
@@ -1980,6 +2034,18 @@ impl CodexGoalProjectionObserver {
             .as_deref()
             .and_then(|thread_id| self.latest_by_thread.get(thread_id))
             .is_some_and(|projection| projection.status.eq_ignore_ascii_case("active"))
+    }
+
+    fn owned_turn_goal_state(&self, owned_turn_id: Option<&str>) -> Option<CodexOwnedGoalState> {
+        let owned_turn_id = owned_turn_id?;
+        let projection = self
+            .current_thread_id
+            .as_deref()
+            .and_then(|thread_id| self.latest_by_thread.get(thread_id))?;
+        (projection.source_final_eligible
+            && projection.turn_relation == GoalProjectionTurnRelationV1::CurrentOwnedTurn
+            && projection.source_turn_id.as_deref() == Some(owned_turn_id))
+        .then(|| classify_owned_goal_state(&projection.status))
     }
 
     fn observe(&mut self, value: &Value, observation_order: u64) -> io::Result<bool> {
@@ -2384,6 +2450,7 @@ fn run_codex_goal_closure_maintenance(
     if let Some(codex_home) = options.codex_home.as_ref() {
         command.env("CODEX_HOME", codex_home);
     }
+    configure_noninteractive_command(&mut command);
     let mut child = command.spawn()?;
     let stdout = child
         .stdout
@@ -2532,7 +2599,7 @@ fn run_codex_goal_closure_maintenance(
     })();
     drop(stdin);
     let mut cleanup_warnings = Vec::new();
-    finish_codex_child_and_stdout_reader(
+    finish_std_codex_child_and_stdout_reader(
         &mut child,
         &mut reader_handle,
         &mut cleanup_warnings,
@@ -2923,6 +2990,10 @@ pub enum CodexRuntimeReceiptStatus {
 #[serde(rename_all = "camelCase")]
 struct CodexRuntimePlanFile {
     pub queue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_lease_owner_digest: Option<String>,
     pub agent_id: Option<String>,
     pub session_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3223,6 +3294,17 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     let bundle = read_json_file(&prompt_bundle_json)?;
     let queue_id =
         string_field(&prepared_receipt, &["queueId", "queue_id"]).map(ToString::to_string);
+    let runtime_class = string_field(&prepared_receipt, &["runtimeClass", "runtime_class"])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let runtime_lease_owner_digest = string_field(
+        &prepared_receipt,
+        &["runtimeLeaseOwnerDigest", "runtime_lease_owner_digest"],
+    )
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(ToString::to_string);
     let continuation =
         serde_json::from_value::<RuntimeContinuationMetadata>(prepared_receipt.clone())
             .unwrap_or_else(|_| RuntimeContinuationMetadata::legacy());
@@ -3361,6 +3443,8 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     };
     let plan = CodexRuntimePlan {
         queue_id: queue_id.clone(),
+        runtime_class,
+        runtime_lease_owner_digest,
         agent_id,
         session_key,
         channel_lane,
@@ -6050,9 +6134,1405 @@ struct CodexAppServerRunResult {
     warnings: Vec<String>,
 }
 
+fn codex_app_server_pre_execution_result(
+    status: CodexRuntimeRunStatus,
+    reason: String,
+    stdout_log: &Path,
+    stderr_log: &Path,
+) -> CodexAppServerRunResult {
+    CodexAppServerRunResult {
+        status,
+        reason,
+        assistant_message: String::new(),
+        assistant_narration: Vec::new(),
+        assistant_raw_message: String::new(),
+        assistant_final_found: false,
+        thread_id: None,
+        event_count: 0,
+        usage: None,
+        stdout_log: Some(stdout_log.to_path_buf()),
+        stderr_log: Some(stderr_log.to_path_buf()),
+        context_recovery: None,
+        tool_use_timeout: None,
+        interruption_reason: None,
+        interrupted_tool_uses: Vec::new(),
+        backend_reasoning_execution: None,
+        warnings: Vec::new(),
+    }
+}
+
 struct StdoutReaderHandle {
     handle: Option<thread::JoinHandle<()>>,
     done_rx: mpsc::Receiver<()>,
+}
+
+#[cfg(windows)]
+struct WindowsCodexProcessJob {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl WindowsCodexProcessJob {
+    fn create() -> io::Result<Self> {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                    .expect("job information size fits u32"),
+            ) == 0
+            {
+                let error = io::Error::last_os_error();
+                let _ = CloseHandle(handle);
+                return Err(error);
+            }
+            Ok(Self { handle })
+        }
+    }
+
+    fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.handle
+    }
+
+    fn terminate(&self) -> io::Result<()> {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        if unsafe { TerminateJobObject(self.handle, 1) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_until_empty(&self, timeout: Duration) -> io::Result<bool> {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        unsafe {
+            let started = Instant::now();
+            loop {
+                let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();
+                if QueryInformationJobObject(
+                    self.handle,
+                    JobObjectBasicAccountingInformation,
+                    std::ptr::addr_of_mut!(accounting).cast(),
+                    u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                        .expect("job accounting information size fits u32"),
+                    std::ptr::null_mut(),
+                ) == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if accounting.ActiveProcesses == 0 {
+                    return Ok(true);
+                }
+                if started.elapsed() >= timeout {
+                    return Ok(false);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsCodexProcessJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        unsafe {
+            // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is the final containment
+            // boundary even if explicit termination/readback failed.
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsAtomicCodexChild {
+    process_handle: Option<std::os::windows::io::OwnedHandle>,
+    primary_thread_handle: Option<std::os::windows::io::OwnedHandle>,
+    process_id: u32,
+    stdin: Option<WindowsOverlappedPipeWriter>,
+    stdout: Option<File>,
+}
+
+#[cfg(windows)]
+struct WindowsOverlappedPipeWriter {
+    handle: std::os::windows::io::OwnedHandle,
+    write_timeout: Duration,
+    poisoned: bool,
+}
+
+#[cfg(windows)]
+impl WindowsOverlappedPipeWriter {
+    fn completed_write(
+        &mut self,
+        expected: usize,
+        transferred: u32,
+        context: &str,
+    ) -> io::Result<usize> {
+        let transferred = usize::try_from(transferred).expect("u32 fits usize on Windows");
+        if transferred == expected {
+            return Ok(expected);
+        }
+        self.poisoned = true;
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!(
+                "overlapped Codex child stdin {context} completed only {transferred}/{expected} bytes; the stream is poisoned"
+            ),
+        ))
+    }
+
+    fn timeout_ms(&self) -> u32 {
+        self.write_timeout
+            .as_millis()
+            .clamp(1, u128::from(u32::MAX - 1)) as u32
+    }
+}
+
+#[cfg(windows)]
+impl Write for WindowsOverlappedPipeWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        use std::mem::zeroed;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::{
+            ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+        use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        if self.poisoned {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "overlapped Codex child stdin is poisoned after an incomplete write",
+            ));
+        }
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        let expected = buffer.len().min(u32::MAX as usize);
+        unsafe {
+            let event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            if event == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let event = OwnedHandle::from_raw_handle(event as *mut _);
+            let mut overlapped: OVERLAPPED = zeroed();
+            overlapped.hEvent = event.as_raw_handle() as isize;
+            let started = WriteFile(
+                self.handle.as_raw_handle() as isize,
+                buffer.as_ptr(),
+                u32::try_from(expected).expect("bounded write size fits u32"),
+                std::ptr::null_mut(),
+                &mut overlapped,
+            );
+            if started != 0 {
+                let mut transferred = 0;
+                if GetOverlappedResult(
+                    self.handle.as_raw_handle() as isize,
+                    &overlapped,
+                    &mut transferred,
+                    0,
+                ) == 0
+                {
+                    self.poisoned = true;
+                    return Err(io::Error::last_os_error());
+                }
+                return self.completed_write(expected, transferred, "write");
+            }
+
+            let start_error = io::Error::last_os_error();
+            if start_error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+                self.poisoned = true;
+                return Err(start_error);
+            }
+
+            let wait = WaitForSingleObject(event.as_raw_handle() as isize, self.timeout_ms());
+            if wait == WAIT_OBJECT_0 {
+                let mut transferred = 0;
+                if GetOverlappedResult(
+                    self.handle.as_raw_handle() as isize,
+                    &overlapped,
+                    &mut transferred,
+                    0,
+                ) == 0
+                {
+                    self.poisoned = true;
+                    return Err(io::Error::last_os_error());
+                }
+                return self.completed_write(expected, transferred, "write");
+            }
+
+            let wait_error = (wait == WAIT_FAILED).then(io::Error::last_os_error);
+            let cancel_requested = CancelIoEx(
+                self.handle.as_raw_handle() as isize,
+                std::ptr::addr_of!(overlapped),
+            );
+            let cancel_error = (cancel_requested == 0).then(io::Error::last_os_error);
+            let mut transferred = 0;
+            let completed = GetOverlappedResult(
+                self.handle.as_raw_handle() as isize,
+                &overlapped,
+                &mut transferred,
+                1,
+            );
+            if completed != 0 {
+                return self.completed_write(expected, transferred, "completion race");
+            }
+
+            self.poisoned = true;
+            let completion_error = io::Error::last_os_error();
+            if wait == WAIT_TIMEOUT
+                && completion_error.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "overlapped Codex child stdin write exceeded its {} ms deadline and was canceled",
+                        self.timeout_ms()
+                    ),
+                ));
+            }
+            if let Some(cancel_error) = cancel_error
+                && cancel_error.raw_os_error() != Some(ERROR_NOT_FOUND as i32)
+            {
+                return Err(io::Error::other(format!(
+                    "overlapped Codex child stdin wait/cancel failed: wait={wait_error:?}; cancel={cancel_error}; completion={completion_error}"
+                )));
+            }
+            Err(io::Error::other(format!(
+                "overlapped Codex child stdin write did not complete: wait={wait_error:?}; completion={completion_error}"
+            )))
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // A completed overlapped WriteFile is the frame commit boundary.
+        // FlushFileBuffers would instead wait for peer consumption and defeat
+        // the protocol deadline.
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn create_windows_child_stdin_pipe(
+    write_timeout: Duration,
+) -> io::Result<(
+    std::os::windows::io::OwnedHandle,
+    WindowsOverlappedPipeWriter,
+)> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{
+        ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+        OPEN_EXISTING, PIPE_ACCESS_OUTBOUND,
+    };
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+    use windows_sys::Win32::System::Threading::CreateEventW;
+
+    unsafe fn owned(handle: HANDLE) -> OwnedHandle {
+        unsafe { OwnedHandle::from_raw_handle(handle as *mut _) }
+    }
+
+    const PIPE_BUFFER_CAPACITY: u32 = 64 * 1024;
+    let mut nonce = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| io::Error::other("failed to generate a unique Codex child stdin pipe name"))?;
+    let nonce = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let pipe_name = format!(
+        r"\\.\pipe\agent-harness-codex-stdin-{}-{nonce}",
+        std::process::id()
+    );
+    let pipe_name = os_string_wide_z(
+        std::ffi::OsStr::new(&pipe_name),
+        "Codex child stdin pipe name",
+    )?;
+
+    unsafe {
+        let parent_stdin_write = CreateNamedPipeW(
+            pipe_name.as_ptr(),
+            PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            PIPE_BUFFER_CAPACITY,
+            PIPE_BUFFER_CAPACITY,
+            0,
+            std::ptr::null(),
+        );
+        if parent_stdin_write == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let parent_stdin_write = owned(parent_stdin_write);
+
+        let connect_event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+        if connect_event == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let connect_event = owned(connect_event);
+        let mut connect_overlapped: OVERLAPPED = zeroed();
+        connect_overlapped.hEvent = connect_event.as_raw_handle() as isize;
+        if ConnectNamedPipe(
+            parent_stdin_write.as_raw_handle() as isize,
+            &mut connect_overlapped,
+        ) != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Codex child stdin named pipe connected before its private child handle was opened",
+            ));
+        }
+        let connect_error = io::Error::last_os_error();
+        if connect_error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Codex child stdin named pipe could not enter its private pending-connect state: {connect_error}"
+                ),
+            ));
+        }
+
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>())
+                .expect("security attributes size fits u32"),
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        let child_stdin_read = CreateFileW(
+            pipe_name.as_ptr(),
+            GENERIC_READ,
+            0,
+            &attributes,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            0,
+        );
+        if child_stdin_read == INVALID_HANDLE_VALUE {
+            let create_error = io::Error::last_os_error();
+            let _ = CancelIoEx(
+                parent_stdin_write.as_raw_handle() as isize,
+                std::ptr::addr_of!(connect_overlapped),
+            );
+            let mut ignored = 0;
+            let completed = GetOverlappedResult(
+                parent_stdin_write.as_raw_handle() as isize,
+                &connect_overlapped,
+                &mut ignored,
+                1,
+            );
+            if completed == 0 {
+                let completion_error = io::Error::last_os_error();
+                if completion_error.raw_os_error() != Some(ERROR_OPERATION_ABORTED as i32) {
+                    return Err(io::Error::other(format!(
+                        "failed to open the Codex child stdin pipe ({create_error}) and could not drain its pending connection ({completion_error})"
+                    )));
+                }
+            }
+            return Err(create_error);
+        }
+        let child_stdin_read = owned(child_stdin_read);
+
+        let mut ignored = 0;
+        if GetOverlappedResult(
+            parent_stdin_write.as_raw_handle() as isize,
+            &connect_overlapped,
+            &mut ignored,
+            1,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok((
+            child_stdin_read,
+            WindowsOverlappedPipeWriter {
+                handle: parent_stdin_write,
+                write_timeout,
+                poisoned: false,
+            },
+        ))
+    }
+}
+
+#[cfg(windows)]
+impl WindowsAtomicCodexChild {
+    fn id(&self) -> u32 {
+        self.process_id
+    }
+
+    fn take_stdin(&mut self) -> Option<WindowsOverlappedPipeWriter> {
+        self.stdin.take()
+    }
+
+    fn take_stdout(&mut self) -> Option<File> {
+        self.stdout.take()
+    }
+
+    fn resume_primary_thread(&mut self) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::ResumeThread;
+
+        let thread = self.primary_thread_handle.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "atomic Codex child primary thread handle is unavailable",
+            )
+        })?;
+        let previous = unsafe { ResumeThread(thread.as_raw_handle() as isize) };
+        if previous == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        if previous != 1 {
+            return Err(io::Error::other(format!(
+                "atomic Codex child had unexpected suspend count {previous} before resume"
+            )));
+        }
+        self.primary_thread_handle = None;
+        Ok(())
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::ExitStatusExt;
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+        let process_handle = self.process_handle.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "atomic Codex child process handle is unavailable",
+            )
+        })?;
+        match unsafe { WaitForSingleObject(process_handle.as_raw_handle() as isize, 0) } {
+            WAIT_TIMEOUT => return Ok(None),
+            WAIT_OBJECT_0 => {}
+            WAIT_FAILED => return Err(io::Error::last_os_error()),
+            other => {
+                return Err(io::Error::other(format!(
+                    "unexpected Codex process poll result {other}"
+                )));
+            }
+        }
+        let mut exit_code = 0_u32;
+        if unsafe { GetExitCodeProcess(process_handle.as_raw_handle() as isize, &mut exit_code) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(ExitStatus::from_raw(exit_code)))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+
+        let process_handle = self.process_handle.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "atomic Codex child process handle is unavailable",
+            )
+        })?;
+        if unsafe { TerminateProcess(process_handle.as_raw_handle() as isize, 1) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        let process_handle = self.process_handle.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "atomic Codex child process handle is unavailable",
+            )
+        })?;
+        let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        match unsafe { WaitForSingleObject(process_handle.as_raw_handle() as isize, timeout_ms) } {
+            WAIT_OBJECT_0 => self.try_wait(),
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            other => Err(io::Error::other(format!(
+                "unexpected Codex process bounded-wait result {other}"
+            ))),
+        }
+    }
+
+    fn release_kernel_handles(&mut self) {
+        self.primary_thread_handle = None;
+        self.process_handle = None;
+    }
+}
+
+#[cfg(windows)]
+struct WindowsProcThreadAttributeList {
+    pointer: windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST,
+    _storage: Vec<usize>,
+    job_handles: Box<[windows_sys::Win32::Foundation::HANDLE; 1]>,
+    stdio_handles: Box<[windows_sys::Win32::Foundation::HANDLE; 3]>,
+}
+
+#[cfg(windows)]
+impl WindowsProcThreadAttributeList {
+    fn for_job_and_stdio(
+        job_handle: windows_sys::Win32::Foundation::HANDLE,
+        stdio_handles: [windows_sys::Win32::Foundation::HANDLE; 3],
+    ) -> io::Result<Self> {
+        use std::mem::size_of;
+        use windows_sys::Win32::System::Threading::{
+            InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST, UpdateProcThreadAttribute,
+        };
+
+        unsafe {
+            let mut bytes = 0_usize;
+            let _ = InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut bytes);
+            if bytes == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let words = bytes.div_ceil(size_of::<usize>());
+            let mut storage = vec![0_usize; words];
+            let pointer = storage.as_mut_ptr().cast();
+            if InitializeProcThreadAttributeList(pointer, 2, 0, &mut bytes) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let list = Self {
+                pointer,
+                _storage: storage,
+                job_handles: Box::new([job_handle]),
+                stdio_handles: Box::new(stdio_handles),
+            };
+            if UpdateProcThreadAttribute(
+                list.pointer,
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                list.job_handles.as_ptr().cast(),
+                size_of::<windows_sys::Win32::Foundation::HANDLE>(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if UpdateProcThreadAttribute(
+                list.pointer,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                list.stdio_handles.as_ptr().cast(),
+                size_of_val(list.stdio_handles.as_ref()),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(list)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsProcThreadAttributeList {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList;
+
+        unsafe {
+            DeleteProcThreadAttributeList(self.pointer);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn os_string_wide_z(value: &OsStr, context: &str) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut wide = value.encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{context} contains an embedded NUL"),
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn push_windows_command_arg(command_line: &mut Vec<u16>, argument: &OsStr) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide = argument.encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Codex child argument contains an embedded NUL",
+        ));
+    }
+    let quote = wide.is_empty()
+        || wide
+            .iter()
+            .any(|value| matches!(*value, 0x09 | 0x20 | 0x22));
+    if !quote {
+        command_line.extend(wide);
+        return Ok(());
+    }
+    command_line.push(u16::from(b'"'));
+    let mut backslashes = 0_usize;
+    for value in wide {
+        if value == u16::from(b'\\') {
+            backslashes = backslashes.saturating_add(1);
+            continue;
+        }
+        if value == u16::from(b'"') {
+            command_line.extend(std::iter::repeat_n(
+                u16::from(b'\\'),
+                backslashes.saturating_mul(2).saturating_add(1),
+            ));
+            command_line.push(value);
+        } else {
+            command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+            command_line.push(value);
+        }
+        backslashes = 0;
+    }
+    command_line.extend(std::iter::repeat_n(
+        u16::from(b'\\'),
+        backslashes.saturating_mul(2),
+    ));
+    command_line.push(u16::from(b'"'));
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_native_codex_command_line(plan: &CodexRuntimePlanFile) -> io::Result<Vec<u16>> {
+    let mut command_line = Vec::new();
+    push_windows_command_arg(&mut command_line, plan.invocation.executable.as_os_str())?;
+    for argument in &plan.invocation.arguments {
+        command_line.push(u16::from(b' '));
+        push_windows_command_arg(&mut command_line, OsStr::new(argument))?;
+    }
+    command_line.push(0);
+    Ok(command_line)
+}
+
+#[cfg(windows)]
+fn push_windows_batch_arg(
+    command_line: &mut Vec<u16>,
+    argument: &OsStr,
+    mut quote: bool,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide = argument.encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) || wide.iter().any(|value| matches!(*value, 0x0a | 0x0d)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "batch file arguments may not contain NUL, carriage return, or newline",
+        ));
+    }
+    if wide.is_empty() || wide.last() == Some(&u16::from(b'\\')) {
+        quote = true;
+    }
+    const UNQUOTED_ASCII: &[u8] = br"#$*+-./:?@\_";
+    for value in &wide {
+        if *value <= 0x7f {
+            let byte = u8::try_from(*value).expect("ASCII value fits u8");
+            if !(byte.is_ascii_alphanumeric() || UNQUOTED_ASCII.contains(&byte)) {
+                quote = true;
+            }
+        } else if (0x80..=0x9f).contains(value) {
+            quote = true;
+        }
+    }
+    if quote {
+        command_line.push(u16::from(b'"'));
+    }
+    let mut backslashes = 0_usize;
+    for value in wide {
+        if value == u16::from(b'\\') {
+            backslashes = backslashes.saturating_add(1);
+        } else {
+            if value == u16::from(b'"') {
+                command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+                command_line.push(u16::from(b'"'));
+            } else if value == u16::from(b'%') {
+                // This is the same no-op cmd.exe expansion guard used by
+                // std::process so a literal percent cannot become %VAR%.
+                command_line.extend("%%cd:~,".encode_utf16());
+            }
+            backslashes = 0;
+        }
+        command_line.push(value);
+    }
+    if quote {
+        command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+        command_line.push(u16::from(b'"'));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_batch_codex_command_line(plan: &CodexRuntimePlanFile) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let script = plan
+        .invocation
+        .executable
+        .as_os_str()
+        .encode_wide()
+        .collect::<Vec<_>>();
+    if script.contains(&u16::from(b'"')) || script.last() == Some(&u16::from(b'\\')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows batch paths may not contain a quote or end with a backslash",
+        ));
+    }
+    let mut command_line = "cmd.exe /e:ON /v:OFF /d /c \""
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    command_line.push(u16::from(b'"'));
+    command_line.extend(script);
+    command_line.push(u16::from(b'"'));
+    for argument in &plan.invocation.arguments {
+        command_line.push(u16::from(b' '));
+        push_windows_batch_arg(&mut command_line, OsStr::new(argument), false)?;
+    }
+    command_line.push(u16::from(b'"'));
+    command_line.push(0);
+    Ok(command_line)
+}
+
+#[cfg(windows)]
+fn windows_system_command_prompt() -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut system_directory = vec![0_u16; 32_768];
+    let length = unsafe {
+        GetSystemDirectoryW(
+            system_directory.as_mut_ptr(),
+            u32::try_from(system_directory.len()).expect("system path buffer fits u32"),
+        )
+    };
+    if length == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let length = usize::try_from(length).expect("system directory length fits usize");
+    if length >= system_directory.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows system directory exceeded the bounded path buffer",
+        ));
+    }
+    system_directory.truncate(length);
+    let mut command_prompt = PathBuf::from(OsString::from_wide(&system_directory));
+    command_prompt.push("cmd.exe");
+    os_string_wide_z(command_prompt.as_os_str(), "Windows command prompt path")
+}
+
+#[cfg(windows)]
+fn windows_codex_application_and_command_line(
+    plan: &CodexRuntimePlanFile,
+) -> io::Result<(Vec<u16>, Vec<u16>)> {
+    let executable = resolve_executable(&plan.invocation.executable).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "could not resolve Codex executable {}",
+                plan.invocation.executable.display()
+            ),
+        )
+    })?;
+    let mut resolved_plan = plan.clone();
+    resolved_plan.invocation.executable = executable;
+    let is_batch = resolved_plan
+        .invocation
+        .executable
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        });
+    if is_batch {
+        Ok((
+            windows_system_command_prompt()?,
+            windows_batch_codex_command_line(&resolved_plan)?,
+        ))
+    } else {
+        Ok((
+            os_string_wide_z(
+                resolved_plan.invocation.executable.as_os_str(),
+                "Codex executable path",
+            )?,
+            windows_native_codex_command_line(&resolved_plan)?,
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn set_case_insensitive_windows_env(
+    values: &mut Vec<(OsString, OsString)>,
+    name: impl Into<OsString>,
+    value: impl Into<OsString>,
+) {
+    let name = name.into();
+    let folded = name.to_string_lossy().to_ascii_uppercase();
+    values.retain(|(existing, _)| existing.to_string_lossy().to_ascii_uppercase() != folded);
+    values.push((name, value.into()));
+}
+
+#[cfg(windows)]
+fn windows_codex_environment(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut values = env::vars_os().collect::<Vec<_>>();
+    for requirement in &plan.invocation.env_requirements {
+        if env::var_os(&requirement.name).is_none()
+            && let Some(value) = secret_env_value(harness_home, &requirement.name)
+        {
+            set_case_insensitive_windows_env(&mut values, &requirement.name, value);
+        }
+    }
+    if let Some(codex_home) = &plan.invocation.codex_home {
+        set_case_insensitive_windows_env(&mut values, "CODEX_HOME", codex_home.as_os_str());
+    }
+    if is_live_harness_home(harness_home) {
+        set_case_insensitive_windows_env(&mut values, "AGENT_HARNESS_LIVE_SESSION", "1");
+    }
+    values.sort_by(|(left, _), (right, _)| {
+        left.to_string_lossy()
+            .to_ascii_uppercase()
+            .cmp(&right.to_string_lossy().to_ascii_uppercase())
+    });
+    let mut block = Vec::new();
+    for (name, value) in values {
+        let name = name.encode_wide().collect::<Vec<_>>();
+        let value = value.encode_wide().collect::<Vec<_>>();
+        if name.is_empty() || name.contains(&0) || value.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Codex child environment contains an invalid name or embedded NUL",
+            ));
+        }
+        block.extend(name);
+        block.push(u16::from(b'='));
+        block.extend(value);
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
+}
+
+#[cfg(windows)]
+fn spawn_atomic_windows_codex_child(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    stderr: File,
+    job: &WindowsCodexProcessJob,
+    stdin_write_timeout: Duration,
+) -> io::Result<WindowsAtomicCodexChild> {
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW,
+    };
+
+    unsafe fn owned(handle: HANDLE) -> OwnedHandle {
+        unsafe { OwnedHandle::from_raw_handle(handle as *mut _) }
+    }
+
+    unsafe {
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>())
+                .expect("security attributes size fits u32"),
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        let (child_stdin_read, parent_stdin_write) =
+            create_windows_child_stdin_pipe(stdin_write_timeout)?;
+
+        let mut parent_stdout_read = 0;
+        let mut child_stdout_write = 0;
+        if CreatePipe(
+            &mut parent_stdout_read,
+            &mut child_stdout_write,
+            &attributes,
+            0,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let parent_stdout_read = owned(parent_stdout_read);
+        let child_stdout_write = owned(child_stdout_write);
+        if SetHandleInformation(
+            parent_stdout_read.as_raw_handle() as isize,
+            HANDLE_FLAG_INHERIT,
+            0,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        let current_process = GetCurrentProcess();
+        let mut child_stderr = 0;
+        if DuplicateHandle(
+            current_process,
+            stderr.as_raw_handle() as isize,
+            current_process,
+            &mut child_stderr,
+            0,
+            1,
+            DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let child_stderr = owned(child_stderr);
+        let stdio_handles = [
+            child_stdin_read.as_raw_handle() as isize,
+            child_stdout_write.as_raw_handle() as isize,
+            child_stderr.as_raw_handle() as isize,
+        ];
+        let attribute_list =
+            WindowsProcThreadAttributeList::for_job_and_stdio(job.raw_handle(), stdio_handles)?;
+        let mut startup: STARTUPINFOEXW = zeroed();
+        startup.StartupInfo.cb =
+            u32::try_from(size_of::<STARTUPINFOEXW>()).expect("startup info size fits u32");
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = stdio_handles[0];
+        startup.StartupInfo.hStdOutput = stdio_handles[1];
+        startup.StartupInfo.hStdError = stdio_handles[2];
+        startup.lpAttributeList = attribute_list.pointer;
+
+        let (application, mut command_line) = windows_codex_application_and_command_line(plan)?;
+        let environment = windows_codex_environment(harness_home, plan)?;
+        let current_directory = os_string_wide_z(
+            plan.invocation.working_directory.as_os_str(),
+            "Codex working directory",
+        )?;
+        let mut process: PROCESS_INFORMATION = zeroed();
+        let flags = CREATE_NO_WINDOW
+            | CREATE_SUSPENDED
+            | CREATE_UNICODE_ENVIRONMENT
+            | EXTENDED_STARTUPINFO_PRESENT;
+        if CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            flags,
+            environment.as_ptr().cast(),
+            current_directory.as_ptr(),
+            std::ptr::addr_of!(startup.StartupInfo),
+            &mut process,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let child = WindowsAtomicCodexChild {
+            process_handle: Some(owned(process.hProcess)),
+            primary_thread_handle: Some(owned(process.hThread)),
+            process_id: process.dwProcessId,
+            stdin: Some(parent_stdin_write),
+            stdout: Some(File::from(parent_stdout_read)),
+        };
+        Ok(child)
+    }
+}
+
+struct CodexChildProcessGuard {
+    #[cfg(windows)]
+    child: WindowsAtomicCodexChild,
+    #[cfg(not(windows))]
+    child: std::process::Child,
+    harness_home: PathBuf,
+    cleanup_fence: Option<crate::runtime_worker::RuntimeQueueChildCleanupFenceAuthority>,
+    process_start_time_ms: Option<i64>,
+    #[cfg(windows)]
+    process_job: WindowsCodexProcessJob,
+    resumed: bool,
+}
+
+#[derive(Clone)]
+struct ChildCleanupProofRetry {
+    harness_home: PathBuf,
+    authority: crate::runtime_worker::RuntimeQueueChildCleanupFenceAuthority,
+    cleanup_proven_at_ms: i64,
+    attempts: u32,
+}
+
+const CHILD_CLEANUP_PROOF_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+static CHILD_CLEANUP_PROOF_RETRY_SENDER: OnceLock<
+    Result<mpsc::Sender<ChildCleanupProofRetry>, String>,
+> = OnceLock::new();
+
+fn child_cleanup_proof_retry_sender() -> io::Result<&'static mpsc::Sender<ChildCleanupProofRetry>> {
+    match CHILD_CLEANUP_PROOF_RETRY_SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("child-cleanup-proof-retry".to_string())
+            .spawn(move || child_cleanup_proof_retry_worker(receiver))
+            .map(|_| sender)
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(sender) => Ok(sender),
+        Err(error) => Err(io::Error::other(format!(
+            "child cleanup proof retry worker could not start: {error}"
+        ))),
+    }
+}
+
+fn child_cleanup_proof_retry_worker(receiver: mpsc::Receiver<ChildCleanupProofRetry>) {
+    let mut pending = VecDeque::new();
+    loop {
+        if pending.is_empty() {
+            match receiver.recv() {
+                Ok(retry) => pending.push_back(retry),
+                Err(_) => return,
+            }
+        }
+        pending.extend(receiver.try_iter());
+        let attempt_count = pending.len();
+        for _ in 0..attempt_count {
+            let Some(retry) = pending.pop_front() else {
+                break;
+            };
+            match crate::runtime_worker::finalize_runtime_queue_child_cleanup_fence(
+                &retry.harness_home,
+                &retry.authority,
+                retry.cleanup_proven_at_ms,
+            ) {
+                Ok(_) => {}
+                // A successor exact-lane authority can only exist after this
+                // generation's fence disappeared. Never retry through it.
+                Err(error)
+                    if crate::runtime_worker::runtime_queue_child_cleanup_authority_is_superseded(
+                        &error,
+                    ) => {}
+                Err(error) => {
+                    let mut retry = retry;
+                    retry.attempts = retry.attempts.saturating_add(1);
+                    if retry.attempts >= CHILD_CLEANUP_PROOF_RETRY_MAX_ATTEMPTS {
+                        fail_closed_child_cleanup_generation(
+                            &retry.harness_home,
+                            &format!(
+                                "durable cleanup proof stayed unavailable after {} worker attempts: {error}",
+                                retry.attempts
+                            ),
+                        );
+                    } else {
+                        pending.push_back(retry);
+                    }
+                }
+            }
+        }
+        if !pending.is_empty() {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn fail_closed_child_cleanup_generation(harness_home: &Path, reason: &str) {
+    let observed_at_ms = current_log_time_ms().unwrap_or(0);
+    let marker_dir = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("child-cleanup-fatal-generation");
+    let marker = marker_dir.join(format!("{}-{observed_at_ms}.txt", std::process::id()));
+    let _ = fs::create_dir_all(&marker_dir);
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&marker)
+    {
+        let _ = writeln!(
+            file,
+            "runtime generation must terminate because durable child cleanup proof cannot be retried: {reason}"
+        );
+        let _ = file.sync_all();
+    }
+    eprintln!(
+        "fatal runtime generation: durable child cleanup proof cannot be retried; marker={}: {reason}",
+        marker.display()
+    );
+    #[cfg(not(test))]
+    std::process::abort();
+}
+
+fn finalize_or_retry_child_cleanup_proof(
+    harness_home: &Path,
+    authority: &crate::runtime_worker::RuntimeQueueChildCleanupFenceAuthority,
+    cleanup_proven_at_ms: i64,
+) {
+    for attempt in 0..3 {
+        match crate::runtime_worker::finalize_runtime_queue_child_cleanup_fence(
+            harness_home,
+            authority,
+            cleanup_proven_at_ms,
+        ) {
+            Ok(_) => return,
+            Err(error)
+                if crate::runtime_worker::runtime_queue_child_cleanup_authority_is_superseded(
+                    &error,
+                ) =>
+            {
+                return;
+            }
+            Err(_) if attempt < 2 => thread::sleep(Duration::from_millis(25)),
+            Err(_) => break,
+        }
+    }
+    let retry = ChildCleanupProofRetry {
+        harness_home: harness_home.to_path_buf(),
+        authority: authority.clone(),
+        cleanup_proven_at_ms,
+        attempts: 0,
+    };
+    #[cfg(test)]
+    if harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("test-failpoints")
+        .join("codex-child-cleanup-retry-dispatch")
+        .is_file()
+    {
+        fail_closed_child_cleanup_generation(
+            harness_home,
+            "injected retry-worker dispatch failure",
+        );
+        return;
+    }
+    let dispatch_result = child_cleanup_proof_retry_sender().and_then(|sender| {
+        sender
+            .send(retry)
+            .map_err(|error| io::Error::other(error.to_string()))
+    });
+    if let Err(error) = dispatch_result {
+        // Continuing this owner generation would permanently fence its lane:
+        // owner-alive restart reconciliation intentionally cannot infer a
+        // proof that never became durable. Terminating releases all Jobs and
+        // lets the next supervised generation use exact dead-owner evidence.
+        fail_closed_child_cleanup_generation(harness_home, &error.to_string());
+    }
+}
+
+impl CodexChildProcessGuard {
+    #[cfg(windows)]
+    fn new(
+        child: WindowsAtomicCodexChild,
+        process_job: WindowsCodexProcessJob,
+        harness_home: &Path,
+        cleanup_fence: Option<crate::runtime_worker::RuntimeQueueChildCleanupFenceAuthority>,
+    ) -> Self {
+        let process_start_time_ms =
+            crate::loop_health::process_start_time_ms_for_pid(i64::from(child.id()));
+        Self {
+            child,
+            harness_home: harness_home.to_path_buf(),
+            cleanup_fence,
+            process_start_time_ms,
+            process_job,
+            resumed: false,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn new(
+        child: std::process::Child,
+        harness_home: &Path,
+        cleanup_fence: Option<crate::runtime_worker::RuntimeQueueChildCleanupFenceAuthority>,
+    ) -> Self {
+        let process_start_time_ms =
+            crate::loop_health::process_start_time_ms_for_pid(i64::from(child.id()));
+        Self {
+            child,
+            harness_home: harness_home.to_path_buf(),
+            cleanup_fence,
+            process_start_time_ms,
+            resumed: true,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    #[cfg(windows)]
+    fn take_stdin(&mut self) -> Option<WindowsOverlappedPipeWriter> {
+        self.child.take_stdin()
+    }
+
+    #[cfg(not(windows))]
+    fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    #[cfg(windows)]
+    fn take_stdout(&mut self) -> Option<File> {
+        self.child.take_stdout()
+    }
+
+    #[cfg(not(windows))]
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
+    fn bind_cleanup_fence_before_execution(&mut self) -> io::Result<()> {
+        let Some(authority) = self.cleanup_fence.as_ref() else {
+            return Ok(());
+        };
+        let bound = crate::runtime_worker::bind_runtime_queue_child_cleanup_fence(
+            &self.harness_home,
+            authority,
+            self.id(),
+            self.process_start_time_ms,
+            {
+                #[cfg(windows)]
+                {
+                    true
+                }
+                #[cfg(not(windows))]
+                {
+                    false
+                }
+            },
+        )?;
+        self.cleanup_fence = Some(bound);
+        Ok(())
+    }
+
+    fn resume_for_execution(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        self.child.resume_primary_thread()?;
+        self.resumed = true;
+        Ok(())
+    }
+}
+
+impl Drop for CodexChildProcessGuard {
+    fn drop(&mut self) {
+        let cleanup_proven;
+        #[cfg(windows)]
+        {
+            let timeout = Duration::from_millis(CODEX_CHILD_TERMINATE_TIMEOUT_MS);
+            cleanup_proven = self.process_job.terminate().is_ok()
+                && matches!(self.child.wait_for_exit(timeout), Ok(Some(_)))
+                && {
+                    // Job accounting does not reach zero while this process
+                    // still owns kernel references to the terminated root.
+                    // Release both root handles before proving the entire Job
+                    // (including descendants) became empty.
+                    self.child.release_kernel_handles();
+                    self.process_job.wait_until_empty(timeout).unwrap_or(false)
+                };
+        }
+        #[cfg(not(windows))]
+        {
+            cleanup_proven = terminate_child_with_timeout(
+                self,
+                Duration::from_millis(CODEX_CHILD_TERMINATE_TIMEOUT_MS),
+            )
+            .unwrap_or(false);
+        }
+        #[cfg(test)]
+        let cleanup_proven = if self
+            .harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("test-failpoints")
+            .join("codex-child-cleanup-unproven")
+            .is_file()
+        {
+            false
+        } else {
+            cleanup_proven
+        };
+        if !cleanup_proven && self.cleanup_fence.is_some() {
+            // An alive owner generation is intentionally not allowed to
+            // reconcile an unproven child-bound fence. Continuing this
+            // process would therefore wedge the exact lane forever. Process
+            // termination closes the Job handle; the supervised successor
+            // can then require exact dead-owner/dead-child evidence.
+            fail_closed_child_cleanup_generation(
+                &self.harness_home,
+                "Windows child process-tree cleanup could not be proven",
+            );
+            return;
+        }
+        if cleanup_proven && let Some(authority) = self.cleanup_fence.as_ref() {
+            // Cleanup proof is persisted before compare-and-remove. If the
+            // final remove fails transiently, normal lease reconciliation can
+            // consume the durable cleanup-proven phase without requiring a
+            // supervisor restart. A proof-persistence failure retains the
+            // earlier phase and continues to fail closed.
+            let cleanup_proven_at_ms =
+                authority.monotonic_cleanup_proof_time(current_log_time_ms().unwrap_or(0));
+            finalize_or_retry_child_cleanup_proof(
+                &self.harness_home,
+                authority,
+                cleanup_proven_at_ms,
+            );
+        }
+    }
 }
 
 impl StdoutReaderHandle {
@@ -6066,6 +7546,12 @@ impl StdoutReaderHandle {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => false,
         }
+    }
+}
+
+impl Drop for StdoutReaderHandle {
+    fn drop(&mut self) {
+        let _ = self.join_for(Duration::from_millis(CODEX_STDOUT_READER_JOIN_TIMEOUT_MS));
     }
 }
 
@@ -6093,21 +7579,62 @@ struct RuntimeCancelCheck {
     session_key: String,
     queue_id: Option<String>,
     lease_guard: RefCell<Option<crate::runtime_worker::RuntimeQueueLeaseGuard>>,
-    lease_capture_error: Option<String>,
+    lease_capture_failure: Option<RuntimeLeaseGuardCaptureFailure>,
+}
+
+struct RuntimeLeaseGuardCaptureFailure {
+    kind: io::ErrorKind,
+    reason: String,
 }
 
 impl RuntimeCancelCheck {
-    fn new(harness_home: &Path, session_key: &str, queue_id: Option<String>) -> Self {
-        let (lease_guard, lease_capture_error) = match queue_id.as_deref() {
-            Some(queue_id) => match current_log_time_ms().and_then(|now_ms| {
-                crate::runtime_worker::capture_runtime_queue_lease_guard(
-                    harness_home,
-                    queue_id,
-                    now_ms,
-                )
-            }) {
-                Ok(guard) => (guard, None),
-                Err(error) => (None, Some(error.to_string())),
+    fn new(
+        harness_home: &Path,
+        session_key: &str,
+        queue_id: Option<String>,
+        runtime_class: Option<&str>,
+        runtime_lease_owner_digest: Option<&str>,
+    ) -> Self {
+        let (lease_guard, lease_capture_failure) = match queue_id.as_deref() {
+            Some(queue_id) => match (runtime_class, runtime_lease_owner_digest) {
+                (Some(runtime_class), Some(owner_digest)) => {
+                    match current_log_time_ms().and_then(|now_ms| {
+                        crate::runtime_worker::capture_runtime_queue_lease_guard_for_authority(
+                            harness_home,
+                            queue_id,
+                            runtime_class,
+                            owner_digest,
+                            now_ms,
+                        )
+                    }) {
+                        Ok(Some(guard)) => (Some(guard), None),
+                        Ok(None) => (
+                            None,
+                            Some(RuntimeLeaseGuardCaptureFailure {
+                                kind: io::ErrorKind::PermissionDenied,
+                                reason: format!(
+                                    "queue-backed runtime `{queue_id}` has no exact fenceable lease in owning class `{runtime_class}`"
+                                ),
+                            }),
+                        ),
+                        Err(error) => (
+                            None,
+                            Some(RuntimeLeaseGuardCaptureFailure {
+                                kind: error.kind(),
+                                reason: error.to_string(),
+                            }),
+                        ),
+                    }
+                }
+                _ => (
+                    None,
+                    Some(RuntimeLeaseGuardCaptureFailure {
+                        kind: io::ErrorKind::InvalidData,
+                        reason: format!(
+                            "queue-backed runtime `{queue_id}` is missing its exact runtime class or lease acquisition digest"
+                        ),
+                    }),
+                ),
             },
             None => (None, None),
         };
@@ -6124,15 +7651,53 @@ impl RuntimeCancelCheck {
             session_key: session_key.to_string(),
             queue_id,
             lease_guard: RefCell::new(lease_guard),
-            lease_capture_error,
+            lease_capture_failure,
         }
     }
 
+    fn lease_capture_protocol_failure(&self) -> Option<String> {
+        let failure = self.lease_capture_failure.as_ref()?;
+        Some(if failure.kind == io::ErrorKind::WouldBlock {
+            format!(
+                "runtime queue lease guard capture retryable backpressure: {}",
+                failure.reason
+            )
+        } else {
+            format!(
+                "runtime queue lease guard capture failed: {}",
+                failure.reason
+            )
+        })
+    }
+
+    fn child_cleanup_lease_authority(
+        &self,
+    ) -> io::Result<Option<crate::runtime_worker::RuntimeQueueChildCleanupLeaseAuthority>> {
+        if let Some(failure) = self.lease_capture_failure.as_ref() {
+            return Err(io::Error::new(
+                failure.kind,
+                format!(
+                    "runtime queue lease guard capture failed: {}",
+                    failure.reason
+                ),
+            ));
+        }
+        Ok(self
+            .lease_guard
+            .borrow()
+            .as_ref()
+            .map(|guard| guard.child_cleanup_lease_authority()))
+    }
+
     fn poll(&self) -> io::Result<Option<String>> {
-        if let Some(error) = self.lease_capture_error.as_deref() {
-            return Ok(Some(format!(
-                "runtime queue lease guard capture failed: {error}"
-            )));
+        if let Some(failure) = self.lease_capture_failure.as_ref() {
+            return Err(io::Error::new(
+                failure.kind,
+                format!(
+                    "runtime queue lease guard capture failed: {}",
+                    failure.reason
+                ),
+            ));
         }
         let now_ms = current_log_time_ms()?;
         if let Some(guard) = self.lease_guard.borrow_mut().as_mut()
@@ -6184,10 +7749,14 @@ impl RuntimeCancelCheck {
         &self,
         required_through_at_ms: i64,
     ) -> io::Result<Option<crate::runtime_worker::RuntimeQueueLeaseRenewalReceipt>> {
-        if let Some(error) = self.lease_capture_error.as_deref() {
-            return Err(io::Error::other(format!(
-                "runtime queue lease guard capture failed: {error}"
-            )));
+        if let Some(failure) = self.lease_capture_failure.as_ref() {
+            return Err(io::Error::new(
+                failure.kind,
+                format!(
+                    "runtime queue lease guard capture failed: {}",
+                    failure.reason
+                ),
+            ));
         }
         let now_ms = current_log_time_ms()?;
         let mut guard = self.lease_guard.borrow_mut();
@@ -6209,10 +7778,14 @@ impl RuntimeCancelCheck {
     }
 
     fn has_pending_exact_lane_work(&self) -> io::Result<bool> {
-        if let Some(error) = self.lease_capture_error.as_deref() {
-            return Err(io::Error::other(format!(
-                "runtime queue lease guard capture failed: {error}"
-            )));
+        if let Some(failure) = self.lease_capture_failure.as_ref() {
+            return Err(io::Error::new(
+                failure.kind,
+                format!(
+                    "runtime queue lease guard capture failed: {}",
+                    failure.reason
+                ),
+            ));
         }
         let guard = self.lease_guard.borrow();
         let Some(guard) = guard.as_ref() else {
@@ -6321,6 +7894,49 @@ fn codex_app_server_approval_policy(policy: CodexApprovalPolicy) -> &'static str
     }
 }
 
+#[cfg(test)]
+fn codex_post_spawn_failpoint_file(harness_home: &Path, stage: &str) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("test-failpoints")
+        .join(format!("codex-post-spawn-{stage}"))
+}
+
+#[cfg(test)]
+fn fail_codex_post_spawn_at(harness_home: &Path, stage: &str) -> io::Result<()> {
+    if codex_post_spawn_failpoint_file(harness_home, stage).is_file() {
+        return Err(io::Error::other(format!(
+            "injected Codex post-spawn failure at `{stage}`"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn fail_codex_post_spawn_at(_harness_home: &Path, _stage: &str) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn record_codex_test_child_pid(harness_home: &Path, pid: u32) -> io::Result<()> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    fs::create_dir_all(&queue_dir)?;
+    fs::write(queue_dir.join("test-codex-child.pid"), pid.to_string())?;
+    append_json_line(
+        &queue_dir.join("test-codex-child-generations.jsonl"),
+        &json!({
+            "pid": pid,
+            "processStartTimeMs": crate::loop_health::process_start_time_ms_for_pid(i64::from(pid))
+        }),
+    )
+}
+
+#[cfg(not(test))]
+fn record_codex_test_child_pid(_harness_home: &Path, _pid: u32) -> io::Result<()> {
+    Ok(())
+}
+
 fn drive_codex_app_server(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
@@ -6332,6 +7948,34 @@ fn drive_codex_app_server(
     context_policy: &CodexContextPolicy,
     compact_before_turn: bool,
 ) -> io::Result<CodexAppServerRunResult> {
+    let cancel_check = RuntimeCancelCheck::new(
+        harness_home,
+        &plan.session_key,
+        plan.queue_id.clone(),
+        plan.runtime_class.as_deref(),
+        plan.runtime_lease_owner_digest.as_deref(),
+    );
+    if let Some(reason) = cancel_check.lease_capture_protocol_failure() {
+        return Ok(CodexAppServerRunResult {
+            status: CodexRuntimeRunStatus::ProtocolError,
+            reason,
+            assistant_message: String::new(),
+            assistant_narration: Vec::new(),
+            assistant_raw_message: String::new(),
+            assistant_final_found: false,
+            thread_id: None,
+            event_count: 0,
+            usage: None,
+            stdout_log: None,
+            stderr_log: None,
+            context_recovery: None,
+            tool_use_timeout: None,
+            interruption_reason: None,
+            interrupted_tool_uses: Vec::new(),
+            backend_reasoning_execution: None,
+            warnings: Vec::new(),
+        });
+    }
     let productive_deadline_config =
         resolve_productive_deadline_config(harness_home, plan.agent_id.as_deref(), timeout_ms)?;
     let execution_dir = runtime_execution_dir(plan);
@@ -6343,90 +7987,170 @@ fn drive_codex_app_server(
         .create(true)
         .append(true)
         .open(&stderr_log)?;
+    #[cfg(not(windows))]
     let mut command = Command::new(&plan.invocation.executable);
+    #[cfg(not(windows))]
     command
         .args(&plan.invocation.arguments)
         .current_dir(&plan.invocation.working_directory)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
+    #[cfg(not(windows))]
     apply_required_secret_env(
         &mut command,
         harness_home,
         &plan.invocation.env_requirements,
     );
+    #[cfg(not(windows))]
     apply_codex_home_env(&mut command, plan);
+    #[cfg(not(windows))]
     apply_live_agent_session_env(&mut command, harness_home);
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    #[cfg(windows)]
+    let cleanup_fence = match cancel_check.child_cleanup_lease_authority() {
+        Ok(Some(authority)) => {
+            match crate::runtime_worker::prearm_runtime_queue_child_cleanup_fence(
+                harness_home,
+                &authority,
+                current_log_time_ms()?,
+            ) {
+                Ok(fence) => Some(fence),
+                Err(error) => {
+                    return Ok(codex_app_server_pre_execution_result(
+                        CodexRuntimeRunStatus::ProtocolError,
+                        format!(
+                            "Codex child execution was not started because its exact-lane cleanup fence could not be prearmed: {error}"
+                        ),
+                        &stdout_log,
+                        &stderr_log,
+                    ));
+                }
+            }
+        }
+        Ok(None) => None,
         Err(error) => {
-            return Ok(CodexAppServerRunResult {
-                status: CodexRuntimeRunStatus::SpawnFailed,
-                reason: format!("failed to spawn codex app-server process: {error}"),
-                assistant_message: String::new(),
-                assistant_narration: Vec::new(),
-                assistant_raw_message: String::new(),
-                assistant_final_found: false,
-                thread_id: None,
-                event_count: 0,
-                usage: None,
-                stdout_log: Some(stdout_log),
-                stderr_log: Some(stderr_log),
-                context_recovery: None,
-                tool_use_timeout: None,
-                interruption_reason: None,
-                interrupted_tool_uses: Vec::new(),
-                backend_reasoning_execution: None,
-                warnings: Vec::new(),
-            });
+            return Ok(codex_app_server_pre_execution_result(
+                CodexRuntimeRunStatus::ProtocolError,
+                format!("Codex child cleanup authority could not be proven: {error}"),
+                &stdout_log,
+                &stderr_log,
+            ));
         }
     };
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = terminate_child(&mut child);
-        return Ok(CodexAppServerRunResult {
-            status: CodexRuntimeRunStatus::ProtocolError,
-            reason: "codex app-server stdin pipe was unavailable".to_string(),
-            assistant_message: String::new(),
-            assistant_narration: Vec::new(),
-            assistant_raw_message: String::new(),
-            assistant_final_found: false,
-            thread_id: None,
-            event_count: 0,
-            usage: None,
-            stdout_log: Some(stdout_log),
-            stderr_log: Some(stderr_log),
-            context_recovery: None,
-            tool_use_timeout: None,
-            interruption_reason: None,
-            interrupted_tool_uses: Vec::new(),
-            backend_reasoning_execution: None,
-            warnings: Vec::new(),
-        });
+    #[cfg(not(windows))]
+    let cleanup_fence = None;
+    #[cfg(windows)]
+    let child_cleanup_fence = cleanup_fence.clone();
+    #[cfg(windows)]
+    let mut child = match WindowsCodexProcessJob::create().and_then(|process_job| {
+        spawn_atomic_windows_codex_child(
+            harness_home,
+            plan,
+            stderr,
+            &process_job,
+            Duration::from_millis(idle_timeout_ms.max(1)),
+        )
+        .map(|child| {
+            CodexChildProcessGuard::new(child, process_job, harness_home, child_cleanup_fence)
+        })
+    }) {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(fence) = cleanup_fence.as_ref() {
+                let cleanup_proven_at_ms =
+                    fence.monotonic_cleanup_proof_time(current_log_time_ms().unwrap_or(0));
+                finalize_or_retry_child_cleanup_proof(harness_home, fence, cleanup_proven_at_ms);
+            }
+            return Ok(codex_app_server_pre_execution_result(
+                CodexRuntimeRunStatus::SpawnFailed,
+                format!("failed to atomically spawn contained codex app-server process: {error}"),
+                &stdout_log,
+                &stderr_log,
+            ));
+        }
     };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = terminate_child(&mut child);
-        return Ok(CodexAppServerRunResult {
-            status: CodexRuntimeRunStatus::ProtocolError,
-            reason: "codex app-server stdout pipe was unavailable".to_string(),
-            assistant_message: String::new(),
-            assistant_narration: Vec::new(),
-            assistant_raw_message: String::new(),
-            assistant_final_found: false,
-            thread_id: None,
-            event_count: 0,
-            usage: None,
-            stdout_log: Some(stdout_log),
-            stderr_log: Some(stderr_log),
-            context_recovery: None,
-            tool_use_timeout: None,
-            interruption_reason: None,
-            interrupted_tool_uses: Vec::new(),
-            backend_reasoning_execution: None,
-            warnings: Vec::new(),
-        });
+    #[cfg(all(windows, test))]
+    if harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("test-failpoints")
+        .join("codex-child-after-atomic-spawn")
+        .is_file()
+    {
+        let _ = fs::write(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("test-atomic-codex-child.pid"),
+            child.id().to_string(),
+        );
+        let _ = fs::write(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("test-atomic-codex-child-start-time-ms"),
+            child
+                .process_start_time_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+        return Ok(codex_app_server_pre_execution_result(
+            CodexRuntimeRunStatus::SpawnFailed,
+            "injected failure after atomic Job-at-creation spawn".to_string(),
+            &stdout_log,
+            &stderr_log,
+        ));
+    }
+    #[cfg(not(windows))]
+    let mut child = match command.spawn() {
+        Ok(child) => CodexChildProcessGuard::new(child, harness_home, cleanup_fence),
+        Err(error) => {
+            return Ok(codex_app_server_pre_execution_result(
+                CodexRuntimeRunStatus::SpawnFailed,
+                format!("failed to spawn codex app-server process: {error}"),
+                &stdout_log,
+                &stderr_log,
+            ));
+        }
     };
+    record_codex_test_child_pid(harness_home, child.id())?;
+    let Some(mut stdin) = child.take_stdin() else {
+        return Ok(codex_app_server_pre_execution_result(
+            CodexRuntimeRunStatus::ProtocolError,
+            "codex app-server stdin pipe was unavailable".to_string(),
+            &stdout_log,
+            &stderr_log,
+        ));
+    };
+    let Some(stdout) = child.take_stdout() else {
+        return Ok(codex_app_server_pre_execution_result(
+            CodexRuntimeRunStatus::ProtocolError,
+            "codex app-server stdout pipe was unavailable".to_string(),
+            &stdout_log,
+            &stderr_log,
+        ));
+    };
+    if let Err(error) = child.bind_cleanup_fence_before_execution() {
+        return Ok(codex_app_server_pre_execution_result(
+            CodexRuntimeRunStatus::ProtocolError,
+            format!(
+                "Codex child remained suspended because its cleanup fence could not bind the child generation: {error}"
+            ),
+            &stdout_log,
+            &stderr_log,
+        ));
+    }
+    if let Err(error) = child.resume_for_execution() {
+        return Ok(codex_app_server_pre_execution_result(
+            CodexRuntimeRunStatus::ProtocolError,
+            format!("Codex child could not be resumed under proven containment: {error}"),
+            &stdout_log,
+            &stderr_log,
+        ));
+    }
     let (line_rx, mut reader_handle) = spawn_stdout_reader(stdout, stdout_log.clone());
+    fail_codex_post_spawn_at(harness_home, "state-init")?;
     let mut timeouts = CodexProtocolTimeouts::new(timeout_ms, idle_timeout_ms);
     timeouts.configure_productive_deadline(productive_deadline_config);
     let mut state = CodexProtocolState {
@@ -6434,8 +8158,6 @@ fn drive_codex_app_server(
         external_effect_context: codex_external_effect_runtime_context(harness_home, plan)?,
         ..CodexProtocolState::default()
     };
-    let cancel_check =
-        RuntimeCancelCheck::new(harness_home, &plan.session_key, plan.queue_id.clone());
     let mut progress =
         progress_context.map(|context| CodexProgressEmitter::new(harness_home, context));
     emit_codex_runtime_status(
@@ -6504,6 +8226,7 @@ fn drive_codex_app_server(
             ));
         }
     }
+    fail_codex_post_spawn_at(harness_home, "after-initialize")?;
     if let Err(error) = write_json_rpc(
         &mut stdin,
         &json!({
@@ -6637,6 +8360,7 @@ fn drive_codex_app_server(
     } else {
         "thread/start"
     };
+    fail_codex_post_spawn_at(harness_home, "before-thread-start")?;
     if let Err(error) = write_json_rpc(
         &mut stdin,
         &json!({
@@ -7915,6 +9639,7 @@ fn drive_codex_app_server(
         }
     }
 
+    fail_codex_post_spawn_at(harness_home, "before-turn-wait")?;
     let wait_result = wait_for_turn_completed(
         &line_rx,
         &mut child,
@@ -7927,10 +9652,18 @@ fn drive_codex_app_server(
         narration_config,
         Some(&mut steer_bridge),
     )?;
-    let (active_status, active_reason) = match &wait_result {
+    let (mut active_status, mut active_reason) = match &wait_result {
         ProtocolWait::TurnCompleted => (
             CodexActiveTurnStatus::Completed,
-            "codex app-server turn completed".to_string(),
+            state
+                .captured_final_boundary_reason
+                .as_ref()
+                .map(|reason| {
+                    format!(
+                        "harness-owned turn closed at the captured final before native continuation: {reason}"
+                    )
+                })
+                .unwrap_or_else(|| "codex app-server turn completed".to_string()),
         ),
         ProtocolWait::TimedOut(reason) => (
             CodexActiveTurnStatus::Failed,
@@ -7965,8 +9698,40 @@ fn drive_codex_app_server(
                 .to_string(),
         ),
     };
+    if let Some(reason) = state.goal_authority_boundary_reason.as_ref() {
+        active_status = CodexActiveTurnStatus::Failed;
+        active_reason =
+            format!("native Goal continuation stopped at a missing authority boundary: {reason}");
+    }
     let deadline_drain_sent = steer_bridge.deadline_drain_sent;
     steer_bridge.finish(active_status, &active_reason)?;
+    if let Some(reason) = state.goal_authority_boundary_reason.clone() {
+        finish_codex_child_and_stdout_reader(
+            &mut child,
+            &mut reader_handle,
+            &mut state.warnings,
+            "native Goal continuation authority boundary",
+        );
+        return Ok(CodexAppServerRunResult {
+            status: CodexRuntimeRunStatus::ProtocolError,
+            reason,
+            assistant_message: String::new(),
+            assistant_narration: Vec::new(),
+            assistant_raw_message: String::new(),
+            assistant_final_found: false,
+            thread_id: Some(thread_id),
+            event_count: state.event_count,
+            usage: state.usage.clone(),
+            stdout_log: Some(stdout_log),
+            stderr_log: Some(stderr_log),
+            context_recovery,
+            tool_use_timeout: None,
+            interruption_reason: None,
+            interrupted_tool_uses: Vec::new(),
+            backend_reasoning_execution: state.backend_reasoning_execution.clone(),
+            warnings: state.warnings,
+        });
+    }
 
     let status = match wait_result {
         ProtocolWait::TurnCompleted => CodexRuntimeRunStatus::Completed,
@@ -8208,9 +9973,20 @@ fn drive_codex_app_server(
             )
         })
         .unwrap_or_default();
+    let captured_final_boundary = state.captured_final_boundary_reason.clone();
     Ok(CodexAppServerRunResult {
         status,
-        reason: if deadline_drain_sent {
+        reason: if let Some(boundary) = captured_final_boundary.as_deref() {
+            if deadline_drain_sent {
+                format!(
+                    "codex app-server turn completed after deadline drain at the captured final before an unowned regular continuation; {boundary}{completion_reason}"
+                )
+            } else {
+                format!(
+                    "codex app-server harness-owned turn completed at the captured final before an unowned regular continuation; {boundary}{completion_reason}"
+                )
+            }
+        } else if deadline_drain_sent {
             format!(
                 "codex app-server turn completed after deadline drain and assistant output was captured{completion_reason}"
             )
@@ -8504,7 +10280,7 @@ impl CodexCapabilityHandshakeFailure {
 #[allow(clippy::too_many_arguments)]
 fn wait_for_codex_capability_rpc_response(
     line_rx: &mpsc::Receiver<Result<String, String>>,
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     progress: &mut Option<CodexProgressEmitter>,
@@ -8602,7 +10378,7 @@ fn wait_for_codex_capability_rpc_response(
 #[allow(clippy::too_many_arguments)]
 fn verify_codex_reasoning_capability_same_connection(
     line_rx: &mpsc::Receiver<Result<String, String>>,
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     progress: &mut Option<CodexProgressEmitter>,
@@ -10431,6 +12207,8 @@ struct CodexProtocolState {
     active_external_effect: Option<ExternalEffectIntentV1>,
     parked_external_effect: Option<ExternalEffectIntentV1>,
     external_effect_protocol_failure: Option<String>,
+    captured_final_boundary_reason: Option<String>,
+    goal_authority_boundary_reason: Option<String>,
 }
 
 fn external_effect_id_from_reason(reason: &str) -> Option<&str> {
@@ -11362,6 +13140,13 @@ struct InFlightCodexTurnSteer {
     file: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexOwnedEventDisposition {
+    Owned,
+    Divergent,
+    CapturedFinalBoundary,
+}
+
 const CODEX_FOREIGN_EVENT_WARNING_LIMIT: usize = 8;
 const CODEX_SCOPE_PREVIEW_LIMIT: usize = 64;
 const CODEX_OWNED_ITEM_ID_LIMIT: usize = 256;
@@ -11681,7 +13466,12 @@ impl CodexTurnSteerBridge {
         })
     }
 
-    fn owns_event(&mut self, value: &Value, state: &mut CodexProtocolState) -> io::Result<bool> {
+    fn owns_event(
+        &mut self,
+        value: &Value,
+        state: &mut CodexProtocolState,
+        cancel_check: Option<&RuntimeCancelCheck>,
+    ) -> io::Result<CodexOwnedEventDisposition> {
         let scope = CodexEventScope::from_json(value);
         let method = json_method(value).unwrap_or("<unknown>");
         let previous_owned_turn_id = self.owned_turn_id.clone();
@@ -11692,7 +13482,112 @@ impl CodexTurnSteerBridge {
             value,
             &scope,
         ) {
-            return Ok(self.divergent_event(state, method, &scope, reason));
+            if reason == "turn-mismatch"
+                && state.assistant_final_found()
+                && is_regular_turn_started(value)
+                && scope.thread_id.as_deref() == Some(self.binding.thread_id.as_str())
+            {
+                let goal_state = state
+                    .goal_projection_observer
+                    .as_ref()
+                    .and_then(|observer| {
+                        observer.owned_turn_goal_state(self.owned_turn_id.as_deref())
+                    });
+                let (pending_exact_lane_work, exact_lane_work_unproven) = if goal_state
+                    == Some(CodexOwnedGoalState::Active)
+                {
+                    match cancel_check {
+                            Some(check) => match check.has_pending_exact_lane_work() {
+                                Ok(pending) => (pending, None),
+                                Err(error) => (false, Some(error.to_string())),
+                            },
+                            None => (
+                                false,
+                                Some(
+                                    "runtime lease guard was unavailable while checking pending exact-lane work"
+                                        .to_string(),
+                                ),
+                            ),
+                        }
+                } else {
+                    (false, None)
+                };
+                if goal_state == Some(CodexOwnedGoalState::Active)
+                    && !self.deadline_drain_sent
+                    && !self.deadline_drain_prompt_observed
+                    && !pending_exact_lane_work
+                    && exact_lane_work_unproven.is_none()
+                {
+                    let continuation_turn_id = scope
+                        .turn_id
+                        .clone()
+                        .expect("same-thread regular turn start has a turn id");
+                    let prior_turn_id = self.owned_turn_id.clone();
+                    self.owned_turn_id = Some(continuation_turn_id.clone());
+                    self.owned_item_ids.clear();
+                    self.binding.active_turn_id = Some(continuation_turn_id.clone());
+                    self.binding.status = CodexActiveTurnStatus::Running;
+                    self.binding.updated_at_ms = current_log_time_ms()?;
+                    self.binding.reason =
+                        "adopted same-thread native continuation for the demonstrably active Goal"
+                            .to_string();
+                    write_codex_active_turn_binding(&self.binding_file, &self.binding)?;
+                    state.active_tool_use = None;
+                    state.warnings.push(format!(
+                        "adopted same-thread native Goal continuation: priorTurnId={}; continuationTurnId={}",
+                        bounded_codex_scope(prior_turn_id.as_deref()),
+                        bounded_codex_scope(Some(continuation_turn_id.as_str()))
+                    ));
+                    return Ok(CodexOwnedEventDisposition::Owned);
+                }
+
+                let terminal_goal_status = match goal_state.as_ref() {
+                    Some(CodexOwnedGoalState::Terminal(status)) => Some(status.as_str()),
+                    _ => None,
+                };
+                let goal_authority_unproven = self.work_authority_class
+                    == WorkAuthorityClassV1::GoalCampaign
+                    && (matches!(
+                        goal_state.as_ref(),
+                        None | Some(CodexOwnedGoalState::Other(_))
+                    ) || exact_lane_work_unproven.is_some());
+                let closes_at_boundary = self.deadline_drain_sent
+                    || self.deadline_drain_prompt_observed
+                    || terminal_goal_status.is_some()
+                    || goal_authority_unproven
+                    || pending_exact_lane_work
+                    || self.work_authority_class != WorkAuthorityClassV1::GoalCampaign;
+                if closes_at_boundary {
+                    let mut boundary_reason = format!(
+                        "captured-final-before-unowned-regular-continuation; ownedTurnId={}; continuationTurnId={}; workAuthority={:?}; goalStatus={}; pendingExactLaneWork={}; exactLaneProof={}",
+                        bounded_codex_scope(self.owned_turn_id.as_deref()),
+                        bounded_codex_scope(scope.turn_id.as_deref()),
+                        self.work_authority_class,
+                        terminal_goal_status.unwrap_or("<unproven>"),
+                        pending_exact_lane_work,
+                        exact_lane_work_unproven.as_deref().unwrap_or("proven")
+                    );
+                    if goal_authority_unproven {
+                        boundary_reason = format!(
+                            "{GOAL_CONTINUATION_AUTHORITY_BOUNDARY_MARKER}; {boundary_reason}"
+                        );
+                        state.goal_authority_boundary_reason = Some(boundary_reason.clone());
+                    }
+                    if pending_exact_lane_work {
+                        state.warnings.push(
+                            "bounded native Goal continuation because newer exact-lane work is already durable; the queued human turn keeps FIFO priority"
+                                .to_string(),
+                        );
+                    }
+                    state.warnings.push(format!(
+                        "bounded native Goal continuation at the harness-owned final boundary: {boundary_reason}"
+                    ));
+                    state.captured_final_boundary_reason = Some(boundary_reason);
+                    return Ok(CodexOwnedEventDisposition::CapturedFinalBoundary);
+                }
+            }
+            self.divergent_event(state, method, &scope, reason);
+            return Ok(CodexOwnedEventDisposition::Divergent);
         }
         if previous_owned_turn_id != self.owned_turn_id
             && let Some(turn_id) = self.owned_turn_id.clone()
@@ -11700,7 +13595,7 @@ impl CodexTurnSteerBridge {
             self.set_active_turn_id(turn_id)?;
         }
 
-        Ok(true)
+        Ok(CodexOwnedEventDisposition::Owned)
     }
 
     fn divergent_event(
@@ -11755,6 +13650,31 @@ impl CodexTurnSteerBridge {
                 GoalProjectionObservationPhaseV1::OwnedTurn,
                 self.owned_turn_id.as_deref(),
             );
+        }
+    }
+
+    fn captured_final_terminal_boundary_reason(
+        &self,
+        state: &CodexProtocolState,
+    ) -> Option<String> {
+        if !state.assistant_final_found() {
+            return None;
+        }
+        if self.deadline_drain_sent || self.deadline_drain_prompt_observed {
+            return Some(
+                "captured-final-at-explicit-bounded-yield; native continuation is not authorized"
+                    .to_string(),
+            );
+        }
+        match state
+            .goal_projection_observer
+            .as_ref()
+            .and_then(|observer| observer.owned_turn_goal_state(self.owned_turn_id.as_deref()))
+        {
+            Some(CodexOwnedGoalState::Terminal(status)) => Some(format!(
+                "captured-final-at-owned-goal-terminal; goalStatus={status}"
+            )),
+            _ => None,
         }
     }
 
@@ -12714,7 +14634,7 @@ impl CodexProtocolTimeouts {
 
 fn wait_for_thread_start(
     line_rx: &mpsc::Receiver<Result<String, String>>,
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     progress: &mut Option<CodexProgressEmitter>,
@@ -12788,7 +14708,7 @@ fn settle_resumed_thread(
     plan: &CodexRuntimePlanFile,
     thread_id: &str,
     line_rx: &mpsc::Receiver<Result<String, String>>,
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     progress: &mut Option<CodexProgressEmitter>,
@@ -13099,7 +15019,7 @@ fn rehydrate_goal_on_thread(
     replacement_thread_id: &str,
     request_id: i64,
     line_rx: &mpsc::Receiver<Result<String, String>>,
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     progress: &mut Option<CodexProgressEmitter>,
@@ -13257,7 +15177,7 @@ fn rehydrate_goal_on_thread(
 #[allow(clippy::too_many_arguments)]
 fn finish_rehydrated_goal_auto_turn(
     line_rx: &mpsc::Receiver<Result<String, String>>,
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     reader_handle: &mut StdoutReaderHandle,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
@@ -13374,7 +15294,7 @@ fn is_thread_active_status(value: &Value) -> bool {
 
 fn run_official_context_compact(
     line_rx: &mpsc::Receiver<Result<String, String>>,
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     progress: &mut Option<CodexProgressEmitter>,
@@ -13451,7 +15371,7 @@ fn run_official_context_compact(
 
 fn wait_for_context_compaction_completed(
     line_rx: &mpsc::Receiver<Result<String, String>>,
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     progress: &mut Option<CodexProgressEmitter>,
@@ -13897,7 +15817,7 @@ fn handle_codex_deadline_boundary(
 
 fn wait_for_turn_completed(
     line_rx: &mpsc::Receiver<Result<String, String>>,
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     progress: &mut Option<CodexProgressEmitter>,
@@ -13912,10 +15832,27 @@ fn wait_for_turn_completed(
         match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, poll_interval)?
         {
             ProtocolEvent::Json(value) => {
-                if let Some(bridge) = steer_bridge.as_deref_mut()
-                    && !bridge.owns_event(&value, state)?
-                {
-                    continue;
+                if let Some(bridge) = steer_bridge.as_deref_mut() {
+                    match bridge.owns_event(&value, state, cancel_check)? {
+                        CodexOwnedEventDisposition::Owned => {}
+                        CodexOwnedEventDisposition::Divergent => continue,
+                        CodexOwnedEventDisposition::CapturedFinalBoundary => {
+                            if let Err(error) = write_json_rpc(
+                                stdin,
+                                &json!({
+                                    "method": "turn/interrupt",
+                                    "params": {
+                                        "threadId": bridge.binding.thread_id.clone()
+                                    }
+                                }),
+                            ) {
+                                state.warnings.push(format!(
+                                    "failed to interrupt unowned regular continuation after captured final: {error}"
+                                ));
+                            }
+                            return Ok(ProtocolWait::TurnCompleted);
+                        }
+                    }
                 }
                 if let Some(bridge) = steer_bridge.as_deref() {
                     bridge.sync_goal_projection_observation_context(state);
@@ -13965,6 +15902,28 @@ fn wait_for_turn_completed(
                     }
                     return Ok(ProtocolWait::TurnCompleted);
                 }
+                if let Some(bridge) = steer_bridge.as_deref_mut()
+                    && let Some(reason) = bridge.captured_final_terminal_boundary_reason(state)
+                {
+                    state.warnings.push(format!(
+                        "closed the harness-owned turn at a durable Goal/yield terminal boundary: {reason}"
+                    ));
+                    state.captured_final_boundary_reason = Some(reason);
+                    if let Err(error) = write_json_rpc(
+                        stdin,
+                        &json!({
+                            "method": "turn/interrupt",
+                            "params": {
+                                "threadId": bridge.binding.thread_id.clone()
+                            }
+                        }),
+                    ) {
+                        state.warnings.push(format!(
+                            "failed to interrupt app-server after Goal/yield terminal boundary: {error}"
+                        ));
+                    }
+                    return Ok(ProtocolWait::TurnCompleted);
+                }
                 if json_id(&value) == Some(1)
                     && let Some(thread_id) = extract_thread_id(&value)
                 {
@@ -14003,17 +15962,20 @@ enum ProtocolEvent {
 
 fn receive_protocol_event(
     line_rx: &mpsc::Receiver<Result<String, String>>,
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     state: &mut CodexProtocolState,
     timeouts: &mut CodexProtocolTimeouts,
     cancel_check: Option<&RuntimeCancelCheck>,
     poll_interval: Option<Duration>,
 ) -> io::Result<ProtocolEvent> {
     loop {
-        if let Some(cancel_check) = cancel_check
-            && let Some(reason) = cancel_check.poll()?
-        {
-            return Ok(ProtocolEvent::Canceled(reason));
+        if let Some(cancel_check) = cancel_check {
+            if let Some(reason) = cancel_check.lease_capture_protocol_failure() {
+                return Ok(ProtocolEvent::Failed(reason));
+            }
+            if let Some(reason) = cancel_check.poll()? {
+                return Ok(ProtocolEvent::Canceled(reason));
+            }
         }
         let now = Instant::now();
         if let Some(reason) = timeouts.timed_out_reason(now) {
@@ -14062,7 +16024,7 @@ fn receive_protocol_event(
 }
 
 fn finish_codex_child_and_stdout_reader(
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     reader_handle: &mut StdoutReaderHandle,
     warnings: &mut Vec<String>,
     context: &str,
@@ -14086,8 +16048,33 @@ fn finish_codex_child_and_stdout_reader(
     }
 }
 
-fn codex_app_server_write_failed_result(
+fn finish_std_codex_child_and_stdout_reader(
     child: &mut std::process::Child,
+    reader_handle: &mut StdoutReaderHandle,
+    warnings: &mut Vec<String>,
+    context: &str,
+) {
+    match terminate_std_child_with_timeout(
+        child,
+        Duration::from_millis(CODEX_CHILD_TERMINATE_TIMEOUT_MS),
+    ) {
+        Ok(true) => {}
+        Ok(false) => warnings.push(format!(
+            "codex app-server child did not exit within {CODEX_CHILD_TERMINATE_TIMEOUT_MS}ms after {context}; terminal receipt will still be written"
+        )),
+        Err(error) => warnings.push(format!(
+            "codex app-server child termination failed after {context}: {error}"
+        )),
+    }
+    if !reader_handle.join_for(Duration::from_millis(CODEX_STDOUT_READER_JOIN_TIMEOUT_MS)) {
+        warnings.push(format!(
+            "codex app-server stdout reader did not finish within {CODEX_STDOUT_READER_JOIN_TIMEOUT_MS}ms after {context}; detached so terminal receipt can be written"
+        ));
+    }
+}
+
+fn codex_app_server_write_failed_result(
+    child: &mut CodexChildProcessGuard,
     reader_handle: &mut StdoutReaderHandle,
     state: &mut CodexProtocolState,
     stdout_log: &Path,
@@ -14120,7 +16107,7 @@ fn codex_app_server_write_failed_result(
 
 #[allow(clippy::too_many_arguments)]
 fn codex_app_server_terminal_failure_result(
-    child: &mut std::process::Child,
+    child: &mut CodexChildProcessGuard,
     reader_handle: &mut StdoutReaderHandle,
     state: &mut CodexProtocolState,
     stdout_log: &Path,
@@ -14208,20 +16195,34 @@ fn spawn_stdout_reader<R: Read + Send + 'static>(
 }
 
 fn write_json_rpc(stdin: &mut impl Write, value: &Value) -> io::Result<()> {
-    serde_json::to_writer(&mut *stdin, value).map_err(io::Error::other)?;
-    writeln!(stdin)?;
+    let mut frame = serde_json::to_vec(value).map_err(io::Error::other)?;
+    frame.push(b'\n');
+    stdin.write_all(&frame)?;
     stdin.flush()
 }
 
-fn terminate_child(child: &mut std::process::Child) -> io::Result<()> {
-    let _ = terminate_child_with_timeout(
-        child,
-        Duration::from_millis(CODEX_CHILD_TERMINATE_TIMEOUT_MS),
-    )?;
-    Ok(())
+fn terminate_child_with_timeout(
+    child: &mut CodexChildProcessGuard,
+    timeout: Duration,
+) -> io::Result<bool> {
+    if child.try_wait()?.is_some() {
+        return Ok(true);
+    }
+
+    let started = Instant::now();
+    terminate_child_process_tree(child, timeout);
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if started.elapsed() >= timeout {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
-fn terminate_child_with_timeout(
+fn terminate_std_child_with_timeout(
     child: &mut std::process::Child,
     timeout: Duration,
 ) -> io::Result<bool> {
@@ -14229,8 +16230,8 @@ fn terminate_child_with_timeout(
         return Ok(true);
     }
 
-    terminate_child_process_tree(child);
     let started = Instant::now();
+    terminate_std_child_process_tree(child, timeout);
     loop {
         if child.try_wait()?.is_some() {
             return Ok(true);
@@ -14243,17 +16244,65 @@ fn terminate_child_with_timeout(
 }
 
 #[cfg(windows)]
-fn terminate_child_process_tree(child: &mut std::process::Child) {
-    let _ = Command::new("taskkill")
+fn terminate_std_child_process_tree(child: &mut std::process::Child, timeout: Duration) {
+    let mut command = Command::new("taskkill");
+    command
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    configure_noninteractive_command(&mut command);
+    if let Ok(mut taskkill) = command.spawn() {
+        let started = Instant::now();
+        loop {
+            if taskkill.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            if started.elapsed() >= timeout {
+                let _ = taskkill.kill();
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    } else {
+        let _ = child.kill();
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate_std_child_process_tree(child: &mut std::process::Child, _timeout: Duration) {
+    let _ = child.kill();
+}
+
+#[cfg(windows)]
+fn terminate_child_process_tree(child: &mut CodexChildProcessGuard, timeout: Duration) {
+    // Keep the root alive until taskkill has enumerated and terminated its
+    // descendants. Killing the root immediately after an asynchronous spawn
+    // can make `/T` lose the process tree and leave the app-server wrapper or
+    // one of its descendants alive after the runtime terminal boundary.
+    let mut command = Command::new("taskkill");
+    command
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_noninteractive_command(&mut command);
+    if let Ok(mut taskkill) = command.spawn() {
+        let started = Instant::now();
+        loop {
+            if taskkill.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            if started.elapsed() >= timeout {
+                let _ = taskkill.kill();
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     let _ = child.kill();
 }
 
 #[cfg(not(windows))]
-fn terminate_child_process_tree(child: &mut std::process::Child) {
+fn terminate_child_process_tree(child: &mut CodexChildProcessGuard, _timeout: Duration) {
     let _ = child.kill();
 }
 
@@ -15747,6 +17796,7 @@ fn spawn_launch_probe(
     );
     apply_codex_home_env(&mut command, plan);
     apply_live_agent_session_env(&mut command, harness_home);
+    configure_noninteractive_command(&mut command);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -17571,6 +19621,15 @@ mod tests {
         enqueue_channel_step, load_agent_registry, prepare_runtime_queue_item,
         runtime_worker::release_runtime_queue_lease,
     };
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
 
     #[test]
     fn shell_execution_failure_classifier_requires_complete_appx_drift_evidence() {
@@ -20205,6 +22264,822 @@ done
     }
 
     #[test]
+    fn queue_backed_runtime_missing_or_legacy_lease_fails_before_model_spawn() {
+        for lease_case in ["missing", "legacy-owner"] {
+            let root = temp_root(&format!("queue_backed_runtime_fails_closed_{lease_case}"));
+            let source = write_codex_runtime_source(&root);
+            let harness_home = root.join(".agent-harness");
+            enqueue_and_prepare(&source, &harness_home);
+            let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+                harness_home: harness_home.clone(),
+                execution_dir: None,
+                codex_executable: Some(std::env::current_exe().unwrap()),
+            })
+            .unwrap();
+            let plan = plan_report.plan.as_ref().unwrap();
+            let queue_id = plan
+                .queue_id
+                .as_deref()
+                .expect("prepared plan must be queue-backed");
+            let runtime_class = plan
+                .runtime_class
+                .as_deref()
+                .expect("prepared plan must carry its owning runtime class");
+            assert!(
+                plan.runtime_lease_owner_digest
+                    .as_deref()
+                    .is_some_and(|digest| digest.len() == 64)
+            );
+            let plan_file = plan_report.plan_file.as_ref().unwrap();
+            replace_env_requirements(plan_file, serde_json::json!([]));
+            let (executable, arguments) = fake_app_server_command(&root);
+            replace_invocation(plan_file, executable, arguments);
+
+            let lease_file = harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("classes")
+                .join(normalize_key_part(runtime_class))
+                .join("runtime-leases.json");
+            let mut lease_state: Value =
+                serde_json::from_slice(&fs::read(&lease_file).unwrap()).unwrap();
+            let leases = lease_state["leases"].as_object_mut().unwrap();
+            if lease_case == "missing" {
+                leases.remove(queue_id);
+            } else {
+                leases.get_mut(queue_id).unwrap()["owner"] =
+                    Value::String(format!("pid:{}", std::process::id()));
+            }
+            fs::write(
+                &lease_file,
+                serde_json::to_string_pretty(&lease_state).unwrap(),
+            )
+            .unwrap();
+
+            let report = run_codex_runtime(CodexRuntimeRunOptions {
+                harness_home: harness_home.clone(),
+                execution_dir: None,
+                plan_file: None,
+                timeout_ms: 5_000,
+                idle_timeout_ms: 5_000,
+                progress_context: None,
+            })
+            .unwrap();
+
+            assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+            assert_eq!(report.receipt.event_count, 0);
+            assert!(report.receipt.reason.contains("lease guard capture failed"));
+            assert!(report.completion.is_none());
+            assert!(
+                !root.join("fake-app-server-input.jsonl").exists(),
+                "the app-server must receive no model protocol input for {lease_case}"
+            );
+            let execution_dir = plan_report.execution_dir.as_ref().unwrap();
+            assert!(
+                !execution_dir.join("codex-runtime-run.stderr.log").exists(),
+                "the app-server process must not be spawned for {lease_case}"
+            );
+            let lease_state_after: Value =
+                serde_json::from_slice(&fs::read(&lease_file).unwrap()).unwrap();
+            if lease_case == "missing" {
+                assert!(lease_state_after["leases"].get(queue_id).is_none());
+            } else {
+                assert!(lease_state_after["leases"][queue_id]["owner"].is_string());
+            }
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_fence_persistence_or_binding_failure_never_executes_the_suspended_target() {
+        for stage in ["persist", "bind"] {
+            let root = temp_root(&format!("child_fence_{stage}_failure"));
+            let source = write_codex_runtime_source(&root);
+            let harness_home = root.join(".agent-harness");
+            enqueue_and_prepare(&source, &harness_home);
+            let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+                harness_home: harness_home.clone(),
+                execution_dir: None,
+                codex_executable: Some(std::env::current_exe().unwrap()),
+            })
+            .unwrap();
+            let queue_id = plan_report
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.queue_id.clone())
+                .unwrap();
+            let plan_file = plan_report.plan_file.as_ref().unwrap();
+            replace_env_requirements(plan_file, serde_json::json!([]));
+            let (executable, arguments) = fake_app_server_command(&root);
+            replace_invocation(plan_file, executable, arguments);
+            let failpoint = harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("test-failpoints")
+                .join(format!("codex-child-cleanup-fence-{stage}"));
+            fs::create_dir_all(failpoint.parent().unwrap()).unwrap();
+            fs::write(&failpoint, "fail").unwrap();
+
+            let report = run_codex_runtime(CodexRuntimeRunOptions {
+                harness_home: harness_home.clone(),
+                execution_dir: None,
+                plan_file: None,
+                timeout_ms: 30_000,
+                idle_timeout_ms: 30_000,
+                progress_context: None,
+            })
+            .unwrap();
+
+            assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+            assert!(
+                !root.join("fake-app-server.pid").exists(),
+                "the suspended target must not execute when fence {stage} fails"
+            );
+            assert!(!root.join("fake-app-server-input.jsonl").exists());
+            assert!(
+                child_cleanup_fence_files(&harness_home).is_empty(),
+                "proven pre-execution cleanup should remove the {stage} fence"
+            );
+            crate::runtime_worker::release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failure_after_atomic_job_spawn_reaps_suspended_root_before_clearing_fence() {
+        let root = temp_root("failure_after_atomic_job_spawn");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let queue_id = plan_report
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.queue_id.clone())
+            .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+        let failpoint = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("test-failpoints")
+            .join("codex-child-after-atomic-spawn");
+        fs::create_dir_all(failpoint.parent().unwrap()).unwrap();
+        fs::write(&failpoint, "fail").unwrap();
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::SpawnFailed);
+        assert!(
+            !root.join("fake-app-server.pid").exists(),
+            "the target script must never execute while the Job-at-create root is suspended"
+        );
+        let child_pid: i64 = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("test-atomic-codex-child.pid"),
+        )
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+        let child_start_time_ms: i64 = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("test-atomic-codex-child-start-time-ms"),
+        )
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("atomic child must have an OS start identity");
+        assert_process_generation_reaped(
+            child_pid,
+            child_start_time_ms,
+            "atomic-spawn failure suspended root",
+        );
+        assert!(
+            child_cleanup_fence_files(&harness_home).is_empty(),
+            "prearm authority may clear only after root and Job-empty readback"
+        );
+        crate::runtime_worker::release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_proof_retry_unblocks_same_process_after_transient_persist_or_clear_failure() {
+        for failure in ["proof", "clear"] {
+            let root = temp_root(&format!("child_cleanup_retry_{failure}"));
+            let source = write_codex_runtime_source(&root);
+            let harness_home = root.join(".agent-harness");
+            enqueue_and_prepare(&source, &harness_home);
+            let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+                harness_home: harness_home.clone(),
+                execution_dir: None,
+                codex_executable: Some(std::env::current_exe().unwrap()),
+            })
+            .unwrap();
+            let queue_id = plan_report
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.queue_id.clone())
+                .unwrap();
+            let plan_file = plan_report.plan_file.as_ref().unwrap();
+            replace_env_requirements(plan_file, serde_json::json!([]));
+            let (executable, arguments) = fake_app_server_command(&root);
+            replace_invocation(plan_file, executable, arguments);
+            let failpoints = harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("test-failpoints");
+            fs::create_dir_all(&failpoints).unwrap();
+            fs::write(
+                codex_post_spawn_failpoint_file(&harness_home, "state-init"),
+                "fail",
+            )
+            .unwrap();
+            let proof_failpoint = failpoints.join(format!("codex-child-cleanup-fence-{failure}"));
+            fs::write(&proof_failpoint, "fail").unwrap();
+
+            let error = run_codex_runtime(CodexRuntimeRunOptions {
+                harness_home: harness_home.clone(),
+                execution_dir: None,
+                plan_file: None,
+                timeout_ms: 30_000,
+                idle_timeout_ms: 30_000,
+                progress_context: None,
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("state-init"));
+            assert_eq!(
+                child_cleanup_fence_files(&harness_home).len(),
+                1,
+                "transient {failure} failure must initially retain exact-lane authority"
+            );
+
+            fs::remove_file(&proof_failpoint).unwrap();
+            for _ in 0..100 {
+                if child_cleanup_fence_files(&harness_home).is_empty() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                child_cleanup_fence_files(&harness_home).is_empty(),
+                "the process-owned retry worker did not finish {failure} recovery"
+            );
+            crate::runtime_worker::release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_proof_retry_dispatch_failure_requires_generation_termination() {
+        let root = temp_root("child_cleanup_retry_dispatch_failure");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+        let failpoints = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("test-failpoints");
+        fs::create_dir_all(&failpoints).unwrap();
+        fs::write(
+            codex_post_spawn_failpoint_file(&harness_home, "state-init"),
+            "fail",
+        )
+        .unwrap();
+        fs::write(failpoints.join("codex-child-cleanup-fence-proof"), "fail").unwrap();
+        fs::write(
+            failpoints.join("codex-child-cleanup-retry-dispatch"),
+            "fail",
+        )
+        .unwrap();
+
+        let error = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("state-init"));
+        assert_eq!(child_cleanup_fence_files(&harness_home).len(), 1);
+        let fatal_markers = fs::read_dir(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("child-cleanup-fatal-generation"),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(
+            fatal_markers.len(),
+            1,
+            "production must abort this owner generation rather than silently wedge its lane"
+        );
+        assert!(
+            fs::read_to_string(fatal_markers[0].path())
+                .unwrap()
+                .contains("injected retry-worker dispatch failure")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_cleanup_proof_failure_requires_generation_termination() {
+        let root = temp_root("persistent_child_cleanup_proof_failure");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+        let failpoints = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("test-failpoints");
+        fs::create_dir_all(&failpoints).unwrap();
+        fs::write(
+            codex_post_spawn_failpoint_file(&harness_home, "state-init"),
+            "fail",
+        )
+        .unwrap();
+        fs::write(failpoints.join("codex-child-cleanup-fence-proof"), "fail").unwrap();
+
+        let error = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("state-init"));
+        let marker_dir = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("child-cleanup-fatal-generation");
+        for _ in 0..100 {
+            if marker_dir.is_dir() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let markers = fs::read_dir(&marker_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(markers.len(), 1);
+        assert!(
+            fs::read_to_string(markers[0].path())
+                .unwrap()
+                .contains("stayed unavailable")
+        );
+        assert_eq!(child_cleanup_fence_files(&harness_home).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_child_stdin_write_returns_before_a_sleeping_peer_exits() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let (child_stdin_read, mut parent_stdin_write) =
+            create_windows_child_stdin_pipe(Duration::from_millis(750)).unwrap();
+        let (received_tx, received_rx) = mpsc::sync_channel(1);
+        let peer = thread::spawn(move || {
+            let mut reader = File::from(child_stdin_read);
+            let mut first = [0u8; 1];
+            reader.read_exact(&mut first).unwrap();
+            received_tx.send(()).unwrap();
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        let frame = vec![b'x'; 48 * 1024];
+        let started = Instant::now();
+        let result = parent_stdin_write.write_all(&frame);
+        let elapsed = started.elapsed();
+
+        assert!(
+            received_rx.recv_timeout(Duration::from_millis(500)).is_ok(),
+            "the sleeping peer never received the beginning of the frame"
+        );
+        assert!(
+            result.is_ok(),
+            "parent write failed after waiting for the sleeping peer: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(750),
+            "parent write took {elapsed:?}; it waited for the peer instead of committing to the pipe buffer"
+        );
+
+        drop(parent_stdin_write);
+        peer.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_child_stdin_write_cancels_and_poisons_after_its_deadline() {
+        use std::io::Write;
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let (child_stdin_read, mut parent_stdin_write) =
+            create_windows_child_stdin_pipe(Duration::from_millis(200)).unwrap();
+        let (holding_tx, holding_rx) = mpsc::sync_channel(1);
+        let peer = thread::spawn(move || {
+            holding_tx.send(()).unwrap();
+            thread::sleep(Duration::from_secs(2));
+            drop(child_stdin_read);
+        });
+        holding_rx.recv_timeout(Duration::from_millis(500)).unwrap();
+
+        let oversized_frame = vec![b'x'; 96 * 1024];
+        let started = Instant::now();
+        let error = parent_stdin_write.write_all(&oversized_frame).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "overlapped cancellation took {elapsed:?}; the write waited for the peer to close"
+        );
+        let poisoned = parent_stdin_write.write(b"x").unwrap_err();
+        assert_eq!(poisoned.kind(), io::ErrorKind::BrokenPipe);
+        assert!(poisoned.to_string().contains("poisoned"));
+
+        drop(parent_stdin_write);
+        peer.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_batch_launcher_matches_std_escape_corpus_without_injection() {
+        let root = temp_root("atomic_batch_launcher_escape_corpus");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let mut plan: CodexRuntimePlanFile =
+            serde_json::from_slice(&fs::read(plan_report.plan_file.unwrap()).unwrap()).unwrap();
+        let capture_script = root.join("capture-batch-args.js");
+        fs::write(
+            &capture_script,
+            r#"
+var fso = new ActiveXObject("Scripting.FileSystemObject");
+var capture = fso.BuildPath(fso.GetParentFolderName(WScript.ScriptFullName), "batch-args.json");
+var args = [];
+for (var i = 0; i < WScript.Arguments.length; i++) {
+    args.push(WScript.Arguments.Item(i));
+}
+function quoteJson(value) {
+    return '"' + value
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"')
+        .replace(/\r/g, "\\r")
+        .replace(/\n/g, "\\n")
+        .replace(/\t/g, "\\t") + '"';
+}
+var encoded = [];
+for (var j = 0; j < args.length; j++) {
+    encoded.push(quoteJson(args[j]));
+}
+var file = fso.CreateTextFile(capture, true, true);
+file.Write("[" + encoded.join(",") + "]");
+file.Close();
+"#,
+        )
+        .unwrap();
+        let batch = root.join("capture-batch-args.cmd");
+        fs::write(
+            &batch,
+            r#"@echo off
+"%SystemRoot%\System32\cscript.exe" //nologo "%~dp0capture-batch-args.js" %*
+"#,
+        )
+        .unwrap();
+        let sentinel = root.join("batch-injection-sentinel.txt");
+        let expected = vec![
+            "\\".to_string(),
+            "hello^\"world".to_string(),
+            "trailing\\".to_string(),
+            "\"quoted\"".to_string(),
+            "%PATH%".to_string(),
+            format!("safe & echo compromised>{}", sentinel.display()),
+        ];
+        let capture_file = root.join("batch-args.json");
+        let read_capture = || {
+            let capture = fs::read(&capture_file).unwrap();
+            assert_eq!(
+                capture.get(..2),
+                Some(&[0xff, 0xfe][..]),
+                "WSH Unicode capture must start with a UTF-16LE byte-order mark"
+            );
+            assert_eq!(
+                (capture.len() - 2) % 2,
+                0,
+                "WSH Unicode capture must contain complete UTF-16LE code units"
+            );
+            let capture = String::from_utf16(
+                &capture[2..]
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            serde_json::from_str::<Vec<String>>(&capture).unwrap()
+        };
+
+        let mut upstream_command = std::process::Command::new(&batch);
+        upstream_command.args(&expected);
+        configure_noninteractive_command(&mut upstream_command);
+        let upstream_status = upstream_command.status().unwrap();
+        assert!(
+            upstream_status.success(),
+            "std::process batch launcher failed: {upstream_status}"
+        );
+        let upstream_actual = read_capture();
+        assert!(
+            !sentinel.exists(),
+            "the std::process batch launcher allowed argument injection"
+        );
+        fs::remove_file(&capture_file).unwrap();
+
+        plan.invocation.executable = batch;
+        plan.invocation.arguments = expected.clone();
+        plan.invocation.env_requirements.clear();
+        let stderr = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(root.join("batch-stderr.log"))
+            .unwrap();
+        let job = WindowsCodexProcessJob::create().unwrap();
+        let mut child = spawn_atomic_windows_codex_child(
+            &harness_home,
+            &plan,
+            stderr,
+            &job,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        drop(child.take_stdin());
+        drop(child.take_stdout());
+        child.resume_primary_thread().unwrap();
+        let status = child
+            .wait_for_exit(Duration::from_secs(15))
+            .unwrap()
+            .expect("batch launcher did not exit");
+        assert!(status.success(), "batch launcher failed: {status}");
+        child.release_kernel_handles();
+        assert!(
+            job.wait_until_empty(Duration::from_secs(5)).unwrap(),
+            "batch launcher Job retained a descendant after root exit"
+        );
+        let atomic_actual = read_capture();
+        assert_eq!(atomic_actual, upstream_actual);
+        assert!(
+            !sentinel.exists(),
+            "a batch argument escaped its quoted argument boundary"
+        );
+
+        plan.invocation.arguments = vec!["line-one\nline-two".to_string()];
+        let error = windows_batch_codex_command_line(&plan).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn post_spawn_failpoints_reap_the_contained_child_before_returning() {
+        for stage in [
+            "state-init",
+            "after-initialize",
+            "before-thread-start",
+            "before-turn-wait",
+        ] {
+            let root = temp_root(&format!("post_spawn_cleanup_{stage}"));
+            let source = write_codex_runtime_source(&root);
+            let harness_home = root.join(".agent-harness");
+            enqueue_and_prepare(&source, &harness_home);
+            let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+                harness_home: harness_home.clone(),
+                execution_dir: None,
+                codex_executable: Some(std::env::current_exe().unwrap()),
+            })
+            .unwrap();
+            let queue_id = plan_report
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.queue_id.clone())
+                .unwrap();
+            let plan_file = plan_report.plan_file.as_ref().unwrap();
+            replace_env_requirements(plan_file, serde_json::json!([]));
+            let (executable, arguments) = fake_app_server_command(&root);
+            replace_invocation(plan_file, executable, arguments);
+            fs::write(root.join("fake-app-server-hold-after-turn-start"), "hold").unwrap();
+            fs::write(root.join("fake-app-server-spawn-descendant"), "spawn").unwrap();
+            let failpoint = codex_post_spawn_failpoint_file(&harness_home, stage);
+            fs::create_dir_all(failpoint.parent().unwrap()).unwrap();
+            fs::write(&failpoint, "fail").unwrap();
+
+            let error = run_codex_runtime(CodexRuntimeRunOptions {
+                harness_home: harness_home.clone(),
+                execution_dir: None,
+                plan_file: None,
+                timeout_ms: 30_000,
+                idle_timeout_ms: 30_000,
+                progress_context: None,
+            })
+            .unwrap_err();
+
+            assert!(error.to_string().contains(stage), "{stage}: {error}");
+            let child_generation = fs::read_to_string(
+                harness_home
+                    .join("state")
+                    .join("runtime-queue")
+                    .join("test-codex-child-generations.jsonl"),
+            )
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .next_back()
+            .expect("post-spawn failure must record its child generation");
+            let pid = child_generation.get("pid").and_then(Value::as_i64).unwrap();
+            let process_start_time_ms = child_generation
+                .get("processStartTimeMs")
+                .and_then(Value::as_i64)
+                .expect("post-spawn child must have an OS start identity");
+            assert_process_generation_reaped(
+                pid,
+                process_start_time_ms,
+                &format!("post-spawn failure `{stage}` root"),
+            );
+            let descendant_generation_file =
+                root.join("fake-app-server-descendant-generation.json");
+            if stage != "state-init" {
+                assert!(
+                    descendant_generation_file.is_file(),
+                    "post-spawn failure `{stage}` must exercise a real descendant"
+                );
+            }
+            if let Ok(text) = fs::read_to_string(&descendant_generation_file) {
+                let descendant_generation: Value = serde_json::from_str(&text).unwrap();
+                let descendant_pid = descendant_generation
+                    .get("pid")
+                    .and_then(Value::as_i64)
+                    .unwrap();
+                let descendant_start_time_ms = descendant_generation
+                    .get("processStartTimeMs")
+                    .and_then(Value::as_i64)
+                    .expect("descendant must record an OS start identity");
+                assert_process_generation_reaped(
+                    descendant_pid,
+                    descendant_start_time_ms,
+                    &format!("post-spawn failure `{stage}` descendant"),
+                );
+            }
+            assert!(
+                child_cleanup_fence_files(&harness_home).is_empty(),
+                "successful job-object cleanup must not fence `{stage}`"
+            );
+            crate::runtime_worker::release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unproven_child_cleanup_fences_the_runtime_lease() {
+        let root = temp_root("unproven_child_cleanup_fences_runtime_lease");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
+        let queue_id = plan.queue_id.clone().unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+        let failpoint = codex_post_spawn_failpoint_file(&harness_home, "state-init");
+        fs::create_dir_all(failpoint.parent().unwrap()).unwrap();
+        fs::write(&failpoint, "fail").unwrap();
+        fs::write(
+            failpoint
+                .parent()
+                .unwrap()
+                .join("codex-child-cleanup-unproven"),
+            "fail",
+        )
+        .unwrap();
+
+        let error = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("state-init"));
+
+        let fences = child_cleanup_fence_files(&harness_home);
+        assert_eq!(fences.len(), 1);
+        assert!(fences[0].is_file());
+        let release = crate::runtime_worker::release_runtime_queue_lease(&harness_home, &queue_id)
+            .unwrap_err();
+        assert_eq!(release.kind(), io::ErrorKind::WouldBlock);
+        assert!(release.to_string().contains("child-cleanup safety fence"));
+        let fatal_markers = fs::read_dir(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("child-cleanup-fatal-generation"),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(
+            fatal_markers.len(),
+            1,
+            "production must terminate the owner generation when Job cleanup is unproven"
+        );
+        assert!(
+            fs::read_to_string(fatal_markers[0].path())
+                .unwrap()
+                .contains("process-tree cleanup could not be proven")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_codex_runtime_drives_fake_app_server_and_records_outputs() {
         let root = temp_root("run_codex_runtime_drives_fake_app_server_and_records_outputs");
         let source = write_codex_runtime_source(&root);
@@ -20324,7 +23199,7 @@ done
         replace_invocation(plan_file, executable, arguments);
 
         let report = run_codex_runtime(CodexRuntimeRunOptions {
-            harness_home,
+            harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
             timeout_ms: 30_000,
@@ -20785,6 +23660,394 @@ done
             serde_json::from_slice(&fs::read(active_binding_file).unwrap()).unwrap();
         assert_eq!(active_binding["activeTurnId"], "turn-parent");
         assert_eq!(active_binding["threadId"], "thread-test");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn captured_parent_final_bounds_unowned_native_regular_continuation() {
+        let root = temp_root("captured_parent_final_bounds_unowned_native_regular_continuation");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_owned_codex_events_mode(&harness_home, "authoritative");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let events = [
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-parent","kind":"regular"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-parent","item":{"type":"agentMessage","id":"parent-final","text":"Checkpoint captured for the user.","phase":"final_answer"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-native-goal-next","kind":"regular"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-native-goal-next","item":{"type":"agentMessage","id":"replacement-final","text":"NATIVE CONTINUATION MUST NOT REPLACE THE CAPTURED FINAL","phase":"final_answer"}}}"#,
+        ];
+        let (executable, arguments) = scripted_owned_events_app_server_command(
+            &root,
+            "captured-final-native-continuation",
+            &events,
+        );
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert!(
+            report
+                .receipt
+                .reason
+                .contains("captured-final-before-unowned-regular-continuation")
+        );
+        let transcript = fs::read_to_string(
+            report
+                .completion
+                .as_ref()
+                .unwrap()
+                .transcript_file
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(transcript.contains("Checkpoint captured for the user."));
+        assert!(!transcript.contains("NATIVE CONTINUATION MUST NOT REPLACE"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_owned_goal_adopts_same_thread_native_regular_continuation() {
+        let root = temp_root("active_owned_goal_adopts_same_thread_native_regular_continuation");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_owned_codex_events_mode(&harness_home, "authoritative");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let events = [
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-goal-1","kind":"regular"}}}"#,
+            r#"{"method":"thread/goal/updated","params":{"threadId":"thread-test","turnId":"turn-goal-1","goal":{"id":"goal-1","objective":"finish the long task","status":"active"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-goal-1","item":{"type":"agentMessage","id":"goal-checkpoint-1","text":"First autonomous checkpoint.","phase":"final_answer"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-goal-2","kind":"regular"}}}"#,
+            r#"{"method":"thread/goal/updated","params":{"threadId":"thread-test","turnId":"turn-goal-2","goal":{"id":"goal-1","objective":"finish the long task","status":"active"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-goal-2","item":{"type":"agentMessage","id":"goal-final-2","text":"Second autonomous turn completed the slice.","phase":"final_answer"}}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-goal-2","status":"completed"}}}"#,
+        ];
+        let (executable, arguments) = scripted_owned_events_app_server_command(
+            &root,
+            "active-goal-native-continuation",
+            &events,
+        );
+        replace_invocation(plan_file, executable, arguments);
+        let other_lane_queue_id = enqueue_pending_turn(
+            &source,
+            &harness_home,
+            "dm-other",
+            "unrelated lane follow-up",
+            1235,
+        );
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("adopted same-thread native Goal continuation"))
+        );
+        assert!(
+            !report
+                .receipt
+                .reason
+                .contains("captured-final-before-unowned-regular-continuation")
+        );
+        let transcript = fs::read_to_string(
+            report
+                .completion
+                .as_ref()
+                .unwrap()
+                .transcript_file
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(transcript.contains("Second autonomous turn completed the slice."));
+        assert!(!transcript.contains("First autonomous checkpoint."));
+        assert!(
+            fs::read_to_string(
+                harness_home
+                    .join("state")
+                    .join("runtime-queue")
+                    .join("pending.jsonl")
+            )
+            .unwrap()
+            .contains(&other_lane_queue_id),
+            "different-lane work must remain queued without fencing the owned Goal lane"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_lane_human_input_fences_native_goal_continuation_at_the_final_boundary() {
+        let root = temp_root("exact_lane_human_fences_native_goal_continuation");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_owned_codex_events_mode(&harness_home, "authoritative");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let human_queue_id = enqueue_pending_turn(
+            &source,
+            &harness_home,
+            "dm-42",
+            "new human direction must run next",
+            1235,
+        );
+        let events = [
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-goal-1","kind":"regular"}}}"#,
+            r#"{"method":"thread/goal/updated","params":{"threadId":"thread-test","turnId":"turn-goal-1","goal":{"id":"goal-1","objective":"finish the long task","status":"active"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-goal-1","item":{"type":"agentMessage","id":"goal-checkpoint-1","text":"Checkpoint before human input.","phase":"final_answer"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-goal-2","kind":"regular"}}}"#,
+            r#"{"method":"thread/goal/updated","params":{"threadId":"thread-test","turnId":"turn-goal-2","goal":{"id":"goal-1","objective":"finish the long task","status":"active"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-goal-2","item":{"type":"agentMessage","id":"goal-final-2","text":"NATIVE TURN MUST NOT BYPASS HUMAN INPUT","phase":"final_answer"}}}"#,
+        ];
+        let (executable, arguments) =
+            scripted_owned_events_app_server_command(&root, "exact-lane-human-fence", &events);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert!(
+            report.receipt.reason.contains("pendingExactLaneWork=true"),
+            "{}",
+            report.receipt.reason
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("adopted same-thread native Goal continuation"))
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("queued human turn keeps FIFO priority"))
+        );
+        let transcript = fs::read_to_string(
+            report
+                .completion
+                .as_ref()
+                .unwrap()
+                .transcript_file
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(transcript.contains("Checkpoint before human input."));
+        assert!(!transcript.contains("NATIVE TURN MUST NOT BYPASS HUMAN INPUT"));
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(
+            pending.contains(&human_queue_id),
+            "the exact-lane human turn must remain the next durable queue item"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn goal_campaign_missing_current_turn_update_stops_before_third_turn_without_timeout() {
+        let root = temp_root("goal_campaign_missing_current_turn_update");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_owned_codex_events_mode(&harness_home, "authoritative");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let mut plan_value: Value = serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
+        plan_value["campaignSliceGeneration"] = Value::from(1);
+        fs::write(
+            plan_file,
+            serde_json::to_string_pretty(&plan_value).unwrap(),
+        )
+        .unwrap();
+        let events = [
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-goal-1","kind":"regular"}}}"#,
+            r#"{"method":"thread/goal/updated","params":{"threadId":"thread-test","turnId":"turn-goal-1","goal":{"id":"goal-1","objective":"finish the long task","status":"active"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-goal-1","item":{"type":"agentMessage","id":"goal-checkpoint-1","text":"First autonomous checkpoint.","phase":"final_answer"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-goal-2","kind":"regular"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-goal-2","item":{"type":"agentMessage","id":"goal-checkpoint-2","text":"UNPROVEN SECOND TURN FINAL MUST BE PARKED","phase":"final_answer"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-goal-3","kind":"regular"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-goal-3","item":{"type":"agentMessage","id":"goal-final-3","text":"THIRD TURN MUST NOT BE ADOPTED","phase":"final_answer"}}}"#,
+        ];
+        let (executable, arguments) = scripted_owned_events_app_server_command(
+            &root,
+            "goal-campaign-missing-current-turn-update",
+            &events,
+        );
+        replace_invocation(plan_file, executable, arguments);
+
+        let started = Instant::now();
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "missing current-turn Goal authority must not wait for the 30-second timeout"
+        );
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(
+            report
+                .receipt
+                .reason
+                .contains(GOAL_CONTINUATION_AUTHORITY_BOUNDARY_MARKER)
+        );
+        assert!(report.completion.is_none());
+        assert_eq!(
+            report
+                .warnings
+                .iter()
+                .filter(|warning| {
+                    warning.contains("adopted same-thread native Goal continuation")
+                })
+                .count(),
+            1,
+            "only turn 2 may be adopted from turn 1's exact active Goal proof"
+        );
+        let active_binding_file = codex_active_turn_binding_file(
+            &harness_home,
+            &canonical_test_session("telegram:dm-42:user-7:main"),
+        );
+        let active_binding: Value =
+            serde_json::from_slice(&fs::read(active_binding_file).unwrap()).unwrap();
+        assert_eq!(active_binding["activeTurnId"], "turn-goal-2");
+        assert_eq!(active_binding["status"], "failed");
+        assert!(
+            !report
+                .receipt
+                .reason
+                .to_ascii_lowercase()
+                .contains("timed out")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blocked_owned_goal_closes_at_captured_final_before_native_wake() {
+        let root = temp_root("blocked_owned_goal_closes_at_captured_final_before_native_wake");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_owned_codex_events_mode(&harness_home, "authoritative");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let events = [
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-goal-blocked","kind":"regular"}}}"#,
+            r#"{"method":"thread/goal/updated","params":{"threadId":"thread-test","turnId":"turn-goal-blocked","goal":{"id":"goal-blocked","objective":"wait for authority","status":"blocked"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-goal-blocked","item":{"type":"agentMessage","id":"blocked-final","text":"The goal is checkpointed and blocked.","phase":"final_answer"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-must-not-wake","kind":"regular"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-must-not-wake","item":{"type":"agentMessage","id":"bad-wake-final","text":"BLOCKED GOAL MUST NOT AUTO-WAKE","phase":"final_answer"}}}"#,
+        ];
+        let (executable, arguments) =
+            scripted_owned_events_app_server_command(&root, "blocked-goal-native-wake", &events);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert!(
+            report
+                .receipt
+                .reason
+                .contains("captured-final-at-owned-goal-terminal; goalStatus=blocked")
+        );
+        let transcript = fs::read_to_string(
+            report
+                .completion
+                .as_ref()
+                .unwrap()
+                .transcript_file
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(transcript.contains("The goal is checkpointed and blocked."));
+        assert!(!transcript.contains("BLOCKED GOAL MUST NOT AUTO-WAKE"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -22347,6 +25610,7 @@ done
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
     #[test]
     fn run_codex_runtime_recovers_tool_use_idle_timeout_with_fresh_thread() {
         let root = temp_root("run_codex_runtime_recovers_tool_use_idle_timeout_with_fresh_thread");
@@ -22364,8 +25628,9 @@ done
         let (executable, arguments) = tool_timeout_then_success_app_server_command(&root);
         replace_invocation(plan_file, executable, arguments);
 
+        let started = std::time::Instant::now();
         let report = run_codex_runtime(CodexRuntimeRunOptions {
-            harness_home,
+            harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
             timeout_ms: 30_000,
@@ -22394,10 +25659,23 @@ done
         let transcript_file = report.completion.unwrap().transcript_file.unwrap();
         let transcript = fs::read_to_string(transcript_file).unwrap();
         assert!(transcript.contains("Recovered after tool timeout."));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "tool idle recovery did not win before the stalled peer's bounded exit"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("tool-timeout-attempt.txt"))
+                .unwrap()
+                .trim(),
+            "2"
+        );
+        assert_two_reaped_codex_child_generations(&harness_home);
+        assert!(child_cleanup_fence_files(&harness_home).is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
     #[test]
     fn run_codex_runtime_keeps_external_review_recovery_as_evidence_not_final() {
         let root =
@@ -22417,7 +25695,7 @@ done
         replace_invocation(plan_file, executable, arguments);
 
         let report = run_codex_runtime(CodexRuntimeRunOptions {
-            harness_home,
+            harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
             timeout_ms: 20_000,
@@ -22446,6 +25724,14 @@ done
         assert!(evidence.is_file());
         let evidence_text = fs::read_to_string(evidence).unwrap();
         assert!(evidence_text.contains("Claude second brain review"));
+        assert_eq!(
+            fs::read_to_string(root.join("tool-timeout-review-only-attempt.txt"))
+                .unwrap()
+                .trim(),
+            "2"
+        );
+        assert_two_reaped_codex_child_generations(&harness_home);
+        assert!(child_cleanup_fence_files(&harness_home).is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -24157,10 +27443,19 @@ done
         )
         .unwrap();
 
-        let first =
-            RuntimeCancelCheck::new(&harness_home, session_key, Some("queue-a".to_string()));
-        let second =
-            RuntimeCancelCheck::new(&harness_home, session_key, Some("queue-b".to_string()));
+        let unchecked_marker_consumer = |queue_id: &str| RuntimeCancelCheck {
+            path: cancel_file.clone(),
+            receipt_file: harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("cancel-consumptions.jsonl"),
+            session_key: session_key.to_string(),
+            queue_id: Some(queue_id.to_string()),
+            lease_guard: RefCell::new(None),
+            lease_capture_failure: None,
+        };
+        let first = unchecked_marker_consumer("queue-a");
+        let second = unchecked_marker_consumer("queue-b");
 
         assert_eq!(first.poll().unwrap().as_deref(), Some("sibling stop"));
         assert!(cancel_file.exists());
@@ -24176,6 +27471,28 @@ done
         assert!(consumption_text.contains("queue-b"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lease_guard_capture_contention_is_protocol_backpressure_not_cancel() {
+        let check = RuntimeCancelCheck {
+            path: PathBuf::from("unused-cancel-request.json"),
+            receipt_file: PathBuf::from("unused-cancel-receipt.jsonl"),
+            session_key: "discord:channel:user:main".to_string(),
+            queue_id: Some("turn:lease-contention".to_string()),
+            lease_guard: RefCell::new(None),
+            lease_capture_failure: Some(RuntimeLeaseGuardCaptureFailure {
+                kind: io::ErrorKind::WouldBlock,
+                reason: "runtime queue lease lock is busy for class `interactive`".to_string(),
+            }),
+        };
+
+        let protocol_failure = check
+            .lease_capture_protocol_failure()
+            .expect("transient lease contention must become a protocol failure");
+        assert!(protocol_failure.contains("retryable backpressure"));
+        assert!(!protocol_failure.contains("operator requested stop"));
+        assert_eq!(check.poll().unwrap_err().kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
@@ -25005,6 +28322,49 @@ done
         .unwrap();
     }
 
+    fn enqueue_pending_turn(
+        source: &crate::AgentSource,
+        harness_home: &Path,
+        channel_id: &str,
+        text: &str,
+        now_ms: i64,
+    ) -> String {
+        let registry = load_agent_registry(source).unwrap();
+        let skills = build_source_skill_index(source).unwrap();
+        let turn = build_turn_plan(
+            source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: channel_id.to_string(),
+                user_id: "user-7".to_string(),
+                text: text.to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let step = build_channel_step(&registry, &turn);
+        enqueue_channel_step(
+            &step,
+            RuntimeQueueEnqueueOptions {
+                harness_home: harness_home.to_path_buf(),
+                runtime_workspace: None,
+                inbound_canonical_id: None,
+                now_ms,
+            },
+        )
+        .unwrap()
+        .item
+        .expect("follow-up must enqueue")
+        .queue_id
+    }
+
     fn replace_env_requirements(plan_file: &Path, requirements: Value) {
         let mut value: Value = serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
         value["invocation"]["envRequirements"] = requirements;
@@ -25164,9 +28524,23 @@ done
             &script,
             r#"
 $capture = Join-Path $PSScriptRoot 'fake-app-server-input.jsonl'
+$pidFile = Join-Path $PSScriptRoot 'fake-app-server.pid'
+$spawnDescendant = Join-Path $PSScriptRoot 'fake-app-server-spawn-descendant'
+$descendantGenerationFile = Join-Path $PSScriptRoot 'fake-app-server-descendant-generation.json'
+$holdAfterTurnStart = Join-Path $PSScriptRoot 'fake-app-server-hold-after-turn-start'
 $denyMax = Join-Path $PSScriptRoot 'fake-app-server-live-deny-max'
 $webSearchAbsent = Join-Path $PSScriptRoot 'fake-app-server-web-search-absent'
 $webSearchEvent = Join-Path $PSScriptRoot 'fake-app-server-web-search-event'
+Set-Content -LiteralPath $pidFile -Value $PID
+if (Test-Path -LiteralPath $spawnDescendant) {
+    $powershell = Join-Path $PSHOME 'powershell.exe'
+    $descendant = Start-Process -FilePath $powershell -ArgumentList @('-NoProfile', '-Command', 'while ($true) { Start-Sleep -Seconds 1 }') -WindowStyle Hidden -PassThru
+    $descendantStartTimeMs = ([DateTimeOffset]$descendant.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
+    @{
+        pid = [Int64]$descendant.Id
+        processStartTimeMs = [Int64]$descendantStartTimeMs
+    } | ConvertTo-Json -Compress | Set-Content -LiteralPath $descendantGenerationFile
+}
 while ($true) {
     if ($null -eq $threadMethod) { $threadMethod = 'unknown' }
     $line = [Console]::In.ReadLine()
@@ -25206,6 +28580,9 @@ while ($true) {
         }
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
+        if (Test-Path -LiteralPath $holdAfterTurnStart) {
+            while ($true) { Start-Sleep -Milliseconds 250 }
+        }
         [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}')
         if (Test-Path -LiteralPath $webSearchEvent) {
             [Console]::Out.WriteLine('{"method":"item/started","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"web-test","type":"webSearch","query":"private fixture query","action":{"type":"search","query":"private fixture query","queries":["private fixture query"]}}}}')
@@ -26528,9 +29905,12 @@ while ($true) {
             &script,
             r#"
 capture="$(dirname "$0")/fake-app-server-input.jsonl"
+pid_file="$(dirname "$0")/fake-app-server.pid"
+hold_after_turn_start="$(dirname "$0")/fake-app-server-hold-after-turn-start"
 deny_max="$(dirname "$0")/fake-app-server-live-deny-max"
 web_search_absent="$(dirname "$0")/fake-app-server-web-search-absent"
 web_search_event="$(dirname "$0")/fake-app-server-web-search-event"
+printf '%s\n' "$$" > "$pid_file"
 while IFS= read -r line; do
     printf '%s\n' "$line" >> "$capture"
     case "$line" in
@@ -26563,6 +29943,9 @@ while IFS= read -r line; do
             fi
             ;;
         *'"method":"turn/start"'*)
+            if [ -f "$hold_after_turn_start" ]; then
+                while :; do sleep 1; done
+            fi
             if [ -f "$web_search_event" ]; then
                 printf '%s\n' '{"method":"item/started","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"web-test","type":"webSearch","query":"private fixture query","action":{"type":"search","query":"private fixture query","queries":["private fixture query"]}}}}'
             fi
@@ -27485,6 +30868,80 @@ done
             "agent-harness-codex-runtime-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn child_cleanup_fence_files(harness_home: &Path) -> Vec<PathBuf> {
+        let dir = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("child-cleanup-fences");
+        let mut files = fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        entry
+                            .file_type()
+                            .ok()
+                            .is_some_and(|kind| kind.is_file())
+                            .then(|| entry.path())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        files.sort();
+        files
+    }
+
+    #[cfg(windows)]
+    fn assert_process_generation_reaped(pid: i64, process_start_time_ms: i64, context: &str) {
+        let state = crate::loop_health::exact_process_generation_state(pid, process_start_time_ms);
+        assert_eq!(
+            state,
+            crate::loop_health::ExactProcessGenerationState::DeadOrReused,
+            "{context} retained its exact live generation pid={pid} start={process_start_time_ms}; observedStart={:?}; observedAlive={:?}",
+            crate::loop_health::process_start_time_ms_for_pid(pid),
+            crate::loop_health::process_alive_for_pid(pid)
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_two_reaped_codex_child_generations(harness_home: &Path) {
+        let history = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("test-codex-child-generations.jsonl"),
+        )
+        .unwrap();
+        let rows = history
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "expected exactly two Codex child attempts");
+        let generations = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get("pid").and_then(Value::as_i64).unwrap(),
+                    row.get("processStartTimeMs")
+                        .and_then(Value::as_i64)
+                        .expect("test child generation must have an OS start time"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(
+            generations[0].0, generations[1].0,
+            "fresh-thread recovery reused the original child pid"
+        );
+        for (pid, process_start_time_ms) in generations {
+            assert_process_generation_reaped(
+                pid,
+                process_start_time_ms,
+                "Codex child recovery generation",
+            );
+        }
     }
 
     fn canonical_test_session(session_key: &str) -> String {

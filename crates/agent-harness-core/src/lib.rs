@@ -68,6 +68,7 @@ pub mod model_catalog;
 pub mod nudge;
 pub mod operation_plan;
 pub mod ops;
+pub mod process_launch;
 pub mod progress;
 pub(crate) mod progress_event_index;
 pub mod prompt;
@@ -112,6 +113,7 @@ pub mod supervision;
 pub mod supervisor;
 pub mod supervisor_inventory;
 pub mod supervisor_keeper;
+pub mod supervisor_master;
 pub mod supervisor_topology;
 pub mod task_budget;
 pub mod task_transition;
@@ -843,8 +845,9 @@ pub use supervisor_keeper::{
     WINDOWS_RECONCILE_KEEPER_OBSERVATION_SCHEMA, WINDOWS_RECONCILE_KEEPER_PLAN_SCHEMA,
     WindowsReconcileKeeperAction, WindowsReconcileKeeperExecutable, WindowsReconcileKeeperPlan,
     WindowsReconcileKeeperPlanOptions, WindowsReconcileKeeperPrincipal,
-    WindowsReconcileKeeperScript, WindowsReconcileKeeperSettings, WindowsReconcileKeeperTask,
-    WindowsReconcileKeeperTrigger, write_windows_reconcile_keeper_plan,
+    WindowsReconcileKeeperSchedulerAction, WindowsReconcileKeeperScript,
+    WindowsReconcileKeeperSettings, WindowsReconcileKeeperTask, WindowsReconcileKeeperTrigger,
+    write_windows_reconcile_keeper_plan,
 };
 pub use supervisor_topology::{
     SupervisorTopologyEntry, SupervisorTopologyOverrides, SupervisorTopologySource,

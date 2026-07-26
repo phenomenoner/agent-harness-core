@@ -40,6 +40,7 @@ use crate::{
         DEFAULT_MEMORY_BACKFILL_RETRY_CAP, DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION,
         MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions, run_memory_embedding_backfill,
     },
+    process_launch::configure_noninteractive_command,
     run_learning_review,
     runtime_pipeline::latest_assistant_final_text,
     subagent_lifecycle::{
@@ -2301,11 +2302,13 @@ fn terminate_worker_child_process_tree(
     child: &mut std::process::Child,
     process_tree_job: Option<&WindowsWorkerProcessJob>,
 ) {
-    let _ = Command::new("taskkill")
+    let mut command = Command::new("taskkill");
+    command
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    configure_noninteractive_command(&mut command);
+    let _ = command.status();
     if let Some(process_tree_job) = process_tree_job {
         process_tree_job.terminate();
     }
@@ -2855,13 +2858,19 @@ fn run_durable_coordinator_watchdog(
                 format!("durable watchdog references missing wait {wait_id}"),
             )
         })?;
-    if wait.child_group_id != group_id
-        || wait.state
-            != crate::worker_coordination::WorkerCoordinatorWaitStateV1::WaitingForChildren
-    {
+    if wait.child_group_id != group_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("durable watchdog wait {wait_id} has wrong group or state"),
+            format!("durable watchdog wait {wait_id} has wrong group"),
+        ));
+    }
+    if wait.state == crate::worker_coordination::WorkerCoordinatorWaitStateV1::Quarantined {
+        return Ok(quarantined_coordinator_watchdog_result(wait_id));
+    }
+    if wait.state != crate::worker_coordination::WorkerCoordinatorWaitStateV1::WaitingForChildren {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("durable watchdog wait {wait_id} is not waiting for children"),
         ));
     }
     let mut actual_children = children
@@ -2905,6 +2914,25 @@ fn run_durable_coordinator_watchdog(
         },
     );
     let transaction = conn.unchecked_transaction().map_err(io::Error::other)?;
+    let current_wait =
+        crate::worker_coordination::load_worker_coordinator_wait(&transaction, wait_id)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("durable watchdog wait {wait_id} disappeared before resume commit"),
+                )
+            })?;
+    if current_wait.state == crate::worker_coordination::WorkerCoordinatorWaitStateV1::Quarantined {
+        drop(transaction);
+        return Ok(quarantined_coordinator_watchdog_result(wait_id));
+    }
+    if current_wait != wait {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("durable watchdog wait {wait_id} changed before resume commit"),
+        ));
+    }
     ensure_expected_child_mailbox_records_in_transaction(&transaction, &wait, children, now_ms)?;
     let create = crate::worker_resume::create_or_coalesce_resume_intent_in_transaction(
         &transaction,
@@ -3058,6 +3086,26 @@ fn run_durable_coordinator_watchdog(
             "coordinatorResumeInserted": inserted,
         })),
     })
+}
+
+fn quarantined_coordinator_watchdog_result(wait_id: &str) -> WorkerJobExecutionResult {
+    WorkerJobExecutionResult {
+        status: WorkerJobStatus::Canceled,
+        reason: format!(
+            "durable coordinator wait {wait_id} was quarantined; resume remains suppressed"
+        ),
+        audit_path: None,
+        artifact_refs: Some(json!({
+            "coordinatorWaitId": wait_id,
+            "waitState": "quarantined",
+            "resumeSuppressed": true,
+        })),
+        result: Some(json!({
+            "coordinatorWaitId": wait_id,
+            "waitState": "quarantined",
+            "resumeSuppressed": true,
+        })),
+    }
 }
 
 fn ensure_expected_child_mailbox_records_in_transaction(
@@ -3425,12 +3473,20 @@ fn worker_lanes(conn: &Connection) -> io::Result<Vec<String>> {
 #[derive(Debug, Clone)]
 struct RuntimeWorkerTerminal {
     worker_status: WorkerJobStatus,
+    handling: RuntimeWorkerTerminalHandling,
     runtime_status: String,
+    terminal_control_source: Option<String>,
     runtime_class: String,
     origin: String,
     reason: String,
     transcript_file: Option<PathBuf>,
     receipt_file: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeWorkerTerminalHandling {
+    PublishMailbox,
+    QuarantineWaitWithoutMailbox,
 }
 
 fn reconcile_runtime_queued_jobs(
@@ -3467,7 +3523,9 @@ fn reconcile_runtime_queued_jobs(
         .collect::<BTreeSet<_>>();
     let mut terminals = BTreeMap::<String, RuntimeWorkerTerminal>::new();
     for record in find_runtime_queue_terminal_history(&queue_dir, &requested_queue_ids)? {
-        let Some(worker_status) = worker_status_from_runtime_terminal(&record.status) else {
+        let Some((worker_status, handling)) =
+            worker_terminal_handling(&record.status, record.terminal_control_source.as_deref())
+        else {
             continue;
         };
         let (Some(runtime_class), Some(origin)) = (record.runtime_class, record.origin) else {
@@ -3477,7 +3535,9 @@ fn reconcile_runtime_queued_jobs(
             record.queue_id,
             RuntimeWorkerTerminal {
                 worker_status,
+                handling,
                 runtime_status: record.status,
+                terminal_control_source: record.terminal_control_source,
                 runtime_class,
                 origin,
                 reason: record
@@ -3495,7 +3555,9 @@ fn reconcile_runtime_queued_jobs(
         else {
             continue;
         };
-        let Some(worker_status) = worker_status_from_runtime_terminal(&record.status) else {
+        let Some((worker_status, handling)) =
+            worker_terminal_handling(&record.status, record.terminal_control_source.as_deref())
+        else {
             continue;
         };
         let (Some(runtime_class), Some(origin)) = (record.runtime_class, record.origin) else {
@@ -3507,7 +3569,9 @@ fn reconcile_runtime_queued_jobs(
             record.queue_id,
             RuntimeWorkerTerminal {
                 worker_status,
+                handling,
                 runtime_status: record.status,
+                terminal_control_source: record.terminal_control_source,
                 runtime_class,
                 origin,
                 reason: record
@@ -3571,12 +3635,27 @@ fn set_runtime_terminal_with_mailbox(
     now_ms: i64,
 ) -> io::Result<()> {
     let transaction = conn.unchecked_transaction().map_err(io::Error::other)?;
+    let quarantined_wait_ids = if terminal.handling
+        == RuntimeWorkerTerminalHandling::QuarantineWaitWithoutMailbox
+    {
+        crate::worker_coordination::quarantine_worker_coordinator_waits_for_child_in_transaction(
+            &transaction,
+            &job.job_id,
+            now_ms,
+        )
+        .map_err(io::Error::other)?
+    } else {
+        Vec::new()
+    };
     let result = json!({
         "runtimeQueueId": runtime_queue_id,
         "runtimeStatus": terminal.runtime_status,
+        "terminalControlSource": terminal.terminal_control_source,
         "reason": terminal.reason,
         "terminalReceiptFile": terminal.receipt_file,
-        "correlation": "exact-runtime-queue-id"
+        "correlation": "exact-runtime-queue-id",
+        "mailboxPublished": terminal.handling == RuntimeWorkerTerminalHandling::PublishMailbox,
+        "quarantinedCoordinatorWaitIds": quarantined_wait_ids,
     });
     let updated = transaction
         .execute(
@@ -3596,6 +3675,10 @@ fn set_runtime_terminal_with_mailbox(
             "worker {} was not runtime-queued during terminal mailbox commit",
             job.job_id
         )));
+    }
+
+    if terminal.handling == RuntimeWorkerTerminalHandling::QuarantineWaitWithoutMailbox {
+        return transaction.commit().map_err(io::Error::other);
     }
 
     let queue_digest = fnv1a_64_hex(runtime_queue_id);
@@ -3805,13 +3888,28 @@ fn legacy_incomplete_result_owner(job: &WorkerJob, runtime_queue_id: &str) -> Wo
     })
 }
 
-fn worker_status_from_runtime_terminal(status: &str) -> Option<WorkerJobStatus> {
+fn worker_terminal_handling(
+    status: &str,
+    terminal_control_source: Option<&str>,
+) -> Option<(WorkerJobStatus, RuntimeWorkerTerminalHandling)> {
+    let publish = RuntimeWorkerTerminalHandling::PublishMailbox;
+    let quarantine = RuntimeWorkerTerminalHandling::QuarantineWaitWithoutMailbox;
     match status {
-        "completed" => Some(WorkerJobStatus::Succeeded),
-        "canceled" => Some(WorkerJobStatus::Canceled),
+        "completed" => Some((WorkerJobStatus::Succeeded, publish)),
+        "canceled" => Some((WorkerJobStatus::Canceled, publish)),
+        "suppressed" => match terminal_control_source {
+            Some("quarantine") => Some((WorkerJobStatus::FailedTerminal, quarantine)),
+            Some("scoped-stop" | "queue-skip") => Some((WorkerJobStatus::Canceled, quarantine)),
+            // `run-once-terminal` is a carrier for earlier terminal evidence.
+            // The hot index returns that earlier terminal first. A compacted
+            // carrier without its underlying result must remain visibly
+            // unresolved instead of guessing an outcome.
+            Some("run-once-terminal") | None | Some(_) => None,
+        },
+        "external-effect-denied" => Some((WorkerJobStatus::FailedTerminal, publish)),
         "dead-letter" | "failed-terminal" | "no-runtime-plan" | "preflight-blocked"
         | "spawn-failed" | "protocol-error" | "context-exhausted" | "timeout" => {
-            Some(WorkerJobStatus::FailedTerminal)
+            Some((WorkerJobStatus::FailedTerminal, publish))
         }
         _ => None,
     }
@@ -4155,7 +4253,7 @@ fn shell_command_for(script: &Path, argv: &[String]) -> Command {
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if extension == "ps1" {
+    let mut command = if extension == "ps1" {
         let mut command = Command::new("powershell");
         command
             .arg("-NoProfile")
@@ -4174,7 +4272,9 @@ fn shell_command_for(script: &Path, argv: &[String]) -> Command {
         let mut command = Command::new(script);
         command.args(argv);
         command
-    }
+    };
+    configure_noninteractive_command(&mut command);
+    command
 }
 
 fn script_allowed(script: &Path, config: &WorkerDispatchConfig) -> bool {
@@ -4780,7 +4880,9 @@ mod tests {
         .unwrap();
         let terminal = RuntimeWorkerTerminal {
             worker_status: WorkerJobStatus::Succeeded,
+            handling: RuntimeWorkerTerminalHandling::PublishMailbox,
             runtime_status: "completed".to_string(),
+            terminal_control_source: None,
             runtime_class: "worker".to_string(),
             origin: "worker".to_string(),
             reason: "test terminal".to_string(),
@@ -5377,6 +5479,332 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_worker_reconciliation_terminalizes_quarantined_suppression_without_mailbox() {
+        let root = temp_root("runtime_worker_reconciliation_terminalizes_quarantine");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let owner = exact_result_owner(
+            [
+                "discord", "account", "channel", "user", "main", "codex", "root", "turn",
+            ],
+            "virtual-suppressed",
+        );
+        let mut options = llm_options(
+            &harness_home,
+            &source,
+            &workspace,
+            "suppressed-reconcile",
+            1000,
+        );
+        options.rate_key = None;
+        let job = enqueue_worker_job_v3(WorkerEnqueueOptionsV3 {
+            options: WorkerEnqueueOptionsV2 {
+                options,
+                child_policy: None,
+            },
+            result_owner: Some(owner),
+        })
+        .unwrap()
+        .job;
+
+        let dispatched = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "suppressed-reconcile-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+        assert_eq!(dispatched.status, WorkerRunOnceStatus::Dispatched);
+        let queue_id = runtime_queue_values(&harness_home)[0]["queueId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            serde_json::json!({
+                "schema": "agent-harness.runtime-run-once.v1",
+                "queueId": queue_id,
+                "status": "suppressed",
+                "reason": "typed exact-lane quarantine",
+                "runtimeClass": "worker",
+                "origin": "worker",
+                "terminalControlSource": "quarantine",
+                "completedAtMs": 1002
+            })
+            .to_string(),
+        )
+        .unwrap();
+        crate::runtime_worker::rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new())
+            .unwrap();
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        assert_eq!(
+            reconcile_runtime_queued_jobs(&harness_home, &conn, 1003).unwrap(),
+            1,
+            "a terminally suppressed exact worker queue must not remain runtime-queued"
+        );
+        let (status, result): (String, String) = conn
+            .query_row(
+                "SELECT status, result_json FROM jobs WHERE job_id=?1",
+                params![job.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, WorkerJobStatus::FailedTerminal.as_str());
+        assert!(result.contains(r#""runtimeStatus":"suppressed""#));
+        assert!(result.contains(r#""mailboxPublished":false"#));
+        let mailbox_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM worker_result_mailbox_v1 WHERE source_worker_job_id=?1",
+                params![job.job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mailbox_rows, 0,
+            "quarantine suppression must not create an auto-resumable exact-owner mailbox"
+        );
+        let resume_jobs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE kind=?1",
+                params![WorkerJobKind::CoordinatorResume.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resume_jobs, 0,
+            "terminal reconciliation may publish the mailbox result but must not itself resume a coordinator"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quarantined_runtime_child_cannot_revive_durable_coordinator() {
+        let root = temp_root("quarantined_runtime_child_cannot_revive_durable_coordinator");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let session_key = "discord:dm:user:main:root-session:cont-quarantine";
+        let exact_owner = crate::worker_result_mailbox::ExactWorkerResultOwnerV1::new(
+            FullLaneKeyV1::new(
+                "discord",
+                "account-a",
+                "dm",
+                "user",
+                "main",
+                "interactive",
+                "root-session",
+                session_key,
+            )
+            .unwrap(),
+            "virtual-quarantine",
+            Some("worker-parent-quarantine".to_string()),
+            Some("parent-queue-quarantine".to_string()),
+            "source-queue-quarantine",
+            None,
+            None,
+        )
+        .unwrap();
+        let mut child_options = llm_options(
+            &harness_home,
+            &source,
+            &workspace,
+            "quarantined-child",
+            1_000,
+        );
+        child_options.job_group_id = Some("group-quarantine".to_string());
+        child_options.rate_key = None;
+        let child = enqueue_worker_job_v3(WorkerEnqueueOptionsV3 {
+            options: WorkerEnqueueOptionsV2 {
+                options: child_options,
+                child_policy: None,
+            },
+            result_owner: Some(WorkerResultOwnerV1::Exact(exact_owner.clone())),
+        })
+        .unwrap()
+        .job;
+        let watchdog = enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::Watchdog,
+            lane: Some("watchdog".to_string()),
+            payload: json!({
+                "sourceHome": source,
+                "sourceWorkspace": workspace,
+                "coordinationMode": "durable-v1",
+                "coordinatorWaitId": "wait-quarantine",
+            }),
+            idempotency_key: Some("watchdog-quarantine".to_string()),
+            parent_job_id: None,
+            job_group_id: Some("group-quarantine".to_string()),
+            master_agent_id: Some("main".to_string()),
+            master_session_key: Some(session_key.to_string()),
+            wake_policy: Some(json!({"mode":"all_completed"})),
+            source: Some("test".to_string()),
+            priority: 10,
+            available_at_ms: Some(1_000),
+            max_attempts: 3,
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+            cascade_timeout_ms: None,
+            rate_key: None,
+            concurrency_group_key: Some("master:main".to_string()),
+            now_ms: 1_000,
+        })
+        .unwrap()
+        .job;
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        let transaction = conn.unchecked_transaction().unwrap();
+        crate::worker_coordination::persist_waiting_for_children_in_transaction(
+            &transaction,
+            &crate::worker_coordination::WorkerCoordinatorWaitCreateOptionsV1 {
+                wait_id: "wait-quarantine".to_string(),
+                owner: exact_owner,
+                child_group_id: "group-quarantine".to_string(),
+                expected_child_job_ids: vec![child.job_id.clone()],
+                now_ms: 1_000,
+            },
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        drop(conn);
+
+        let dispatched = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "quarantined-child-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1_001,
+        })
+        .unwrap();
+        assert_eq!(dispatched.status, WorkerRunOnceStatus::Dispatched);
+        let queue_id = runtime_queue_values(&harness_home)[0]["queueId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            json!({
+                "schema": "agent-harness.runtime-run-once.v1",
+                "queueId": queue_id,
+                "status": "suppressed",
+                "reason": "typed exact-lane quarantine",
+                "runtimeClass": "worker",
+                "origin": "worker",
+                "terminalControlSource": "quarantine",
+                "completedAtMs": 1_002,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        crate::runtime_worker::rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new())
+            .unwrap();
+
+        let watchdog_run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("watchdog".to_string()),
+            worker_id: "quarantine-watchdog-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1_003,
+        })
+        .unwrap();
+        assert_eq!(watchdog_run.status, WorkerRunOnceStatus::Failed);
+        assert_eq!(
+            watchdog_run.result.as_ref().unwrap().status,
+            WorkerJobStatus::Canceled
+        );
+        assert_eq!(
+            watchdog_run
+                .result
+                .as_ref()
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()["resumeSuppressed"],
+            true
+        );
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        assert_eq!(
+            find_job_by_id(&conn, &child.job_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            WorkerJobStatus::FailedTerminal
+        );
+        assert_eq!(
+            find_job_by_id(&conn, &watchdog.job_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            WorkerJobStatus::Canceled
+        );
+        assert_eq!(
+            crate::worker_coordination::load_worker_coordinator_wait(&conn, "wait-quarantine")
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::worker_coordination::WorkerCoordinatorWaitStateV1::Quarantined
+        );
+        let mailbox_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM worker_result_mailbox_v1 WHERE source_worker_job_id=?1",
+                params![child.job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mailbox_rows, 0);
+        let resume_jobs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE kind=?1",
+                params![WorkerJobKind::CoordinatorResume.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resume_jobs, 0);
+        let resume_intents: i64 = conn
+            .query_row("SELECT COUNT(*) FROM worker_resume_intents_v1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(resume_intents, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_worker_terminal_control_sources_have_distinct_fail_closed_semantics() {
+        let quarantine = RuntimeWorkerTerminalHandling::QuarantineWaitWithoutMailbox;
+        let publish = RuntimeWorkerTerminalHandling::PublishMailbox;
+        assert_eq!(
+            worker_terminal_handling("suppressed", Some("quarantine")),
+            Some((WorkerJobStatus::FailedTerminal, quarantine))
+        );
+        for source in ["scoped-stop", "queue-skip"] {
+            assert_eq!(
+                worker_terminal_handling("suppressed", Some(source)),
+                Some((WorkerJobStatus::Canceled, quarantine))
+            );
+        }
+        assert_eq!(
+            worker_terminal_handling("external-effect-denied", None),
+            Some((WorkerJobStatus::FailedTerminal, publish))
+        );
+        assert_eq!(worker_terminal_handling("run-once-terminal", None), None);
+        assert_eq!(
+            worker_terminal_handling("suppressed", Some("run-once-terminal")),
+            None
+        );
+        assert_eq!(worker_terminal_handling("skipped", None), None);
     }
 
     #[test]
@@ -6247,7 +6675,7 @@ mod tests {
         fs::write(
             &script,
             format!(
-                "$child = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -PassThru\r\nSet-Content -LiteralPath '{}' -Value $child.Id\r\nWait-Process -Id $child.Id\r\n",
+                "$child = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -WindowStyle Hidden -PassThru\r\nSet-Content -LiteralPath '{}' -Value $child.Id\r\nWait-Process -Id $child.Id\r\n",
                 pid_file.display()
             ),
         )
@@ -6290,11 +6718,13 @@ mod tests {
         }
         let alive = crate::loop_health::process_alive_for_pid(descendant_pid);
         if alive != Some(false) {
-            let _ = Command::new("taskkill")
+            let mut command = Command::new("taskkill");
+            command
                 .args(["/PID", &descendant_pid.to_string(), "/T", "/F"])
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+                .stderr(Stdio::null());
+            configure_noninteractive_command(&mut command);
+            let _ = command.status();
         }
         assert_eq!(
             alive,
@@ -6364,8 +6794,9 @@ mod tests {
     }
 
     #[test]
-    fn skill_synthesis_worker_defaults_to_proposal_only_without_apply_authority() {
-        let root = temp_root("skill_synthesis_worker_defaults_to_proposal_only");
+    fn legacy_skill_synthesis_worker_without_policy_fields_remains_non_mutating() {
+        let root =
+            temp_root("legacy_skill_synthesis_worker_without_policy_fields_remains_non_mutating");
         let harness_home = root.join(".agent-harness");
         enqueue_worker_job(WorkerEnqueueOptions {
             harness_home: harness_home.clone(),

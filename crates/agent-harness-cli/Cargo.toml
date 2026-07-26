@@ -20,6 +20,9 @@ ureq = { version = "2", features = ["json"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }

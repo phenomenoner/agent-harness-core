@@ -69,8 +69,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I3",
-            statement: "terminal states and lost queue ownership are irreversible: pending or retryable work at its attempt cap becomes terminal before selection or lease, lease renewal is exact owner-generation and lane fenced, missing or expired leases are never recreated, append-only queued admission rows cannot override effective terminal state, and typed continuation/external-effect states never resurrect a fenced parent generation",
-            owner: "runtime_pipeline/workers",
+            statement: "terminal states and lost queue ownership are irreversible: execution ownership is exact owner-generation, acquisition, and account-aware agent/channel/user/session lane fenced; runtime class is capacity only; queue-backed Windows app-server execution prearms an exact-lane child-cleanup fence and uses Job-at-create containment before resume; cleanup proof is monotonic and stale authority cannot clear a successor; transient contention is retryable backpressure; missing or expired leases are never recreated",
+            owner: "codex_runtime/runtime_pipeline/runtime_worker/workers",
         },
         InvariantEntry {
             id: "I4",
@@ -79,8 +79,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I5",
-            statement: "crash recovery loses no work and duplicates no side effects; retry schedules, task/effect dispositions, commit-before-enqueue continuation intents, readback-required ambiguous mutations, supervisor process-instance fencing, and dead-generation lease recovery after bounded active-task shutdown remain reconstructable",
-            owner: "queue_shadow/supervision/runtime_worker/runtime_pipeline/goal_continuation/external_effect",
+            statement: "crash recovery loses no work and duplicates no side effects; ingress WAL distinguishes exact process-generation/recovery ownership, explicit handler unwind, durable effect boundaries, recovery, and completion; failed /new unwind settlement retries in-process or terminates the owner generation instead of remaining duplicate-suppressed, while retry schedules, task/effect dispositions, commit-before-enqueue transition and continuation intents, supervisor process-instance fencing, and dead-generation lease recovery remain reconstructable",
+            owner: "channel_ingress/channel_session_transition/queue_shadow/supervision/runtime_worker/runtime_pipeline/goal_continuation/external_effect",
         },
         InvariantEntry {
             id: "I6",
@@ -94,8 +94,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I8",
-            statement: "agent identity and /new task boundaries are routing and admission boundaries; /new freezes one target session, holds ordinary ingress until governed closure is proven and the boundary commits, then replays held work FIFO without inheriting the previous task",
-            owner: "channel_state/channel_session_transition/channel_ingress/runtime_pipeline/prompt/turns/skills/memory",
+            statement: "account-aware agent identity and /new task boundaries are routing and admission boundaries; /new freezes one target session and deterministic old-session acknowledgement, holds ordinary ingress until governed closure is proven and the boundary commits, then replays held work FIFO without legacy-state fallback or previous-task inheritance",
+            owner: "channel_state/channel_session_transition/channel_ingress/runtime_pipeline/prompt/turns/skills/memory/agent-harness-cli",
         },
         InvariantEntry {
             id: "I9",
@@ -139,13 +139,13 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I17",
-            statement: "durable control artifacts are authoritative before ingress admission, runtime execution, retry or continuation, progress delivery, restart consumption, and notification; transition holds, parked waits, expiry, stop, skip, and quarantine are checked before acting, administrative no-work or lease-busy cannot erase a durable park, and every suppression, settlement, or replay is idempotently receipted",
+            statement: "durable control artifacts are authoritative before ingress admission, runtime execution, retry or continuation, progress delivery, restart consumption, and notification; ingress completion, transition holds, parked waits, expiry, stop, skip, and quarantine are checked before acting, administrative no-work or class-lock contention cannot erase a durable park or become a user stop, and every suppression, takeover, settlement, or replay is idempotently receipted",
             owner: "channel_ingress/channel_session_transition/runtime_worker/runtime_pipeline/runtime_queue/progress/channel_runtime/task_transition/external_effect/dream_director/cron_scheduler/deterministic_cron",
         },
         InvariantEntry {
             id: "I18",
-            statement: "final delivery planning treats delivered or skipped-permanent receipts as terminal evidence, even if later retryable provider failures are recorded for the same logical delivery",
-            owner: "channel_delivery/agent-harness-cli",
+            statement: "delivery planning, status, health, and metrics use one cursor-backed indexed disposition in which delivered or skipped-permanent receipts remain terminal despite later retryable failures or a bounded receipt-tail window",
+            owner: "channel_delivery/channel_delivery_index/status/health/metrics/agent-harness-cli",
         },
         InvariantEntry {
             id: "I19",
@@ -154,8 +154,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I20",
-            statement: "skill ecosystem mutation is proposal-only by default and any apply requires explicit operator or worker authorization through the lint, guard, checksum, backup, and receipt pipeline; selection is agent-scoped, rejects weak body-only automatic matches, deduplicates active/imported copies by original id with active-source preference, and preserves hard lifecycle/allowlist/invocation gates",
-            owner: "skills/skill_usage/turns/skill_apply/skill_guard/skill_lint/skill_curator/prompt",
+            statement: "skill ecosystem mutation is proposal-mediated and traceable, with guarded autonomous apply as the default for selected-skill self-improvement and synthesized agent-created skills; every apply passes lint, guard, exact target/checksum, lock, backup, and receipt gates, failed gates block or quarantine, explicit proposal-only and legacy no-policy jobs remain non-mutating, selection preserves agent-scoped lifecycle/allowlist/invocation gates, and curator idle fencing uses only hot open work, unreconciled runtime leases, and active or retryable worker state rather than append-only historical terminal or parked totals",
+            owner: "skills/skill_usage/turns/self_improvement/skill_synthesis/skill_apply/skill_guard/skill_lint/skill_curator/prompt/workers",
         },
         InvariantEntry {
             id: "I21",
@@ -169,12 +169,12 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I23",
-            statement: "each child has an immutable independent model/effort policy and exact master-owned result owner; child terminal results enter the durable mailbox and never directly create the parent final outbox",
-            owner: "child_execution_policy/worker_adapters/workers/worker_result_mailbox/runtime_pipeline",
+            statement: "each child has an immutable independent model/effort policy and exact master-owned result owner; ordinary child terminal results enter the durable mailbox and never directly create the parent final outbox, while quarantine, scoped-stop, and queue-skip suppression atomically quarantine any waiting coordinator without publishing a resumable mailbox and ambiguous suppression remains unresolved",
+            owner: "child_execution_policy/worker_adapters/workers/worker_result_mailbox/worker_coordination/runtime_pipeline",
         },
         InvariantEntry {
             id: "I24",
-            statement: "coordinator resume is durable, exact-lane, coalesced, and at-most-once: an active parent lease suppresses wakeup, a confirmed released lease schedules one typed continuation, and mailbox acknowledgement follows continuation lease acquisition",
+            statement: "coordinator resume is durable, exact-lane, coalesced, and at-most-once: an active parent lease suppresses wakeup, a confirmed released lease schedules one typed continuation, mailbox acknowledgement follows continuation lease acquisition, and a quarantined wait wins a transaction-time re-read and creates no mailbox, resume intent, or coordinator-resume job",
             owner: "worker_coordination/worker_resume/coordinator_resume/workers/runtime_worker",
         },
         InvariantEntry {
@@ -184,8 +184,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I26",
-            statement: "supervisor availability has one config-derived topology authority and two explicit ownership layers: reconcile-managed mode has one deployment-owned same-user OS task with one SID-equivalent logon trigger, one indefinite one-minute recovery trigger, one action, and IgnoreNew owning one singleton root keeper, while scheduled-task child ownership remains the compatibility mode; periodic recovery is authoritative and restart-on-failure is defense in depth; the global keeper hold is committed before child stop and cleared only after validated child start, readiness binds the exact task action, triggers, and live keeper instance to the current plan, idempotent stop requires fresh external quiescence when the keeper is already dead, reconcile-launched parents are outside the launcher console-control domain, and every configured service identity is unique",
-            owner: "activation/health/supervisor_topology/supervisor_keeper/supervisor_inventory/ops/agent-harness-cli",
+            statement: "supervisor availability has one config-derived topology authority and one explicit ownership mode. Compatibility mode retains the deployment-owned same-user OS task, hidden adapter, singleton reconcile keeper, and one intermediate supervisor-run per service. Direct-owner mode uses the mutually exclusive form of the same OS ownership lease, one exact master generation, direct retained child handles, master-only canonical service-state writes, freshness-bounded heartbeat restart, generation-scoped drain holds, and tree-kill-on-owner-exit containment. Observe mode is non-owning and never activation-ready. Compatibility and direct owners cannot coexist; mode/config drift is revalidated before every external-effect spawn and drains the direct master. Stopped-state import is provenance-bound and never adopts a PID. PID-only, mismatched, stale, unknown, or observe-only evidence cannot fence recovery. Every non-interactive Windows child remains no-console or hidden-window by default. Direct-owner activation is Windows-only until an equivalent native process-tree adapter passes the same lifecycle scenarios; unsupported hosts reject it before state mutation.",
+            owner: "activation/health/supervisor_topology/supervisor_keeper/supervisor_inventory/supervisor_master/process_launch/ops/agent-harness-cli",
         },
         InvariantEntry {
             id: "I27",
@@ -199,7 +199,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I29",
-            statement: "agent-library dream and topology maintenance is proposal-first, non-indexable, idempotent, subordinate to foreground work, staged under one writer lease, and activated only at a later catalog epoch with rollback",
+            statement: "agent-library dream and topology maintenance is trace-first, non-indexable, idempotent, subordinate to foreground work, staged under one writer lease, and targeted for guarded autonomous activation at a later catalog epoch once serialized ownership, atomic rollback, T3 replay, and controlled T4 soak gates are complete",
             owner: "skill_dream_jobs/skill_dream_workspace/skill_dream/knowledge_classifier/skill_topology/skill_replay/cron_scheduler",
         },
         InvariantEntry {
@@ -239,8 +239,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I37",
-            statement: "every goal, ordinary task, bounded-yield completion, and needs-user wait passes typed transition authority before final or progress selection; each applicable terminal receipt states one source-closure kind and reason with derived source-final expectation and outbox disposition; exact current-owned goals receive bounded implicit autonomy only without an explicit policy block, while explicit opt-outs park visibly and lease-free; continuations commit before parent suppression, snapshot ordinary same-lane input generation, isolate malformed records per intent, use rollback-readable separate fencing, revalidate authority after lease and before external effects, create at most one child under concurrent reconciliation, and yield unleased scheduler priority or further chaining to newer human input before acknowledgement",
-            owner: "goal_transition/task_transition/goal_continuation/runtime_pipeline/context_rollover/runtime_worker/progress/external_effect",
+            statement: "every goal, ordinary task, bounded-yield completion, and needs-user wait passes typed transition authority before final or progress selection; an active current-owned goal may adopt same-thread native continuation under the same exact lease, while terminal, blocked, paused, or explicit park closes the provider boundary and releases the lane without auto-wake; continuations commit before parent suppression and revalidate exact authority after lease",
+            owner: "codex_runtime/goal_transition/task_transition/goal_continuation/runtime_pipeline/context_rollover/runtime_worker/progress/external_effect",
         },
         InvariantEntry {
             id: "I38",
@@ -249,7 +249,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I39",
-            statement: "OperationPlan mutations enforce stored open-item limits and dependency-graph acyclicity before any durable write; rejected over-limit or cyclic mutations leave item, event, receipt, item-version, and plan-version state unchanged",
+            statement: "OperationPlan mutations are serialized per plan and enforce stored open-item limits plus dependency-graph acyclicity before any durable write; concurrent contenders cannot both pass one stale limit snapshot and rejected mutations leave all plan state unchanged",
             owner: "operation_plan",
         },
     ]
@@ -366,6 +366,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.runtime-queue-leases.v1",
             owner_module: "runtime_worker",
             compatibility: "class-scoped state JSON accepts legacy owner strings and structured owner envelopes in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.runtime-queue-child-cleanup-fence.v1",
+            owner_module: "runtime_worker/codex_runtime",
+            compatibility: "per-exact-lane state JSON; queue/class/lane, owner digest and acquisition, phase, optional child PID/start generation, containment flag, fenced time, and monotonic cleanup-proof time are stable in v1; additive diagnostic fields only",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.runtime-queue-lease-renewal.v1",
@@ -538,6 +543,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "append-once transition phases; BoundaryCommitted is the only admission-release authority",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.ingress-claim.v2",
+            owner_module: "channel_ingress",
+            compatibility: "per-provider-event WAL state; exact canonical event/lane/session/command identity, first-seen time, and initial owner process instance are immutable; current ownership transfers only through recorded recovery, explicit handler unwind permits retry before process death, and legacy v1 claims remain readable but non-takeover because they lack process-start authority",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.channel-approval-prompt.v1",
             owner_module: "channel_action/runtime_pipeline",
             compatibility: "provider-neutral approval presentation contains safe public action ids and bounded summaries, never bearer capabilities",
@@ -699,13 +709,53 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         },
         SchemaRegistryEntry {
             schema: "agent-harness.supervisor-service-state.v1",
-            owner_module: "supervisor",
-            compatibility: "service state JSON may add diagnostic fields in v1; launchOwner/servicePriority distinguish observe-only external runners from rust-supervisor-run children",
+            owner_module: "supervisor/supervisor_master",
+            compatibility: "service state JSON may add diagnostic fields in v1; launchOwner distinguishes compatibility rust-supervisor-run from direct rust-standalone-master ownership, supervisorPid/supervisorProcessStartTimeMs identify the owner independently of child processId/processStartTimeMs, and only the active owner writes canonical service state",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-master-state.v1",
+            owner_module: "supervisor_master/activation",
+            compatibility: "atomic direct-owner generation snapshot; mode, generation, exact PID/start identity, containment capability, phase, desired service set, and heartbeat remain fail-closed while diagnostics may grow additively",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-master-event.v1",
+            owner_module: "supervisor_master",
+            compatibility: "append-only lifecycle event; master generation, event kind, optional service identity, and event time are stable evidence anchors",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-owner-lease.v1",
+            owner_module: "supervisor_master",
+            compatibility: "informational envelope only; OS shared or exclusive lock ownership is authoritative and file existence never proves ownership",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-master-observation.v1",
+            owner_module: "supervisor_master",
+            compatibility: "observe-only desired topology and compatibility assessment; it must not acquire ownership, spawn children, or write canonical service state",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-compatibility-import.v1",
+            owner_module: "supervisor_master",
+            compatibility: "stopped-state assessment with source digests and no PID adoption; unknown schema, owner, state, liveness, or identity remains blocking",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-compatibility-import-receipt.v1",
+            owner_module: "supervisor_master",
+            compatibility: "generation-specific import receipt bound to master generation plus service-spec, config, executable, and source-state digests",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-control-request.v1",
+            owner_module: "supervisor_master",
+            compatibility: "transport-neutral local-control request; generation, idempotency, bounded action, timestamp, and authenticated peer proof are mandatory before a future transport may mutate ownership",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-control-response.v1",
+            owner_module: "supervisor_master",
+            compatibility: "transport-neutral local-control response; request and master generation identities remain stable while diagnostics may grow additively",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.supervisor-inventory.v1",
             owner_module: "supervisor_inventory",
-            compatibility: "desired-service inventory reports may add health fields in v1; missing/stale/launch action semantics remain stable",
+            compatibility: "desired-service inventory reports may add health and owner-identity fields in v1; missing/stale health classification is independent of launch admission, so stale child health cannot create a second owner while an exact live managed supervisor owns restart/backoff",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.supervisor-reconcile.v1",
@@ -720,7 +770,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.windows-reconcile-keeper-plan.v1",
             owner_module: "supervisor_keeper",
-            compatibility: "immutable same-user task plan bound to canonical deployment paths, executable digest, exactly one action, one logon plus one indefinite periodic recovery trigger, IgnoreNew settings, global hold/state/readback locations, ownership identity, and deterministic plan digest",
+            compatibility: "immutable same-user task plan bound to canonical deployment paths, executable digest, exactly one manifest-bound hidden scheduler action plus one direct keeper action, one logon plus one indefinite periodic recovery trigger, IgnoreNew settings, global hold/state/readback locations, ownership identity, and deterministic plan digest",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.windows-reconcile-keeper-observation.v1",
@@ -920,7 +970,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.skill-dream-run.v1",
             owner_module: "skill_dream",
-            compatibility: "append-only run receipts; reports are non-indexable, proposal-only runs cannot activate revisions, and trigger sources share one idempotent ledger",
+            compatibility: "append-only run receipts; reports are non-indexable, current non-mutating runs cannot activate revisions, and trigger sources share one idempotent ledger",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.skill-replay-manifest.v1",
@@ -1521,6 +1571,38 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             promotion_gate: "Run the exact 0.144.5 fixture plus the fake MCP server park/approve/submit/confirm replay, channel token isolation matrix, readback ambiguity matrix, and provider progress renderers; live connector mutation requires an explicitly authorized bounded smoke and readback receipt.",
         },
         ScenarioMatrixEntry {
+            id: "skill-ecosystem-autonomous-learning",
+            title: "Traceable guarded autonomous skill learning",
+            changed_areas: vec![
+                "self improvement",
+                "skill synthesis",
+                "skill apply",
+                "workers",
+                "CLI",
+            ],
+            required_invariants: vec!["I20"],
+            required_evidence: vec![
+                "selected-skill improvement and agent-created synthesis persist proposal and decision traces before mutation",
+                "normal current-policy synthesis autonomously applies only after lint, guard, exact target/checksum, lock, and backup gates pass",
+                "unsafe candidates block or quarantine without changing a skill file",
+                "explicit proposal-only and legacy no-policy jobs remain non-mutating",
+                "an applied synthesized skill can be reselected and a checksum conflict retains rollback evidence",
+            ],
+            runnable_tests: vec![
+                "self_improvement::tests::self_improvement_config_defaults_to_enabled_dispatch_replace",
+                "self_improvement::tests::skill_synthesis_propose_only_remains_an_explicit_opt_out",
+                "self_improvement::tests::self_improvement_hook_enqueues_skill_synthesis_for_complex_no_skill_turn",
+                "skill_synthesis::tests::closed_loop_scenario_selects_synthesizes_applies_and_reselects",
+                "skill_apply::tests::skill_autonomous_apply_approves_and_applies_agent_created_create",
+                "skill_apply::tests::skill_autonomous_apply_blocks_dangerous_agent_created_content",
+                "skill_apply::tests::skill_apply_guard_caution_quarantines_agent_created_apply",
+                "workers::tests::legacy_skill_synthesis_worker_without_policy_fields_remains_non_mutating",
+                "agent-harness-cli::tests::skill_synthesize_cli_guarded_applies_by_default",
+                "agent-harness-cli::tests::skill_synthesize_cli_propose_only_is_an_explicit_opt_out",
+            ],
+            promotion_gate: "Run the complete current-policy path in a stopped staging home: default trace/review/apply/reselection, dangerous and caution block/quarantine, explicit proposal-only zero mutation, legacy no-policy zero mutation, checksum conflict, backup restore, public/private hygiene, and feature-mode rollback. Live cutover remains a separate operator-authorized deployment action.",
+        },
+        ScenarioMatrixEntry {
             id: "skill-selection-anchor-dedupe",
             title: "Skill selection lexical anchors and active-source deduplication",
             changed_areas: vec!["skill selection", "agent-scoped skill sources"],
@@ -1575,7 +1657,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "runtime_pipeline::tests::run_runtime_queue_once_records_agent_reply_outbox",
                 "virtual_skill_manifest::tests::t3_skill_virtual_evidence_replay_is_exact_idempotent_and_proposal_only",
             ],
-            promotion_gate: "Keep F1 and F2 disabled independently by default. Promote instrumentation only after this pack plus an integrated exact-lane multi-rollover and /new T3 replay prove byte-identical serving, append-once joins, zero rehydration use, and proposal-only learning; serving/catalog activation remains separate.",
+            promotion_gate: "Keep F1 and F2 disabled independently by default. Promote instrumentation only after this pack plus an integrated exact-lane multi-rollover and /new T3 replay prove byte-identical serving, append-once joins, zero rehydration use, and non-mutating observer learning; serving/catalog activation remains separate.",
         },
         ScenarioMatrixEntry {
             id: "progress-surface-volume",
@@ -2054,6 +2136,8 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "Windows Task Scheduler root keeper",
                 "activation and health readiness",
                 "Windows process-control boundary",
+                "non-interactive child window suppression",
+                "service supervisor versus child-attempt ownership",
                 "deployment path confinement",
             ],
             required_invariants: vec!["I5", "I17", "I26"],
@@ -2061,11 +2145,14 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "one validated config-derived topology is shared by reconcile, readiness, keeper generation, and guarded operations; explicit service configuration wins and ambiguous normalized identities fail closed",
                 "stop commits the global keeper hold before best-effort union shutdown even when config is malformed or ownership mode changed, while start validates every target before clearing the global hold last",
                 "generated scripts require exact successful ops-control status and preserve or recreate the global hold after any partial start or stop",
-                "one same-user enabled and Running task has exactly one action, one SID-equivalent logon trigger, one indefinite one-minute recovery trigger, IgnoreNew, the exact settings/plan/action digests, contained deployment paths, and one fresh singleton keeper process",
+                "one same-user enabled and Running task has exactly one hash-bound hidden launch action, one SID-equivalent logon trigger, one indefinite one-minute recovery trigger, IgnoreNew, the exact settings/plan/action digests, contained deployment paths, and one fresh singleton keeper process",
                 "periodic trigger boundaries do not duplicate a running keeper; an incident-shaped 0xC000013A root death recovers one new generation within the periodic bound, and the recovered root remains singleton across the next boundary",
+                "a dead child in restart backoff remains stale but does not create another supervisor-run while the exact supervisor PID/start owner is alive; the same owner may restart its child and a reused supervisor PID cannot fence recovery",
                 "guarded stop proves every exact owner and descendant absent; repeated stop/uninstall accepts an already-dead keeper only through exact disabled-task and external-quiescence evidence without a stale terminal heartbeat",
                 "installation refuses a foreign existing task and live plan generation or readiness rejects source-tree, sibling, or global executable and tool paths",
+                "live plan promotion consumes one exact restart grant only from the process environment, and no generated keeper script accepts or forwards the raw token through any process command line",
                 "the production reconcile launch seam isolates stdio and the Windows console-control domain so an unrelated launcher control break cannot terminate managed parents",
+                "the scheduler root adapter starts hidden and synchronously waits for a no-console keeper, while every non-interactive service, Node, bridge, worker, diagnostic, and cleanup child is window-suppressed and remains alive in process/window readback",
                 "scheduled-task child ownership remains compatible when reconcile-managed mode is disabled",
             ],
             runnable_tests: vec![
@@ -2078,14 +2165,67 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "supervisor_keeper::tests::live_plan_rejects_non_deployment_executables_but_developer_staging_is_explicit",
                 "supervisor_keeper::tests::existing_task_identity_fixture_rejects_foreign_task_without_mutation",
                 "supervisor_keeper::tests::developer_script_seam_fails_closed_on_partial_ops_receipts",
+                "supervisor_keeper::tests::scheduler_root_uses_hash_bound_hidden_synchronous_launcher",
+                "supervisor_keeper::tests::start_and_stop_scripts_preserve_guarded_control_ordering",
+                "supervisor_keeper::tests::live_control_scripts_require_action_bound_token_before_mutation",
+                "live_control::tests::exact_restart_validation_rejects_a_broader_cutover_grant",
+                "ops::tests::cutover_status_requires_the_exact_requested_action",
+                "agent-harness-cli::tests::live_keeper_plan_cli_requires_token_held_topology_and_zero_live_owners",
+                "process_launch::windows_tests::configured_noninteractive_console_process_has_no_console_window",
                 "activation::tests::reconcile_keeper_readiness_requires_current_task_and_exact_live_process",
-                "activation::tests::readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan",
+                "activation::tests::keeper_readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan",
                 "activation::tests::readiness_keeps_missing_plan_warning_for_scheduled_task_mode",
                 "health::tests::reconcile_managed_health_requires_a_fresh_exact_live_keeper_process",
+                "supervisor_inventory::tests::dead_child_in_backoff_does_not_request_a_second_live_supervisor_owner",
                 "agent-harness-cli::tests::supervisor_reconcile_all_includes_isolated_ledger_maintenance_owner",
+                "agent-harness-cli::tests::supervisor_launch_guard_fences_live_supervisor_while_child_is_in_backoff",
+                "agent-harness-cli::tests::supervisor_launch_guard_does_not_trust_reused_supervisor_pid",
                 "windows_process_boundary::production_reconcile_spawn_child_survives_launcher_control_break",
             ],
-            promotion_gate: "Promote only after focused contracts, full serial workspace, generated Windows PowerShell parsing, exact stopped-state dual-trigger task readback, idempotent repeated install, a real user-scoped task start/periodic-boundary singleton/incident-shaped keeper-death recovery/complete stop/idempotent uninstall lifecycle, and the production process-boundary replay pass. Post-cutover readback must show one current-plan keeper, both exact triggers, one action, every expected child, no source or staging paths, no global hold, no stale or conflicting owner, and no pending/retryable provider queue.",
+            promotion_gate: "Promote only after focused contracts, full serial workspace, generated Windows PowerShell parsing, exact stopped-state dual-trigger task readback, idempotent repeated install, a real user-scoped task start/periodic-boundary singleton/child-backoff owner singleton/incident-shaped keeper-death recovery/complete stop/idempotent uninstall lifecycle, the production process-boundary replay, and process/window readback proving the hidden root and all non-interactive descendants remain alive without visible windows. Post-cutover readback must show one current-plan keeper, both exact triggers, one hidden action, one exact supervisor owner per service, every expected child, no source or staging paths, no global hold, no visible non-interactive window, no stale or conflicting owner, and no pending/retryable provider queue.",
+        },
+        ScenarioMatrixEntry {
+            id: "standalone-master-direct-owner",
+            title: "One standalone master directly owns the configured service trees",
+            changed_areas: vec![
+                "supervisor ownership mode and OS lease",
+                "direct child lifecycle and process-tree containment",
+                "heartbeat freshness, restart backoff, and breaker state",
+                "stopped-state compatibility import",
+                "activation and canonical service-state ownership",
+                "cross-platform host adapter boundary",
+            ],
+            required_invariants: vec!["I3", "I5", "I7", "I17", "I26", "I30"],
+            required_evidence: vec![
+                "one exact direct-owner master holds the exclusive OS lease and every configured service process has that master as its independently observed OS parent with no supervisor-run intermediary",
+                "compatibility reconcile and supervisor-run owners hold shared leases, direct ownership is mutually exclusive, and a runtime config generation change drains before releasing ownership",
+                "child crash and a live-but-hung stale heartbeat each produce bounded replacement without overlapping attempts; repeated failures open the configured breaker",
+                "clean drain removes only generation-owned ephemeral holds and a second clean master generation starts from stopped canonical state without PID adoption",
+                "abrupt master death reaps the complete owned Windows Job tree and leaves durable queue, outbox, and service state available to one recovered generation",
+                "desired arguments and environment cannot redirect authoritative home, service, executable, ownership, or generation identity",
+                "observe mode writes a separate receipt only, and unsupported non-Windows direct ownership fails before lease, receipt, process, or canonical state mutation",
+                "native Linux and macOS process-group containment plus host recovery must pass this lifecycle matrix before cross-platform direct-owner activation is claimed",
+            ],
+            runnable_tests: vec![
+                "supervisor_master::tests::compatibility_import_is_idempotent_and_never_adopts_process_identity",
+                "supervisor_master::tests::compatibility_import_rejects_running_state_without_positive_pids",
+                "supervisor_master::tests::compatibility_leases_coexist_and_fence_direct_owner",
+                "activation::tests::direct_owner_readiness_requires_exact_live_master_generation_and_child",
+                "activation::tests::observe_ownership_mode_is_explicitly_not_activation_ready",
+                "standalone_master_lifecycle::clean_start_has_one_master_and_direct_child_parents",
+                "standalone_master_lifecycle::second_master_is_rejected_without_child_mutation",
+                "standalone_master_lifecycle::child_crash_backoff_restart_keeps_one_attempt",
+                "standalone_master_lifecycle::repeated_child_crashes_open_breaker_without_an_overlapping_attempt",
+                "standalone_master_lifecycle::partial_startup_failure_keeps_live_sibling_owned_and_drains_it_cleanly",
+                "standalone_master_lifecycle::stale_matching_heartbeat_is_reaped_and_restarted",
+                "standalone_master_lifecycle::clean_stop_removes_ephemeral_holds_and_allows_second_generation",
+                "standalone_master_lifecycle::ownership_mode_flip_drains_direct_owner_before_releasing_lease",
+                "standalone_master_lifecycle::hostile_desired_identity_args_fail_before_master_state_mutation",
+                "standalone_master_lifecycle::abrupt_master_death_reaps_direct_child",
+                "standalone_master_lifecycle::abrupt_master_death_reaps_gateway_descendant_tree",
+                "standalone_master_lifecycle::observe_mode_has_no_process_or_canonical_state_side_effects",
+            ],
+            promotion_gate: "The normal Windows direct-owner cutover gate is passed after focused lifecycle replay, full serial workspace and public-contract checks, rollback rehearsal, independent review, stopped-state migration, post-cutover process and health readback, and exact-lane Telegram and Discord delivery. Promotion of an exact release tag still requires artifact-bound readback. A long-duration endurance claim and non-Windows activation remain blocked until their own soak, native containment, signal, host-recovery, and packaging evidence reaches the same scenario altitude.",
         },
     ]
 }
@@ -2121,10 +2261,10 @@ pub fn release_checklist() -> ReleaseChecklist {
             "scenario matrix gate reviewed for changed components",
             "CHANGELOG.md updated",
             "docs/skills/help stale guidance review completed",
-            "skill ecosystem changes passed per-agent source/allowlist/usage-prior isolation, selection, proposal-only synthesis with zero mutation, separately authorized apply, lint, guard, lifecycle, pack, doctor, and closed-loop scenario gates",
+            "skill ecosystem changes passed per-agent source/allowlist/usage-prior isolation, selection, default proposal trace plus guarded autonomous synthesis/apply/reselection, automatic block/quarantine, explicit proposal-only and legacy no-policy zero mutation, checksum/backup rollback, lint, guard, lifecycle, pack, doctor, and closed-loop scenario gates",
             "skill ecosystem v2 C1 joined schemas, privacy-safe baseline, query isolation, separate F1/F2 no-serving-side-effect gates, exact-lane rollover/new T3 replay, and feature-disable rollback passed while active serving remains unchanged",
             "skill ecosystem v2 C2 router quality, progressive-disclosure budgets, frozen manifest, unknown-until-verified attributable episode/classification/proposal evidence, exact-cohort canary, policy rollback, rebaseline inventory, held-out replay, topology downgrade, and snapshot restore passed",
-            "unattended skill dream remains proposal-only and blocked until trigger equivalence, source exclusions, lease/heartbeat, foreground yield, no-change skip, artifact validation, report isolation, T3 replay, and controlled T4 staging shadow soak pass",
+            "unattended skill dream remains non-mutating until trigger equivalence, source exclusions, lease/heartbeat, foreground yield, no-change skip, artifact validation, atomic rollback, report isolation, T3 replay, and controlled T4 staging shadow soak pass; guarded autonomous apply is the target after those blockers close",
             "topology contract impact matrix reviewed for changed modules",
             "channel/runtime changes passed the agent-boundary scenario matrix",
             "runtime terminal-control changes passed sticky terminal, suppression idempotency, final progress surface silence, lease reconcile, prepared-terminalization, retry-fresh-id, and live ghost-queue replay checks",
@@ -2146,7 +2286,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "interactive receipt readers passed bounded-history, busy-lock, and isolated ledger-maintenance-owner scenario checks",
             "goal continuation restart changes passed malformed-ledger isolation, rollback-reader, concurrent exact-once, post-lease fence, and full runtime-queue replay checks",
             "OperationPlan mutation changes passed stored open-item limits, dependency-cycle rejection, optimistic versioning, atomic no-write rejection, and joined continuation replay checks",
-            "root-keeper availability changes passed shared-topology identity, fail-closed guarded stop/start, exact task/process ownership, deployment path confinement, foreign-task refusal, production process-boundary, scheduled-task compatibility, and real task restart lifecycle checks",
+            "root-keeper availability changes passed shared-topology identity, fail-closed guarded stop/start, exact task/process ownership, supervisor-versus-child identity separation, child-backoff owner singleton boundaries, deployment path confinement, foreign-task refusal, production process-boundary, scheduled-task compatibility, and real task restart lifecycle checks",
             "cron freshness changes passed config run-cap validation, cron-canon health/status warnings, deterministic catch-up, and stale-source sender suppression checks",
             "cron/backup incident hardening passed exact-source, timezone/calendar, per-entry timeout/attempt, pre-lease exhaustion, process-tree timeout, occurrence-idempotency, verified-retention, and zero-stale-catch-up checks",
             "Codex tool-use timeout changes passed bounded recovery checks",
@@ -2482,6 +2622,19 @@ mod tests {
             &"virtual_skill_manifest::tests::t3_skill_virtual_evidence_replay_is_exact_idempotent_and_proposal_only"
         ));
         assert!(skill.promotion_gate.contains("multi-rollover"));
+
+        let autonomous = scenarios
+            .iter()
+            .find(|entry| entry.id == "skill-ecosystem-autonomous-learning")
+            .expect("skill autonomous learning scenario");
+        assert!(autonomous.required_invariants.contains(&"I20"));
+        assert!(autonomous.runnable_tests.contains(
+            &"self_improvement::tests::self_improvement_hook_enqueues_skill_synthesis_for_complex_no_skill_turn"
+        ));
+        assert!(autonomous.runnable_tests.contains(
+            &"agent-harness-cli::tests::skill_synthesize_cli_propose_only_is_an_explicit_opt_out"
+        ));
+        assert!(autonomous.promotion_gate.contains("block/quarantine"));
     }
 
     #[test]
@@ -2586,7 +2739,7 @@ mod tests {
             .expect("supervisor root keeper availability scenario");
         assert!(root_keeper.required_invariants.contains(&"I26"));
         assert!(root_keeper.runnable_tests.contains(
-            &"activation::tests::readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan"
+            &"activation::tests::keeper_readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan"
         ));
         assert!(root_keeper.runnable_tests.contains(
             &"activation::tests::readiness_keeps_missing_plan_warning_for_scheduled_task_mode"
@@ -2601,7 +2754,19 @@ mod tests {
             &"supervisor_keeper::tests::developer_script_seam_fails_closed_on_partial_ops_receipts"
         ));
         assert!(root_keeper.runnable_tests.contains(
+            &"live_control::tests::exact_restart_validation_rejects_a_broader_cutover_grant"
+        ));
+        assert!(root_keeper.runnable_tests.contains(
+            &"agent-harness-cli::tests::live_keeper_plan_cli_requires_token_held_topology_and_zero_live_owners"
+        ));
+        assert!(root_keeper.runnable_tests.contains(
             &"windows_process_boundary::production_reconcile_spawn_child_survives_launcher_control_break"
+        ));
+        assert!(root_keeper.runnable_tests.contains(
+            &"supervisor_inventory::tests::dead_child_in_backoff_does_not_request_a_second_live_supervisor_owner"
+        ));
+        assert!(root_keeper.runnable_tests.contains(
+            &"agent-harness-cli::tests::supervisor_launch_guard_fences_live_supervisor_while_child_is_in_backoff"
         ));
 
         let operation_plan = scenarios
@@ -2664,7 +2829,7 @@ mod tests {
             &"goal continuation restart changes passed malformed-ledger isolation, rollback-reader, concurrent exact-once, post-lease fence, and full runtime-queue replay checks"
         ));
         assert!(release_checklist().required_items.contains(
-            &"root-keeper availability changes passed shared-topology identity, fail-closed guarded stop/start, exact task/process ownership, deployment path confinement, foreign-task refusal, production process-boundary, scheduled-task compatibility, and real task restart lifecycle checks"
+            &"root-keeper availability changes passed shared-topology identity, fail-closed guarded stop/start, exact task/process ownership, supervisor-versus-child identity separation, child-backoff owner singleton boundaries, deployment path confinement, foreign-task refusal, production process-boundary, scheduled-task compatibility, and real task restart lifecycle checks"
         ));
     }
 

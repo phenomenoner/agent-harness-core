@@ -145,7 +145,7 @@ def build_journeys(nodes: dict[str, dict]) -> list[dict]:
         {
             "id": "agent-isolation",
             "title": "Multi-Agent Isolation",
-            "summary": "Inspect where agentId must survive so main, Xiaoxiaoli, and future agents do not cross-suppress or cross-pollute state.",
+            "summary": "Inspect where agentId must survive so main, non-main, and future agents do not cross-suppress or cross-pollute state.",
             "why": "Use this when a non-main agent behaves like main, inherits the wrong memory, or loses final delivery because another agent owns shared state.",
             "nodes": existing(
                 [
@@ -163,7 +163,7 @@ def build_journeys(nodes: dict[str, dict]) -> list[dict]:
             "steps": [
                 {"title": "Agent is a routing boundary", "body": "agentId must survive channel state, prompt assembly, runtime lanes, outbox, delivery, and memory."},
                 {"title": "Artifacts are scoped", "body": "Sessions and memory artifacts can be stored under per-agent paths."},
-                {"title": "Recall still needs stricter policy", "body": "Xiaoxiaoli currently allows global imported fallback memory, so public/non-main agents need a recall compartment gate."},
+                {"title": "Recall still needs stricter policy", "body": "Public and non-main agents need an explicit recall compartment gate so they cannot inherit private global imported memory."},
                 {"title": "Promotion proof", "body": "Run the full multi-agent matrix and a memory recall regression that excludes main private/global imported memories."},
             ],
         },
@@ -187,7 +187,7 @@ def build_journeys(nodes: dict[str, dict]) -> list[dict]:
             ),
             "steps": [
                 {"title": "Keep the queue alive", "body": "Leases and runtime classes prevent one slow task from hiding every other lane."},
-                {"title": "Bound external tools", "body": "Round10 adds an initial active tool-use idle guard and one bounded recovery prompt."},
+                {"title": "Bound external tools", "body": "The runtime includes an initial active tool-use idle guard and one bounded recovery prompt."},
                 {"title": "Separate progress from final", "body": "Progress panels can be verbose; final channel replies must stay final-answer only."},
                 {"title": "Preserve continuity", "body": "Virtual-session rollover must prove fresh concrete sessions without losing working context or trace."},
             ],

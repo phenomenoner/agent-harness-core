@@ -1,5 +1,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -56,6 +58,7 @@ pub struct WindowsReconcileKeeperPlan {
     pub fallback_receipt_file: PathBuf,
     pub executable: WindowsReconcileKeeperExecutable,
     pub action: WindowsReconcileKeeperAction,
+    pub scheduler_action: WindowsReconcileKeeperSchedulerAction,
     pub task: WindowsReconcileKeeperTask,
     pub scripts: Vec<WindowsReconcileKeeperScript>,
     pub plan_digest: String,
@@ -77,6 +80,18 @@ pub struct WindowsReconcileKeeperAction {
     pub working_directory: PathBuf,
     pub direct_executable: bool,
     pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsReconcileKeeperSchedulerAction {
+    pub executable: PathBuf,
+    pub arguments: String,
+    pub argument_vector: Vec<String>,
+    pub working_directory: PathBuf,
+    pub window_style: &'static str,
+    pub child_create_no_window: bool,
+    pub synchronous_wait: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -227,12 +242,19 @@ fn build_windows_reconcile_keeper_plan(
     let fallback_receipt_file = output_dir.join("stop-fallback-latest.json");
 
     let install_script = scripts_dir.join("install.ps1");
+    let hidden_launch_script = scripts_dir.join("launch-hidden.ps1");
     let start_script = scripts_dir.join("start.ps1");
     let stop_script = scripts_dir.join("stop.ps1");
     let uninstall_script = scripts_dir.join("uninstall.ps1");
     let rollback_script = scripts_dir.join("rollback.ps1");
     let readback_script = scripts_dir.join("readback.ps1");
     let scripts = vec![
+        WindowsReconcileKeeperScript {
+            name: "launch-hidden",
+            path: hidden_launch_script.clone(),
+            purpose: "launch and synchronously own the reconcile master without a console window",
+            sha256: String::new(),
+        },
         WindowsReconcileKeeperScript {
             name: "install",
             path: install_script.clone(),
@@ -324,6 +346,31 @@ fn build_windows_reconcile_keeper_plan(
         digest: String::new(),
     };
     action.digest = action_digest(&action)?;
+    let scheduler_argument_vector = vec![
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-WindowStyle".to_string(),
+        "Hidden".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-File".to_string(),
+        path_arg(&hidden_launch_script),
+    ];
+    let scheduler_arguments = scheduler_argument_vector
+        .iter()
+        .map(|argument| windows_quote_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let scheduler_action = WindowsReconcileKeeperSchedulerAction {
+        executable: windows_powershell_executable(),
+        arguments: scheduler_arguments,
+        argument_vector: scheduler_argument_vector,
+        working_directory: runtime_workspace.clone(),
+        window_style: "hidden",
+        child_create_no_window: true,
+        synchronous_wait: true,
+    };
     let deployment_identity = deployment_identity_digest(&harness_home);
     let ownership_identity = format!(
         "agent-harness.windows-reconcile-keeper:{}:{}",
@@ -385,40 +432,46 @@ fn build_windows_reconcile_keeper_plan(
         fallback_receipt_file,
         executable,
         action,
+        scheduler_action,
         task,
         scripts,
         plan_digest: String::new(),
     };
     let generated_scripts = vec![
         (
+            "launch-hidden",
+            hidden_launch_script.clone(),
+            hidden_launch_script_body(&plan.plan_file, &plan.harness_home),
+        ),
+        (
             "install",
             install_script.clone(),
-            install_script_body(&plan.plan_file, options.live_deployment),
+            install_script_body(&plan.plan_file, &plan.harness_home, options.live_deployment),
         ),
         (
             "start",
             start_script.clone(),
-            start_script_body(&plan.plan_file, options.live_deployment),
+            start_script_body(&plan.plan_file, &plan.harness_home, options.live_deployment),
         ),
         (
             "stop",
             stop_script.clone(),
-            stop_script_body(&plan.plan_file, options.live_deployment),
+            stop_script_body(&plan.plan_file, &plan.harness_home, options.live_deployment),
         ),
         (
             "uninstall",
             uninstall_script.clone(),
-            uninstall_script_body(&plan.plan_file, options.live_deployment),
+            uninstall_script_body(&plan.plan_file, &plan.harness_home, options.live_deployment),
         ),
         (
             "rollback",
             rollback_script.clone(),
-            rollback_script_body(&plan.plan_file),
+            rollback_script_body(&plan.plan_file, &plan.harness_home),
         ),
         (
             "readback",
             readback_script.clone(),
-            readback_script_body(&plan.plan_file),
+            readback_script_body(&plan.plan_file, &plan.harness_home),
         ),
     ];
     for script in &mut plan.scripts {
@@ -448,14 +501,49 @@ fn build_windows_reconcile_keeper_plan(
 fn write_windows_reconcile_keeper_bundle_direct(
     bundle: WindowsReconcileKeeperBundle,
 ) -> io::Result<WindowsReconcileKeeperPlan> {
+    ensure_keeper_write_path_physically_contained(
+        &bundle.plan.harness_home,
+        &bundle.plan.output_dir,
+        "keeper output directory",
+    )?;
     fs::create_dir_all(&bundle.plan.output_dir)?;
+    ensure_keeper_write_path_physically_contained(
+        &bundle.plan.harness_home,
+        &bundle.plan.output_dir,
+        "created keeper output directory",
+    )?;
     for (path, body) in &bundle.generated_scripts {
+        ensure_keeper_write_path_physically_contained(
+            &bundle.plan.harness_home,
+            path,
+            "keeper script",
+        )?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+            ensure_keeper_write_path_physically_contained(
+                &bundle.plan.harness_home,
+                parent,
+                "created keeper script directory",
+            )?;
         }
         fs::write(path, body)?;
+        ensure_keeper_write_path_physically_contained(
+            &bundle.plan.harness_home,
+            path,
+            "materialized keeper script",
+        )?;
     }
+    ensure_keeper_write_path_physically_contained(
+        &bundle.plan.harness_home,
+        &bundle.plan.plan_file,
+        "keeper plan",
+    )?;
     crate::write_json_atomic(&bundle.plan.plan_file, &bundle.plan)?;
+    ensure_keeper_write_path_physically_contained(
+        &bundle.plan.harness_home,
+        &bundle.plan.plan_file,
+        "materialized keeper plan",
+    )?;
     verify_materialized_keeper_bundle(&bundle.plan.output_dir, &bundle.plan)?;
     Ok(bundle.plan)
 }
@@ -467,7 +555,17 @@ fn promote_windows_reconcile_keeper_bundle(
     let parent = output_dir
         .parent()
         .ok_or_else(|| invalid_input("keeper output directory has no parent"))?;
+    ensure_keeper_write_path_physically_contained(
+        &bundle.plan.harness_home,
+        parent,
+        "keeper output parent",
+    )?;
     fs::create_dir_all(parent)?;
+    ensure_keeper_write_path_physically_contained(
+        &bundle.plan.harness_home,
+        parent,
+        "created keeper output parent",
+    )?;
     let nonce = format!(
         "{}-{}",
         std::process::id(),
@@ -479,7 +577,20 @@ fn promote_windows_reconcile_keeper_bundle(
     let candidate_dir = parent.join(format!(".windows-reconcile-keeper.candidate.{nonce}"));
     let previous_dir = parent.join(format!(".windows-reconcile-keeper.previous.{nonce}"));
     let failed_dir = parent.join(format!(".windows-reconcile-keeper.failed.{nonce}"));
+    for (path, label) in [
+        (&candidate_dir, "keeper candidate directory"),
+        (&previous_dir, "keeper previous directory"),
+        (&failed_dir, "keeper failed directory"),
+        (&output_dir, "keeper output directory"),
+    ] {
+        ensure_keeper_write_path_physically_contained(&bundle.plan.harness_home, path, label)?;
+    }
     fs::create_dir(&candidate_dir)?;
+    ensure_keeper_write_path_physically_contained(
+        &bundle.plan.harness_home,
+        &candidate_dir,
+        "created keeper candidate directory",
+    )?;
 
     let materialize = (|| -> io::Result<()> {
         for (canonical_path, body) in &bundle.generated_scripts {
@@ -491,17 +602,43 @@ fn promote_windows_reconcile_keeper_bundle(
                 ))
             })?;
             let candidate_path = candidate_dir.join(relative);
+            ensure_keeper_write_path_physically_contained(
+                &bundle.plan.harness_home,
+                &candidate_path,
+                "candidate keeper script",
+            )?;
             if let Some(parent) = candidate_path.parent() {
                 fs::create_dir_all(parent)?;
+                ensure_keeper_write_path_physically_contained(
+                    &bundle.plan.harness_home,
+                    parent,
+                    "created candidate keeper script directory",
+                )?;
             }
             let mut file = File::create(&candidate_path)?;
             file.write_all(body.as_bytes())?;
             file.sync_all()?;
+            ensure_keeper_write_path_physically_contained(
+                &bundle.plan.harness_home,
+                &candidate_path,
+                "materialized candidate keeper script",
+            )?;
         }
         let plan_bytes = serde_json::to_vec_pretty(&bundle.plan).map_err(io::Error::other)?;
-        let mut plan_file = File::create(candidate_dir.join("keeper-plan.json"))?;
+        let candidate_plan = candidate_dir.join("keeper-plan.json");
+        ensure_keeper_write_path_physically_contained(
+            &bundle.plan.harness_home,
+            &candidate_plan,
+            "candidate keeper plan",
+        )?;
+        let mut plan_file = File::create(&candidate_plan)?;
         plan_file.write_all(&plan_bytes)?;
         plan_file.sync_all()?;
+        ensure_keeper_write_path_physically_contained(
+            &bundle.plan.harness_home,
+            &candidate_plan,
+            "materialized candidate keeper plan",
+        )?;
         verify_materialized_keeper_bundle(&candidate_dir, &bundle.plan)
     })();
     if let Err(error) = materialize {
@@ -516,6 +653,16 @@ fn promote_windows_reconcile_keeper_bundle(
 
     let had_previous = output_dir.exists();
     if had_previous {
+        ensure_keeper_write_path_physically_contained(
+            &bundle.plan.harness_home,
+            &output_dir,
+            "current keeper generation before preservation",
+        )?;
+        ensure_keeper_write_path_physically_contained(
+            &bundle.plan.harness_home,
+            &previous_dir,
+            "previous keeper generation destination",
+        )?;
         fs::rename(&output_dir, &previous_dir).map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -526,10 +673,38 @@ fn promote_windows_reconcile_keeper_bundle(
                 ),
             )
         })?;
+        ensure_keeper_write_path_physically_contained(
+            &bundle.plan.harness_home,
+            &previous_dir,
+            "preserved keeper generation",
+        )?;
     }
+    ensure_keeper_write_path_physically_contained(
+        &bundle.plan.harness_home,
+        &candidate_dir,
+        "candidate keeper generation before promotion",
+    )?;
+    ensure_keeper_write_path_physically_contained(
+        &bundle.plan.harness_home,
+        &output_dir,
+        "keeper promotion destination",
+    )?;
     if let Err(promote_error) = fs::rename(&candidate_dir, &output_dir) {
         let restore_error = if had_previous {
-            fs::rename(&previous_dir, &output_dir).err()
+            ensure_keeper_write_path_physically_contained(
+                &bundle.plan.harness_home,
+                &previous_dir,
+                "preserved keeper generation before restore",
+            )
+            .and_then(|_| {
+                ensure_keeper_write_path_physically_contained(
+                    &bundle.plan.harness_home,
+                    &output_dir,
+                    "keeper restore destination",
+                )
+            })
+            .and_then(|_| fs::rename(&previous_dir, &output_dir))
+            .err()
         } else {
             None
         };
@@ -546,11 +721,42 @@ fn promote_windows_reconcile_keeper_bundle(
             ),
         ));
     }
+    ensure_keeper_write_path_physically_contained(
+        &bundle.plan.harness_home,
+        &output_dir,
+        "promoted keeper generation",
+    )?;
 
     if let Err(verification_error) = verify_materialized_keeper_bundle(&output_dir, &bundle.plan) {
-        let quarantine_error = fs::rename(&output_dir, &failed_dir).err();
+        let quarantine_error = ensure_keeper_write_path_physically_contained(
+            &bundle.plan.harness_home,
+            &output_dir,
+            "failed keeper generation before quarantine",
+        )
+        .and_then(|_| {
+            ensure_keeper_write_path_physically_contained(
+                &bundle.plan.harness_home,
+                &failed_dir,
+                "failed keeper quarantine destination",
+            )
+        })
+        .and_then(|_| fs::rename(&output_dir, &failed_dir))
+        .err();
         let restore_error = if had_previous {
-            fs::rename(&previous_dir, &output_dir).err()
+            ensure_keeper_write_path_physically_contained(
+                &bundle.plan.harness_home,
+                &previous_dir,
+                "preserved keeper generation before verification restore",
+            )
+            .and_then(|_| {
+                ensure_keeper_write_path_physically_contained(
+                    &bundle.plan.harness_home,
+                    &output_dir,
+                    "keeper verification restore destination",
+                )
+            })
+            .and_then(|_| fs::rename(&previous_dir, &output_dir))
+            .err()
         } else {
             None
         };
@@ -576,7 +782,17 @@ fn verify_materialized_keeper_bundle(
     physical_output_dir: &Path,
     expected_plan: &WindowsReconcileKeeperPlan,
 ) -> io::Result<()> {
+    ensure_keeper_write_path_physically_contained(
+        &expected_plan.harness_home,
+        physical_output_dir,
+        "keeper bundle readback directory",
+    )?;
     let plan_path = physical_output_dir.join("keeper-plan.json");
+    ensure_keeper_write_path_physically_contained(
+        &expected_plan.harness_home,
+        &plan_path,
+        "keeper plan readback",
+    )?;
     let persisted: Value =
         serde_json::from_slice(&fs::read(&plan_path)?).map_err(io::Error::other)?;
     let observed_plan_digest =
@@ -601,6 +817,11 @@ fn verify_materialized_keeper_bundle(
                 ))
             })?;
         let physical_path = physical_output_dir.join(relative);
+        ensure_keeper_write_path_physically_contained(
+            &expected_plan.harness_home,
+            &physical_path,
+            "keeper script readback",
+        )?;
         let observed = sha256_file(&physical_path)?;
         if observed != script.sha256 {
             return Err(invalid_input(format!(
@@ -612,8 +833,8 @@ fn verify_materialized_keeper_bundle(
     Ok(())
 }
 
-fn install_script_body(plan_file: &Path, live_deployment: bool) -> String {
-    let mut body = script_control_header(plan_file, live_deployment);
+fn install_script_body(plan_file: &Path, harness_home: &Path, live_deployment: bool) -> String {
+    let mut body = script_control_header(plan_file, harness_home, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
     body.push_str(account_identity_function_body());
@@ -628,7 +849,7 @@ fn install_script_body(plan_file: &Path, live_deployment: bool) -> String {
         );
     }
     body.push_str(
-        r#"Assert-KeeperLiveControlAuthorization -Action 'cutover'
+        r#"Assert-KeeperLiveControlAuthorization -Action 'restart'
 Assert-LegacySupervisorTasksQuiescent -Phase 'install'
 
 $CurrentUserId = if ($KeeperFixtureMode) { [string]$Plan.task.principal.userId } else { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
@@ -794,8 +1015,52 @@ if (-not $KeeperFixtureMode) {
     body
 }
 
-fn start_script_body(plan_file: &Path, live_deployment: bool) -> String {
-    let mut body = script_control_header(plan_file, live_deployment);
+fn hidden_launch_script_body(plan_file: &Path, harness_home: &Path) -> String {
+    let mut body = script_plan_header(plan_file, harness_home);
+    body.push_str(
+        r#"if ([string]$Plan.schedulerAction.windowStyle -ne 'hidden' -or
+    $Plan.schedulerAction.childCreateNoWindow -ne $true -or
+    $Plan.schedulerAction.synchronousWait -ne $true) {
+  throw 'keeper scheduler action does not require the hidden synchronous launch policy'
+}
+$CurrentPowerShell = [IO.Path]::GetFullPath((Join-Path $PSHOME 'powershell.exe'))
+$PlannedPowerShell = [IO.Path]::GetFullPath([string]$Plan.schedulerAction.executable)
+if (-not [string]::Equals($CurrentPowerShell, $PlannedPowerShell, [StringComparison]::OrdinalIgnoreCase)) {
+  throw "keeper hidden launcher host mismatch: planned=$PlannedPowerShell current=$CurrentPowerShell"
+}
+if (-not (Test-Path -LiteralPath $Plan.executable.path -PathType Leaf)) {
+  throw "canonical harness CLI is missing: $($Plan.executable.path)"
+}
+$ObservedExecutableDigest = Get-FileSha256 -Path $Plan.executable.path
+if ($ObservedExecutableDigest -ne [string]$Plan.executable.sha256) {
+  throw 'canonical harness CLI digest mismatch'
+}
+
+$StartInfo = New-Object Diagnostics.ProcessStartInfo
+$StartInfo.FileName = [string]$Plan.action.executable
+$StartInfo.Arguments = [string]$Plan.action.arguments
+$StartInfo.WorkingDirectory = [string]$Plan.action.workingDirectory
+$StartInfo.UseShellExecute = $false
+$StartInfo.CreateNoWindow = $true
+$StartInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+$Child = [Diagnostics.Process]::Start($StartInfo)
+if ($null -eq $Child) {
+  throw 'keeper hidden launcher did not receive a child process'
+}
+try {
+  $Child.WaitForExit()
+  $ChildExitCode = $Child.ExitCode
+} finally {
+  $Child.Dispose()
+}
+exit $ChildExitCode
+"#,
+    );
+    body
+}
+
+fn start_script_body(plan_file: &Path, harness_home: &Path, live_deployment: bool) -> String {
+    let mut body = script_control_header(plan_file, harness_home, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
     body.push_str(account_identity_function_body());
@@ -917,8 +1182,8 @@ if (-not $StartReady) {
     body
 }
 
-fn stop_script_body(plan_file: &Path, live_deployment: bool) -> String {
-    let mut body = script_control_header(plan_file, live_deployment);
+fn stop_script_body(plan_file: &Path, harness_home: &Path, live_deployment: bool) -> String {
+    let mut body = script_control_header(plan_file, harness_home, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
     body.push_str(account_identity_function_body());
@@ -1275,8 +1540,8 @@ if (-not $KeeperFixtureMode) {
     body
 }
 
-fn uninstall_script_body(plan_file: &Path, live_deployment: bool) -> String {
-    let mut body = script_control_header(plan_file, live_deployment);
+fn uninstall_script_body(plan_file: &Path, harness_home: &Path, live_deployment: bool) -> String {
+    let mut body = script_control_header(plan_file, harness_home, live_deployment);
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
     body.push_str(account_identity_function_body());
@@ -1289,7 +1554,7 @@ $StopScript = ($Plan.scripts | Where-Object { $_.name -eq 'stop' }).path
     );
     if live_deployment {
         body.push_str(
-            "Invoke-KeeperScript -Path $StopScript -Arguments @('-LiveControlToken', $ResolvedLiveControlToken, '-TimeoutSeconds', [string]$TimeoutSeconds)\n",
+            "Invoke-KeeperScript -Path $StopScript -Arguments @('-TimeoutSeconds', [string]$TimeoutSeconds)\n",
         );
     } else {
         body.push_str(
@@ -1349,11 +1614,11 @@ if (-not $KeeperFixtureMode) {
     body
 }
 
-fn rollback_script_body(plan_file: &Path) -> String {
+fn rollback_script_body(plan_file: &Path, harness_home: &Path) -> String {
     let mut body = String::from(
-        "param([string] $LiveControlToken, [Parameter(Mandatory = $true)][string] $PriorGenerationPackage, [ValidateRange(1, 300)][int] $TimeoutSeconds = 30)\n",
+        "param([Parameter(Mandatory = $true)][string] $PriorGenerationPackage, [ValidateRange(1, 300)][int] $TimeoutSeconds = 30)\n",
     );
-    body.push_str(&script_plan_header(plan_file));
+    body.push_str(&script_plan_header(plan_file, harness_home));
     body.push_str(live_control_token_body());
     body.push_str(atomic_json_function_body());
     body.push_str(ensure_keeper_hold_function_body());
@@ -1362,7 +1627,7 @@ fn rollback_script_body(plan_file: &Path) -> String {
     body.push_str(legacy_task_preflight_function_body());
     body.push_str(
         r#"$KeeperFixtureMode = ($Plan.deploymentMode -eq 'developer-staging') -and (-not [string]::IsNullOrWhiteSpace($env:AGENT_HARNESS_KEEPER_TEST_TASK_OBSERVATION_FILE))
-Assert-KeeperLiveControlAuthorization -Action 'cutover'
+Assert-KeeperLiveControlAuthorization -Action 'restart'
 if (-not (Test-Path -LiteralPath $PriorGenerationPackage -PathType Leaf)) {
   throw 'an explicit prior-generation rollback package JSON file is required'
 }
@@ -1433,7 +1698,7 @@ $OfflineRecovery = [ordered]@{
 Write-AtomicJson -Path $OfflineRecoveryFile -Value $OfflineRecovery
 
 $StopScript = ($Plan.scripts | Where-Object { $_.name -eq 'stop' }).path
-Invoke-KeeperScript -Path $StopScript -Arguments @('-LiveControlToken', $ResolvedLiveControlToken, '-TimeoutSeconds', [string]$TimeoutSeconds)
+Invoke-KeeperScript -Path $StopScript -Arguments @('-TimeoutSeconds', [string]$TimeoutSeconds)
 $StopProofFile = Join-Path ([string]$Plan.outputDir) 'stop-proof-latest.json'
 $StopProof = Get-Content -LiteralPath $StopProofFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
 $StopProofExact = ([string]$StopProof.schema -eq 'agent-harness.windows-reconcile-keeper-stop-proof.v1') -and
@@ -1572,9 +1837,9 @@ if ($RollbackErrors.Count -gt 0) {
     body
 }
 
-fn readback_script_body(plan_file: &Path) -> String {
+fn readback_script_body(plan_file: &Path, harness_home: &Path) -> String {
     let mut body = String::from("param([string] $QueryNonce)\n");
-    body.push_str(&script_plan_header(plan_file));
+    body.push_str(&script_plan_header(plan_file, harness_home));
     body.push_str(atomic_json_function_body());
     body.push_str(account_identity_function_body());
     body.push_str(
@@ -1689,14 +1954,25 @@ $Observation | ConvertTo-Json -Depth 16
     body
 }
 
-fn script_plan_header(plan_file: &Path) -> String {
+fn script_plan_header(plan_file: &Path, harness_home: &Path) -> String {
     let mut body = format!(
-        "$ErrorActionPreference = 'Stop'\n$PlanFile = {}\n$Plan = Get-Content -LiteralPath $PlanFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop\n",
-        ps_quote_path(plan_file)
+        "$ErrorActionPreference = 'Stop'\n$ExpectedHarnessHome = {}\n$PlanFile = {}\n$CurrentScriptPath = [IO.Path]::GetFullPath([string]$MyInvocation.MyCommand.Path)\n",
+        ps_quote_path(harness_home),
+        ps_quote_path(plan_file),
+    );
+    body.push_str(keeper_physical_path_function_body());
+    body.push_str(
+        r#"[void](Assert-KeeperPhysicalContainment -Root $ExpectedHarnessHome -Path $PlanFile -RequireExisting $true)
+[void](Assert-KeeperPhysicalContainment -Root $ExpectedHarnessHome -Path $CurrentScriptPath -RequireExisting $true)
+$Plan = Get-Content -LiteralPath $PlanFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+"#,
     );
     body.push_str(file_sha256_function_body());
+    body.push_str(keeper_plan_integrity_function_body());
     body.push_str(
-        r#"$CurrentScriptPath = [IO.Path]::GetFullPath([string]$MyInvocation.MyCommand.Path)
+        r#"Assert-KeeperPlanIntegrity
+Assert-KeeperPlanPhysicalContainment
+
 $ScriptManifestMatches = @($Plan.scripts | Where-Object {
   [string]::Equals([IO.Path]::GetFullPath([string]$_.path), $CurrentScriptPath, [StringComparison]::OrdinalIgnoreCase)
 })
@@ -1715,11 +1991,15 @@ if ([string]::IsNullOrWhiteSpace([string]$ScriptManifestEntry.sha256) -or
     body
 }
 
-fn script_control_header(plan_file: &Path, live_deployment: bool) -> String {
-    let mut body = String::from(
-        "param([string] $LiveControlToken, [ValidateRange(1, 300)][int] $TimeoutSeconds = 30)\n",
-    );
-    body.push_str(&script_plan_header(plan_file));
+fn script_control_header(plan_file: &Path, harness_home: &Path, live_deployment: bool) -> String {
+    let mut body = if live_deployment {
+        String::from("param([ValidateRange(1, 300)][int] $TimeoutSeconds = 30)\n")
+    } else {
+        String::from(
+            "param([string] $LiveControlToken, [ValidateRange(1, 300)][int] $TimeoutSeconds = 30)\n",
+        )
+    };
+    body.push_str(&script_plan_header(plan_file, harness_home));
     if live_deployment {
         body.push_str(live_control_token_body());
     } else {
@@ -1731,7 +2011,7 @@ fn script_control_header(plan_file: &Path, live_deployment: bool) -> String {
 fn developer_staging_control_body() -> &'static str {
     r#"$ResolvedLiveControlToken = $null
 function Assert-KeeperLiveControlAuthorization {
-  param([Parameter(Mandatory = $true)][ValidateSet('start', 'stop', 'uninstall', 'cutover')][string] $Action)
+  param([Parameter(Mandatory = $true)][ValidateSet('start', 'stop', 'restart', 'uninstall', 'cutover')][string] $Action)
   if ([string]$Plan.deploymentMode -ne 'developer-staging') {
     throw 'developer-staging keeper control script refuses a non-staging plan'
   }
@@ -1741,20 +2021,20 @@ function Assert-KeeperLiveControlAuthorization {
 }
 
 fn live_control_token_body() -> &'static str {
-    r#"$ResolvedLiveControlToken = if (-not [string]::IsNullOrWhiteSpace($LiveControlToken)) { $LiveControlToken } elseif (-not [string]::IsNullOrWhiteSpace($env:AGENT_HARNESS_LIVE_CONTROL_TOKEN)) { $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN } else { $null }
+    r#"$ResolvedLiveControlToken = if (-not [string]::IsNullOrWhiteSpace($env:AGENT_HARNESS_LIVE_CONTROL_TOKEN)) { $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN } else { $null }
 if ([string]::IsNullOrWhiteSpace($ResolvedLiveControlToken)) {
-  throw 'live-control token is required for reconcile keeper control'
+  throw 'AGENT_HARNESS_LIVE_CONTROL_TOKEN is required for reconcile keeper control'
 }
 
 function Assert-KeeperLiveControlAuthorization {
-  param([Parameter(Mandatory = $true)][ValidateSet('start', 'stop', 'uninstall', 'cutover')][string] $Action)
+  param([Parameter(Mandatory = $true)][ValidateSet('start', 'stop', 'restart', 'uninstall', 'cutover')][string] $Action)
   if ($KeeperFixtureMode -and -not [string]::IsNullOrWhiteSpace($env:AGENT_HARNESS_KEEPER_TEST_AUTH_RECEIPT_FILE)) {
     $AuthorizationDocument = Get-Content -LiteralPath $env:AGENT_HARNESS_KEEPER_TEST_AUTH_RECEIPT_FILE -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     $AuthorizationProperty = $AuthorizationDocument.PSObject.Properties[$Action]
     $Authorization = if ($null -ne $AuthorizationProperty) { $AuthorizationProperty.Value } else { $AuthorizationDocument }
     $AuthorizationExitCode = 0
   } else {
-    $AuthorizationOutput = & $Plan.executable.path 'ops-cutover-status' '--harness-home' $Plan.harnessHome '--action' $Action '--live-control-token' $ResolvedLiveControlToken 2>&1
+    $AuthorizationOutput = & $Plan.executable.path 'ops-cutover-status' '--harness-home' $Plan.harnessHome '--action' $Action 2>&1
     $AuthorizationExitCode = $LASTEXITCODE
     if ($AuthorizationExitCode -eq 0) {
       try {
@@ -1787,7 +2067,7 @@ fn ops_control_invocation_body(
 ) -> String {
     let native = if live_deployment {
         format!(
-            "$Ops{variable_suffix}Output = & $Plan.executable.path 'ops-control' '{action}' '--harness-home' $Plan.harnessHome '--reason' 'windows reconcile keeper {action}' '--live-control-token' $ResolvedLiveControlToken 2>&1\n$Ops{variable_suffix}ExitCode = $LASTEXITCODE\n"
+            "$Ops{variable_suffix}Output = & $Plan.executable.path 'ops-control' '{action}' '--harness-home' $Plan.harnessHome '--reason' 'windows reconcile keeper {action}' 2>&1\n$Ops{variable_suffix}ExitCode = $LASTEXITCODE\n"
         )
     } else {
         format!(
@@ -1812,7 +2092,7 @@ if ($KeeperFixtureMode) {{
 
 fn start_rollback_function_body(live_deployment: bool) -> String {
     let rollback_invocation = if live_deployment {
-        "$RollbackStopOutput = & $Plan.executable.path 'ops-control' 'stop' '--harness-home' $Plan.harnessHome '--reason' 'windows reconcile keeper transactional start rollback' '--live-control-token' $ResolvedLiveControlToken 2>&1\n$RollbackStopExitCode = $LASTEXITCODE\n".to_string()
+        "$RollbackStopOutput = & $Plan.executable.path 'ops-control' 'stop' '--harness-home' $Plan.harnessHome '--reason' 'windows reconcile keeper transactional start rollback' 2>&1\n$RollbackStopExitCode = $LASTEXITCODE\n".to_string()
     } else {
         r#"if ($KeeperFixtureMode) {
   $RollbackFixtureDocument = Get-Content -LiteralPath $env:AGENT_HARNESS_KEEPER_TEST_OPS_RECEIPT_FILE -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
@@ -2241,9 +2521,9 @@ function Test-KeeperTaskExact {
     ([string]$Snapshot.principal.logonType -eq [string]$Plan.task.principal.logonType) -and
     ([string]$Snapshot.principal.runLevel -eq [string]$Plan.task.principal.runLevel) -and
     ([int]$Snapshot.action.count -eq 1) -and
-    [string]::Equals([string]$Snapshot.action.execute, [string]$Plan.action.executable, [StringComparison]::OrdinalIgnoreCase) -and
-    ([string]$Snapshot.action.arguments -eq [string]$Plan.action.arguments) -and
-    [string]::Equals([string]$Snapshot.action.workingDirectory, [string]$Plan.action.workingDirectory, [StringComparison]::OrdinalIgnoreCase) -and
+    [string]::Equals([string]$Snapshot.action.execute, [string]$Plan.schedulerAction.executable, [StringComparison]::OrdinalIgnoreCase) -and
+    ([string]$Snapshot.action.arguments -eq [string]$Plan.schedulerAction.arguments) -and
+    [string]::Equals([string]$Snapshot.action.workingDirectory, [string]$Plan.schedulerAction.workingDirectory, [StringComparison]::OrdinalIgnoreCase) -and
     ([int]$Snapshot.trigger.count -eq 2) -and
     ([int]$Snapshot.trigger.logonCount -eq 1) -and
     ([int]$Snapshot.trigger.recoveryCount -eq 1) -and
@@ -2269,7 +2549,7 @@ function Test-KeeperTaskSameDeploymentStale {
   $OwnershipPrefix = 'Agent Harness reconcile keeper; taskPath=' + [string]$Plan.task.path + '; ownership=agent-harness.windows-reconcile-keeper:' + [string]$Plan.deploymentIdentity + ':'
   $LegacyOwnershipPrefix = 'Agent Harness reconcile keeper; ownership=agent-harness.windows-reconcile-keeper:' + [string]$Plan.deploymentIdentity + ':'
   try {
-    $ExpectedExecutable = [IO.Path]::GetFullPath([string]$Plan.action.executable)
+    $ExpectedExecutable = [IO.Path]::GetFullPath([string]$Plan.schedulerAction.executable)
     $ObservedExecutable = [IO.Path]::GetFullPath([string]$Snapshot.action.execute)
     $RuntimeRoot = [IO.Path]::GetFullPath((Join-Path ([string]$Plan.harnessHome) 'runtime-workspace')).TrimEnd('\', '/')
     $ObservedWorkingDirectory = [IO.Path]::GetFullPath([string]$Snapshot.action.workingDirectory).TrimEnd('\', '/')
@@ -2348,9 +2628,9 @@ function Set-KeeperTaskXmlDisabled {
 function New-KeeperTaskXml {
   $Description = [Security.SecurityElement]::Escape([string]$Plan.task.description)
   $UserId = [Security.SecurityElement]::Escape([string]$Plan.task.principal.userId)
-  $Command = [Security.SecurityElement]::Escape([string]$Plan.action.executable)
-  $Arguments = [Security.SecurityElement]::Escape([string]$Plan.action.arguments)
-  $WorkingDirectory = [Security.SecurityElement]::Escape([string]$Plan.action.workingDirectory)
+  $Command = [Security.SecurityElement]::Escape([string]$Plan.schedulerAction.executable)
+  $Arguments = [Security.SecurityElement]::Escape([string]$Plan.schedulerAction.arguments)
+  $WorkingDirectory = [Security.SecurityElement]::Escape([string]$Plan.schedulerAction.workingDirectory)
   $RecoveryStartBoundary = [Security.SecurityElement]::Escape((Get-KeeperRecoveryStartBoundaryText))
   $RecoveryInterval = [Security.SecurityElement]::Escape([string]$Plan.task.trigger.recoveryInterval)
   return @"
@@ -2717,6 +2997,62 @@ fn invoke_keeper_script_function_body() -> &'static str {
 "#
 }
 
+fn keeper_physical_path_function_body() -> &'static str {
+    r#"function Assert-KeeperPhysicalContainment {
+  param(
+    [Parameter(Mandatory = $true)][string] $Root,
+    [Parameter(Mandatory = $true)][string] $Path,
+    [Parameter(Mandatory = $true)][bool] $RequireExisting
+  )
+  $RootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+  $PathFull = [IO.Path]::GetFullPath($Path)
+  $RootPrefix = $RootFull + [IO.Path]::DirectorySeparatorChar
+  if (-not [string]::Equals($PathFull, $RootFull, [StringComparison]::OrdinalIgnoreCase) -and
+      -not $PathFull.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "keeper physical containment rejected path outside harness home: $PathFull"
+  }
+
+  $VolumeRoot = [IO.Path]::GetPathRoot($PathFull)
+  if ([string]::IsNullOrWhiteSpace($VolumeRoot)) {
+    throw "keeper physical containment could not resolve a volume root: $PathFull"
+  }
+  $Current = $VolumeRoot
+  $Relative = $PathFull.Substring($VolumeRoot.Length)
+  $Segments = $Relative.Split([char[]]@('\', '/'), [StringSplitOptions]::RemoveEmptyEntries)
+  foreach ($Segment in $Segments) {
+    $Current = Join-Path $Current $Segment
+    if (-not (Test-Path -LiteralPath $Current)) { break }
+    $Item = Get-Item -LiteralPath $Current -Force -ErrorAction Stop
+    if (([int]$Item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw "keeper physical containment rejected reparse point: $Current"
+    }
+  }
+  if ($RequireExisting -and -not (Test-Path -LiteralPath $PathFull)) {
+    throw "keeper physical containment requires an existing path: $PathFull"
+  }
+  return $PathFull
+}
+
+function Assert-KeeperPlanPhysicalContainment {
+  if (-not [string]::Equals([IO.Path]::GetFullPath([string]$Plan.harnessHome), [IO.Path]::GetFullPath($ExpectedHarnessHome), [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'keeper physical containment rejected a plan for a different harness home'
+  }
+  if (-not [string]::Equals([IO.Path]::GetFullPath([string]$Plan.planFile), [IO.Path]::GetFullPath($PlanFile), [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'keeper physical containment rejected a redirected plan file'
+  }
+  foreach ($RequiredPath in @($Plan.outputDir, $Plan.planFile)) {
+    [void](Assert-KeeperPhysicalContainment -Root $ExpectedHarnessHome -Path ([string]$RequiredPath) -RequireExisting $true)
+  }
+  foreach ($Script in @($Plan.scripts)) {
+    [void](Assert-KeeperPhysicalContainment -Root $ExpectedHarnessHome -Path ([string]$Script.path) -RequireExisting $true)
+  }
+  foreach ($PlannedPath in @($Plan.stopFile, $Plan.stateFile, $Plan.leaseFile, $Plan.observationFile, $Plan.fallbackReceiptFile)) {
+    [void](Assert-KeeperPhysicalContainment -Root $ExpectedHarnessHome -Path ([string]$PlannedPath) -RequireExisting $false)
+  }
+}
+"#
+}
+
 fn file_sha256_function_body() -> &'static str {
     r#"function Get-FileSha256 {
   param([Parameter(Mandatory = $true)][string] $Path)
@@ -2736,10 +3072,152 @@ fn file_sha256_function_body() -> &'static str {
 "#
 }
 
+fn keeper_plan_integrity_function_body() -> &'static str {
+    r#"function ConvertTo-KeeperCanonicalJsonString {
+  param([AllowNull()][AllowEmptyString()][string] $Value)
+  if ($null -eq $Value) { return 'null' }
+  $Builder = New-Object Text.StringBuilder
+  [void]$Builder.Append('"')
+  foreach ($Character in $Value.ToCharArray()) {
+    $Code = [int]$Character
+    if ($Code -eq 34) {
+      [void]$Builder.Append('\"')
+    } elseif ($Code -eq 92) {
+      [void]$Builder.Append('\\')
+    } elseif ($Code -eq 8) {
+      [void]$Builder.Append('\b')
+    } elseif ($Code -eq 9) {
+      [void]$Builder.Append('\t')
+    } elseif ($Code -eq 10) {
+      [void]$Builder.Append('\n')
+    } elseif ($Code -eq 12) {
+      [void]$Builder.Append('\f')
+    } elseif ($Code -eq 13) {
+      [void]$Builder.Append('\r')
+    } elseif ($Code -lt 32) {
+      [void]$Builder.Append(('\u' + $Code.ToString('x4', [Globalization.CultureInfo]::InvariantCulture)))
+    } else {
+      [void]$Builder.Append($Character)
+    }
+  }
+  [void]$Builder.Append('"')
+  return $Builder.ToString()
+}
+
+function ConvertTo-KeeperCanonicalJson {
+  param(
+    [AllowNull()] $Value,
+    [AllowNull()][string] $ExcludedProperty
+  )
+  if ($null -eq $Value) { return 'null' }
+  if ($Value -is [string] -or $Value -is [char]) {
+    return ConvertTo-KeeperCanonicalJsonString -Value ([string]$Value)
+  }
+  if ($Value -is [bool]) {
+    if ([bool]$Value) { return 'true' }
+    return 'false'
+  }
+  if ($Value -is [byte] -or $Value -is [sbyte] -or
+      $Value -is [int16] -or $Value -is [uint16] -or
+      $Value -is [int32] -or $Value -is [uint32] -or
+      $Value -is [int64] -or $Value -is [uint64]) {
+    return ([IFormattable]$Value).ToString($null, [Globalization.CultureInfo]::InvariantCulture)
+  }
+  if ($Value -is [decimal] -or $Value -is [single] -or $Value -is [double]) {
+    throw 'keeper plan canonical JSON does not permit floating-point values'
+  }
+  if ($Value -is [Collections.IDictionary]) {
+    $Names = New-Object 'Collections.Generic.List[string]'
+    foreach ($Key in $Value.Keys) {
+      if ($Key -isnot [string]) { throw 'keeper plan canonical JSON object key is not a string' }
+      if ([string]::Equals([string]$Key, $ExcludedProperty, [StringComparison]::Ordinal)) { continue }
+      $Names.Add([string]$Key)
+    }
+    $Names.Sort([StringComparer]::Ordinal)
+    $Entries = New-Object 'Collections.Generic.List[string]'
+    foreach ($Name in $Names) {
+      $KeyJson = ConvertTo-KeeperCanonicalJsonString -Value $Name
+      $ValueJson = ConvertTo-KeeperCanonicalJson -Value $Value[$Name]
+      $Entries.Add($KeyJson + ':' + $ValueJson)
+    }
+    return '{' + [string]::Join(',', $Entries.ToArray()) + '}'
+  }
+  if ($Value -is [Collections.IEnumerable]) {
+    $Items = New-Object 'Collections.Generic.List[string]'
+    foreach ($Item in $Value) {
+      $Items.Add((ConvertTo-KeeperCanonicalJson -Value $Item))
+    }
+    return '[' + [string]::Join(',', $Items.ToArray()) + ']'
+  }
+  if ($Value -is [pscustomobject]) {
+    $Names = New-Object 'Collections.Generic.List[string]'
+    foreach ($Property in $Value.PSObject.Properties) {
+      if ([string]::Equals([string]$Property.Name, $ExcludedProperty, [StringComparison]::Ordinal)) { continue }
+      $Names.Add([string]$Property.Name)
+    }
+    $Names.Sort([StringComparer]::Ordinal)
+    $Entries = New-Object 'Collections.Generic.List[string]'
+    foreach ($Name in $Names) {
+      $KeyJson = ConvertTo-KeeperCanonicalJsonString -Value $Name
+      $Property = $Value.PSObject.Properties[$Name]
+      $ValueJson = ConvertTo-KeeperCanonicalJson -Value $Property.Value
+      $Entries.Add($KeyJson + ':' + $ValueJson)
+    }
+    return '{' + [string]::Join(',', $Entries.ToArray()) + '}'
+  }
+  throw "keeper plan canonical JSON encountered unsupported type: $($Value.GetType().FullName)"
+}
+
+function Get-KeeperCanonicalJsonSha256 {
+  param(
+    [Parameter(Mandatory = $true)] $Value,
+    [Parameter(Mandatory = $true)][string] $ExcludedProperty
+  )
+  $CanonicalJson = ConvertTo-KeeperCanonicalJson -Value $Value -ExcludedProperty $ExcludedProperty
+  $Utf8NoBom = New-Object Text.UTF8Encoding($false)
+  $Bytes = $Utf8NoBom.GetBytes($CanonicalJson)
+  $Hasher = [Security.Cryptography.SHA256]::Create()
+  try {
+    $Hash = $Hasher.ComputeHash($Bytes)
+  } finally {
+    $Hasher.Dispose()
+  }
+  return ([BitConverter]::ToString($Hash)).Replace('-', '').ToLowerInvariant()
+}
+
+function Assert-KeeperPlanIntegrity {
+  if ($null -eq $Plan.action) {
+    throw 'keeper plan action is missing'
+  }
+  $StoredActionDigest = [string]$Plan.action.digest
+  $ObservedActionDigest = Get-KeeperCanonicalJsonSha256 -Value $Plan.action -ExcludedProperty 'digest'
+  if (-not [string]::Equals($StoredActionDigest, $ObservedActionDigest, [StringComparison]::Ordinal)) {
+    throw 'keeper action digest does not match canonical action content'
+  }
+  $StoredPlanDigest = [string]$Plan.planDigest
+  $ObservedPlanDigest = Get-KeeperCanonicalJsonSha256 -Value $Plan -ExcludedProperty 'planDigest'
+  if (-not [string]::Equals($StoredPlanDigest, $ObservedPlanDigest, [StringComparison]::Ordinal)) {
+    throw 'keeper plan digest does not match canonical plan content'
+  }
+}
+"#
+}
+
 fn atomic_json_function_body() -> &'static str {
     r#"function Write-AtomicJson([string] $Path, [object] $Value) {
+  Assert-KeeperPlanPhysicalContainment
+  $FixtureEffectWrite = ([string]$Plan.deploymentMode -eq 'developer-staging') -and
+    (-not [string]::IsNullOrWhiteSpace($env:AGENT_HARNESS_KEEPER_TEST_EFFECT_FILE)) -and
+    [string]::Equals([IO.Path]::GetFullPath($Path), [IO.Path]::GetFullPath($env:AGENT_HARNESS_KEEPER_TEST_EFFECT_FILE), [StringComparison]::OrdinalIgnoreCase)
+  if (-not $FixtureEffectWrite) {
+    [void](Assert-KeeperPhysicalContainment -Root $ExpectedHarnessHome -Path $Path -RequireExisting $false)
+  }
   $Parent = Split-Path -Parent $Path
   New-Item -ItemType Directory -Force -Path $Parent | Out-Null
+  if (-not $FixtureEffectWrite) {
+    [void](Assert-KeeperPhysicalContainment -Root $ExpectedHarnessHome -Path $Parent -RequireExisting $true)
+    [void](Assert-KeeperPhysicalContainment -Root $ExpectedHarnessHome -Path $Path -RequireExisting $false)
+  }
   $Nonce = $PID.ToString() + '.' + [Guid]::NewGuid().ToString('N')
   $TempPath = Join-Path $Parent ('.' + [IO.Path]::GetFileName($Path) + '.tmp.' + $Nonce)
   $BackupPath = Join-Path $Parent ('.' + [IO.Path]::GetFileName($Path) + '.bak.' + $Nonce)
@@ -2757,6 +3235,156 @@ fn atomic_json_function_body() -> &'static str {
   }
 }
 "#
+}
+
+fn ensure_keeper_write_path_physically_contained(
+    harness_home: &Path,
+    target: &Path,
+    label: &str,
+) -> io::Result<()> {
+    let canonical_harness_home = canonical_directory(harness_home, "keeper harness home")?;
+    if !keeper_paths_equal(&canonical_harness_home, harness_home) {
+        return Err(invalid_input(format!(
+            "keeper physical containment failed because harness home now resolves to {} instead of {}",
+            canonical_harness_home.display(),
+            harness_home.display()
+        )));
+    }
+    let relative = target.strip_prefix(harness_home).map_err(|_| {
+        invalid_input(format!(
+            "keeper physical containment failed for {label}: {} is outside {}",
+            target.display(),
+            harness_home.display()
+        ))
+    })?;
+    if relative.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return Err(invalid_input(format!(
+            "keeper physical containment failed for {label}: {} has a non-normal relative component",
+            target.display()
+        )));
+    }
+
+    let mut current = harness_home.to_path_buf();
+    ensure_keeper_existing_path_component(
+        &canonical_harness_home,
+        &current,
+        "keeper harness home",
+    )?;
+    for component in relative.components() {
+        if matches!(component, std::path::Component::CurDir) {
+            continue;
+        }
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(_) => {
+                ensure_keeper_existing_path_component(&canonical_harness_home, &current, label)?
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "keeper physical containment could not inspect {label} {}: {error}",
+                        current.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_keeper_existing_path_component(
+    canonical_harness_home: &Path,
+    path: &Path,
+    label: &str,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "keeper physical containment could not inspect {label} {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    if keeper_metadata_is_reparse(&metadata) {
+        return Err(invalid_input(format!(
+            "keeper physical containment rejected a reparse point in {label}: {}",
+            path.display()
+        )));
+    }
+    let resolved = fs::canonicalize(path)
+        .map(normalize_canonical_path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "keeper physical containment could not resolve {label} {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+    if !keeper_path_is_within(&resolved, canonical_harness_home) {
+        return Err(invalid_input(format!(
+            "keeper physical containment rejected {label} {} because it resolves outside {}",
+            path.display(),
+            canonical_harness_home.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn keeper_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn keeper_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn keeper_paths_equal(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\"))
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn keeper_path_is_within(path: &Path, root: &Path) -> bool {
+    if keeper_paths_equal(path, root) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy().replace('/', "\\");
+        let mut root = root.to_string_lossy().replace('/', "\\");
+        while root.ends_with('\\') {
+            root.pop();
+        }
+        path.len() > root.len()
+            && path
+                .get(..root.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&root))
+            && path.as_bytes().get(root.len()) == Some(&b'\\')
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(root)
+    }
 }
 
 fn canonical_directory(path: &Path, label: &str) -> io::Result<PathBuf> {
@@ -2807,6 +3435,19 @@ fn normalize_canonical_path(path: PathBuf) -> PathBuf {
         }
     }
     path
+}
+
+fn windows_powershell_executable() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .and_then(|path| canonical_file(&path, "Windows PowerShell").ok())
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"))
 }
 
 fn validate_task_name(task_name: &str) -> io::Result<()> {
@@ -3046,6 +3687,88 @@ pub fn validate_live_windows_reconcile_keeper_plan(plan: &Value) -> Result<(), S
             "live keeper action working directory is not the runtime workspace".to_string(),
         );
     }
+    let scheduler_executable = canonical_value_file(
+        plan,
+        "/schedulerAction/executable",
+        "keeper scheduler PowerShell",
+    )?;
+    let expected_scheduler_executable = canonical_file(
+        &std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .ok_or_else(|| "SystemRoot is unavailable for live keeper validation".to_string())?
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe"),
+        "canonical Windows PowerShell",
+    )
+    .map_err(|error| error.to_string())?;
+    if scheduler_executable != expected_scheduler_executable
+        || plan
+            .pointer("/schedulerAction/workingDirectory")
+            .and_then(Value::as_str)
+            != Some(runtime_workspace.to_string_lossy().as_ref())
+        || plan
+            .pointer("/schedulerAction/windowStyle")
+            .and_then(Value::as_str)
+            != Some("hidden")
+        || plan
+            .pointer("/schedulerAction/childCreateNoWindow")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || plan
+            .pointer("/schedulerAction/synchronousWait")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(
+            "live keeper scheduler action must use canonical Windows PowerShell and the hidden synchronous child policy"
+                .to_string(),
+        );
+    }
+    let hidden_launcher = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("windows-reconcile-keeper")
+        .join("scripts")
+        .join("launch-hidden.ps1");
+    let expected_scheduler_argument_vector = vec![
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-WindowStyle".to_string(),
+        "Hidden".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-File".to_string(),
+        hidden_launcher.display().to_string(),
+    ];
+    let observed_scheduler_argument_vector = plan
+        .pointer("/schedulerAction/argumentVector")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "live keeper scheduler argument vector is missing".to_string())?
+        .iter()
+        .map(|value| {
+            value.as_str().map(ToString::to_string).ok_or_else(|| {
+                "live keeper scheduler argument vector contains non-text".to_string()
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_scheduler_arguments = expected_scheduler_argument_vector
+        .iter()
+        .map(|argument| windows_quote_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if observed_scheduler_argument_vector != expected_scheduler_argument_vector
+        || plan
+            .pointer("/schedulerAction/arguments")
+            .and_then(Value::as_str)
+            != Some(expected_scheduler_arguments.as_str())
+    {
+        return Err(
+            "live keeper scheduler action does not exactly bind the hidden launcher".to_string(),
+        );
+    }
 
     let tools_root = harness_home.join("tools");
     for (flag, label) in [
@@ -3137,6 +3860,7 @@ pub fn validate_live_windows_reconcile_keeper_plan(plan: &Value) -> Result<(), S
         .and_then(Value::as_array)
         .ok_or_else(|| "live keeper script manifest is missing".to_string())?;
     for name in [
+        "launch-hidden",
         "install",
         "start",
         "stop",
@@ -3197,9 +3921,6 @@ pub fn keeper_task_identity_matches(plan: &Value, observed: &Value) -> bool {
         ("/task/name", "/task/name"),
         ("/task/description", "/task/description"),
         ("/task/principal/userId", "/principal/userId"),
-        ("/action/executable", "/action/execute"),
-        ("/action/arguments", "/action/arguments"),
-        ("/action/workingDirectory", "/action/workingDirectory"),
         ("/task/trigger/userId", "/trigger/userId"),
         (
             "/task/trigger/recoveryStartBoundary",
@@ -3220,7 +3941,24 @@ pub fn keeper_task_identity_matches(plan: &Value, observed: &Value) -> bool {
             return false;
         }
     }
-    observed.pointer("/action/count").and_then(Value::as_u64) == Some(1)
+    let scheduled_action = plan
+        .get("schedulerAction")
+        .or_else(|| plan.get("action"))
+        .and_then(Value::as_object);
+    let scheduled_action_matches = scheduled_action.is_some_and(|action| {
+        action.get("executable").and_then(Value::as_str)
+            == observed.pointer("/action/execute").and_then(Value::as_str)
+            && action.get("arguments").and_then(Value::as_str)
+                == observed
+                    .pointer("/action/arguments")
+                    .and_then(Value::as_str)
+            && action.get("workingDirectory").and_then(Value::as_str)
+                == observed
+                    .pointer("/action/workingDirectory")
+                    .and_then(Value::as_str)
+    });
+    scheduled_action_matches
+        && observed.pointer("/action/count").and_then(Value::as_u64) == Some(1)
         && observed.pointer("/trigger/count").and_then(Value::as_u64) == Some(2)
         && observed
             .pointer("/trigger/logonCount")
@@ -3293,10 +4031,20 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 mod tests {
     use super::*;
     #[cfg(windows)]
-    use std::process::Command;
-    #[cfg(windows)]
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(windows)]
+    struct Command;
+
+    #[cfg(windows)]
+    impl Command {
+        fn new(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+            let mut command = std::process::Command::new(program);
+            crate::process_launch::configure_noninteractive_command(&mut command);
+            command
+        }
+    }
 
     #[cfg(windows)]
     static KEEPER_SCRIPT_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -3310,6 +4058,27 @@ mod tests {
         assert!(plan.action.direct_executable);
         assert_eq!(plan.action.executable, plan.executable.path);
         assert_eq!(plan.action.working_directory, fixture.runtime_workspace());
+        assert_eq!(plan.scheduler_action.window_style, "hidden");
+        assert!(plan.scheduler_action.child_create_no_window);
+        assert!(plan.scheduler_action.synchronous_wait);
+        assert_eq!(
+            plan.scheduler_action.argument_vector,
+            vec![
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-WindowStyle".to_string(),
+                "Hidden".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                plan.output_dir
+                    .join("scripts")
+                    .join("launch-hidden.ps1")
+                    .display()
+                    .to_string(),
+            ]
+        );
         assert!(
             plan.task
                 .name
@@ -3398,7 +4167,7 @@ mod tests {
         );
         assert_eq!(plan.task.path, "\\");
         assert!(!fixture.root.join("sibling-output").exists());
-        assert_eq!(plan.scripts.len(), 6);
+        assert_eq!(plan.scripts.len(), 7);
         assert!(plan.scripts.iter().all(|script| script.sha256.len() == 64));
 
         fixture.remove();
@@ -3497,17 +4266,34 @@ mod tests {
         }
 
         let live_plan = write_windows_reconcile_keeper_plan(fixture.live_options()).unwrap();
-        for name in ["install", "start", "stop", "uninstall"] {
+        for name in ["install", "start", "stop", "uninstall", "rollback"] {
             let live_script = fixture.script(&live_plan, name);
             assert!(
-                live_script.contains("live-control token is required"),
-                "live {name} must retain the token gate"
+                live_script.contains("AGENT_HARNESS_LIVE_CONTROL_TOKEN is required"),
+                "live {name} must retain the environment-only token gate"
+            );
+            assert!(
+                !live_script.contains("param([string] $LiveControlToken"),
+                "live {name} must not accept a token through process argv"
+            );
+            assert!(
+                !live_script.contains("-LiveControlToken"),
+                "live {name} must not forward a token through PowerShell argv"
+            );
+            assert!(
+                !live_script.contains("--live-control-token"),
+                "live {name} must not forward a token through child argv"
             );
         }
         assert!(
             fixture
-                .script(&live_plan, "start")
-                .contains("--live-control-token' $ResolvedLiveControlToken")
+                .script(&live_plan, "install")
+                .contains("Assert-KeeperLiveControlAuthorization -Action 'restart'")
+        );
+        assert!(
+            fixture
+                .script(&live_plan, "rollback")
+                .contains("Assert-KeeperLiveControlAuthorization -Action 'restart'")
         );
 
         let live_uninstall = fixture.script(&live_plan, "uninstall");
@@ -3757,6 +4543,51 @@ if ($XmlBoundary -ne '{}') {{ throw "task XML recovery boundary normalized to $X
     }
 
     #[test]
+    fn scheduler_root_uses_hash_bound_hidden_synchronous_launcher() {
+        let fixture = Fixture::new("hidden_scheduler_root");
+        let plan = write_windows_reconcile_keeper_plan(fixture.options()).unwrap();
+        let launcher = fixture.script(&plan, "launch-hidden");
+        let install = fixture.script(&plan, "install");
+
+        assert_eq!(plan.scheduler_action.window_style, "hidden");
+        assert!(plan.scheduler_action.child_create_no_window);
+        assert!(plan.scheduler_action.synchronous_wait);
+        assert!(
+            plan.scheduler_action
+                .argument_vector
+                .windows(2)
+                .any(|pair| pair == ["-WindowStyle", "Hidden"])
+        );
+        assert!(
+            plan.scheduler_action
+                .argument_vector
+                .last()
+                .is_some_and(|value| value.ends_with("launch-hidden.ps1"))
+        );
+        for required in [
+            "$StartInfo.UseShellExecute = $false",
+            "$StartInfo.CreateNoWindow = $true",
+            "$StartInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden",
+            "$Child.WaitForExit()",
+            "$ChildExitCode = $Child.ExitCode",
+            "exit $ChildExitCode",
+        ] {
+            assert!(
+                launcher.contains(required),
+                "hidden launcher is missing {required}"
+            );
+        }
+        let integrity = launcher.find("\nAssert-KeeperPlanIntegrity\n").unwrap();
+        let spawn = launcher.find("[Diagnostics.Process]::Start").unwrap();
+        assert!(integrity < spawn);
+        assert!(install.contains("$Plan.schedulerAction.executable"));
+        assert!(install.contains("$Plan.schedulerAction.arguments"));
+        assert!(install.contains("$Plan.schedulerAction.workingDirectory"));
+
+        fixture.remove();
+    }
+
+    #[test]
     fn plan_digest_is_deterministic_and_excludes_only_its_own_field() {
         let fixture = Fixture::new("deterministic_digest");
         let first = write_windows_reconcile_keeper_plan(fixture.options()).unwrap();
@@ -3941,7 +4772,7 @@ if ($XmlBoundary -ne '{}') {{ throw "task XML recovery boundary normalized to $X
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");
 
         for (script_name, action, mutation) in [
-            ("install", "cutover", "Register-ScheduledTask"),
+            ("install", "restart", "Register-ScheduledTask"),
             (
                 "start",
                 "start",
@@ -3977,7 +4808,8 @@ if ($XmlBoundary -ne '{}') {{ throw "task XML recovery boundary normalized to $X
                 .unwrap();
             assert!(!output.status.success());
             assert!(
-                String::from_utf8_lossy(&output.stderr).contains("token is required"),
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("AGENT_HARNESS_LIVE_CONTROL_TOKEN is required"),
                 "{script_name} did not fail closed on a missing live token"
             );
 
@@ -4077,9 +4909,9 @@ if ($XmlBoundary -ne '{}') {{ throw "task XML recovery boundary normalized to $X
             "principal": {"userId": plan.task.principal.user_id},
             "action": {
                 "count": 1,
-                "execute": plan.action.executable,
-                "arguments": plan.action.arguments,
-                "workingDirectory": plan.action.working_directory,
+                "execute": plan.scheduler_action.executable,
+                "arguments": plan.scheduler_action.arguments,
+                "workingDirectory": plan.scheduler_action.working_directory,
             },
             "trigger": {
                 "count": 2,
@@ -4109,6 +4941,267 @@ if ($XmlBoundary -ne '{}') {{ throw "task XML recovery boundary normalized to $X
         );
         assert!(install.contains("refusing to overwrite foreign scheduled task"));
         fixture.remove();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn keeper_scripts_reject_tampered_plan_digests_before_scheduler_mutation() {
+        let _guard = KEEPER_SCRIPT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+
+        for (name, tamper, expected_error) in [
+            (
+                "stale_plan_digest",
+                "task",
+                "keeper plan digest does not match canonical plan content",
+            ),
+            (
+                "stale_action_digest",
+                "action",
+                "keeper action digest does not match canonical action content",
+            ),
+        ] {
+            let fixture = Fixture::new(name);
+            let plan = write_windows_reconcile_keeper_plan(fixture.options()).unwrap();
+            let install = plan
+                .scripts
+                .iter()
+                .find(|script| script.name == "install")
+                .unwrap();
+            let observation_file = fixture.root.join("task.json");
+            let legacy_file = fixture.root.join("legacy.json");
+            let effect_file = fixture.root.join("effect.json");
+            let missing = missing_task_snapshot(&plan);
+            let exact_disabled = exact_task_snapshot(&plan, "Disabled", false);
+            fs::write(
+                &observation_file,
+                serde_json::to_vec(&serde_json::json!({
+                    "sequence": [
+                        missing.clone(),
+                        missing,
+                        exact_disabled.clone(),
+                        exact_disabled
+                    ]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(&legacy_file, br#"{"tasks":[]}"#).unwrap();
+
+            let mut persisted: Value =
+                serde_json::from_slice(&fs::read(&plan.plan_file).unwrap()).unwrap();
+            match tamper {
+                "task" => {
+                    persisted["task"]["settings"]["restartCount"] =
+                        Value::Number(serde_json::Number::from(254));
+                }
+                "action" => {
+                    persisted["action"]["arguments"] =
+                        Value::String("tampered action arguments".to_string());
+                    persisted["planDigest"] =
+                        Value::String(windows_reconcile_keeper_plan_digest(&persisted).unwrap());
+                }
+                _ => unreachable!(),
+            }
+            fs::write(&plan.plan_file, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+            let output = Command::new(&powershell)
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ])
+                .arg(&install.path)
+                .env(
+                    "AGENT_HARNESS_KEEPER_TEST_TASK_OBSERVATION_FILE",
+                    &observation_file,
+                )
+                .env(
+                    "AGENT_HARNESS_KEEPER_TEST_LEGACY_OBSERVATION_FILE",
+                    &legacy_file,
+                )
+                .env("AGENT_HARNESS_KEEPER_TEST_EFFECT_FILE", &effect_file)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{name} unexpectedly reached a successful install"
+            );
+            assert!(
+                stderr.contains(expected_error),
+                "{name} did not fail at the plan-integrity gate: {stderr}"
+            );
+            assert!(
+                !effect_file.exists(),
+                "{name} reached the scheduled-task mutation seam"
+            );
+            fixture.remove();
+        }
+    }
+
+    #[test]
+    fn every_generated_keeper_script_validates_both_digests_before_scheduler_access() {
+        let fixture = Fixture::new("all_script_integrity_order");
+        let plan = write_windows_reconcile_keeper_plan(fixture.options()).unwrap();
+        for script in &plan.scripts {
+            let generated = fs::read_to_string(&script.path).unwrap();
+            let action_digest = generated
+                .find("Get-KeeperCanonicalJsonSha256 -Value $Plan.action")
+                .unwrap_or_else(|| panic!("{} lacks action digest recomputation", script.name));
+            let plan_digest = generated
+                .find("Get-KeeperCanonicalJsonSha256 -Value $Plan -ExcludedProperty 'planDigest'")
+                .unwrap_or_else(|| panic!("{} lacks plan digest recomputation", script.name));
+            let integrity_call = generated
+                .find("\nAssert-KeeperPlanIntegrity\n")
+                .unwrap_or_else(|| panic!("{} lacks the integrity gate", script.name));
+            assert!(
+                action_digest < integrity_call && plan_digest < integrity_call,
+                "{} invokes its integrity gate before defining both recomputations",
+                script.name
+            );
+
+            let first_control_or_spawn_access = [
+                "Get-ScheduledTask",
+                "Get-ScheduledTaskInfo",
+                "Register-ScheduledTask",
+                "Unregister-ScheduledTask",
+                "Enable-ScheduledTask",
+                "Disable-ScheduledTask",
+                "Start-ScheduledTask",
+                "Stop-ScheduledTask",
+                "Export-ScheduledTask",
+                "[Diagnostics.Process]::Start",
+            ]
+            .iter()
+            .filter_map(|marker| generated.find(marker))
+            .min()
+            .unwrap_or_else(|| panic!("{} has no scheduler or spawn seam", script.name));
+            assert!(
+                integrity_call < first_control_or_spawn_access,
+                "{} accesses Task Scheduler or spawns before validating the plan",
+                script.name
+            );
+        }
+        fixture.remove();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn keeper_generator_rejects_preexisting_state_junction_before_any_write() {
+        let fixture = Fixture::new("generator_state_junction");
+        let external_state = fixture.root.join("external-state");
+        let state_junction = fixture.harness_home.join("state");
+        fs::create_dir_all(&external_state).unwrap();
+        create_directory_junction(&state_junction, &external_state);
+
+        let result = write_windows_reconcile_keeper_plan(fixture.options());
+        let escaped_output = external_state
+            .join("supervisor/windows-reconcile-keeper")
+            .exists();
+        let error = result.err().map(|error| error.to_string());
+
+        fs::remove_dir(&state_junction).unwrap();
+        fixture.remove();
+
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|message| message.contains("physical containment")),
+            "pre-existing state junction was not rejected: {error:?}"
+        );
+        assert!(
+            !escaped_output,
+            "keeper output escaped through the pre-existing state junction"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn keeper_script_rejects_post_generation_state_junction_before_any_effect() {
+        let _guard = KEEPER_SCRIPT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture = Fixture::new("runtime_state_junction");
+        let plan = write_windows_reconcile_keeper_plan(fixture.options()).unwrap();
+        let state_path = fixture.harness_home.join("state");
+        let relocated_state = fixture.root.join("relocated-state");
+        fs::rename(&state_path, &relocated_state).unwrap();
+        create_directory_junction(&state_path, &relocated_state);
+
+        let observation_file = fixture.root.join("task.json");
+        let legacy_file = fixture.root.join("legacy.json");
+        let effect_file = fixture.root.join("effect.json");
+        let missing = missing_task_snapshot(&plan);
+        let exact_disabled = exact_task_snapshot(&plan, "Disabled", false);
+        fs::write(
+            &observation_file,
+            serde_json::to_vec(&serde_json::json!({
+                "sequence": [
+                    missing.clone(),
+                    missing,
+                    exact_disabled.clone(),
+                    exact_disabled
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(&legacy_file, br#"{"tasks":[]}"#).unwrap();
+
+        let install = plan
+            .scripts
+            .iter()
+            .find(|script| script.name == "install")
+            .unwrap();
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let output = Command::new(&powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&install.path)
+            .env(
+                "AGENT_HARNESS_KEEPER_TEST_TASK_OBSERVATION_FILE",
+                &observation_file,
+            )
+            .env(
+                "AGENT_HARNESS_KEEPER_TEST_LEGACY_OBSERVATION_FILE",
+                &legacy_file,
+            )
+            .env("AGENT_HARNESS_KEEPER_TEST_EFFECT_FILE", &effect_file)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let reached_effect = effect_file.exists();
+
+        fs::remove_dir(&state_path).unwrap();
+        fs::rename(&relocated_state, &state_path).unwrap();
+        fixture.remove();
+
+        assert!(
+            !output.status.success(),
+            "runtime state junction unexpectedly reached a successful install"
+        );
+        assert!(
+            stderr.contains("physical containment"),
+            "runtime state junction did not fail at the physical containment gate: {stderr}"
+        );
+        assert!(
+            !reached_effect,
+            "runtime state junction reached the scheduled-task mutation seam"
+        );
     }
 
     #[cfg(windows)]
@@ -5102,9 +6195,9 @@ if ($XmlBoundary -ne '{}') {{ throw "task XML recovery boundary normalized to $X
             },
             "action": {
                 "count": 1,
-                "execute": plan.action.executable,
-                "arguments": plan.action.arguments,
-                "workingDirectory": plan.action.working_directory,
+                "execute": plan.scheduler_action.executable,
+                "arguments": plan.scheduler_action.arguments,
+                "workingDirectory": plan.scheduler_action.working_directory,
             },
             "trigger": {
                 "count": 2,
@@ -5156,6 +6249,24 @@ if ($XmlBoundary -ne '{}') {{ throw "task XML recovery boundary normalized to $X
     fn arg_value(args: &[String], flag: &str) -> String {
         let index = args.iter().position(|value| value == flag).unwrap();
         args[index + 1].clone()
+    }
+
+    #[cfg(windows)]
+    fn create_directory_junction(link: &Path, target: &Path) {
+        let output = Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to create test junction {} -> {}: {}{}",
+            link.display(),
+            target.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     struct Fixture {

@@ -942,6 +942,12 @@ fn validate_supervisor_object(path: &str, value: &Value, errors: &mut Vec<String
             "enabled" | "manageAllLoops" | "autoReconcile" => {
                 expect_bool(path_key(path, key), child, errors)
             }
+            "ownershipMode" => expect_enum(
+                path_key(path, key),
+                child,
+                &["compatibility", "observe", "direct-owner"],
+                errors,
+            ),
             "defaultHeartbeatTimeoutMs" | "restartDelayMs" | "idleMs" => {
                 expect_positive_i64(path_key(path, key), child, errors)
             }
@@ -960,6 +966,27 @@ fn validate_supervisor_object(path: &str, value: &Value, errors: &mut Vec<String
             "services" => validate_supervisor_services(path_key(path, key), child, errors),
             other => errors.push(format!("unknown supervisor config key `{other}` at {path}")),
         }
+    }
+    let ownership_mode = object
+        .get("ownershipMode")
+        .and_then(Value::as_str)
+        .unwrap_or("compatibility");
+    if ownership_mode != "compatibility"
+        && object
+            .get("autoReconcile")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        errors.push(format!(
+            "{path}.autoReconcile must be false when {path}.ownershipMode is `{ownership_mode}`"
+        ));
+    }
+    if ownership_mode == "direct-owner"
+        && object.get("enabled").and_then(Value::as_bool) != Some(true)
+    {
+        errors.push(format!(
+            "{path}.enabled must be true when {path}.ownershipMode is `direct-owner`"
+        ));
     }
 }
 
@@ -1587,6 +1614,81 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn supervisor_direct_owner_requires_enabled_without_auto_reconcile() {
+        let root = temp_root("supervisor_direct_owner_requires_explicit_fences");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "schema": "agent-harness.config.v1",
+              "supervisor": {
+                "enabled": true,
+                "autoReconcile": false,
+                "ownershipMode": "direct-owner"
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_harness_config(&harness_home).unwrap().status,
+            HarnessConfigValidationStatus::Valid
+        );
+
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "schema": "agent-harness.config.v1",
+              "supervisor": {
+                "enabled": false,
+                "autoReconcile": true,
+                "ownershipMode": "direct-owner"
+              }
+            }"#,
+        )
+        .unwrap();
+        let invalid = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(invalid.status, HarnessConfigValidationStatus::Invalid);
+        assert!(invalid.errors.iter().any(|error| {
+            error.contains("autoReconcile must be false")
+                && error.contains("ownershipMode is `direct-owner`")
+        }));
+        assert!(invalid.errors.iter().any(|error| {
+            error.contains("enabled must be true")
+                && error.contains("ownershipMode is `direct-owner`")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_observe_rejects_auto_reconcile() {
+        let root = temp_root("supervisor_observe_rejects_auto_reconcile");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "schema": "agent-harness.config.v1",
+              "supervisor": {
+                "enabled": true,
+                "autoReconcile": true,
+                "ownershipMode": "observe"
+              }
+            }"#,
+        )
+        .unwrap();
+        let invalid = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(invalid.status, HarnessConfigValidationStatus::Invalid);
+        assert!(invalid.errors.iter().any(|error| {
+            error.contains("autoReconcile must be false")
+                && error.contains("ownershipMode is `observe`")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn validates_current_config_shape() {
         let root = temp_root("validates_current_config_shape");
         let harness_home = root.join(".agent-harness");
@@ -1664,6 +1766,7 @@ mod tests {
               },
               "learning": {
                 "skillLearning": { "enabled": true, "applyMode": "propose" },
+                "skillSynthesis": { "enabled": true, "mode": "auto", "dailyCap": 3, "minToolCalls": 5, "minAssistantChars": 600 },
                 "selfImprovementReview": { "enabled": true, "mode": "dispatch-and-replace", "notify": true, "dailyCap": 24, "maxSelectedSkills": 1 },
                 "memoryNudge": { "enabled": true, "turnInterval": 6 },
                 "backgroundReview": { "enabled": true, "trigger": "signal", "dailyJobCap": 24 },

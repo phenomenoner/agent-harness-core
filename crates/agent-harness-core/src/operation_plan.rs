@@ -398,6 +398,18 @@ fn create_operation_plan_internal(
     lane_digest: Option<String>,
     enforce_exact_lane: bool,
 ) -> io::Result<OperationPlanCreateReport> {
+    let transaction_file =
+        operation_plan_mutation_transaction_file(&options.harness_home, &options.plan_id);
+    crate::logging::with_jsonl_append_lock(&transaction_file, || {
+        create_operation_plan_internal_locked(options, lane_digest, enforce_exact_lane)
+    })
+}
+
+fn create_operation_plan_internal_locked(
+    options: CreateOperationPlanOptions,
+    lane_digest: Option<String>,
+    enforce_exact_lane: bool,
+) -> io::Result<OperationPlanCreateReport> {
     let plan_dir = operation_plan_dir(&options.harness_home, &options.plan_id);
     let plan_file = plan_dir.join(PLAN_FILE);
     let receipts_file = plan_dir.join(RECEIPTS_FILE);
@@ -604,6 +616,16 @@ pub fn list_operation_plans(harness_home: PathBuf) -> io::Result<Vec<OperationPl
 pub fn add_operation_plan_item(
     options: OperationPlanAddItemOptions,
 ) -> io::Result<OperationPlanAddItemReport> {
+    let transaction_file =
+        operation_plan_mutation_transaction_file(&options.harness_home, &options.plan_id);
+    crate::logging::with_jsonl_append_lock(&transaction_file, || {
+        add_operation_plan_item_locked(options)
+    })
+}
+
+fn add_operation_plan_item_locked(
+    options: OperationPlanAddItemOptions,
+) -> io::Result<OperationPlanAddItemReport> {
     let plan_dir = operation_plan_dir(&options.harness_home, &options.plan_id);
     let plan_file = plan_dir.join(PLAN_FILE);
     let items_file = plan_dir.join(ITEMS_FILE);
@@ -696,6 +718,16 @@ pub fn add_operation_plan_item(
 }
 
 pub fn update_operation_plan_item(
+    options: OperationPlanUpdateItemOptions,
+) -> io::Result<OperationPlanUpdateItemReport> {
+    let transaction_file =
+        operation_plan_mutation_transaction_file(&options.harness_home, &options.plan_id);
+    crate::logging::with_jsonl_append_lock(&transaction_file, || {
+        update_operation_plan_item_locked(options)
+    })
+}
+
+fn update_operation_plan_item_locked(
     options: OperationPlanUpdateItemOptions,
 ) -> io::Result<OperationPlanUpdateItemReport> {
     let plan_dir = operation_plan_dir(&options.harness_home, &options.plan_id);
@@ -822,6 +854,16 @@ pub fn update_operation_plan_item(
 pub fn delegate_operation_plan_item(
     options: OperationPlanDelegateItemOptions,
 ) -> io::Result<OperationPlanUpdateItemReport> {
+    let transaction_file =
+        operation_plan_mutation_transaction_file(&options.harness_home, &options.plan_id);
+    crate::logging::with_jsonl_append_lock(&transaction_file, || {
+        delegate_operation_plan_item_locked(options)
+    })
+}
+
+fn delegate_operation_plan_item_locked(
+    options: OperationPlanDelegateItemOptions,
+) -> io::Result<OperationPlanUpdateItemReport> {
     let plan_dir = operation_plan_dir(&options.harness_home, &options.plan_id);
     let plan_file = plan_dir.join(PLAN_FILE);
     let items_file = plan_dir.join(ITEMS_FILE);
@@ -943,6 +985,16 @@ pub fn delegate_operation_plan_item(
 pub fn promote_operation_plan_items_from_dependencies(
     options: OperationPlanPromoteDependenciesOptions,
 ) -> io::Result<OperationPlanPromoteDependenciesReport> {
+    let transaction_file =
+        operation_plan_mutation_transaction_file(&options.harness_home, &options.plan_id);
+    crate::logging::with_jsonl_append_lock(&transaction_file, || {
+        promote_operation_plan_items_from_dependencies_locked(options)
+    })
+}
+
+fn promote_operation_plan_items_from_dependencies_locked(
+    options: OperationPlanPromoteDependenciesOptions,
+) -> io::Result<OperationPlanPromoteDependenciesReport> {
     let plan_dir = operation_plan_dir(&options.harness_home, &options.plan_id);
     let plan_file = plan_dir.join(PLAN_FILE);
     let items_file = plan_dir.join(ITEMS_FILE);
@@ -1025,6 +1077,16 @@ pub fn promote_operation_plan_items_from_dependencies(
 pub fn comment_on_operation_plan(
     options: OperationPlanCommentOptions,
 ) -> io::Result<OperationPlanCommentReport> {
+    let transaction_file =
+        operation_plan_mutation_transaction_file(&options.harness_home, &options.plan_id);
+    crate::logging::with_jsonl_append_lock(&transaction_file, || {
+        comment_on_operation_plan_locked(options)
+    })
+}
+
+fn comment_on_operation_plan_locked(
+    options: OperationPlanCommentOptions,
+) -> io::Result<OperationPlanCommentReport> {
     let plan_dir = operation_plan_dir(&options.harness_home, &options.plan_id);
     let plan_file = plan_dir.join(PLAN_FILE);
     let comments_file = plan_dir.join(COMMENTS_FILE);
@@ -1083,6 +1145,16 @@ pub fn comment_on_operation_plan(
 pub fn block_operation_plan(
     options: OperationPlanBlockOptions,
 ) -> io::Result<OperationPlanBlockReport> {
+    let transaction_file =
+        operation_plan_mutation_transaction_file(&options.harness_home, &options.plan_id);
+    crate::logging::with_jsonl_append_lock(&transaction_file, || {
+        block_operation_plan_locked(options)
+    })
+}
+
+fn block_operation_plan_locked(
+    options: OperationPlanBlockOptions,
+) -> io::Result<OperationPlanBlockReport> {
     let plan_dir = operation_plan_dir(&options.harness_home, &options.plan_id);
     let plan_file = plan_dir.join(PLAN_FILE);
     let receipts_file = plan_dir.join(RECEIPTS_FILE);
@@ -1138,6 +1210,16 @@ pub fn block_operation_plan(
 }
 
 pub fn complete_operation_plan(
+    options: OperationPlanCompleteOptions,
+) -> io::Result<OperationPlanCompleteReport> {
+    let transaction_file =
+        operation_plan_mutation_transaction_file(&options.harness_home, &options.plan_id);
+    crate::logging::with_jsonl_append_lock(&transaction_file, || {
+        complete_operation_plan_locked(options)
+    })
+}
+
+fn complete_operation_plan_locked(
     options: OperationPlanCompleteOptions,
 ) -> io::Result<OperationPlanCompleteReport> {
     let plan_dir = operation_plan_dir(&options.harness_home, &options.plan_id);
@@ -1313,6 +1395,10 @@ fn operation_plan_dir(harness_home: &Path, plan_id: &str) -> PathBuf {
         .join(safe_name(plan_id))
 }
 
+fn operation_plan_mutation_transaction_file(harness_home: &Path, plan_id: &str) -> PathBuf {
+    operation_plan_dir(harness_home, plan_id).join("mutation-transaction.jsonl")
+}
+
 fn read_json_plan(path: &Path) -> io::Result<OperationPlan> {
     let text = fs::read_to_string(path)?;
     serde_json::from_str(&text).map_err(io::Error::other)
@@ -1428,6 +1514,7 @@ fn safe_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1842,6 +1929,65 @@ mod tests {
         })
         .unwrap();
         assert_eq!(show.items.len(), 1);
+        assert_eq!(show.plan.version, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operation_plan_max_open_items_is_atomic_under_concurrent_adds() {
+        let root = temp_root("operation_plan_max_open_items_is_atomic_under_concurrent_adds");
+        let harness_home = root.join(".agent-harness");
+        create_operation_plan(CreateOperationPlanOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-concurrent-open-limit".to_string(),
+            origin_queue_id: None,
+            session_key: "session-concurrent".to_string(),
+            agent_id: "agent-main".to_string(),
+            goal: "enforce the stored open-item limit atomically".to_string(),
+            acceptance_criteria: None,
+            constraints: None,
+            max_open_items: Some(1),
+            max_fanout: None,
+            now_ms: 4550,
+        })
+        .unwrap();
+
+        const CONTENDERS: usize = 64;
+        let barrier = Arc::new(Barrier::new(CONTENDERS));
+        let mut threads = Vec::new();
+        for index in 0..CONTENDERS {
+            let barrier = Arc::clone(&barrier);
+            let harness_home = harness_home.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                add_operation_plan_item(OperationPlanAddItemOptions {
+                    harness_home,
+                    plan_id: "plan-concurrent-open-limit".to_string(),
+                    item_id: format!("item-{index:02}"),
+                    title: format!("concurrent item {index}"),
+                    body: "only one contender may become durable".to_string(),
+                    depends_on: Vec::new(),
+                    acceptance_criteria: None,
+                    risk: None,
+                    now_ms: 4551 + index as i64,
+                })
+            }));
+        }
+
+        let successful_adds = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(Result::is_ok)
+            .count();
+        let show = show_operation_plan(OperationPlanShowOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-concurrent-open-limit".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(successful_adds, 1, "the plan-wide limit must be atomic");
+        assert_eq!(show.items.len(), 1);
+        assert_eq!(show.open_items.count, 1);
         assert_eq!(show.plan.version, 2);
         let _ = fs::remove_dir_all(root);
     }

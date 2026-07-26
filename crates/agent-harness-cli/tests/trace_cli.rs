@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agent_harness_core::process_launch::configure_noninteractive_command;
+
 fn temp_root(test_name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -15,7 +17,9 @@ fn temp_root(test_name: &str) -> PathBuf {
 }
 
 fn harness_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_agent-harness"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-harness"));
+    configure_noninteractive_command(&mut command);
+    command
 }
 
 #[test]

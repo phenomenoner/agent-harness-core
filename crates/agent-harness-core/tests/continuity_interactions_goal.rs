@@ -452,7 +452,9 @@ fn discord_active_goal_authority_conflict_parks_visibly_instead_of_silent_succes
     ));
     assert_eq!(
         report.receipt.source_closure_reason.as_deref(),
-        Some("goal-transition-needs-authority")
+        Some(
+            "goal-transition-needs-authority: goal-correlated work cannot transition because exact authority is Conflict"
+        )
     );
     assert!(report.receipt.child_queue_id.is_none());
     assert!(report.receipt.continuation_link.is_none());
@@ -622,7 +624,9 @@ fn discord_active_goal_authority_conflict_fences_shell_recovery_child() {
     );
     assert_eq!(
         report.receipt.source_closure_reason.as_deref(),
-        Some("goal-transition-needs-authority")
+        Some(
+            "goal-transition-needs-authority: goal-correlated work cannot transition because exact authority is Conflict"
+        )
     );
     assert!(report.receipt.child_queue_id.is_none());
     assert!(report.receipt.continuation_link.is_none());
@@ -1007,9 +1011,11 @@ fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
         } else {
             assert_eq!(report.receipt.status, RuntimeRunOnceStatus::NeedsUser);
             let expected_reason = match expected {
-                "budget-park" => "shell-recovery-budget-exhausted",
-                "effect-fence-park" => "shell-recovery-external-effect-fenced",
-                _ => "goal-autonomy-observe",
+                "budget-park" => "shell-recovery-budget-exhausted-after-fresh-runtime-continuation",
+                "effect-fence-park" => {
+                    "shell-recovery-fenced-by-external-effect-or-mutation-evidence"
+                }
+                _ => "goal autonomy defaults to observation-only behavior",
             };
             assert_eq!(
                 report.receipt.source_closure_reason.as_deref(),

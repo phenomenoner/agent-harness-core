@@ -137,6 +137,25 @@ pub fn validate_live_control_token(
     action: LiveControlAction,
     now_ms: i64,
 ) -> io::Result<LiveControlTokenValidation> {
+    validate_live_control_token_with_scope(harness_home, token, action, now_ms, false)
+}
+
+pub fn validate_exact_live_control_token(
+    harness_home: &Path,
+    token: Option<&str>,
+    action: LiveControlAction,
+    now_ms: i64,
+) -> io::Result<LiveControlTokenValidation> {
+    validate_live_control_token_with_scope(harness_home, token, action, now_ms, true)
+}
+
+fn validate_live_control_token_with_scope(
+    harness_home: &Path,
+    token: Option<&str>,
+    action: LiveControlAction,
+    now_ms: i64,
+    require_exact_action: bool,
+) -> io::Result<LiveControlTokenValidation> {
     let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) else {
         return Ok(LiveControlTokenValidation {
             status: LiveControlTokenStatus::Missing,
@@ -158,9 +177,12 @@ pub fn validate_live_control_token(
                 let Ok(record) = serde_json::from_str::<LiveControlTokenRecord>(trimmed) else {
                     continue;
                 };
-                if record.token_hash == token_hash
-                    && live_control_action_authorizes(record.action, action)
-                {
+                let action_matches = if require_exact_action {
+                    record.action == action
+                } else {
+                    live_control_action_authorizes(record.action, action)
+                };
+                if record.token_hash == token_hash && action_matches {
                     last_match = Some(record);
                 }
             }
@@ -172,7 +194,11 @@ pub fn validate_live_control_token(
     let Some(record) = last_match else {
         return Ok(LiveControlTokenValidation {
             status: LiveControlTokenStatus::Invalid,
-            reason: "live-control token was not found for this action".to_string(),
+            reason: if require_exact_action {
+                "live-control token was not found for this exact action".to_string()
+            } else {
+                "live-control token was not found for this action".to_string()
+            },
             ticket_id: None,
             expires_at_ms: None,
         });
@@ -524,6 +550,70 @@ mod tests {
                 "{action:?}"
             );
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_restart_validation_rejects_a_broader_cutover_grant() {
+        let root = temp_root("exact_restart_scope");
+        let home = root.join(".agent-harness");
+        fs::create_dir_all(home.join("state").join("cutover")).unwrap();
+        let restart_token = "exact-restart-token";
+        let cutover_token = "broader-cutover-token";
+        let records = [
+            LiveControlTokenRecord {
+                schema: LIVE_CONTROL_TOKEN_SCHEMA.to_string(),
+                token_hash: hash_live_control_token(restart_token),
+                ticket_id: Some("restart-ticket".to_string()),
+                action: LiveControlAction::Restart,
+                issued_to: Some("operator".to_string()),
+                issued_at_ms: 1000,
+                expires_at_ms: 2000,
+                revoked: false,
+                reason: None,
+            },
+            LiveControlTokenRecord {
+                schema: LIVE_CONTROL_TOKEN_SCHEMA.to_string(),
+                token_hash: hash_live_control_token(cutover_token),
+                ticket_id: Some("cutover-ticket".to_string()),
+                action: LiveControlAction::Cutover,
+                issued_to: Some("operator".to_string()),
+                issued_at_ms: 1000,
+                expires_at_ms: 2000,
+                revoked: false,
+                reason: None,
+            },
+        ];
+        fs::write(
+            live_control_tokens_file(&home),
+            records
+                .iter()
+                .map(|record| serde_json::to_string(record).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let exact = validate_exact_live_control_token(
+            &home,
+            Some(restart_token),
+            LiveControlAction::Restart,
+            1500,
+        )
+        .unwrap();
+        assert_eq!(exact.status, LiveControlTokenStatus::Valid);
+
+        let broader = validate_exact_live_control_token(
+            &home,
+            Some(cutover_token),
+            LiveControlAction::Restart,
+            1500,
+        )
+        .unwrap();
+        assert_eq!(broader.status, LiveControlTokenStatus::Invalid);
+        assert!(broader.reason.contains("exact action"));
 
         let _ = fs::remove_dir_all(root);
     }

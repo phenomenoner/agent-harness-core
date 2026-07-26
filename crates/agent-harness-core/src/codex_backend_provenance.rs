@@ -6,7 +6,7 @@ use std::process::Command;
 use ring::digest;
 use serde::{Deserialize, Serialize};
 
-use crate::write_json_atomic;
+use crate::{process_launch::configure_noninteractive_command, write_json_atomic};
 
 pub const CODEX_BACKEND_PROVENANCE_SCHEMA: &str = "agent-harness.codex-backend-provenance.v1";
 pub const REQUIRED_CODEX_BACKEND_VERSION: &str = "0.144.5";
@@ -82,7 +82,10 @@ pub fn probe_codex_backend_provenance(
             expected, executable_sha256
         )));
     }
-    let output = Command::new(&canonical_path).arg("--version").output()?;
+    let mut command = Command::new(&canonical_path);
+    command.arg("--version");
+    configure_noninteractive_command(&mut command);
+    let output = command.output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "Codex version probe exited with {}",

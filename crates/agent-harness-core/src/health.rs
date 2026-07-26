@@ -11,11 +11,16 @@ use serde_json::Value;
 use crate::{
     HarnessGovernedTransitionStatus, HarnessStatusOptions, SkillDoctorStatus, SkillDoctorSummary,
     collect_harness_status, harness_config_candidates,
+    logging::current_log_time_ms,
     loop_health::{process_alive_for_pid, process_start_time_ms_for_pid},
     supervisor_topology::{SupervisorTopologyOverrides, derive_supervisor_topology},
 };
 
 const HEALTHZ_SCHEMA: &str = "agent-harness.healthz.v1";
+
+fn effective_health_observation_time_ms(collection_started_ms: i64, observed_now_ms: i64) -> i64 {
+    collection_started_ms.max(observed_now_ms)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthzOptions {
@@ -279,8 +284,16 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
     let (supervisor_topology_exact, supervisor_topology_findings) =
         exact_reconcile_managed_topology(&options.harness_home, &supervisor_services)?;
     warnings.extend(supervisor_topology_findings);
-    let reconcile_keeper =
-        reconcile_keeper_health(&options.harness_home, options.now_ms, options.loop_stale_ms)?;
+    let keeper_observation_ms = current_log_time_ms()
+        .map(|observed_now_ms| {
+            effective_health_observation_time_ms(options.now_ms, observed_now_ms)
+        })
+        .unwrap_or(options.now_ms);
+    let reconcile_keeper = reconcile_keeper_health(
+        &options.harness_home,
+        keeper_observation_ms,
+        options.loop_stale_ms,
+    )?;
     if reconcile_keeper.as_ref().is_some_and(|keeper| keeper.stale) {
         warnings.push(
             "supervisor reconcile keeper is not live; all child loops can disappear together and remain down"
@@ -493,7 +506,7 @@ fn reconcile_keeper_health(
     now_ms: i64,
     stale_after_ms: i64,
 ) -> io::Result<Option<HealthzReconcileKeeper>> {
-    let manage_all_loops = harness_config_candidates(harness_home)
+    let supervisor_config = harness_config_candidates(harness_home)
         .into_iter()
         .find(|path| path.is_file())
         .map(fs::read_to_string)
@@ -507,13 +520,18 @@ fn reconcile_keeper_health(
             })
         })
         .transpose()?
-        .and_then(|config| {
-            config
-                .pointer("/supervisor/manageAllLoops")
-                .and_then(Value::as_bool)
-        })
+        .and_then(|config| config.get("supervisor").cloned());
+    let manage_all_loops = supervisor_config
+        .as_ref()
+        .and_then(|supervisor| supervisor.get("manageAllLoops"))
+        .and_then(Value::as_bool)
         .unwrap_or(false);
-    if !manage_all_loops {
+    let ownership_mode = supervisor_config
+        .as_ref()
+        .and_then(|supervisor| supervisor.get("ownershipMode"))
+        .and_then(Value::as_str)
+        .unwrap_or("compatibility");
+    if !manage_all_loops || ownership_mode != "compatibility" {
         return Ok(None);
     }
 
@@ -1327,6 +1345,45 @@ mod tests {
             Some("reconcile keeper state is missing")
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_owner_health_does_not_require_compatibility_reconcile_keeper() {
+        let root = temp_root("direct_owner_no_reconcile_keeper");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("harness-config.json"),
+            r#"{"supervisor":{"ownershipMode":"direct-owner","manageAllLoops":true,"autoReconcile":false}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reconcile_keeper_health(&root, 10_000, 120_000).unwrap(),
+            None
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn keeper_observation_time_is_refreshed_after_slow_status_collection() {
+        let collection_started_ms: i64 = 10_000;
+        let observed_at_keeper_read_ms: i64 = 25_000;
+        let heartbeat_at_ms: i64 = 24_000;
+
+        let observation_now_ms =
+            effective_health_observation_time_ms(collection_started_ms, observed_at_keeper_read_ms);
+        let stale_snapshot_age_ms = collection_started_ms.saturating_sub(heartbeat_at_ms);
+        let refreshed_age_ms = observation_now_ms.saturating_sub(heartbeat_at_ms);
+
+        assert!(
+            !(-10_000..=120_000).contains(&stale_snapshot_age_ms),
+            "the pre-scan snapshot must reproduce the false future-heartbeat classification"
+        );
+        assert_eq!(observation_now_ms, observed_at_keeper_read_ms);
+        assert!(
+            (-10_000..=120_000).contains(&refreshed_age_ms),
+            "keeper freshness must be evaluated at the keeper observation boundary"
+        );
     }
 
     #[cfg(windows)]

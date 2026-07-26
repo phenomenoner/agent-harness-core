@@ -1,6 +1,6 @@
 # Adaptive Skill Intelligence
 
-> **Status: product design direction.** Agent Harness Core already provides auditable skill discovery and selection, revision-bound receipts, proposal-mediated mutation, guarded apply, lifecycle tooling, and virtual-session foundations. The outcome-linked learning, contextual belief, and progressive promotion system described here is not yet fully implemented or enabled.
+> **Status: product design direction.** Agent Harness Core already provides auditable skill discovery and selection, revision-bound receipts, proposal-mediated mutation, guarded autonomous apply for mature paths, lifecycle tooling, and virtual-session foundations. The outcome-linked learning, contextual belief, and broad autonomous promotion system described here is not yet fully implemented or enabled.
 
 [Read the web essay](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/) or continue with the source-oriented design below.
 
@@ -13,6 +13,13 @@ Agent Harness Core treats a skill in the same spirit: a versioned piece of **pro
 This creates a capability asset that can compound across tasks. New evidence can improve an existing procedure, reveal a safer or cheaper variant, resolve a conflict, retire an obsolete approach, or justify a new skill. The model may remain unchanged while the agent around it becomes better adapted to its work and environment.
 
 The objective is not unrestricted self-rewriting. It is **evidence-governed procedural learning**: observable, scoped, cost-aware, reversible, and measured against task outcomes.
+
+The product end state is autonomous by default across the skill lifecycle. A
+proposal is an immutable trace, evaluation input, and rollback anchor—not a
+routine human approval queue. Human intervention is reserved for a concrete
+technical or safety blocker such as insufficient evidence, unsafe content,
+privileged effects, non-atomic rollback, ambiguous ownership, or a failed
+reliability gate.
 
 ## What Belongs in a Skill
 
@@ -95,7 +102,7 @@ flowchart LR
     G -- No --> H[Retain evidence only]
     G -- Yes --> I[Versioned proposal]
     I --> J[Held-out evaluation and shadow comparison]
-    J --> K[Approve, promote, reject, or roll back]
+    J --> K[Autonomously promote, block, quarantine, or roll back]
 ```
 
 Being selected or read is not success evidence. A multi-skill task does not give every selected skill equal credit. A user correction may indicate a retrieval mistake, a defective procedure, a composition conflict, an obsolete tool contract, or a one-off fact that should never become a skill.
@@ -131,7 +138,7 @@ An evaluator cascade may use:
 2. statistical checks for repeated outcomes, calibration, drift, and cost;
 3. a bounded lower-cost model for classification or comparison;
 4. a stronger specialist model for ambiguous, novel, or high-impact proposals;
-5. explicit operator review for privileged effects, policy-like changes, broad topology changes, or insufficient evidence.
+5. explicit operator escalation only when privileged effects, policy-like changes, broad topology changes, insufficient evidence, or another concrete blocker prevents autonomous disposition.
 
 Evaluator cost, escalation rate, later overturns, missed regressions, and decision-regret reduction are all measured. The model that performed a task is not automatically its own judge.
 
@@ -198,6 +205,6 @@ The project will move from foundations to adaptive behavior through observable g
 3. compare outcome, coverage, abstention, disclosure, latency, and cost on a frozen replay corpus;
 4. join real task outcomes before generating governed content or topology proposals;
 5. promote only reversible, independently evaluated changes in a narrow cohort;
-6. widen autonomy by evidence and risk class, with a tested downgrade at every boundary.
+6. widen guarded autonomy until it covers the full skill lifecycle, with a tested downgrade at every boundary and operator escalation only for concrete blockers.
 
 Current implementation details and public compatibility behavior are documented in [Skill Ecosystem](skill-ecosystem.md). This article describes the product direction and evaluation contract, not a claim that broad autonomous evolution is already active.

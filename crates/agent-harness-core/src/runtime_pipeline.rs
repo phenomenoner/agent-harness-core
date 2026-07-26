@@ -40,9 +40,10 @@ use crate::rich_presentation::{
     rich_presentation_from_plain_final_with_attachment_count,
 };
 use crate::runtime_worker::{
-    QueueTerminalControl, record_terminal_control_suppression, refresh_runtime_queue_state_index,
-    resolve_queue_terminal_control, runtime_queue_prior_failure_count_from_index,
-    runtime_queue_status_count_from_index,
+    QueueTerminalControl, RuntimeQueueLeaseReleaseAuthority, RuntimeQueueLeaseReleaseStatus,
+    record_terminal_control_suppression, refresh_runtime_queue_state_index,
+    release_runtime_queue_lease_if_owned, resolve_queue_terminal_control,
+    runtime_queue_prior_failure_count_from_index, runtime_queue_status_count_from_index,
 };
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
@@ -65,8 +66,7 @@ use crate::{
     load_response_tone_config, mark_cron_run_runtime_status_by_queue_id,
     mark_virtual_session_terminal, plan_codex_runtime, prepare_runtime_queue_item,
     read_channel_session_state_v2, record_memory_lifecycle_turn,
-    record_skill_usage_from_prompt_bundle, release_runtime_queue_lease,
-    requeue_prepared_context_rollover_if_no_parent_siblings,
+    record_skill_usage_from_prompt_bundle, requeue_prepared_context_rollover_if_no_parent_siblings,
     resolve_inbound_media_artifact_reference, root_working_session_key, run_codex_runtime,
     run_self_improvement_review_hook, write_json_atomic, write_media_policy_receipt,
     write_runtime_queue_quarantine_marker,
@@ -309,10 +309,26 @@ pub enum RuntimeSourceClosureKindV1 {
     SuppressedExactOwnerMismatch,
 }
 
+impl RuntimeSourceClosureKindV1 {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CommittedHandoff => "committed-handoff",
+            Self::TerminalGoalSurface => "terminal-goal-surface",
+            Self::ParkedObserve => "parked-observe",
+            Self::ParkedPolicyDenied => "parked-policy-denied",
+            Self::OrdinaryFinal => "ordinary-final",
+            Self::SuppressedExactOwnerMismatch => "suppressed-exact-owner-mismatch",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeSourceClosureDecision {
     CommittedHandoff,
-    TerminalGoalSurface,
+    TerminalGoalSuccess,
+    TerminalGoalNeedsUser,
+    TerminalGoalCanceled,
+    TerminalGoalFailure,
     ParkedObserve,
     ParkedPolicyDenied,
     OrdinaryFinal,
@@ -323,7 +339,10 @@ impl RuntimeSourceClosureDecision {
     fn kind(self) -> RuntimeSourceClosureKindV1 {
         match self {
             Self::CommittedHandoff => RuntimeSourceClosureKindV1::CommittedHandoff,
-            Self::TerminalGoalSurface => RuntimeSourceClosureKindV1::TerminalGoalSurface,
+            Self::TerminalGoalSuccess
+            | Self::TerminalGoalNeedsUser
+            | Self::TerminalGoalCanceled
+            | Self::TerminalGoalFailure => RuntimeSourceClosureKindV1::TerminalGoalSurface,
             Self::ParkedObserve => RuntimeSourceClosureKindV1::ParkedObserve,
             Self::ParkedPolicyDenied => RuntimeSourceClosureKindV1::ParkedPolicyDenied,
             Self::OrdinaryFinal => RuntimeSourceClosureKindV1::OrdinaryFinal,
@@ -342,9 +361,12 @@ impl RuntimeSourceClosureDecision {
             Self::SuppressedExactOwnerMismatch => {
                 crate::RuntimeTerminalDispositionV1::TerminalSuppression
             }
-            Self::TerminalGoalSurface | Self::OrdinaryFinal => {
+            Self::TerminalGoalSuccess | Self::OrdinaryFinal => {
                 crate::RuntimeTerminalDispositionV1::LogicalSuccess
             }
+            Self::TerminalGoalNeedsUser => crate::RuntimeTerminalDispositionV1::NeedsUser,
+            Self::TerminalGoalCanceled => crate::RuntimeTerminalDispositionV1::LogicalCanceled,
+            Self::TerminalGoalFailure => crate::RuntimeTerminalDispositionV1::LogicalFailure,
         }
     }
 
@@ -352,11 +374,32 @@ impl RuntimeSourceClosureDecision {
         match self {
             Self::CommittedHandoff => SourceFinalExpectationV1::NotApplicable,
             Self::SuppressedExactOwnerMismatch => SourceFinalExpectationV1::ExplicitNonDelivery,
-            Self::TerminalGoalSurface
+            Self::TerminalGoalSuccess
+            | Self::TerminalGoalNeedsUser
+            | Self::TerminalGoalCanceled
+            | Self::TerminalGoalFailure
             | Self::ParkedObserve
             | Self::ParkedPolicyDenied
             | Self::OrdinaryFinal => SourceFinalExpectationV1::Required,
         }
+    }
+}
+
+fn terminal_goal_source_closure(decision: GoalTransitionDecision) -> RuntimeSourceClosureDecision {
+    match decision {
+        GoalTransitionDecision::Complete => RuntimeSourceClosureDecision::TerminalGoalSuccess,
+        GoalTransitionDecision::Pause
+        | GoalTransitionDecision::NeedsUser
+        | GoalTransitionDecision::NeedsAuthority
+        | GoalTransitionDecision::NeedsOperatorAuth => {
+            RuntimeSourceClosureDecision::TerminalGoalNeedsUser
+        }
+        GoalTransitionDecision::Stop => RuntimeSourceClosureDecision::TerminalGoalCanceled,
+        GoalTransitionDecision::Continue
+        | GoalTransitionDecision::Rollover
+        | GoalTransitionDecision::BudgetExhausted
+        | GoalTransitionDecision::NoProgressExhausted
+        | GoalTransitionDecision::Failed => RuntimeSourceClosureDecision::TerminalGoalFailure,
     }
 }
 
@@ -761,6 +804,55 @@ struct RuntimeRunMetadata {
     continuation: RuntimeContinuationMetadata,
 }
 
+struct RuntimeQueueLeaseReleaseGuard {
+    harness_home: PathBuf,
+    queue_id: Option<String>,
+    authority: Option<RuntimeQueueLeaseReleaseAuthority>,
+}
+
+impl RuntimeQueueLeaseReleaseGuard {
+    fn from_prepare(harness_home: &Path, prepare: &RuntimeQueuePrepareReport) -> Self {
+        let authority = prepare.lease_release_authority();
+        let owns_lease = matches!(
+            prepare.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+                | RuntimeExecutionReceiptStatus::AlreadyPrepared
+        ) && authority.is_some();
+        let queue_id = owns_lease
+            .then(|| prepare.receipt.queue_id.clone())
+            .flatten();
+        Self {
+            harness_home: harness_home.to_path_buf(),
+            queue_id,
+            authority,
+        }
+    }
+
+    fn release(&mut self) -> io::Result<RuntimeQueueLeaseReleaseStatus> {
+        let Some(queue_id) = self.queue_id.as_deref() else {
+            return Ok(RuntimeQueueLeaseReleaseStatus::AlreadyAbsent);
+        };
+        let Some(authority) = self.authority.as_ref() else {
+            self.queue_id = None;
+            return Ok(RuntimeQueueLeaseReleaseStatus::OwnershipLost);
+        };
+        let status = release_runtime_queue_lease_if_owned(&self.harness_home, queue_id, authority)?;
+        self.queue_id = None;
+        self.authority = None;
+        Ok(status)
+    }
+}
+
+impl Drop for RuntimeQueueLeaseReleaseGuard {
+    fn drop(&mut self) {
+        if let (Some(queue_id), Some(authority)) =
+            (self.queue_id.as_deref(), self.authority.as_ref())
+        {
+            let _ = release_runtime_queue_lease_if_owned(&self.harness_home, queue_id, authority);
+        }
+    }
+}
+
 fn runtime_run_metadata(prepare: &RuntimeQueuePrepareReport) -> RuntimeRunMetadata {
     if let Some(item) = prepare.item.as_ref() {
         return RuntimeRunMetadata {
@@ -800,6 +892,11 @@ fn run_runtime_queue_once_after_prepare(
         queue_id: options.queue_id.clone(),
         prompt_options: options.prompt_options,
     })?;
+    // The pipeline owns the durable lease after prepare. Every later `?` path,
+    // including protocol-terminal persistence failures, must make a best-effort
+    // release rather than leaving the exact lane parked until expiry.
+    let mut lease_release_guard =
+        RuntimeQueueLeaseReleaseGuard::from_prepare(&options.harness_home, &prepare);
     let mut warnings = prepare.warnings.clone();
     if !reconciled_goal_intents.is_empty() {
         warnings.push(format!(
@@ -970,10 +1067,7 @@ fn run_runtime_queue_once_after_prepare(
             gate_goal_continuation_after_lease(&options.harness_home, item, current_log_time_ms()?);
         let gate = match gate {
             Ok(gate) => gate,
-            Err(error) => {
-                let _ = release_runtime_queue_lease(&options.harness_home, &item.queue_id);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         match gate {
             GoalContinuationLeaseGate::NotContinuation => {}
@@ -986,7 +1080,7 @@ fn run_runtime_queue_once_after_prepare(
             GoalContinuationLeaseGate::Suppressed(fence) => {
                 let queue_id = item.queue_id.clone();
                 let metadata = runtime_run_metadata(&prepare);
-                release_runtime_queue_lease(&options.harness_home, &queue_id)?;
+                let _ = lease_release_guard.release()?;
                 let terminal_control = resolve_queue_terminal_control(
                     &options.harness_home,
                     &queue_id,
@@ -1093,7 +1187,7 @@ fn run_runtime_queue_once_after_prepare(
             )?
         {
             let metadata = runtime_run_metadata(&prepare);
-            if let Err(error) = release_runtime_queue_lease(&options.harness_home, queue_id) {
+            if let Err(error) = lease_release_guard.release() {
                 warnings.push(format!("runtime queue lease release failed: {error}"));
             }
             let _ = record_terminal_control_suppression(
@@ -1186,8 +1280,8 @@ fn run_runtime_queue_once_after_prepare(
             .unwrap_or(1);
         let no_prepared_threshold =
             no_prepared_execution_terminal_threshold(&options.harness_home).max(1);
-        if let Some(queue_id) = prepare.receipt.queue_id.as_deref() {
-            if let Err(error) = release_runtime_queue_lease(&options.harness_home, queue_id) {
+        if prepare.receipt.queue_id.is_some() {
+            if let Err(error) = lease_release_guard.release() {
                 warnings.push(format!("runtime queue lease release failed: {error}"));
             }
         }
@@ -1746,13 +1840,26 @@ fn run_runtime_queue_once_after_prepare(
                 failure.recovery_eligible
                     && failure.kind == CodexShellExecutionFailureKindV1::AppxExecutableDrift
             });
-    let active_goal = goal_transition
+    let active_goal_status = goal_transition
         .goal_status
         .as_deref()
         .is_some_and(is_goal_status_active);
-    let active_progress_only =
-        active_goal && goal_transition.surface == GoalTransitionSurface::ProgressOnly;
-    if active_goal && (active_progress_only || classified_shell_drift) {
+    let campaign_relation = matches!(
+        goal_transition.relation,
+        GoalTransitionRelation::CurrentGoalSlice
+            | GoalTransitionRelation::AuthorizedCampaignContinuation
+    );
+    let unresolved_goal_progress = receipt_status != RuntimeRunOnceStatus::AuthDeferred
+        && goal_transition.surface == GoalTransitionSurface::ProgressOnly
+        && (active_goal_status
+            || campaign_relation
+            || matches!(
+                goal_transition.decision,
+                GoalTransitionDecision::NeedsAuthority
+                    | GoalTransitionDecision::NeedsOperatorAuth
+                    | GoalTransitionDecision::NeedsUser
+            ));
+    if unresolved_goal_progress || (active_goal_status && classified_shell_drift) {
         let shell_effect_fence_clear = shell_recovery_effect_fence_clear(&run.receipt);
         let exact_continuation_authority = goal_transition.authority
             == GoalTransitionAuthority::Ready
@@ -1761,8 +1868,10 @@ fn run_runtime_queue_once_after_prepare(
                 GoalTransitionRelation::CurrentGoalSlice
                     | GoalTransitionRelation::AuthorizedCampaignContinuation
             );
-        let eligible_shell_drift =
-            classified_shell_drift && shell_effect_fence_clear && exact_continuation_authority;
+        let eligible_shell_drift = active_goal_status
+            && classified_shell_drift
+            && shell_effect_fence_clear
+            && exact_continuation_authority;
         let shell_recovery_effect_fenced = classified_shell_drift && !shell_effect_fence_clear;
         let continuation_authorized = (goal_transition.schedule_continuation
             && exact_continuation_authority)
@@ -1828,14 +1937,9 @@ fn run_runtime_queue_once_after_prepare(
             let enqueued = match scheduling_result {
                 Ok(enqueued) => enqueued,
                 Err(error) => {
-                    if let Some(queue_id) = prepare.receipt.queue_id.as_deref() {
-                        let _ = release_runtime_queue_lease(&options.harness_home, queue_id);
-                    }
                     return Err(io::Error::new(
                         error.kind(),
-                        format!(
-                            "active goal continuation failed closed before final outbox: {error}"
-                        ),
+                        format!("goal continuation failed closed before final outbox: {error}"),
                     ));
                 }
             };
@@ -1868,23 +1972,10 @@ fn run_runtime_queue_once_after_prepare(
                 } else {
                     RuntimeSourceClosureDecision::ParkedPolicyDenied
                 });
-            source_closure_reason = Some(if shell_recovery_effect_fenced {
-                "shell-recovery-external-effect-fenced".to_string()
-            } else if shell_recovery_budget_exhausted {
-                "shell-recovery-budget-exhausted".to_string()
-            } else if let Some(reason) = transition_park_reason {
-                reason.to_string()
-            } else {
-                match activation.configured_mode {
-                    GoalAutonomyMode::Disabled => "goal-autonomy-disabled",
-                    GoalAutonomyMode::Active => "goal-autonomy-lane-denied",
-                    GoalAutonomyMode::Observe => "goal-autonomy-observe",
-                }
-                .to_string()
-            });
+            source_closure_reason = Some(activation.reason.clone());
             receipt_status = RuntimeRunOnceStatus::NeedsUser;
             receipt_reason = format!(
-                "active goal parked without an automatic child: {}; priorReason={}",
+                "goal work parked without an automatic child: {}; priorReason={}",
                 activation.reason, receipt_reason
             );
             parked_goal_activation = Some(activation);
@@ -1935,9 +2026,6 @@ fn run_runtime_queue_once_after_prepare(
         let enqueued = match scheduling_result {
             Ok(enqueued) => enqueued,
             Err(error) => {
-                if let Some(queue_id) = prepare.receipt.queue_id.as_deref() {
-                    let _ = release_runtime_queue_lease(&options.harness_home, queue_id);
-                }
                 return Err(io::Error::new(
                     error.kind(),
                     format!("task continuation failed closed before final outbox: {error}"),
@@ -1987,8 +2075,15 @@ fn run_runtime_queue_once_after_prepare(
                         .to_string(),
                 );
             } else {
-                let safe_checkpoint = match run.receipt.transcript_file.as_ref() {
-                    Some(transcript_file) => latest_assistant_response(
+                let checkpoint_is_authoritative = active_goal_status
+                    && goal_transition.authority == GoalTransitionAuthority::Ready
+                    && goal_transition.decision == GoalTransitionDecision::Continue;
+                let safe_checkpoint = match (
+                    checkpoint_is_authoritative,
+                    run.receipt.transcript_file.as_ref(),
+                ) {
+                    (false, _) | (_, None) => None,
+                    (true, Some(transcript_file)) => latest_assistant_response(
                         transcript_file,
                         &AssistantNarrationConfig::default(),
                     )?
@@ -2006,7 +2101,6 @@ fn run_runtime_queue_once_after_prepare(
                             .may_write_final_outbox()
                             .then_some(response.final_text)
                     }),
-                    None => None,
                 };
                 let mut message = ChannelOutboundMessage {
                     platform: context.platform.clone(),
@@ -2822,13 +2916,40 @@ fn run_runtime_queue_once_after_prepare(
     if source_closure_decision.is_none() {
         source_closure_decision = match goal_transition.surface {
             GoalTransitionSurface::TerminalNotice | GoalTransitionSurface::CampaignFinal => {
-                Some(RuntimeSourceClosureDecision::TerminalGoalSurface)
+                let closure = terminal_goal_source_closure(goal_transition.decision);
+                match closure {
+                    RuntimeSourceClosureDecision::TerminalGoalSuccess => {
+                        receipt_status = RuntimeRunOnceStatus::Completed;
+                    }
+                    RuntimeSourceClosureDecision::TerminalGoalNeedsUser => {
+                        receipt_status = RuntimeRunOnceStatus::NeedsUser;
+                    }
+                    RuntimeSourceClosureDecision::TerminalGoalCanceled => {
+                        receipt_status = RuntimeRunOnceStatus::Canceled;
+                    }
+                    RuntimeSourceClosureDecision::TerminalGoalFailure => {
+                        receipt_status = RuntimeRunOnceStatus::FailedTerminal;
+                    }
+                    _ => unreachable!("terminal goal closure classifier returned non-goal shape"),
+                }
+                Some(closure)
             }
             GoalTransitionSurface::OrdinaryFinal => {
                 Some(RuntimeSourceClosureDecision::OrdinaryFinal)
             }
             GoalTransitionSurface::FailureNotice => {
-                Some(RuntimeSourceClosureDecision::TerminalGoalSurface)
+                if !matches!(
+                    receipt_status,
+                    RuntimeRunOnceStatus::DeadLetter
+                        | RuntimeRunOnceStatus::FailedTerminal
+                        | RuntimeRunOnceStatus::ProtocolError
+                        | RuntimeRunOnceStatus::ContextExhausted
+                        | RuntimeRunOnceStatus::SpawnFailed
+                        | RuntimeRunOnceStatus::Timeout
+                ) {
+                    receipt_status = RuntimeRunOnceStatus::FailedTerminal;
+                }
+                Some(RuntimeSourceClosureDecision::TerminalGoalFailure)
             }
             GoalTransitionSurface::SuppressStale => {
                 Some(RuntimeSourceClosureDecision::SuppressedExactOwnerMismatch)
@@ -2836,29 +2957,25 @@ fn run_runtime_queue_once_after_prepare(
             GoalTransitionSurface::ProgressOnly => None,
         };
         if source_closure_decision.is_some() {
-            source_closure_reason = Some(
-                match goal_transition.surface {
-                    GoalTransitionSurface::TerminalNotice
-                    | GoalTransitionSurface::CampaignFinal => "terminal-goal-surface",
-                    GoalTransitionSurface::OrdinaryFinal => "ordinary-final",
-                    GoalTransitionSurface::FailureNotice => "failure-notice",
-                    GoalTransitionSurface::SuppressStale => "suppressed-stale-owner",
-                    GoalTransitionSurface::ProgressOnly => unreachable!(),
+            source_closure_reason = Some(match goal_transition.surface {
+                GoalTransitionSurface::TerminalNotice | GoalTransitionSurface::CampaignFinal => {
+                    format!(
+                        "goal-transition-{}: {}",
+                        goal_transition_decision_token(goal_transition.decision),
+                        goal_transition.reason
+                    )
                 }
-                .to_string(),
-            );
+                GoalTransitionSurface::OrdinaryFinal => "ordinary-final".to_string(),
+                GoalTransitionSurface::FailureNotice => "failure-notice".to_string(),
+                GoalTransitionSurface::SuppressStale => "suppressed-stale-owner".to_string(),
+                GoalTransitionSurface::ProgressOnly => unreachable!(),
+            });
         }
     }
-    if goal_transition.surface == GoalTransitionSurface::ProgressOnly
-        && goal_transition
-            .goal_status
-            .as_deref()
-            .is_some_and(is_goal_status_active)
-        && source_closure_decision.is_none()
-    {
+    if unresolved_goal_progress && source_closure_decision.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "active nonterminal goal has no committed continuation or visible parked outcome",
+            "nonterminal goal work has no committed continuation or visible parked outcome",
         ));
     }
     let terminal_disposition = if let Some(decision) = source_closure_decision {
@@ -2894,7 +3011,10 @@ fn run_runtime_queue_once_after_prepare(
         SourceFinalExpectationV1::ExplicitNonDelivery
     } else if let Some(decision) = source_closure_decision {
         match decision {
-            RuntimeSourceClosureDecision::TerminalGoalSurface
+            RuntimeSourceClosureDecision::TerminalGoalSuccess
+            | RuntimeSourceClosureDecision::TerminalGoalNeedsUser
+            | RuntimeSourceClosureDecision::TerminalGoalCanceled
+            | RuntimeSourceClosureDecision::TerminalGoalFailure
             | RuntimeSourceClosureDecision::OrdinaryFinal => {
                 if matches!(
                     final_outbox_disposition,
@@ -3123,10 +3243,20 @@ fn run_runtime_queue_once_after_prepare(
             )),
         }
     }
-    if let Some(queue_id) = receipt.queue_id.as_deref() {
-        if let Err(error) = release_runtime_queue_lease(&options.harness_home, queue_id) {
-            warnings.push(format!("runtime queue lease release failed: {error}"));
-        }
+    match lease_release_guard.release() {
+        Ok(RuntimeQueueLeaseReleaseStatus::Fenced) => warnings.push(
+            "runtime queue lease was retained because Codex child-tree cleanup was not proven"
+                .to_string(),
+        ),
+        Ok(RuntimeQueueLeaseReleaseStatus::OwnershipLost) => warnings.push(
+            "runtime queue lease was not released because exact acquisition ownership changed"
+                .to_string(),
+        ),
+        Ok(
+            RuntimeQueueLeaseReleaseStatus::Released
+            | RuntimeQueueLeaseReleaseStatus::AlreadyAbsent,
+        ) => {}
+        Err(error) => warnings.push(format!("runtime queue lease release failed: {error}")),
     }
 
     let progress_harness_home = options.harness_home.clone();
@@ -3172,6 +3302,11 @@ fn run_runtime_queue_once_after_prepare(
             context,
             report.receipt.status,
             report.receipt.terminal_disposition,
+            report
+                .receipt
+                .source_closure_kind
+                .map(RuntimeSourceClosureKindV1::as_str),
+            report.receipt.source_closure_reason.as_deref(),
             &report.receipt.reason,
             progress_elapsed_ms,
             &mut report.warnings,
@@ -3316,6 +3451,8 @@ fn append_suppressed_runtime_progress(
         &context,
         RuntimeRunOnceStatus::Suppressed,
         Some(crate::RuntimeTerminalDispositionV1::TerminalSuppression),
+        None,
+        None,
         reason,
         0,
         warnings,
@@ -3407,6 +3544,8 @@ fn append_runtime_progress_finished(
     context: &AgentProgressContext,
     status: RuntimeRunOnceStatus,
     disposition: Option<crate::RuntimeTerminalDispositionV1>,
+    source_closure_kind: Option<&str>,
+    source_closure_reason: Option<&str>,
     reason: &str,
     elapsed_ms: u128,
     warnings: &mut Vec<String>,
@@ -3425,12 +3564,28 @@ fn append_runtime_progress_finished(
         | RuntimeRunOnceStatus::NeedsUser => AgentProgressStatus::Progress,
         _ => AgentProgressStatus::Failed,
     };
-    let preview = runtime_progress_preview(status, reason);
-    let label = match disposition {
-        Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff) => "continuation-handoff",
-        Some(crate::RuntimeTerminalDispositionV1::LogicalCanceled) => "canceled",
-        Some(crate::RuntimeTerminalDispositionV1::NeedsUser) => "waiting-for-approval",
-        Some(crate::RuntimeTerminalDispositionV1::TerminalSuppression) => "terminal-suppression",
+    let needs_user_presentation = crate::progress::classify_needs_user_progress_presentation(
+        disposition,
+        source_closure_kind,
+        source_closure_reason,
+    );
+    let preview =
+        if needs_user_presentation.is_some_and(|presentation| presentation.lifecycle.is_none()) {
+            source_closure_reason.unwrap_or(reason).to_string()
+        } else {
+            runtime_progress_preview(status, reason)
+        };
+    let label = match (disposition, needs_user_presentation) {
+        (Some(crate::RuntimeTerminalDispositionV1::NeedsUser), Some(needs_user_presentation)) => {
+            needs_user_presentation.label
+        }
+        (Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff), _) => {
+            "continuation-handoff"
+        }
+        (Some(crate::RuntimeTerminalDispositionV1::LogicalCanceled), _) => "canceled",
+        (Some(crate::RuntimeTerminalDispositionV1::TerminalSuppression), _) => {
+            "terminal-suppression"
+        }
         _ => "run",
     };
     let mut event = AgentProgressEvent::new(
@@ -3445,8 +3600,10 @@ fn append_runtime_progress_finished(
     .source("runtime-pipeline");
     if disposition == Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff) {
         event = event.lifecycle(crate::AgentProgressLifecycle::Continuing);
-    } else if disposition == Some(crate::RuntimeTerminalDispositionV1::NeedsUser) {
-        event = event.lifecycle(crate::AgentProgressLifecycle::WaitingForApproval);
+    } else if let Some(lifecycle) =
+        needs_user_presentation.and_then(|presentation| presentation.lifecycle)
+    {
+        event = event.lifecycle(lifecycle);
     }
     append_progress_nonfatal(harness_home, event, warnings);
 }
@@ -3652,6 +3809,11 @@ fn final_run_once_status_with_protocol(
     mutation_evidence: Option<crate::RuntimeMutationEvidenceClass>,
 ) -> RuntimeRunOnceStatus {
     if codex_status == CodexRuntimeRunStatus::ProtocolError
+        && reason.contains(crate::codex_runtime::GOAL_CONTINUATION_AUTHORITY_BOUNDARY_MARKER)
+    {
+        return RuntimeRunOnceStatus::NeedsUser;
+    }
+    if codex_status == CodexRuntimeRunStatus::ProtocolError
         && let Some(protocol_failure) = protocol_failure
     {
         use crate::CodexProtocolFailureClass as Class;
@@ -3747,7 +3909,8 @@ fn final_run_once_status(
 
 fn is_retryable_codex_protocol_error(reason: &str) -> bool {
     let lower = reason.to_ascii_lowercase();
-    lower.contains("stream disconnected before completion")
+    lower.contains("runtime queue lease guard capture retryable backpressure")
+        || lower.contains("stream disconnected before completion")
         || lower.contains("websocket closed by server before response.completed")
         || lower.contains("reconnecting...")
 }
@@ -4976,6 +5139,13 @@ fn classify_goal_transition_event(
     run: &CodexRuntimeRunReport,
     receipt_status: RuntimeRunOnceStatus,
 ) -> GoalTransitionEventKind {
+    if run
+        .receipt
+        .reason
+        .contains(crate::codex_runtime::GOAL_CONTINUATION_AUTHORITY_BOUNDARY_MARKER)
+    {
+        return GoalTransitionEventKind::AuthorityBoundary;
+    }
     if run.receipt.status == CodexRuntimeRunStatus::PreflightBlocked
         && run.receipt.reason.contains("needs-operator-auth")
     {
@@ -6800,8 +6970,16 @@ fn active_goal_parked_notice_text(
             }
         }
     };
+    let headline = if activation
+        .reason
+        .starts_with("goal-transition-needs-authority")
+    {
+        "Goal work is parked safely while its exact status or authority is reconciled."
+    } else {
+        "The goal remains active and is parked safely."
+    };
     let mut notice = format!(
-        "The goal remains active and is parked safely. {policy} Resume it manually or authorize a reviewed exact-lane cohort."
+        "{headline} {policy} Resume it manually or authorize a reviewed exact-lane cohort."
     );
     if let Some(checkpoint) = safe_checkpoint
         .map(str::trim)
@@ -7138,19 +7316,21 @@ fn inbound_media_artifacts_field(value: &Value, keys: &[&str]) -> Vec<InboundMed
 mod tests {
     use super::*;
     use crate::codex_runtime::{CodexRuntimeUsage, CodexToolUseTimeout};
+    #[cfg(windows)]
+    use crate::process_launch::configure_noninteractive_command;
     use crate::{
         AgentProgressDeliveryMessageKind, AgentProgressDeliveryPlanOptions,
         AgentProgressDeliveryRecordOptions, AgentProgressDeliveryStatus, AgentSource,
         ChannelReceiveOptions, ChannelReceiveStatus, ScopedStopOptions, ScopedStopTarget,
         build_source_skill_index, plan_agent_progress_delivery, receive_channel_message,
-        record_agent_progress_delivery, record_scoped_stop,
+        record_agent_progress_delivery, record_scoped_stop, release_runtime_queue_lease,
     };
     use std::ffi::OsString;
     use std::fs::OpenOptions;
     use std::io::Write;
     #[cfg(windows)]
     use std::os::windows::fs::OpenOptionsExt;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Barrier, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -7976,6 +8156,258 @@ mod tests {
     }
 
     #[test]
+    fn provider_terminal_kills_lingering_app_server_and_releases_queue_lease() {
+        let _guard = env_lock();
+        let root =
+            temp_root("provider_terminal_kills_lingering_app_server_and_releases_queue_lease");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "discord".to_string(),
+            account_id: None,
+            channel_id: "channel-provider-terminal".to_string(),
+            user_id: "user-provider-terminal".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "finish and release the exact lane".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1_234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+
+        let (fake_codex, app_server_pid_file) =
+            fake_lingering_provider_terminal_codex_executable(&root);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: Some(fake_codex),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert_eq!(
+            report.run.as_ref().unwrap().receipt.status,
+            CodexRuntimeRunStatus::Completed
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("child did not exit")),
+            "a trustworthy provider terminal must not leave the app-server child behind"
+        );
+
+        let app_server_pid = fs::read_to_string(&app_server_pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let child_exited = wait_for_test_process_exit(app_server_pid, Duration::from_millis(2_000));
+        if !child_exited {
+            terminate_test_process(app_server_pid);
+        }
+        assert!(
+            child_exited,
+            "provider-terminal cleanup left app-server pid {app_server_pid} alive"
+        );
+
+        let queue_id = report.receipt.queue_id.as_deref().unwrap();
+        let lease =
+            crate::observe_runtime_queue_lease(crate::RuntimeQueueLeaseObservationOptions {
+                harness_home: harness_home.clone(),
+                queue_id: queue_id.to_string(),
+                observed_at_ms: current_log_time_ms().unwrap(),
+            });
+        assert_eq!(
+            lease.status,
+            crate::RuntimeQueueLeaseObservationStatus::Released,
+            "provider-terminal post-processing must release the exact queue lease: {}",
+            lease.reason
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_telegram_and_discord_exact_lanes_complete_without_class_lock_cancellation() {
+        let _guard = env_lock();
+        let root = temp_root(
+            "concurrent_telegram_and_discord_exact_lanes_complete_without_class_lock_cancellation",
+        );
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"workerDispatch":{"globalConcurrencyLimit":3,"groupConcurrencyLimit":3,"channelConcurrencyLimit":3,"laneConcurrencyLimits":{"llm":3}}}"#,
+        )
+        .unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let telegram = receive_channel_message(ChannelReceiveOptions {
+            source: source.clone(),
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills.clone(),
+            platform: "telegram".to_string(),
+            account_id: Some("telegram-main".to_string()),
+            channel_id: "telegram-channel".to_string(),
+            user_id: "telegram-user".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "complete the Telegram lane".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1_234,
+        })
+        .unwrap();
+        let discord = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "discord".to_string(),
+            account_id: Some("discord-main".to_string()),
+            channel_id: "discord-channel".to_string(),
+            user_id: "discord-user".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "complete the Discord lane".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1_235,
+        })
+        .unwrap();
+        assert_eq!(telegram.status, ChannelReceiveStatus::AgentTurnQueued);
+        assert_eq!(discord.status, ChannelReceiveStatus::AgentTurnQueued);
+        let telegram_queue_id = telegram.queue_id.unwrap();
+        let discord_queue_id = discord.queue_id.unwrap();
+        assert_ne!(telegram_queue_id, discord_queue_id);
+        assert_ne!(telegram.session_key, discord.session_key);
+
+        let fake_codex = fake_codex_executable(&root);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+        let start = Arc::new(Barrier::new(3));
+        let run = |queue_id: String| {
+            let start = Arc::clone(&start);
+            let harness_home = harness_home.clone();
+            let fake_codex = fake_codex.clone();
+            thread::spawn(move || {
+                start.wait();
+                run_runtime_queue_once(RuntimeRunOnceOptions {
+                    harness_home: harness_home.clone(),
+                    queue_id: Some(queue_id),
+                    codex_executable: Some(fake_codex),
+                    timeout_ms: 30_000,
+                    idle_timeout_ms: 30_000,
+                    prompt_options: PromptAssemblyOptions {
+                        harness_home: Some(harness_home),
+                        ..PromptAssemblyOptions::default()
+                    },
+                })
+            })
+        };
+        let telegram_run = run(telegram_queue_id.clone());
+        let discord_run = run(discord_queue_id.clone());
+        start.wait();
+        let reports = [
+            telegram_run.join().unwrap().unwrap(),
+            discord_run.join().unwrap().unwrap(),
+        ];
+
+        for report in &reports {
+            assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+            assert_eq!(
+                report.run.as_ref().unwrap().receipt.status,
+                CodexRuntimeRunStatus::Completed
+            );
+            assert!(
+                !report.receipt.reason.contains("Stopped.")
+                    && !report
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.contains("operator cancel")),
+                "class-lock contention was misclassified as cancellation: {:?}",
+                report.warnings
+            );
+        }
+
+        for queue_id in [&telegram_queue_id, &discord_queue_id] {
+            let lease =
+                crate::observe_runtime_queue_lease(crate::RuntimeQueueLeaseObservationOptions {
+                    harness_home: harness_home.clone(),
+                    queue_id: queue_id.clone(),
+                    observed_at_ms: current_log_time_ms().unwrap(),
+                });
+            assert_eq!(
+                lease.status,
+                crate::RuntimeQueueLeaseObservationStatus::Released,
+                "exact lane lease remained active for {queue_id}: {}",
+                lease.reason
+            );
+        }
+
+        let outbox = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl"),
+        )
+        .unwrap();
+        let messages = outbox
+            .lines()
+            .map(|line| serde_json::from_str::<ChannelOutboundMessage>(line).unwrap())
+            .collect::<Vec<_>>();
+        for (queue_id, platform) in [
+            (&telegram_queue_id, "telegram"),
+            (&discord_queue_id, "discord"),
+        ] {
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| {
+                        message.source_queue_id.as_deref() == Some(queue_id.as_str())
+                            && message.platform == platform
+                    })
+                    .count(),
+                1,
+                "{platform} exact lane did not converge to exactly one final outbox row"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_source_closure_decisions_have_one_consistent_terminal_contract() {
         let cases = [
             (
@@ -7985,9 +8417,27 @@ mod tests {
                 SourceFinalExpectationV1::NotApplicable,
             ),
             (
-                RuntimeSourceClosureDecision::TerminalGoalSurface,
+                RuntimeSourceClosureDecision::TerminalGoalSuccess,
                 RuntimeSourceClosureKindV1::TerminalGoalSurface,
                 crate::RuntimeTerminalDispositionV1::LogicalSuccess,
+                SourceFinalExpectationV1::Required,
+            ),
+            (
+                RuntimeSourceClosureDecision::TerminalGoalNeedsUser,
+                RuntimeSourceClosureKindV1::TerminalGoalSurface,
+                crate::RuntimeTerminalDispositionV1::NeedsUser,
+                SourceFinalExpectationV1::Required,
+            ),
+            (
+                RuntimeSourceClosureDecision::TerminalGoalCanceled,
+                RuntimeSourceClosureKindV1::TerminalGoalSurface,
+                crate::RuntimeTerminalDispositionV1::LogicalCanceled,
+                SourceFinalExpectationV1::Required,
+            ),
+            (
+                RuntimeSourceClosureDecision::TerminalGoalFailure,
+                RuntimeSourceClosureKindV1::TerminalGoalSurface,
+                crate::RuntimeTerminalDispositionV1::LogicalFailure,
                 SourceFinalExpectationV1::Required,
             ),
             (
@@ -8208,6 +8658,98 @@ mod tests {
     }
 
     #[test]
+    fn unrecognized_goal_status_parks_without_agent_final_or_logical_success() {
+        let _guard = env_lock();
+        for status in ["unknown", "awaiting-future-capability"] {
+            let root = temp_root(&format!("unrecognized-goal-status-{status}"));
+            let source = write_pipeline_source(&root);
+            let harness_home = root.join(".agent-harness");
+            let skills = build_source_skill_index(&source).unwrap();
+            let receive = receive_channel_message(ChannelReceiveOptions {
+                source,
+                runtime_workspace: None,
+                harness_home: harness_home.clone(),
+                skill_index: skills,
+                platform: "telegram".to_string(),
+                account_id: Some("acct-goal".to_string()),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                agent_id: Some("main".to_string()),
+                session_key: None,
+                message: "continue the durable campaign".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                inbound_event_kind: None,
+                inbound_event_id: None,
+                skill_limit: 3,
+                now_ms: 1234,
+            })
+            .unwrap();
+            let codex_home = root.join("codex-home");
+            fs::create_dir_all(&codex_home).unwrap();
+            fs::write(codex_home.join("auth.json"), "{}").unwrap();
+            let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+            let untrusted_final = format!("UNTRUSTED {status} GOAL FINAL MUST NOT SURFACE");
+
+            let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+                harness_home: harness_home.clone(),
+                queue_id: receive.queue_id,
+                codex_executable: Some(fake_terminal_goal_codex_executable(
+                    &root,
+                    status,
+                    &untrusted_final,
+                )),
+                timeout_ms: 30_000,
+                idle_timeout_ms: 30_000,
+                prompt_options: PromptAssemblyOptions {
+                    harness_home: Some(harness_home.clone()),
+                    ..PromptAssemblyOptions::default()
+                },
+            })
+            .unwrap();
+
+            assert_eq!(report.receipt.status, RuntimeRunOnceStatus::NeedsUser);
+            assert_eq!(
+                report.receipt.terminal_disposition,
+                Some(crate::RuntimeTerminalDispositionV1::NeedsUser)
+            );
+            assert_ne!(
+                report.receipt.terminal_disposition,
+                Some(crate::RuntimeTerminalDispositionV1::LogicalSuccess)
+            );
+            assert_eq!(
+                report.receipt.source_closure_kind,
+                Some(RuntimeSourceClosureKindV1::ParkedObserve)
+            );
+            assert!(report.receipt.child_queue_id.is_none());
+            let outbound = report
+                .outbound_message
+                .as_ref()
+                .expect("unrecognized Goal status needs one visible parked notice");
+            assert!(outbound.text.contains("Goal work is parked safely"));
+            assert!(!outbound.text.contains(&untrusted_final));
+            let transition_rows = fs::read_to_string(
+                crate::goal_transition::goal_transition_receipts_file(&harness_home),
+            )
+            .unwrap();
+            let transition: GoalTransitionReceiptV1 = serde_json::from_str(
+                transition_rows
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .last()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(transition.decision, GoalTransitionDecision::NeedsAuthority);
+            assert_eq!(transition.surface, GoalTransitionSurface::ProgressOnly);
+            assert!(!transition.terminal);
+            assert!(!transition.allow_campaign_final);
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn paused_goal_emits_one_sanitized_terminal_notice() {
         let _guard = env_lock();
         let root = temp_root("paused_goal_emits_one_sanitized_terminal_notice");
@@ -8254,7 +8796,19 @@ mod tests {
             },
         })
         .unwrap();
-        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::NeedsUser);
+        assert_eq!(
+            report.receipt.terminal_disposition,
+            Some(crate::RuntimeTerminalDispositionV1::NeedsUser)
+        );
+        assert_ne!(
+            report.receipt.terminal_disposition,
+            Some(crate::RuntimeTerminalDispositionV1::LogicalSuccess)
+        );
+        assert_eq!(
+            report.receipt.source_closure_kind,
+            Some(RuntimeSourceClosureKindV1::TerminalGoalSurface)
+        );
         let outbound = report.outbound_message.as_ref().unwrap();
         assert_eq!(outbound.text, "The goal is paused.");
         assert!(!outbound.text.contains("credential"));
@@ -8363,7 +8917,15 @@ mod tests {
             },
         })
         .unwrap();
-        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::FailedTerminal);
+        assert_eq!(
+            report.receipt.terminal_disposition,
+            Some(crate::RuntimeTerminalDispositionV1::LogicalFailure)
+        );
+        assert_eq!(
+            report.receipt.source_closure_kind,
+            Some(RuntimeSourceClosureKindV1::TerminalGoalSurface)
+        );
         assert!(report.receipt.child_queue_id.is_none());
         assert_eq!(
             report
@@ -10092,9 +10654,10 @@ mod tests {
     }
 
     #[test]
-    fn prepared_protocol_error_terminalizes_after_threshold() {
+    fn prepared_sidecar_is_reconstructed_before_protocol_retries_dead_letter() {
         let _guard = env_lock();
-        let root = temp_root("prepared_protocol_error_terminalizes_after_threshold");
+        let root =
+            temp_root("prepared_sidecar_is_reconstructed_before_protocol_retries_dead_letter");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
         let skills = build_source_skill_index(&source).unwrap();
@@ -10130,14 +10693,21 @@ mod tests {
         })
         .unwrap();
         let execution_dir = prepare.receipt.execution_dir.clone().unwrap();
-        fs::remove_file(execution_dir.join("execution-receipt.json")).unwrap();
+        let execution_receipt_file = execution_dir.join("execution-receipt.json");
+        fs::remove_file(&execution_receipt_file).unwrap();
+        assert!(!execution_receipt_file.exists());
         release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+        let fake_codex = fake_reconnecting_codex_executable(&root);
 
         for attempt in 1..=3 {
             let report = run_runtime_queue_once(RuntimeRunOnceOptions {
                 harness_home: harness_home.clone(),
                 queue_id: Some(queue_id.clone()),
-                codex_executable: None,
+                codex_executable: Some(fake_codex.clone()),
                 timeout_ms: 30_000,
                 idle_timeout_ms: 30_000,
                 prompt_options: PromptAssemblyOptions {
@@ -10146,13 +10716,29 @@ mod tests {
                 },
             })
             .unwrap();
+            assert!(
+                execution_receipt_file.is_file(),
+                "the authoritative execution receipt index must reconstruct the sidecar before launch"
+            );
+            let reconstructed: Value =
+                serde_json::from_slice(&fs::read(&execution_receipt_file).unwrap()).unwrap();
+            assert_eq!(
+                string_field(&reconstructed, &["queueId"]),
+                Some(queue_id.as_str())
+            );
+            assert_eq!(
+                report.run.as_ref().unwrap().receipt.status,
+                CodexRuntimeRunStatus::ProtocolError
+            );
             if attempt < 3 {
-                assert_eq!(
-                    report.receipt.status,
-                    RuntimeRunOnceStatus::NoPreparedExecution
-                );
+                assert_eq!(report.receipt.status, RuntimeRunOnceStatus::RetryPending);
+                assert!(report.outbound_message.is_none());
+                force_retry_eligible(&harness_home, &queue_id);
             } else {
-                assert_eq!(report.receipt.status, RuntimeRunOnceStatus::FailedTerminal);
+                assert_eq!(report.receipt.status, RuntimeRunOnceStatus::DeadLetter);
+                let outbound = report.outbound_message.unwrap();
+                assert_eq!(outbound.kind, ChannelOutboundMessageKind::ErrorReply);
+                assert!(outbound.text.contains("dead-letter"));
             }
         }
 
@@ -10163,13 +10749,21 @@ mod tests {
                 .join("run-once-receipts.jsonl"),
         )
         .unwrap();
-        assert!(run_once_receipts.contains(r#""status":"failed-terminal""#));
-        assert!(run_once_receipts.contains("preparedExecutionTerminalizationReason"));
-        let quarantine_dir = harness_home
-            .join("state")
-            .join("runtime-queue")
-            .join("quarantine");
-        assert_eq!(fs::read_dir(quarantine_dir).unwrap().count(), 1);
+        assert_eq!(
+            run_once_receipts
+                .lines()
+                .filter(|line| line.contains(r#""status":"retry-pending""#))
+                .count(),
+            2
+        );
+        assert_eq!(
+            run_once_receipts
+                .lines()
+                .filter(|line| line.contains(r#""status":"dead-letter""#))
+                .count(),
+            1
+        );
+        assert!(!run_once_receipts.contains("preparedExecutionTerminalizationReason"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -11575,6 +12169,172 @@ mod tests {
         );
         assert!(reply.contains("Codex context limit"));
         assert!(reply.contains("queue-context"));
+    }
+
+    #[test]
+    fn runtime_progress_finished_uses_goal_closure_metadata_for_pause() {
+        let root = temp_root("runtime_progress_finished_goal_pause");
+        let context = AgentProgressContext {
+            queue_id: "turn:goal-paused".to_string(),
+            agent_id: Some("main".to_string()),
+            account_id: Some("default".to_string()),
+            thread_id: None,
+            session_key: "discord:channel:user:main".to_string(),
+            platform: "discord".to_string(),
+            channel_id: "channel".to_string(),
+            user_id: "user".to_string(),
+        };
+        let closure_reason = "goal-transition-pause: authoritative Goal is blocked";
+        let mut warnings = Vec::new();
+        append_runtime_progress_finished(
+            &root,
+            &context,
+            RuntimeRunOnceStatus::NeedsUser,
+            Some(crate::RuntimeTerminalDispositionV1::NeedsUser),
+            Some("terminal-goal-surface"),
+            Some(closure_reason),
+            "runtime receipt carries needs-user for compatibility",
+            25,
+            &mut warnings,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let events_file = crate::agent_progress_events_file(&root);
+        let event: AgentProgressEvent = serde_json::from_str(
+            fs::read_to_string(events_file)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(event.label, "goal-paused");
+        assert_eq!(event.preview, closure_reason);
+        assert_eq!(event.lifecycle, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lease_guard_capture_contention_is_retryable_backpressure_not_operator_cancel() {
+        let reason = "runtime queue lease guard capture retryable backpressure: runtime queue lease lock is busy for class `interactive`";
+
+        assert!(is_retryable_codex_protocol_error(reason));
+        assert_eq!(
+            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 1, reason, 3),
+            RuntimeRunOnceStatus::RetryPending
+        );
+        assert_eq!(
+            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 3, reason, 3),
+            RuntimeRunOnceStatus::DeadLetter
+        );
+        assert!(
+            !should_write_failure_outbox(RuntimeRunOnceStatus::RetryPending),
+            "transient class-lock backpressure must not emit a provider failure or `Stopped.`"
+        );
+    }
+
+    fn pipeline_release_guard_with_successor(
+        test_name: &str,
+    ) -> (PathBuf, PathBuf, String, RuntimeQueueLeaseReleaseGuard) {
+        let _guard = env_lock();
+        let root = temp_root(test_name);
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "discord".to_string(),
+            account_id: Some("default".to_string()),
+            channel_id: "channel-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "preserve successor lease".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1_234,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.unwrap();
+        let first = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        let first_authority = first
+            .lease_release_authority()
+            .expect("first exact acquisition authority");
+        let guard = RuntimeQueueLeaseReleaseGuard::from_prepare(&harness_home, &first);
+
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        let successor = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        let successor_authority = successor
+            .lease_release_authority()
+            .expect("successor exact acquisition authority");
+        assert_ne!(
+            first_authority, successor_authority,
+            "fixture must replace acquiredAtMs before stale release"
+        );
+        (root, harness_home, queue_id, guard)
+    }
+
+    fn assert_successor_lease_is_active(harness_home: &Path, queue_id: &str) {
+        let lease =
+            crate::observe_runtime_queue_lease(crate::RuntimeQueueLeaseObservationOptions {
+                harness_home: harness_home.to_path_buf(),
+                queue_id: queue_id.to_string(),
+                observed_at_ms: current_log_time_ms().unwrap(),
+            });
+        assert_eq!(
+            lease.status,
+            crate::RuntimeQueueLeaseObservationStatus::Active,
+            "stale pipeline release removed successor lease: {}",
+            lease.reason
+        );
+    }
+
+    #[test]
+    fn pipeline_explicit_release_preserves_successor_acquisition_for_same_queue() {
+        let (root, harness_home, queue_id, mut guard) =
+            pipeline_release_guard_with_successor("pipeline_explicit_release_preserves_successor");
+        assert_eq!(
+            guard.release().unwrap(),
+            RuntimeQueueLeaseReleaseStatus::OwnershipLost
+        );
+        assert_successor_lease_is_active(&harness_home, &queue_id);
+
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pipeline_drop_preserves_successor_acquisition_for_same_queue() {
+        let (root, harness_home, queue_id, guard) =
+            pipeline_release_guard_with_successor("pipeline_drop_preserves_successor");
+        drop(guard);
+        assert_successor_lease_is_active(&harness_home, &queue_id);
+
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -13010,6 +13770,60 @@ mod tests {
         let evidence_text = fs::read_to_string(evidence).unwrap();
         assert!(evidence_text.contains("agent-harness.external-review-evidence.v1"));
         assert!(evidence_text.contains("Claude second brain review"));
+        assert_eq!(
+            fs::read_to_string(root.join("external-review-only-attempt.txt"))
+                .unwrap()
+                .trim(),
+            "2"
+        );
+        #[cfg(windows)]
+        {
+            let history = fs::read_to_string(
+                harness_home
+                    .join("state")
+                    .join("runtime-queue")
+                    .join("test-codex-child-generations.jsonl"),
+            )
+            .unwrap();
+            let rows = history
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 2, "expected exactly two Codex child attempts");
+            let generations = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.get("pid").and_then(Value::as_i64).unwrap(),
+                        row.get("processStartTimeMs")
+                            .and_then(Value::as_i64)
+                            .expect("test child generation must have an OS start time"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_ne!(generations[0].0, generations[1].0);
+            for (pid, process_start_time_ms) in generations {
+                assert_eq!(
+                    crate::loop_health::exact_process_generation_state(pid, process_start_time_ms),
+                    crate::loop_health::ExactProcessGenerationState::DeadOrReused,
+                    "Codex child generation pid={pid} start={process_start_time_ms} remained alive; observedStart={:?}; observedAlive={:?}",
+                    crate::loop_health::process_start_time_ms_for_pid(pid),
+                    crate::loop_health::process_alive_for_pid(pid)
+                );
+            }
+            let fence_dir = harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("child-cleanup-fences");
+            assert_eq!(
+                fs::read_dir(fence_dir)
+                    .map(|entries| entries.flatten().count())
+                    .unwrap_or(0),
+                0,
+                "external-review recovery returned before cleanup-fence removal"
+            );
+        }
         assert!(
             !execution_dir
                 .join("codex-runtime-completion-receipt.json")
@@ -14389,6 +15203,51 @@ while ($true) {
     }
 
     #[cfg(windows)]
+    fn fake_lingering_provider_terminal_codex_executable(root: &Path) -> (PathBuf, PathBuf) {
+        let script = root.join("fake-lingering-provider-terminal-app-server.ps1");
+        let pid_file = root.join("lingering-provider-terminal-app-server.pid");
+        fs::write(
+            &script,
+            r#"
+$PID | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'lingering-provider-terminal-app-server.pid') -Encoding ascii
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-provider-terminal"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-provider-terminal","turn":{"id":"turn-provider-terminal","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-provider-terminal","turnId":"turn-provider-terminal","item":{"type":"agentMessage","id":"msg-provider-terminal","text":"Provider terminal captured.","phase":"final_answer"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-provider-terminal","turn":{"id":"turn-provider-terminal","status":"completed"}}}')
+        [Console]::Out.Flush()
+        while ($true) { Start-Sleep -Milliseconds 250 }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let cmd = root.join("fake-lingering-provider-terminal-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        (cmd, pid_file)
+    }
+
+    #[cfg(windows)]
     fn fake_active_goal_codex_executable(root: &Path) -> PathBuf {
         let script = root.join("fake-active-goal-app-server.ps1");
         fs::write(
@@ -15206,6 +16065,44 @@ done
     }
 
     #[cfg(not(windows))]
+    fn fake_lingering_provider_terminal_codex_executable(root: &Path) -> (PathBuf, PathBuf) {
+        let script = root.join("fake-lingering-provider-terminal-codex");
+        let pid_file = root.join("lingering-provider-terminal-app-server.pid");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+script_dir=$(dirname -- "$0")
+printf '%s\n' "$$" > "$script_dir/lingering-provider-terminal-app-server.pid"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-provider-terminal"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-provider-terminal","turn":{"id":"turn-provider-terminal","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-provider-terminal","turnId":"turn-provider-terminal","item":{"type":"agentMessage","id":"msg-provider-terminal","text":"Provider terminal captured.","phase":"final_answer"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-provider-terminal","turn":{"id":"turn-provider-terminal","status":"completed"}}}'
+            while IFS= read -r ignored; do :; done
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        (script, pid_file)
+    }
+
+    #[cfg(not(windows))]
     fn fake_active_goal_codex_executable(root: &Path) -> PathBuf {
         let script = root.join("fake-active-goal-codex");
         fs::write(
@@ -15634,6 +16531,58 @@ done
             "agent-harness-runtime-pipeline-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn wait_for_test_process_exit(pid: u32, timeout: Duration) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < timeout {
+            if !test_process_is_alive(pid) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        !test_process_is_alive(pid)
+    }
+
+    #[cfg(windows)]
+    fn test_process_is_alive(pid: u32) -> bool {
+        let filter = format!("PID eq {pid}");
+        let mut command = std::process::Command::new("tasklist");
+        command.args(["/FI", &filter, "/FO", "CSV", "/NH"]);
+        configure_noninteractive_command(&mut command);
+        let Ok(output) = command.output() else {
+            return true;
+        };
+        if !output.status.success() {
+            return true;
+        }
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\",\"{pid}\","))
+    }
+
+    #[cfg(not(windows))]
+    fn test_process_is_alive(pid: u32) -> bool {
+        match std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+        {
+            Ok(status) => status.success(),
+            Err(_) => true,
+        }
+    }
+
+    #[cfg(windows)]
+    fn terminate_test_process(pid: u32) {
+        let mut command = std::process::Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        configure_noninteractive_command(&mut command);
+        let _ = command.status();
+    }
+
+    #[cfg(not(windows))]
+    fn terminate_test_process(pid: u32) {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
     }
 
     fn force_retry_eligible(harness_home: &Path, queue_id: &str) {

@@ -20,9 +20,10 @@ use crate::context_rollover::{
 use crate::execution_mode::{ExecutionModePolicyV1, ExecutionModePreference};
 use crate::runtime_pending_index::read_queued_pending_values_from_index;
 use crate::{
-    ChannelCommandEffect, ChannelOutboundMessage, ChannelStep,
+    ChannelCommandEffect, ChannelOutboundMessage, ChannelOutboundMessageKind, ChannelStep,
     VirtualSessionTaskBoundaryCloseOptions,
     admission::{ScopedStopOptions, ScopedStopTarget, record_scoped_stop},
+    append_channel_outbox_message,
     backend_reasoning::{BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference},
     close_virtual_session_for_task_boundary,
     codex_runtime::{
@@ -482,6 +483,12 @@ pub fn apply_channel_command_step(
         options.now_ms,
         &mut warnings,
     )?;
+    let outbound_messages = match (exact_lane.as_ref(), applied_effect.transition.as_ref()) {
+        (Some(_), Some(intent)) if intent.command == ChannelSessionTransitionCommandV1::New => {
+            vec![new_session_transition_ack(&state, intent)?]
+        }
+        _ => step.outbound_messages.clone(),
+    };
     if let Some(lane) = exact_lane.as_ref() {
         bind_channel_session_state_to_lane_v2(&mut state, lane);
     }
@@ -569,7 +576,7 @@ pub fn apply_channel_command_step(
         receipts_file,
         event: Some(event),
         state: Some(state),
-        outbound_messages: step.outbound_messages.clone(),
+        outbound_messages,
         receipt,
         warnings,
     })
@@ -662,6 +669,9 @@ where
     F: FnMut(&ChannelSessionTransitionClosureMaterialV1) -> io::Result<()>,
 {
     let (lane, mut state) = exact_state_for_transition(&options.harness_home, intent)?;
+    if intent.command == ChannelSessionTransitionCommandV1::New {
+        ensure_new_session_transition_ack(&options.harness_home, &state, intent, None)?;
+    }
     if state.active_session_key == intent.old_session_key {
         fence_channel_external_effects(
             &options.harness_home,
@@ -1325,6 +1335,14 @@ fn apply_effect(
                 })?;
             let boundary_ready = prepared.boundary_ready;
             let transition_intent = prepared.intent;
+            if state.account_id.is_some() {
+                ensure_new_session_transition_ack(
+                    harness_home,
+                    state,
+                    &transition_intent,
+                    Some(warnings),
+                )?;
+            }
             fence_channel_external_effects(
                 harness_home,
                 state,
@@ -2093,6 +2111,68 @@ fn command_name(effect: &ChannelCommandEffect) -> &'static str {
     }
 }
 
+fn ensure_new_session_transition_ack(
+    harness_home: &Path,
+    state: &ChannelSessionState,
+    intent: &ChannelSessionTransitionIntentV1,
+    warnings: Option<&mut Vec<String>>,
+) -> io::Result<ChannelOutboundMessage> {
+    let mut outbound = new_session_transition_ack(state, intent)?;
+    let append = append_channel_outbox_message(harness_home, &mut outbound)?;
+    if let (Some(warnings), Some(warning)) = (warnings, append.index_warning) {
+        warnings.push(warning);
+    }
+    Ok(outbound)
+}
+
+fn new_session_transition_ack(
+    state: &ChannelSessionState,
+    intent: &ChannelSessionTransitionIntentV1,
+) -> io::Result<ChannelOutboundMessage> {
+    if intent.command != ChannelSessionTransitionCommandV1::New {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only a durable /new transition can produce a new-session acknowledgement",
+        ));
+    }
+    let new_session_key = intent.frozen_new_session_key.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable /new transition has no frozen target session",
+        )
+    })?;
+    let digest = digest::digest(&digest::SHA256, intent.transition_id.as_bytes());
+    let mut delivery_id = String::from("delivery:v2:");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest.as_ref().iter().take(16) {
+        delivery_id.push(char::from(HEX[usize::from(*byte >> 4)]));
+        delivery_id.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+    }
+    Ok(ChannelOutboundMessage {
+        platform: state.platform.clone(),
+        account_id: state.account_id.clone(),
+        channel_id: state.channel_id.clone(),
+        user_id: state.user_id.clone(),
+        session_key: intent.old_session_key.clone(),
+        delivery_id: Some(delivery_id),
+        kind: ChannelOutboundMessageKind::CommandReply,
+        source_queue_id: None,
+        source_completion_file: None,
+        text: format!(
+            "New session planned: {}{}",
+            new_session_key,
+            intent
+                .topic
+                .as_ref()
+                .map(|topic| format!(" ({topic})"))
+                .unwrap_or_default()
+        ),
+        presentation: None,
+        delivery_intent: None,
+        attachments: Vec::new(),
+    })
+}
+
 fn write_channel_execution_mode_state(
     harness_home: &Path,
     state: &ChannelSessionState,
@@ -2460,11 +2540,11 @@ mod tests {
     use super::*;
     use crate::{
         AgentProgressContext, AgentProgressDeliveryPlanOptions, AgentProgressKind,
-        AgentProgressStatus, ChannelOutboundMessageKind, ChannelStatusSnapshot, ChannelStepAction,
-        CompletedTurnWorkingSetSnapshotOptions, ContextVirtualSessionRecord,
-        SkillEcosystemIdentity, VirtualSkillManifestStatus, append_agent_progress_event,
-        create_virtual_skill_manifest, load_virtual_skill_manifest, plan_agent_progress_delivery,
-        record_completed_turn_working_set_snapshot,
+        AgentProgressStatus, ChannelOutboundMessageKind, ChannelOutboxAppendOutcome,
+        ChannelStatusSnapshot, ChannelStepAction, CompletedTurnWorkingSetSnapshotOptions,
+        ContextVirtualSessionRecord, SkillEcosystemIdentity, VirtualSkillManifestStatus,
+        append_agent_progress_event, create_virtual_skill_manifest, load_virtual_skill_manifest,
+        plan_agent_progress_delivery, record_completed_turn_working_set_snapshot,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3717,9 +3797,102 @@ mod tests {
     }
 
     #[test]
-    fn account_scoped_new_commits_canonical_frozen_session() {
-        let root = temp_root("account_scoped_new_commits_canonical_frozen_session");
+    fn new_reconciliation_recovers_ack_after_exact_state_commit_crash_window() {
+        let root =
+            temp_root("new_reconciliation_recovers_ack_after_exact_state_commit_crash_window");
         let harness_home = root.join(".agent-harness");
+        let lane =
+            ChannelStateLane::new("telegram", Some("bot-primary"), "dm", "user", "main").unwrap();
+        let mut state = sample_channel_state("telegram", "dm", "user", "main", "old topic");
+        bind_channel_session_state_to_lane_v2(&mut state, &lane);
+        let old_session = state.active_session_key.clone();
+        let frozen_new_session = canonical_session_key_for_lane(
+            "telegram:dm:user:main:session-committed-before-ack",
+            &lane,
+        )
+        .unwrap();
+        write_channel_session_state_v2(&harness_home, &lane, &state).unwrap();
+        let prepared =
+            prepare_channel_session_transition(PrepareChannelSessionTransitionOptionsV1 {
+                harness_home: harness_home.clone(),
+                command: ChannelSessionTransitionCommandV1::New,
+                lane_digest: lane.exact_lane_digest(),
+                old_session_key: old_session.clone(),
+                proposed_new_session_key: Some(frozen_new_session.clone()),
+                topic: Some("durable acknowledgement".to_string()),
+                reason: Some("recover committed state before acknowledgement".to_string()),
+                now_ms: 1000,
+            })
+            .unwrap();
+
+        // Recreate the observed failure boundary: exact state committed, but
+        // the command acknowledgement never reached the channel outbox.
+        state.active_session_key = frozen_new_session.clone();
+        state.session_topic = prepared.intent.topic.clone();
+        write_channel_session_state_v2(&harness_home, &lane, &state).unwrap();
+        let outbox_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("outbox.jsonl");
+        assert!(!outbox_file.is_file());
+
+        let report = reconcile_channel_session_transitions_with(
+            ReconcileChannelSessionTransitionsOptionsV1 {
+                harness_home: harness_home.clone(),
+                executable: PathBuf::from("unused"),
+                arguments: Vec::new(),
+                working_directory: root.clone(),
+                codex_home: None,
+                timeout_ms: 1000,
+                max_transitions: 8,
+                now_ms: 1100,
+            },
+            |_| panic!("not-applicable transition must not execute a backend goal mutation"),
+        )
+        .unwrap();
+        assert_eq!(report.committed, 1, "{report:?}");
+
+        let persisted = fs::read_to_string(&outbox_file)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<ChannelOutboundMessage>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(persisted.len(), 1);
+        let acknowledgement = &persisted[0];
+        assert_eq!(acknowledgement.account_id.as_deref(), Some("bot-primary"));
+        assert_eq!(acknowledgement.session_key, old_session);
+        assert_eq!(
+            acknowledgement.text,
+            format!("New session planned: {frozen_new_session} (durable acknowledgement)")
+        );
+        assert!(
+            acknowledgement
+                .delivery_id
+                .as_deref()
+                .is_some_and(|delivery_id| delivery_id.starts_with("delivery:v2:"))
+        );
+
+        let mut ingress_retry = acknowledgement.clone();
+        let retry = append_channel_outbox_message(&harness_home, &mut ingress_retry).unwrap();
+        assert_eq!(retry.outcome, ChannelOutboxAppendOutcome::AlreadyPresent);
+        assert_eq!(fs::read_to_string(&outbox_file).unwrap().lines().count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn account_scoped_new_commits_canonical_frozen_session_without_mutating_legacy_state() {
+        let root = temp_root(
+            "account_scoped_new_commits_canonical_frozen_session_without_mutating_legacy_state",
+        );
+        let harness_home = root.join(".agent-harness");
+        let legacy_state_file = channel_session_state_file(&harness_home, "telegram", "dm", "user");
+        write_json_atomic(
+            &legacy_state_file,
+            &sample_channel_state("telegram", "dm", "user", "main", "stale legacy topic"),
+        )
+        .unwrap();
+        let legacy_before = fs::read(&legacy_state_file).unwrap();
         let mut step = command_step_with_session(
             "telegram:dm:user:main",
             ChannelCommandEffect::StartNewSession {
@@ -3738,6 +3911,27 @@ mod tests {
             },
         )
         .unwrap();
+        let mut ingress_append = report.outbound_messages[0].clone();
+        assert!(
+            ingress_append
+                .delivery_id
+                .as_deref()
+                .is_some_and(|delivery_id| delivery_id.starts_with("delivery:v2:"))
+        );
+        let retry = append_channel_outbox_message(&harness_home, &mut ingress_append).unwrap();
+        assert_eq!(retry.outcome, ChannelOutboxAppendOutcome::AlreadyPresent);
+        assert_eq!(
+            fs::read_to_string(
+                harness_home
+                    .join("state")
+                    .join("channels")
+                    .join("outbox.jsonl")
+            )
+            .unwrap()
+            .lines()
+            .count(),
+            1
+        );
         let state = report.state.unwrap();
         let lane =
             ChannelStateLane::new("telegram", Some("bot-primary"), "dm", "user", "main").unwrap();
@@ -3755,6 +3949,7 @@ mod tests {
             report.receipt.session_transition_phase,
             Some(ChannelSessionTransitionPhaseV1::BoundaryCommitted)
         );
+        assert_eq!(fs::read(&legacy_state_file).unwrap(), legacy_before);
 
         let _ = fs::remove_dir_all(root);
     }
