@@ -1808,14 +1808,27 @@ fn channel_status(
         .join("channels")
         .join("telegram-offset.json");
     let channel_dir = harness_home.join("state").join("channels");
-    let outbox_file = channel_dir.join("outbox.jsonl");
-    let delivery_receipts =
-        read_delivery_status_tail(&channel_dir.join("delivery-receipts.jsonl"), warnings)?;
-    let all = bounded_outbox_summary(&outbox_file, None, &delivery_receipts, warnings)?;
-    let telegram =
-        bounded_outbox_summary(&outbox_file, Some("telegram"), &delivery_receipts, warnings)?;
-    let discord =
-        bounded_outbox_summary(&outbox_file, Some("discord"), &delivery_receipts, warnings)?;
+    // Status must use the same durable, cursor-backed source of truth as the
+    // delivery planner. Sampling the outbox and only the tail of the receipt
+    // ledger independently can resurrect old delivered rows as "pending" once
+    // their terminal receipts age outside the sample window.
+    let all =
+        crate::channel_delivery_index::plan_channel_outbox_index(&channel_dir, None, 0, warnings)?
+            .summary;
+    let telegram = crate::channel_delivery_index::plan_channel_outbox_index(
+        &channel_dir,
+        Some("telegram"),
+        0,
+        warnings,
+    )?
+    .summary;
+    let discord = crate::channel_delivery_index::plan_channel_outbox_index(
+        &channel_dir,
+        Some("discord"),
+        0,
+        warnings,
+    )?
+    .summary;
 
     Ok(HarnessChannelStatus {
         outbox: HarnessOutboxStatus {
@@ -2713,100 +2726,6 @@ fn default_origin_for_platform(platform: &str) -> String {
     } else {
         "channel".to_string()
     }
-}
-
-fn read_delivery_status_tail(
-    path: &Path,
-    warnings: &mut Vec<String>,
-) -> io::Result<BTreeMap<String, String>> {
-    let Some(sample) = read_tail_sample(path, STATUS_JSONL_SAMPLE_BYTES)? else {
-        return Ok(BTreeMap::new());
-    };
-    if sample.sampled {
-        warnings.push(format!(
-            "delivery receipt status is sampled from the last {} bytes of {}",
-            sample.sampled_bytes,
-            path.display()
-        ));
-    }
-    let mut statuses = BTreeMap::new();
-    for line in sample.text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        let Some(delivery_id) = string_path_any(&value, &["deliveryId", "delivery_id"]) else {
-            continue;
-        };
-        let Some(status) = string_path_any(&value, &["status"]) else {
-            continue;
-        };
-        statuses.insert(delivery_id, status);
-    }
-    Ok(statuses)
-}
-
-fn bounded_outbox_summary(
-    path: &Path,
-    platform: Option<&str>,
-    delivery_statuses: &BTreeMap<String, String>,
-    warnings: &mut Vec<String>,
-) -> io::Result<ChannelOutboxPlanSummary> {
-    let Some(sample) = read_tail_sample(path, STATUS_JSONL_SAMPLE_BYTES)? else {
-        return Ok(ChannelOutboxPlanSummary::default());
-    };
-    if sample.sampled {
-        warnings.push(format!(
-            "channel outbox status is sampled from the last {} bytes of {}",
-            sample.sampled_bytes,
-            path.display()
-        ));
-    }
-    let mut summary = ChannelOutboxPlanSummary::default();
-    summary.sampled = sample.sampled;
-    summary.sampled_bytes = sample.sampled_bytes;
-    for (index, line) in sample.text.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        summary.total_outbox_lines += 1;
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            summary.invalid_lines += 1;
-            continue;
-        };
-        let message_platform = value.get("platform").and_then(Value::as_str);
-        if platform.is_some_and(|platform| message_platform != Some(platform)) {
-            summary.skipped_platform += 1;
-            continue;
-        }
-        let delivery_id = delivery_id_for_status(index + 1, trimmed);
-        match delivery_statuses.get(&delivery_id).map(String::as_str) {
-            Some("delivered") => summary.delivered += 1,
-            Some("failed") => {
-                summary.failed_retryable += 1;
-                summary.pending += 1;
-            }
-            _ => summary.pending += 1,
-        }
-    }
-    Ok(summary)
-}
-
-fn delivery_id_for_status(line_number: usize, line: &str) -> String {
-    format!("delivery:{line_number}:{}", fnv1a_64_hex(line))
-}
-
-fn fnv1a_64_hex(value: &str) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
 }
 
 fn read_receipt_queue_ids_with_status(
@@ -4475,6 +4394,96 @@ mod tests {
         let serialized = serde_json::to_string(&transition).unwrap();
         assert!(!serialized.contains("private-session"));
         assert!(!serialized.contains("private-thread"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_status_does_not_resurrect_delivered_rows_outside_receipt_tail_window() {
+        let root = temp_root(
+            "channel_status_does_not_resurrect_delivered_rows_outside_receipt_tail_window",
+        );
+        let harness_home = root.join(".agent-harness");
+        let channel_dir = harness_home.join("state").join("channels");
+        fs::create_dir_all(&channel_dir).unwrap();
+
+        let delivered_id = "delivery:v2:00000000000000000000000000000001";
+        let message = crate::ChannelOutboundMessage {
+            platform: "telegram".to_string(),
+            account_id: Some("default".to_string()),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            session_key: "telegram:dm:user:main".to_string(),
+            delivery_id: Some(delivered_id.to_string()),
+            kind: crate::ChannelOutboundMessageKind::AgentReply,
+            source_queue_id: Some("queue-delivered".to_string()),
+            source_completion_file: None,
+            text: "done".to_string(),
+            presentation: None,
+            delivery_intent: None,
+            attachments: Vec::new(),
+        };
+        fs::write(
+            channel_dir.join("outbox.jsonl"),
+            format!("{}\n", serde_json::to_string(&message).unwrap()),
+        )
+        .unwrap();
+
+        let delivered = crate::ChannelDeliveryReceipt {
+            schema: "agent-harness.channel-delivery-receipt.v1".to_string(),
+            delivery_id: delivered_id.to_string(),
+            status: crate::ChannelDeliveryStatus::Delivered,
+            platform: "telegram".to_string(),
+            account_id: Some("default".to_string()),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            session_key: "telegram:dm:user:main".to_string(),
+            provider_message_id: Some("provider-1".to_string()),
+            error: None,
+            rendered_units: Vec::new(),
+            presentation: None,
+            at_ms: 1,
+        };
+        let large_later_receipt = crate::ChannelDeliveryReceipt {
+            schema: "agent-harness.channel-delivery-receipt.v1".to_string(),
+            delivery_id: "delivery:v2:00000000000000000000000000000002".to_string(),
+            status: crate::ChannelDeliveryStatus::Failed,
+            platform: "discord".to_string(),
+            account_id: Some("default".to_string()),
+            channel_id: "other".to_string(),
+            user_id: "other".to_string(),
+            session_key: "discord:other:other:main".to_string(),
+            provider_message_id: None,
+            error: Some("x".repeat(STATUS_JSONL_SAMPLE_BYTES as usize + 1_024)),
+            rendered_units: Vec::new(),
+            presentation: None,
+            at_ms: 2,
+        };
+        let receipt_ledger = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&delivered).unwrap(),
+            serde_json::to_string(&large_later_receipt).unwrap()
+        );
+        assert!(receipt_ledger.len() as u64 > STATUS_JSONL_SAMPLE_BYTES);
+        fs::write(channel_dir.join("delivery-receipts.jsonl"), receipt_ledger).unwrap();
+
+        let readiness = check_activation_readiness(ActivationReadinessOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+        let mut warnings = Vec::new();
+        let report = channel_status(&harness_home, &readiness, &mut warnings).unwrap();
+
+        assert_eq!(report.outbox.all.pending, 0);
+        assert_eq!(report.outbox.all.delivered, 1);
+        assert_eq!(report.outbox.telegram.pending, 0);
+        assert_eq!(report.outbox.telegram.delivered, 1);
+        assert!(!report.outbox.all.sampled);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("delivery receipt status is sampled"))
+        );
 
         let _ = fs::remove_dir_all(root);
     }

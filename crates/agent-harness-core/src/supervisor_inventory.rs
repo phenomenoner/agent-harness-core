@@ -51,6 +51,11 @@ pub struct SupervisorInventoryServiceSummary {
     pub process_alive: Option<bool>,
     pub parent_pid: Option<i64>,
     pub process_start_time_ms: Option<i64>,
+    pub supervisor_pid: Option<i64>,
+    pub supervisor_process_alive: Option<bool>,
+    pub supervisor_process_start_time_ms: Option<i64>,
+    pub observed_supervisor_process_start_time_ms: Option<i64>,
+    pub supervisor_owner_active: bool,
     pub watched_stop_file: Option<PathBuf>,
     pub status: Option<String>,
     pub desired_state: Option<String>,
@@ -106,6 +111,8 @@ struct ServiceState {
     process_id: Option<i64>,
     parent_pid: Option<i64>,
     process_start_time_ms: Option<i64>,
+    supervisor_pid: Option<i64>,
+    supervisor_process_start_time_ms: Option<i64>,
     watched_stop_file: Option<PathBuf>,
     status: Option<String>,
     desired_state: Option<String>,
@@ -191,7 +198,9 @@ pub fn reconcile_supervisor_inventory(
                 missing.push(summary);
             }
             SupervisorInventoryStatus::Stale => {
-                launch_commands.push(build_launch_command(&options.harness_home, &desired));
+                if !summary.supervisor_owner_active {
+                    launch_commands.push(build_launch_command(&options.harness_home, &desired));
+                }
                 stale.push(summary);
             }
             SupervisorInventoryStatus::Running => running.push(summary),
@@ -397,6 +406,32 @@ fn build_summary(
             .and_then(|state| state.observed_only)
             .or(heartbeat.observed_only)
     };
+    let supervisor_pid = service_state.and_then(|state| state.supervisor_pid);
+    let supervisor_process_start_time_ms =
+        service_state.and_then(|state| state.supervisor_process_start_time_ms);
+    let supervisor_process_alive = supervisor_pid.and_then(process_alive_for_pid);
+    let observed_supervisor_process_start_time_ms =
+        supervisor_pid.and_then(crate::loop_health::process_start_time_ms_for_pid);
+    let supervisor_identity_matches = supervisor_process_start_time_ms
+        .zip(observed_supervisor_process_start_time_ms)
+        .is_some_and(|(recorded, observed)| recorded == observed);
+    let managed_launch_owner = service_state
+        .and_then(|state| state.launch_owner.as_deref())
+        .is_some_and(|owner| {
+            matches!(
+                owner,
+                "rust-supervisor-run" | crate::supervisor_master::STANDALONE_MASTER_LAUNCH_OWNER
+            )
+        });
+    let standalone_master_owner = service_state.and_then(|state| state.launch_owner.as_deref())
+        == Some(crate::supervisor_master::STANDALONE_MASTER_LAUNCH_OWNER);
+    let standalone_master_heartbeat_fresh =
+        age_ms.is_some_and(|age| age >= 0 && age <= heartbeat_timeout_ms) && !generation_mismatch;
+    let supervisor_owner_active = supervisor_process_alive == Some(true)
+        && supervisor_identity_matches
+        && managed_launch_owner
+        && (!standalone_master_owner || standalone_master_heartbeat_fresh)
+        && service_state.and_then(|state| state.observed_only) == Some(false);
     let ownership_conflict_reason = if generation_mismatch {
         Some("generation-mismatch".to_string())
     } else if observed_only == Some(true) {
@@ -422,6 +457,11 @@ fn build_summary(
         process_alive,
         parent_pid,
         process_start_time_ms,
+        supervisor_pid,
+        supervisor_process_alive,
+        supervisor_process_start_time_ms,
+        observed_supervisor_process_start_time_ms,
+        supervisor_owner_active,
         watched_stop_file,
         status,
         desired_state: service_state.and_then(|state| state.desired_state.clone()),
@@ -548,6 +588,8 @@ fn read_service_state(
                 process_id: None,
                 parent_pid: None,
                 process_start_time_ms: None,
+                supervisor_pid: None,
+                supervisor_process_start_time_ms: None,
                 watched_stop_file: None,
                 status: None,
                 desired_state: None,
@@ -573,6 +615,7 @@ fn read_service_state(
     let process_id = i64_path(&value, &["pid"]).or_else(|| i64_path(&value, &["processId"]));
     let parent_pid =
         i64_path(&value, &["parentPid"]).or_else(|| i64_path(&value, &["supervisorPid"]));
+    let supervisor_pid = i64_path(&value, &["supervisorPid"]);
     let last_heartbeat_at_ms =
         i64_path(&value, &["lastHeartbeatAtMs"]).or_else(|| i64_path(&value, &["heartbeatAtMs"]));
     Ok(ServiceState {
@@ -581,6 +624,8 @@ fn read_service_state(
         process_id,
         parent_pid,
         process_start_time_ms: i64_path(&value, &["processStartTimeMs"]),
+        supervisor_pid,
+        supervisor_process_start_time_ms: i64_path(&value, &["supervisorProcessStartTimeMs"]),
         watched_stop_file: pathbuf_path(&value, &["watchedStopFile"]),
         status: string_path(&value, &["status"]),
         desired_state: string_path(&value, &["desiredState"]),
@@ -673,6 +718,8 @@ fn default_service_state(fallback_service_id: &str) -> ServiceState {
         process_id: None,
         parent_pid: None,
         process_start_time_ms: None,
+        supervisor_pid: None,
+        supervisor_process_start_time_ms: None,
         watched_stop_file: None,
         status: None,
         desired_state: None,
@@ -960,6 +1007,77 @@ mod tests {
     }
 
     #[test]
+    fn stale_standalone_master_heartbeat_does_not_fence_recovery() {
+        let root = temp_root("stale_standalone_master_heartbeat_does_not_fence_recovery");
+        let harness_home = root.join(".agent-harness");
+        let supervisor_pid = i64::from(std::process::id());
+        let supervisor_process_start_time_ms =
+            crate::loop_health::process_start_time_ms_for_pid(supervisor_pid)
+                .expect("current master process start identity");
+        let now_ms = current_ms();
+        write_service_state(
+            &harness_home,
+            "progress-delivery-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "progress-delivery-loop",
+                "serviceKind": "progress-delivery",
+                "status": "running",
+                "desiredState": "running",
+                "actualState": "running",
+                "pid": supervisor_pid,
+                "processId": supervisor_pid,
+                "processStartTimeMs": supervisor_process_start_time_ms,
+                "supervisorPid": supervisor_pid,
+                "supervisorProcessStartTimeMs": supervisor_process_start_time_ms,
+                "launchOwner": "rust-standalone-master",
+                "observedOnly": false,
+                "generationId": "master-generation-a",
+                "lastHeartbeatAtMs": now_ms - 10_000,
+            }),
+        );
+        write_heartbeat_state(
+            &harness_home,
+            "progress-delivery-loop",
+            serde_json::json!({
+                "status": "running",
+                "processId": supervisor_pid,
+                "generationId": "master-generation-a",
+                "launchOwner": "rust-standalone-master",
+                "atMs": now_ms - 10_000,
+                "detail": "stale standalone heartbeat",
+            }),
+        );
+
+        let report = reconcile_supervisor_inventory(SupervisorInventoryOptions {
+            harness_home: harness_home.clone(),
+            desired_services: vec![SupervisorInventoryServiceConfig {
+                enabled: true,
+                service_id: "progress-delivery-loop".to_string(),
+                service_kind: "progress-delivery".to_string(),
+                args: Vec::new(),
+                priority: "standard".to_string(),
+                restart_delay_ms: 15_000,
+                heartbeat_timeout_ms: Some(1_000),
+            }],
+            now_ms: Some(now_ms),
+            default_heartbeat_timeout_ms: Some(120_000),
+        })
+        .unwrap();
+
+        assert_eq!(report.stale.len(), 1);
+        let summary = report.stale.first().unwrap();
+        assert_eq!(summary.supervisor_process_alive, Some(true));
+        assert!(
+            !summary.supervisor_owner_active,
+            "a live master process cannot fence recovery with a stale service heartbeat"
+        );
+        assert_eq!(report.launch_commands.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn dead_pid_desired_running_classified_restartable() {
         let root = temp_root("dead_pid_desired_running_classified_restartable");
         let harness_home = root.join(".agent-harness");
@@ -1006,6 +1124,62 @@ mod tests {
                 .first()
                 .map(|item| item.service_id.as_str()),
             Some("progress-delivery-loop")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dead_child_in_backoff_does_not_request_a_second_live_supervisor_owner() {
+        let root = temp_root("dead_child_in_backoff_does_not_request_second_live_supervisor_owner");
+        let harness_home = root.join(".agent-harness");
+        let supervisor_pid = i64::from(std::process::id());
+        let supervisor_process_start_time_ms =
+            crate::loop_health::process_start_time_ms_for_pid(supervisor_pid)
+                .expect("current supervisor process start identity");
+        let now_ms = current_ms();
+        write_service_state(
+            &harness_home,
+            "discord-outbox-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "discord-outbox-loop",
+                "serviceKind": "final-outbox",
+                "status": "restart-backoff",
+                "desiredState": "running",
+                "actualState": "restart-backoff",
+                "pid": -1,
+                "processId": -1,
+                "processStartTimeMs": 1,
+                "supervisorPid": supervisor_pid,
+                "supervisorProcessStartTimeMs": supervisor_process_start_time_ms,
+                "launchOwner": "rust-supervisor-run",
+                "observedOnly": false,
+                "lastHeartbeatAtMs": now_ms,
+            }),
+        );
+
+        let report = reconcile_supervisor_inventory(SupervisorInventoryOptions {
+            harness_home: harness_home.clone(),
+            desired_services: vec![SupervisorInventoryServiceConfig {
+                enabled: true,
+                service_id: "discord-outbox-loop".to_string(),
+                service_kind: "final-outbox".to_string(),
+                args: Vec::new(),
+                priority: "final-delivery".to_string(),
+                restart_delay_ms: 60_000,
+                heartbeat_timeout_ms: Some(120_000),
+            }],
+            now_ms: Some(now_ms),
+            default_heartbeat_timeout_ms: Some(120_000),
+        })
+        .unwrap();
+
+        assert_eq!(report.stale.len(), 1);
+        assert!(
+            report.launch_commands.is_empty(),
+            "a verified live supervisor owns child restart/backoff and must fence a second owner"
         );
 
         let _ = fs::remove_dir_all(root);

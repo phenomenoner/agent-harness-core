@@ -53,6 +53,72 @@ pub const DEFAULT_AGENT_PROGRESS_HOT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_AGENT_PROGRESS_HOT_RETAINED_TERMINAL_QUEUES: usize = 1_024;
 static PROGRESS_EVENT_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NeedsUserProgressPresentation {
+    pub(crate) label: &'static str,
+    pub(crate) lifecycle: Option<AgentProgressLifecycle>,
+}
+
+pub(crate) fn classify_needs_user_progress_presentation(
+    disposition: Option<crate::RuntimeTerminalDispositionV1>,
+    source_closure_kind: Option<&str>,
+    source_closure_reason: Option<&str>,
+) -> Option<NeedsUserProgressPresentation> {
+    if disposition != Some(crate::RuntimeTerminalDispositionV1::NeedsUser) {
+        return None;
+    }
+
+    let closure_kind = source_closure_kind
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let closure_reason = source_closure_reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let parked_label = match closure_kind {
+        Some("parked-observe") => Some("goal-parked-observe"),
+        Some("parked-policy-denied") => Some("goal-parked-policy"),
+        _ => None,
+    };
+    if let Some(label) = parked_label {
+        return Some(NeedsUserProgressPresentation {
+            label,
+            lifecycle: None,
+        });
+    }
+
+    if closure_kind == Some("terminal-goal-surface")
+        || closure_reason.is_some_and(|reason| reason.starts_with("goal-transition-"))
+    {
+        let label = match closure_reason {
+            Some(reason) if reason.starts_with("goal-transition-pause") => "goal-paused",
+            Some(reason) if reason.starts_with("goal-transition-needs-authority") => {
+                "goal-needs-authority"
+            }
+            Some(reason) if reason.starts_with("goal-transition-needs-operator-auth") => {
+                "goal-needs-operator-auth"
+            }
+            Some(reason) if reason.starts_with("goal-transition-needs-user") => "goal-needs-user",
+            _ => "goal-needs-user",
+        };
+        return Some(NeedsUserProgressPresentation {
+            label,
+            lifecycle: None,
+        });
+    }
+
+    if closure_kind.is_some() || closure_reason.is_some() {
+        return Some(NeedsUserProgressPresentation {
+            label: "needs-user",
+            lifecycle: None,
+        });
+    }
+
+    Some(NeedsUserProgressPresentation {
+        label: "waiting-for-approval",
+        lifecycle: Some(AgentProgressLifecycle::WaitingForApproval),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentProgressContext {
@@ -1569,7 +1635,9 @@ pub fn plan_agent_progress_delivery(
                     }
                     let synthetic = terminal_control_suppressed_progress_events(
                         kept.last().expect("kept is not empty"),
-                        &control,
+                        &control.control,
+                        control.source_closure_kind.as_deref(),
+                        control.source_closure_reason.as_deref(),
                         options.now_ms,
                     );
                     kept.clear();
@@ -2299,6 +2367,12 @@ fn render_agent_progress_status(
     ));
     if effective_progress_lifecycle(latest) == Some(AgentProgressLifecycle::Continuing) {
         "🔄 Continuing — moving work to a new context".to_string()
+    } else if let Some(title) = needs_user_progress_title(&latest.label) {
+        format!(
+            "{title} — {} — {}",
+            elapsed,
+            quote_safe_preview(&latest.preview, max_preview_chars)
+        )
     } else if effective_progress_lifecycle(latest)
         == Some(AgentProgressLifecycle::WaitingForApproval)
     {
@@ -2343,6 +2417,18 @@ fn render_agent_progress_status(
             ));
         }
         status
+    }
+}
+
+fn needs_user_progress_title(label: &str) -> Option<&'static str> {
+    match label {
+        "goal-paused" => Some("⏸️ Goal paused"),
+        "goal-parked-observe" | "goal-parked-policy" => Some("⏸️ Goal parked"),
+        "goal-needs-user" => Some("⏸️ Needs user input"),
+        "goal-needs-authority" => Some("⏸️ Needs authority"),
+        "goal-needs-operator-auth" => Some("🔐 Needs operator authentication"),
+        "needs-user" => Some("⏸️ Needs user action"),
+        _ => None,
     }
 }
 
@@ -3179,17 +3265,33 @@ fn terminal_control_for_progress_queue(
     queue_id: &str,
     session_key: Option<&str>,
     warnings: &mut Vec<String>,
-) -> Option<QueueTerminalControlMatch> {
+) -> Option<ProgressTerminalControlMatch> {
     let Some(index) = index else {
         return None;
     };
-    match resolve_queue_terminal_control_from_index(
-        queue_dir,
-        queue_id,
-        session_key,
-        index.queues.get(queue_id),
-    ) {
-        Ok(QueueTerminalControl::Terminal(control)) => Some(control),
+    let indexed = index.queues.get(queue_id);
+    match resolve_queue_terminal_control_from_index(queue_dir, queue_id, session_key, indexed) {
+        Ok(QueueTerminalControl::Terminal(control)) => {
+            let (source_closure_kind, source_closure_reason) = if control.source
+                == crate::runtime_worker::TerminalControlSource::RunOnceTerminal
+            {
+                indexed
+                    .map(|entry| {
+                        (
+                            entry.terminal_source_closure_kind.clone(),
+                            entry.terminal_source_closure_reason.clone(),
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                (None, None)
+            };
+            Some(ProgressTerminalControlMatch {
+                control,
+                source_closure_kind,
+                source_closure_reason,
+            })
+        }
         Ok(QueueTerminalControl::Runnable) => None,
         Err(error) => {
             warnings.push(format!(
@@ -3200,9 +3302,17 @@ fn terminal_control_for_progress_queue(
     }
 }
 
+struct ProgressTerminalControlMatch {
+    control: QueueTerminalControlMatch,
+    source_closure_kind: Option<String>,
+    source_closure_reason: Option<String>,
+}
+
 fn terminal_control_suppressed_progress_events(
     latest: &StoredProgressEvent,
     control: &QueueTerminalControlMatch,
+    source_closure_kind: Option<&str>,
+    source_closure_reason: Option<&str>,
     now_ms: i64,
 ) -> Vec<StoredProgressEvent> {
     let context = AgentProgressContext {
@@ -3229,6 +3339,11 @@ fn terminal_control_suppressed_progress_events(
                 }
                 _ => Some(crate::RuntimeTerminalDispositionV1::TerminalSuppression),
             });
+    let needs_user_presentation = classify_needs_user_progress_presentation(
+        disposition,
+        source_closure_kind,
+        source_closure_reason,
+    );
     let preview = match disposition {
         Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff) => {
             "continuation admitted; logical task is still active".to_string()
@@ -3238,6 +3353,15 @@ fn terminal_control_suppressed_progress_events(
         }
         Some(crate::RuntimeTerminalDispositionV1::LogicalFailure) => control.reason.clone(),
         Some(crate::RuntimeTerminalDispositionV1::LogicalSuccess) => "completed".to_string(),
+        Some(crate::RuntimeTerminalDispositionV1::NeedsUser)
+            if needs_user_presentation
+                .is_some_and(|presentation| presentation.lifecycle.is_none()) =>
+        {
+            source_closure_reason.unwrap_or(&control.reason).to_string()
+        }
+        Some(crate::RuntimeTerminalDispositionV1::NeedsUser) => {
+            format!("waiting for user or authority: {}", control.reason)
+        }
         _ => format!(
             "suppressed by terminal control: {}",
             control.source.as_str()
@@ -3257,6 +3381,15 @@ fn terminal_control_suppressed_progress_events(
         }
         Some(crate::RuntimeTerminalDispositionV1::LogicalSuccess) => {
             ("run", AgentProgressStatus::Completed, None)
+        }
+        Some(crate::RuntimeTerminalDispositionV1::NeedsUser) => {
+            let presentation = needs_user_presentation
+                .expect("NeedsUser disposition must have a progress presentation");
+            (
+                presentation.label,
+                AgentProgressStatus::Progress,
+                presentation.lifecycle,
+            )
         }
         _ => ("terminal-suppression", AgentProgressStatus::Completed, None),
     };
@@ -4061,6 +4194,116 @@ mod tests {
         }
     }
 
+    fn render_needs_user_terminal_control(
+        source_closure_kind: Option<&str>,
+        source_closure_reason: Option<&str>,
+    ) -> (String, AgentProgressEvent) {
+        let latest = StoredProgressEvent {
+            line_number: 1,
+            event: AgentProgressEvent::new(
+                &context(),
+                AgentProgressKind::Runtime,
+                "runtime",
+                "working",
+                AgentProgressStatus::Progress,
+                1_000,
+            ),
+        };
+        let events = terminal_control_suppressed_progress_events(
+            &latest,
+            &QueueTerminalControlMatch {
+                source: crate::runtime_worker::TerminalControlSource::RunOnceTerminal,
+                reason: "runtime receipt requires user action".to_string(),
+                suppression_recorded: false,
+                terminal_status: Some("needs-user".to_string()),
+                terminal_disposition: Some(crate::RuntimeTerminalDispositionV1::NeedsUser),
+                continuation_link: None,
+            },
+            source_closure_kind,
+            source_closure_reason,
+            2_000,
+        );
+        let refs = events.iter().map(|event| &event.event).collect::<Vec<_>>();
+        (
+            render_agent_progress_panel(&refs, 2_000, 8, 120),
+            events.last().unwrap().event.clone(),
+        )
+    }
+
+    #[test]
+    fn parked_goal_closures_never_render_connector_approval() {
+        for (closure_kind, closure_reason) in [
+            (
+                "parked-observe",
+                "goal-autonomy-observe: automatic continuation is observation-only",
+            ),
+            (
+                "parked-policy-denied",
+                "goal-autonomy-lane-denied: exact lane authority is ambiguous",
+            ),
+        ] {
+            let (panel, terminal) =
+                render_needs_user_terminal_control(Some(closure_kind), Some(closure_reason));
+            assert!(panel.contains("Goal parked"), "{closure_kind}: {panel}");
+            assert!(panel.contains(closure_reason), "{closure_kind}: {panel}");
+            assert!(
+                !panel.contains("Waiting for approval"),
+                "{closure_kind}: {panel}"
+            );
+            assert!(
+                !panel.contains("connector action"),
+                "{closure_kind}: {panel}"
+            );
+            assert_eq!(terminal.lifecycle, None, "{closure_kind}: {terminal:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_goal_needs_user_classes_render_distinct_non_connector_states() {
+        for (closure_reason, expected_title) in [
+            (
+                "goal-transition-needs-user: choose the target branch",
+                "Needs user input",
+            ),
+            (
+                "goal-transition-needs-authority: exact lane authority is missing",
+                "Needs authority",
+            ),
+            (
+                "goal-transition-needs-operator-auth: refresh the Codex login",
+                "Needs operator authentication",
+            ),
+        ] {
+            let (panel, terminal) = render_needs_user_terminal_control(
+                Some("terminal-goal-surface"),
+                Some(closure_reason),
+            );
+            assert!(panel.contains(expected_title), "{closure_reason}: {panel}");
+            assert!(panel.contains(closure_reason), "{closure_reason}: {panel}");
+            assert!(
+                !panel.contains("Waiting for approval"),
+                "{closure_reason}: {panel}"
+            );
+            assert!(
+                !panel.contains("connector action"),
+                "{closure_reason}: {panel}"
+            );
+            assert_eq!(terminal.lifecycle, None, "{closure_reason}: {terminal:?}");
+        }
+    }
+
+    #[test]
+    fn connector_approval_without_goal_closure_keeps_waiting_for_approval() {
+        let (panel, terminal) = render_needs_user_terminal_control(None, None);
+        assert!(panel.contains("Waiting for approval"), "{panel}");
+        assert!(panel.contains("connector action is parked"), "{panel}");
+        assert_eq!(
+            terminal.lifecycle,
+            Some(AgentProgressLifecycle::WaitingForApproval)
+        );
+        assert_eq!(terminal.label, "waiting-for-approval");
+    }
+
     #[test]
     fn continuation_handoff_never_renders_done() {
         let latest = StoredProgressEvent {
@@ -4091,12 +4334,84 @@ mod tests {
                     virtual_lane_digest: None,
                 }),
             },
+            None,
+            None,
             2_000,
         );
         let refs = events.iter().map(|event| &event.event).collect::<Vec<_>>();
         let panel = render_agent_progress_panel(&refs, 2_000, 8, 120);
         assert!(panel.contains("Continuing"));
         assert!(!panel.contains("Done"));
+    }
+
+    #[test]
+    fn blocked_goal_needs_user_never_renders_completed() {
+        let latest = StoredProgressEvent {
+            line_number: 1,
+            event: AgentProgressEvent::new(
+                &context(),
+                AgentProgressKind::Runtime,
+                "runtime",
+                "working",
+                AgentProgressStatus::Progress,
+                1_000,
+            ),
+        };
+        let events = terminal_control_suppressed_progress_events(
+            &latest,
+            &QueueTerminalControlMatch {
+                source: crate::runtime_worker::TerminalControlSource::RunOnceTerminal,
+                reason: "authoritative Goal is blocked".to_string(),
+                suppression_recorded: false,
+                terminal_status: Some("needs-user".to_string()),
+                terminal_disposition: Some(crate::RuntimeTerminalDispositionV1::NeedsUser),
+                continuation_link: None,
+            },
+            Some("terminal-goal-surface"),
+            Some("goal-transition-pause: authoritative Goal is blocked"),
+            2_000,
+        );
+        let refs = events.iter().map(|event| &event.event).collect::<Vec<_>>();
+        let panel = render_agent_progress_panel(&refs, 2_000, 8, 120);
+        assert!(panel.contains("Goal paused"), "{panel}");
+        assert!(!panel.contains("Waiting for approval"), "{panel}");
+        assert!(!panel.contains("connector action"), "{panel}");
+        assert!(!panel.contains("Done"), "{panel}");
+        assert!(!panel.contains("completed"), "{panel}");
+    }
+
+    #[test]
+    fn failed_goal_renders_failed_not_completed() {
+        let latest = StoredProgressEvent {
+            line_number: 1,
+            event: AgentProgressEvent::new(
+                &context(),
+                AgentProgressKind::Runtime,
+                "runtime",
+                "working",
+                AgentProgressStatus::Progress,
+                1_000,
+            ),
+        };
+        let events = terminal_control_suppressed_progress_events(
+            &latest,
+            &QueueTerminalControlMatch {
+                source: crate::runtime_worker::TerminalControlSource::RunOnceTerminal,
+                reason: "non-retryable Goal failure".to_string(),
+                suppression_recorded: false,
+                terminal_status: Some("failed-terminal".to_string()),
+                terminal_disposition: Some(crate::RuntimeTerminalDispositionV1::LogicalFailure),
+                continuation_link: None,
+            },
+            None,
+            None,
+            2_000,
+        );
+        let refs = events.iter().map(|event| &event.event).collect::<Vec<_>>();
+        let panel = render_agent_progress_panel(&refs, 2_000, 8, 120);
+        assert!(panel.contains("Failed"), "{panel}");
+        assert!(!panel.contains("Done"), "{panel}");
+        assert!(!panel.contains("completed"), "{panel}");
     }
 
     #[test]
@@ -4122,6 +4437,8 @@ mod tests {
                 terminal_disposition: None,
                 continuation_link: None,
             },
+            None,
+            None,
             2_000,
         );
         let refs = events.iter().map(|event| &event.event).collect::<Vec<_>>();

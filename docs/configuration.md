@@ -16,7 +16,42 @@ Use `--source-home` for imported prompt files, registry, skills, and legacy cont
 
 ## Supervisor Plans and Receipt Maintenance
 
-`supervisor-plan` generates the Windows Task Scheduler start/stop bundle from the authoritative harness configuration. Do not hand-edit generated runner scripts: regenerate the bundle after changing supervised loop configuration, first using `supervisor-reconcile --all --dry-run` to review ownership.
+`supervisor-plan` generates the legacy per-service Windows Task Scheduler bundle for developer staging only. It is rejected for a live `.agent-harness` target because per-service tasks would create a second launch-owner authority. Do not hand-edit generated runner scripts; production uses the single reconcile keeper described below.
+
+When `supervisor.manageAllLoops=true`, use the reconcile-managed root-keeper bundle instead of a one-shot reconcile launch. `supervisor-keeper-plan` writes one same-user Task Scheduler plan and seven scripts below `state/supervisor/windows-reconcile-keeper/`. The scheduled action invokes canonical Windows PowerShell with `-WindowStyle Hidden` and the manifest-bound `launch-hidden.ps1` adapter. That adapter revalidates its own hash, the plan, and the canonical deployed CLI hash before starting the direct keeper action with `UseShellExecute=false`, `CreateNoWindow=true`, and absolute `--harness-home`, `--source-home`, `--workspace`, `--runtime-workspace`, executable, gateway, and global `--stop-file` arguments. It waits synchronously and returns the keeper exit code; it is a window-suppression boundary, not another topology authority. Generated paths are normal absolute Win32 paths (not `\\?\` extended paths), and the default task name includes a digest of the exact harness home so two deployments cannot overwrite each other's task.
+
+The generated task contract is `Interactive`/`Limited` with exactly one same-user `AtLogOn` trigger and one indefinite `PT1M` time trigger anchored at the deterministic `2000-01-01T00:00:00` boundary. `IgnoreNew` turns each periodic firing into an idempotent recovery check instead of a second keeper, while `StartWhenAvailable`, battery-safe settings, and `PT0S` execution time retain the intended desktop-session behavior. Task Scheduler restart-on-failure is retained as defense in depth, but periodic recovery is the availability mechanism: restart-on-failure alone is not a correctness guarantee for externally terminated task actions. This contract recovers while the designated desktop user is logged in and resumes after the next logon; it is not an always-on, pre-login or through-logoff Windows Service contract. Registration leaves the task disabled from its first observable state. The generated control order is transactional:
+
+1. Live plan generation and `install.ps1` validate cutover authority, bind generated content digests, inventory prior exact launch owners, and register or upgrade only an exact-owned stopped task in the disabled state. A stale-upgrade failure restores the previous exact task definition.
+2. `start.ps1` revalidates the current task and legacy-owner quiescence before clearing holds. A post-clear failure restores the global and child stop state, proves partial process trees stopped or records manual recovery, and leaves the exact keeper disabled.
+3. `stop.ps1` first commits the global keeper hold and child stop markers, then requires a matching post-request keeper generation/PID terminal state and absence of every exact child process tree. An already-dead keeper has an empty initial process tree and is still a valid stopped-state proof; stale state and partial exit cannot report success.
+4. `readback.ps1` independently queries Task Scheduler for the exact task path/name, one action, both triggers, settings, executable digest, global hold, and keeper runtime state. Task Scheduler aliases for the same Windows account are compared by SID while both planned and observed spellings remain visible. Readiness never advances freshness by timestamp-only self-attestation.
+5. `uninstall.ps1` reuses the guarded complete-stop path, re-proves exact ownership, and only then unregisters the task.
+
+`harness.ps1 gateway keeper-plan`, `keeper-install`, `keeper-readback`, and `keeper-uninstall` expose those explicit phases. `gateway start/stop/restart` consume the generated keeper scripts through an explicit Windows PowerShell process with process-scoped `ExecutionPolicy Bypass`; generated scripts use the same boundary for sibling scripts, compute executable SHA-256 through .NET rather than module auto-loading, and atomically replace JSON through same-directory temporary and backup files. Start no longer launches a one-shot reconcile process. Reconcile readiness and `healthz` compare the exact expected and observed topology and fail closed on empty, missing, unexpected, stale, wrong-kind, wrong-owner, held, disabled, or drifted state. Live keeper-plan promotion requires an exact `restart` grant supplied only through `AGENT_HARNESS_LIVE_CONTROL_TOKEN`; the plan command rejects token argv, and generated live scripts inherit the environment token without forwarding it in PowerShell or child-process command lines. The restart grant composes only its guarded start and failure-containment stop substeps. Other destructive live-home controls retain their action-specific validation. With a same-user writable token ledger this is an operational accident guard, not an unforgeable security boundary against a process holding that user's full shell authority.
+
+### Supervisor ownership modes
+
+`supervisor.ownershipMode` accepts `compatibility` (default), `observe`, or `direct-owner`:
+
+```json
+{
+  "supervisor": {
+    "enabled": true,
+    "manageAllLoops": true,
+    "autoReconcile": false,
+    "ownershipMode": "direct-owner"
+  }
+}
+```
+
+- `compatibility` retains the current reconcile keeper and one `supervisor-run` owner per service. `autoReconcile` may be enabled only in this mode.
+- `observe` derives the desired direct topology and writes a separate observation receipt. It does not acquire the ownership lease, spawn a child, or write canonical service state, and it is never activation-ready.
+- `direct-owner` requires `enabled=true` and `autoReconcile=false`. On Windows, one `supervisor-master` holds the exclusive ownership lease and directly retains every configured child. Compatibility owners use shared handles to the same lease, so the modes cannot co-own a deployment.
+
+Direct ownership checks the exact config generation before every initial or restart spawn. Service arguments may repeat `--harness-home`, `--service`, or `--harness-cli` only with the exact authoritative value; they cannot redirect identity or deployment paths. Reserved ownership and generation environment variables are written by the master after caller-supplied environment. Startup imports only provenance-bound stopped state and never adopts a prior PID.
+
+The current direct-owner implementation requires Windows kill-on-close Job containment. Other operating systems reject direct ownership before creating a lease, receipt, child, or canonical state. Unix process-group/session containment and Windows Service, systemd, and launchd host packages remain separate portability work; do not describe the present implementation as native cross-platform supervision.
 
 `runtime-loop` polls durable terminal control for its active queue items. `--active-task-shutdown-grace-ms` controls the bounded cooperative grace (15 seconds by default). If an exact queue stop remains active after the grace, the loop exits non-zero so `supervisor-run` restarts it and existing generation-fenced lease reconciliation can suppress the stopped item. A watched service stop uses the same grace but exits cleanly so an operator stop does not trigger restart.
 
@@ -97,7 +132,7 @@ This example selects models; it does not hard-code a reasoning capability. Use t
 
 `skills/` is indexed from operator-authored, imported, bundled, agent-created, and pack namespaces. Category subdirectories are supported one level below each root, and `.archive/` or other dot directories are excluded from discovery.
 
-`harness-config.json` can configure the skill matcher, virtual-manifest observer, catalog, taxonomy, lint, guard, synthesis, nudges, and curator. Defaults keep serving unchanged and mutation paths proposal-only and checksum guarded:
+`harness-config.json` can configure the skill matcher, virtual-manifest observer, catalog, taxonomy, lint, guard, synthesis, nudges, and curator. Shadow observation keeps serving unchanged. Mature agent-created synthesis defaults to guarded autonomous apply with proposal/decision traces, while unfinished mutation families remain disabled until their own technical and safety gates pass:
 
 ```json
 {
@@ -140,7 +175,7 @@ This example selects models; it does not hard-code a reasoning capability. Use t
   "learning": {
     "skillSynthesis": {
       "enabled": true,
-      "mode": "propose-only",
+      "mode": "auto",
       "dailyCap": 3,
       "minToolCalls": 5,
       "minAssistantChars": 600
@@ -171,7 +206,7 @@ This example selects models; it does not hard-code a reasoning capability. Use t
 
 `skills.virtualManifest.observeEnabled` is a separate default-off F2 instrumentation switch. It requires an exact F1 route receipt and records a frozen exact-lane virtual manifest plus append-once delivery evidence. It cannot alter active skill IDs or prompt bytes. Concrete backend rollover rehydrates the frozen revision without a fresh routing link; `/new` closes the old manifest and starts without inherited task intent. Enabling F1 alone never creates manifest or delivery evidence.
 
-`learning.skillSynthesis.mode = "propose-only"` is the default skill-learning posture: a complex successful turn that did not use a matching skill may enqueue a `skill_synthesis` worker job and persist a reviewable proposal, but it cannot mutate a skill. Explicit `"auto"`, `"apply"`, or `"dispatch-and-replace"` config supplies worker apply authorization; the worker still requires both `applyAuthorized=true` and `proposeOnly=false`, then runs lint/guard review and the checksum/backup apply path. The CLI likewise requires explicit `skill-synthesize --apply`.
+`learning.skillSynthesis.mode = "auto"` is the default skill-learning posture: a complex successful turn that did not use a matching skill may enqueue a `skill_synthesis` worker job, persist a reviewable proposal trace, run autonomous lint/guard review, and apply only through the checksum/target-lock/backup/receipt path. `"propose-only"` remains an explicit non-mutating replay or operator opt-out. Normal runtime jobs carry `applyAuthorized=true` and `proposeOnly=false`; legacy queued or externally constructed jobs that omit those fields remain non-mutating so an upgrade cannot reinterpret historical work. The CLI follows the same default and accepts `skill-synthesize --propose-only` as the opt-out.
 
 Unknown taxonomy categories do not fail config validation; `skill-lint` reports category quality issues so operators can add categories without breaking older binaries. `skill-view` can print a selected skill body or support file and records a `viewed` usage event.
 
@@ -223,7 +258,7 @@ spawnable Node executable.
 
 `timeout` run-once receipts are terminal for the parent queue id. Runtime selection, status open-item counts, native typing context, and progress delivery all treat the parent turn as closed after a timeout. To retry work, enqueue a new turn or explicit retry id rather than reusing the old queue id.
 
-Round10 adds one guarded exception before terminal timeout selection: when Codex runtime observes an active tool-use item and then hits the idle JSONL timeout, the harness stops the prior app-server/tool path, records `toolUseTimeout` in `agent-harness.codex-runtime-run.v1`, and opens one bounded fresh-thread recovery prompt so the model can decide whether to retry narrowly, use an alternative, or report a blocker. If that recovery output is only external review evidence, it is recorded as `agent-harness.external-review-evidence.v1` and does not close the parent workflow as a final reply. If recovery fails, the resulting timeout remains terminal for the parent queue id. This is an initial guard, not full per-tool supervisor parity.
+One guarded exception runs before terminal timeout selection: when Codex runtime observes an active tool-use item and then hits the idle JSONL timeout, the harness stops the prior app-server/tool path, records `toolUseTimeout` in `agent-harness.codex-runtime-run.v1`, and opens one bounded fresh-thread recovery prompt so the model can decide whether to retry narrowly, use an alternative, or report a blocker. If that recovery output is only external review evidence, it is recorded as `agent-harness.external-review-evidence.v1` and does not close the parent workflow as a final reply. If recovery fails, the resulting timeout remains terminal for the parent queue id. This is an initial guard, not full per-tool supervisor parity.
 
 Context preflight also applies an absolute high-usage guard through `codexContext.highContextUsageCompactTokenLimit` (default `120000`). This covers bound-thread incidents where prompt bytes are modest but prior recorded usage is already very high and no `modelContextWindow` ratio can be computed; the guard forces official compact before the next turn when an existing thread is bound.
 
@@ -319,7 +354,7 @@ Runtime queue items now carry `runtimeClass` and `origin` metadata. Channel ingr
 }
 ```
 
-The runtime loop uses class-scoped lease files under `state/runtime-queue/classes/<class>/runtime-leases.json`. Legacy root `state/runtime-queue/runtime-leases.json` is still read during capacity checks so an upgrade does not ignore active pre-Round5 leases.
+The runtime loop uses class-scoped lease files under `state/runtime-queue/classes/<class>/runtime-leases.json`. Legacy root `state/runtime-queue/runtime-leases.json` is still read during capacity checks so an upgrade does not ignore active leases written before the class-scoped migration.
 
 For ordinary channel-origin `interactive` main-agent items, the session lane key is `runtimeClass + agentId + platform + channelId + userId + sessionKey`. `perSessionMaxActive=1` and `sessionFifo=true` mean a second same-session message waits for the older same-lane item to reach terminal run status even when broader `perChannelMaxActive` capacity remains. Worker/subagent lanes can keep wider fan-out because `sameSessionMainAgentSerialization` is false outside the interactive main-agent lane by default.
 
@@ -484,7 +519,9 @@ Progress delivery modes:
 
 ## Goal Autonomy
 
-Goal transition and final-outbox gating are always observable, but autonomous child enqueue is independently activated. The safe default is observation-only:
+Goal transition and final-outbox gating are always observable. When the `goalAutonomy` block is absent, an exact current-owned Goal with a canonical lane and authorized continuation is allowed to keep running in bounded child slices. Generic callers and historical, foreign, or unproven Goal state never gain this implicit authority.
+
+Add an explicit block when the deployment needs an opt-out or a fixed allow-list. For example, this disables autonomous child enqueue while retaining transition evidence:
 
 ```json
 {
@@ -503,9 +540,11 @@ Goal transition and final-outbox gating are always observable, but autonomous ch
 }
 ```
 
-`mode` accepts `disabled`, `observe`, or `active`. Active mode is still fail-closed unless the current canonical FullLaneKey SHA-256 is explicitly listed in `activeLaneDigests`; a lane from another account, channel, user, agent, runtime class, root session, or concrete session is not a substitute. The validator requires every digest to be 64 hexadecimal characters and requires at least one digest when mode is `active`.
+`mode` accepts `disabled`, `observe`, or `active`. Explicit `disabled` and `observe` are opt-outs from the implicit product default. Explicit active mode is fail-closed unless the current canonical FullLaneKey SHA-256 is listed in `activeLaneDigests`; a lane from another account, channel, user, agent, runtime class, root session, or concrete session is not a substitute. The validator requires every digest to be 64 hexadecimal characters and requires at least one digest when mode is `active`.
 
-An active goal slice writes a unified transition before final-outbox selection. If continuation is authorized, the runtime commits a deterministic intent before enqueue, keeps `campaignSliceGeneration` separate from context-recovery `continuationIndex`, reconciles commit/enqueue interruptions on restart, and acknowledges the intent only after the child acquires the runtime lane lease. Candidate/foundation cutover must remain `observe`; activating one reviewed exact-lane C2-G cohort is a separate live operation requiring explicit approval and rollback evidence.
+An active goal slice writes a unified transition before final-outbox selection. If continuation is authorized, the runtime commits a deterministic intent before enqueue, snapshots the lane's ordinary-human-input generation, keeps `campaignSliceGeneration` separate from context-recovery `continuationIndex`, and reconciles commit/enqueue interruptions on restart. A separate rollback-readable fence revokes stale intent authority. The child is acknowledged only after it acquires the runtime lane lease and passes a second authority, fence, and human-input check.
+
+Ordinary same-lane user text remains durable queue input. At the next scheduler checkpoint it outranks an unleased autonomous continuation, and its newer input generation fences that older continuation during reconciliation, after lease, and before further child chaining. It does not preempt an already active lease; use `/steer` for explicit same-turn steering. `/new` remains an independent session boundary. Promotion still requires reviewed replay and rollback evidence for the exact lane and deployment.
 
 Goal slices are bounded to 30–45 minutes. `sliceIdleTimeoutMs` must be at least one minute and below the hard timeout. `sliceDrainWindowMs` is deliberately derived and must equal the smaller of 10% of the hard timeout or 180000 ms, matching the runtime deadline-drain guard. `wallClockBudgetMs` cannot exceed 48 hours. Slice-count, cumulative token-cost, repeated-progress-fingerprint, and recovery-count breakers are positive hard boundaries; reaching one stops continuation through the unified transition and emits at most one sanitized terminal notice. `goal-campaign-status --target-home <staging-home>` is read-only and reports the effective policy plus the latest append-only budget receipt for each campaign.
 

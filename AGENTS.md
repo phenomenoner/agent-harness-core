@@ -26,6 +26,13 @@
 - Treat `agentId` and the exact `platform`, `accountId`, `channelId`, `userId`, and `sessionKey` tuple as routing and continuity boundaries. Do not substitute evidence from another agent or channel.
 - For software changes, apply `completeness-and-test-synthesis` before a completion claim: classify blast radius, map touched invariants, run fresh verification at the required tier, and report gaps. Cross-cutting identity, routing, shared-state, memory, delivery, supervisor, or security changes normally require scenario/replay evidence (T3) unless the user accepts a lower-tier gap.
 
+## Workspace And Build-Output Boundary
+
+- Resolve the source root with `git rev-parse --show-toplevel` before creating an isolated checkout or selecting a build output directory. Task-created Git worktrees must be descendants of the ignored `<source-root>/.worktrees/` directory; do not create sibling checkouts such as `<source-root>-release-*` beside the repository.
+- Keep Cargo output below `<source-root>/target/`, including explicit `--target-dir` staging, test, and release directories. Keep scratch evidence below `<source-root>/.debug/`. A task may not create build, release, worktree, cache, or evidence directories in the source root's parent.
+- Do not initialize or create `.git` markers in an ancestor directory. Do not repurpose a separately managed skill source such as an external `.skill-repo` as build output or a project worktree.
+- Before removing a pre-existing external worktree or ancestor artifact, prove its registration, cleanliness, branch reachability, and process ownership. Preserve an unmerged branch or other exclusive state until the user approves a recoverable cleanup.
+
 ## Public And Private Surfaces
 
 - Treat root policy/project files and public `docs/` and `tools/` entries as GitHub-facing. Keep secrets, local receipts, channel/user identifiers, machine-specific runbooks, private handoffs, graph/session caches, and debug evidence out of them.

@@ -68,6 +68,7 @@ pub mod model_catalog;
 pub mod nudge;
 pub mod operation_plan;
 pub mod ops;
+pub mod process_launch;
 pub mod progress;
 pub(crate) mod progress_event_index;
 pub mod prompt;
@@ -111,6 +112,9 @@ pub mod subagents;
 pub mod supervision;
 pub mod supervisor;
 pub mod supervisor_inventory;
+pub mod supervisor_keeper;
+pub mod supervisor_master;
+pub mod supervisor_topology;
 pub mod task_budget;
 pub mod task_transition;
 pub mod token_efficiency;
@@ -383,12 +387,14 @@ pub use goal_closure::{
     record_goal_closure_intent, record_goal_closure_phase, resolve_goal_closure_target,
 };
 pub use goal_continuation::{
-    GOAL_CONTINUATION_INTENT_SCHEMA, GoalAutonomyActivation, GoalAutonomyMode,
-    GoalContinuationIntentStatus, GoalContinuationIntentV1, TASK_CONTINUATION_INTENT_SCHEMA,
-    acknowledge_goal_continuation_after_lease, commit_goal_continuation_intent,
-    commit_task_continuation_intent, ensure_goal_continuation_enqueued,
-    goal_continuation_intents_file, latest_goal_continuation_intent, load_goal_autonomy_activation,
-    reconcile_goal_continuation_intents,
+    GOAL_CONTINUATION_INTENT_SCHEMA, GOAL_CONTINUATION_RECONCILIATION_ERROR_SCHEMA,
+    GoalAutonomyActivation, GoalAutonomyMode, GoalContinuationIntentStatus,
+    GoalContinuationIntentV1, GoalContinuationReconciliationErrorV1,
+    TASK_CONTINUATION_INTENT_SCHEMA, acknowledge_goal_continuation_after_lease,
+    commit_goal_continuation_intent, commit_task_continuation_intent,
+    ensure_goal_continuation_enqueued, goal_continuation_intents_file,
+    goal_continuation_reconciliation_errors_file, latest_goal_continuation_intent,
+    load_goal_autonomy_activation, reconcile_goal_continuation_intents,
 };
 pub use goal_lineage::{
     GOAL_LINEAGE_DOCTOR_SCHEMA, GOAL_LINEAGE_SCHEMA, GOAL_LINEAGE_SUPERSESSION_SCHEMA,
@@ -414,8 +420,8 @@ pub use harness_skills::{
     builtin_harness_skill_manifest_file, sync_builtin_harness_skills,
 };
 pub use health::{
-    HealthzLoop, HealthzOptions, HealthzOutbox, HealthzQueue, HealthzReport, HealthzSkills,
-    HealthzState, collect_healthz,
+    HealthzLoop, HealthzOptions, HealthzOutbox, HealthzQueue, HealthzReconcileKeeper,
+    HealthzReport, HealthzSkills, HealthzState, collect_healthz,
 };
 pub use importer::{
     ConfigSemantics, ConflictPolicy, DryRunImportOptions, ExecuteImportOptions, ImportAction,
@@ -834,6 +840,19 @@ pub use supervisor_inventory::{
     SupervisorInventoryOptions, SupervisorInventoryReport, SupervisorInventoryServiceConfig,
     SupervisorInventoryServiceSummary, SupervisorInventoryStatus, SupervisorLaunchCommand,
     reconcile_supervisor_inventory,
+};
+pub use supervisor_keeper::{
+    WINDOWS_RECONCILE_KEEPER_OBSERVATION_SCHEMA, WINDOWS_RECONCILE_KEEPER_PLAN_SCHEMA,
+    WindowsReconcileKeeperAction, WindowsReconcileKeeperExecutable, WindowsReconcileKeeperPlan,
+    WindowsReconcileKeeperPlanOptions, WindowsReconcileKeeperPrincipal,
+    WindowsReconcileKeeperSchedulerAction, WindowsReconcileKeeperScript,
+    WindowsReconcileKeeperSettings, WindowsReconcileKeeperTask, WindowsReconcileKeeperTrigger,
+    write_windows_reconcile_keeper_plan,
+};
+pub use supervisor_topology::{
+    SupervisorTopologyEntry, SupervisorTopologyOverrides, SupervisorTopologySource,
+    derive_supervisor_topology, supervisor_loop_service_kind, supervisor_service_id_suffix,
+    validate_supervisor_service_id,
 };
 pub use task_budget::{
     DEFAULT_MAX_DISPOSITION_RECOVERY, DEFAULT_MAX_NO_PROGRESS_SLICES, DEFAULT_MAX_RECOVERY_SLICES,

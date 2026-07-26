@@ -23,6 +23,7 @@ use crate::memory_owner::{
     record_memory_owner_endpoint_probe, record_memory_owner_heartbeat,
     record_memory_owner_shadow_receipt, record_memory_owner_trust_scope_receipt,
 };
+use crate::process_launch::configure_noninteractive_command;
 use crate::skill_envelope::strip_skill_envelopes_for_memory;
 
 const MEMORY_SEARCH_RECEIPT_SCHEMA: &str = "agent-harness.memory-search-receipt.v1";
@@ -5214,6 +5215,7 @@ fn invoke_openclaw_mem_bridge(
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
         .env("NODE_NO_WARNINGS", "1");
+    configure_noninteractive_command(&mut command);
     let started = Instant::now();
     let mut child = match command.spawn() {
         Ok(child) => child,

@@ -1,7 +1,11 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::io::ErrorKind;
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +24,7 @@ use crate::{
 };
 
 const CHANNEL_RECEIVE_SCHEMA: &str = "agent-harness.channel-receive.v1";
-const INGRESS_CLAIM_SCHEMA: &str = "agent-harness.ingress-claim.v1";
+const INGRESS_CLAIM_SCHEMA: &str = "agent-harness.ingress-claim.v2";
 const INGRESS_CLAIM_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,10 +118,164 @@ struct IngressClaimRecord {
     agent_id: Option<String>,
     event_kind: String,
     event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_digest: Option<String>,
     first_seen_at_ms: i64,
     expires_at_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     queue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    initial_owner_process_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    initial_owner_process_start_time_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_process_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_process_start_time_ms: Option<i64>,
+    #[serde(default)]
+    recovery_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_recovered_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_at_ms: Option<i64>,
+    #[serde(default)]
+    retryable_after_failure: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_failed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IngressClaimIdentity {
+    inbound_canonical_id: String,
+    platform: String,
+    account_id: Option<String>,
+    channel_id: String,
+    user_id: String,
+    agent_id: Option<String>,
+    event_kind: String,
+    event_id: String,
+    command_name: Option<String>,
+    session_key: Option<String>,
+    lane_digest: Option<String>,
+}
+
+enum IngressClaimRecovery {
+    Recovered,
+    Duplicate { queue_id: Option<String> },
+}
+
+#[derive(Debug)]
+struct NewIngressClaimFailureGuard {
+    path: PathBuf,
+    harness_home: PathBuf,
+    authority: IngressClaimFailureAuthority,
+    failed_at_ms: i64,
+    armed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IngressClaimFailureAuthority {
+    inbound_canonical_id: String,
+    owner_process_id: i64,
+    owner_process_start_time_ms: Option<i64>,
+    recovery_count: u32,
+}
+
+impl NewIngressClaimFailureGuard {
+    fn new(path: &Path, harness_home: &Path, failed_at_ms: i64) -> io::Result<Self> {
+        let mut capture_error = None;
+        let mut captured = None;
+        for attempt in 0..3 {
+            #[cfg(test)]
+            let result = if harness_home
+                .join("state")
+                .join("channels")
+                .join("test-failpoints")
+                .join("new-ingress-claim-guard-capture")
+                .is_file()
+            {
+                Err(io::Error::other(
+                    "injected new ingress claim guard capture failure",
+                ))
+            } else {
+                capture_new_ingress_claim_failure_authority(path)
+            };
+            #[cfg(not(test))]
+            let result = capture_new_ingress_claim_failure_authority(path);
+            match result {
+                Ok(authority) => {
+                    captured = Some(authority);
+                    break;
+                }
+                Err(error) if attempt < 2 => {
+                    capture_error = Some(error);
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => {
+                    capture_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let Some(authority) = captured else {
+            let error = capture_error.unwrap_or_else(|| {
+                io::Error::other("new ingress claim failure authority was not captured")
+            });
+            fail_closed_new_ingress_owner_generation(
+                harness_home,
+                &format!("failed to arm /new unwind authority: {error}"),
+            );
+            return Err(error);
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            harness_home: harness_home.to_path_buf(),
+            authority,
+            failed_at_ms,
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+fn capture_new_ingress_claim_failure_authority(
+    path: &Path,
+) -> io::Result<IngressClaimFailureAuthority> {
+    crate::logging::with_jsonl_append_lock(path, || {
+        let record = read_ingress_claim_record(path)?;
+        let owner_process_id = record.owner_process_id.ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "new ingress claim is missing owner process identity",
+            )
+        })?;
+        Ok(IngressClaimFailureAuthority {
+            inbound_canonical_id: record.inbound_canonical_id,
+            owner_process_id,
+            owner_process_start_time_ms: record.owner_process_start_time_ms,
+            recovery_count: record.recovery_count,
+        })
+    })
+}
+
+impl Drop for NewIngressClaimFailureGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            settle_or_retry_failed_new_ingress_claim(
+                &self.path,
+                &self.harness_home,
+                &self.authority,
+                self.failed_at_ms,
+            );
+        }
+    }
 }
 
 const HELD_CHANNEL_MESSAGE_SCHEMA: &str = "agent-harness.held-channel-message.v1";
@@ -321,80 +479,127 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
             options.now_ms,
         )?;
         let path = ingress_claim_file(&channel_state_dir, &options.platform, canonical_id);
-        match create_ingress_claim(
-            &path,
+        let claim_identity = ingress_claim_identity(
             canonical_id,
             &options.platform,
-            Some(account_id.clone()),
+            Some(account_id.as_str()),
             &options.channel_id,
             &options.user_id,
-            options.agent_id.clone(),
+            turn.agent.as_ref().map(|agent| agent.id.as_str()),
             event_kind,
             event_id,
-            options.now_ms,
-        ) {
+            command_name.as_deref(),
+            Some(step.session_key.as_str()),
+        )?;
+        match create_ingress_claim(&path, &claim_identity, options.now_ms) {
             Ok(()) => claim_file = Some(path),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                let duplicate_sibling_of = read_ingress_claim_queue_id(&path)?;
-                let receipt = ChannelReceiveReceipt {
-                    status: ChannelReceiveStatus::DuplicateSuppressed,
-                    platform: options.platform,
-                    account_id: Some(account_id.clone()),
-                    channel_id: options.channel_id,
-                    user_id: options.user_id,
-                    session_key: step.session_key.clone(),
-                    queue_id: None,
-                    inbound_canonical_id: inbound_canonical_id.clone(),
-                    duplicate_sibling_of: duplicate_sibling_of.clone(),
-                    outbound_count: 0,
-                    reason: "duplicate inbound provider event suppressed before queue effects"
-                        .to_string(),
-                };
-                append_json_line(&receipts_file, &receipt)?;
-                append_harness_log(
-                    &options.harness_home,
-                    &HarnessLogEvent::new(
+                let recovery = if command_name.as_deref() == Some("new") {
+                    recover_orphaned_ingress_claim(
+                        &path,
+                        &options.harness_home,
+                        &claim_identity,
                         options.now_ms,
-                        HarnessLogLevel::Info,
-                        "channel",
-                        "channel.receive.duplicate",
-                        receipt.reason.clone(),
-                    )
-                    .session_key(Some(step.session_key.clone()))
-                    .agent_id(turn.agent.as_ref().map(|agent| agent.id.clone()))
-                    .channel(
-                        receipt.platform.clone(),
-                        receipt.channel_id.clone(),
-                        receipt.user_id.clone(),
-                    ),
-                )?;
-                return Ok(ChannelReceiveReport {
-                    schema: CHANNEL_RECEIVE_SCHEMA,
-                    harness_home: options.harness_home,
-                    platform: receipt.platform.clone(),
-                    account_id: receipt.account_id.clone(),
-                    channel_id: receipt.channel_id.clone(),
-                    user_id: receipt.user_id.clone(),
-                    session_key: step.session_key,
-                    status: ChannelReceiveStatus::DuplicateSuppressed,
-                    step_action: step.action,
-                    command_name,
-                    queue_id: None,
-                    inbound_canonical_id,
-                    duplicate_sibling_of,
-                    outbox_file,
-                    receipts_file,
-                    command_apply: None,
-                    queue_enqueue: None,
-                    outbound_messages: Vec::new(),
-                    receipt,
-                    warnings,
-                });
+                    )?
+                } else {
+                    IngressClaimRecovery::Duplicate {
+                        queue_id: read_ingress_claim_queue_id(&path)?,
+                    }
+                };
+                match recovery {
+                    IngressClaimRecovery::Recovered => {
+                        warnings.push(
+                            "recovered orphaned /new ingress claim after its owner process ended"
+                                .to_string(),
+                        );
+                        claim_file = Some(path);
+                    }
+                    IngressClaimRecovery::Duplicate {
+                        queue_id: duplicate_sibling_of,
+                    } => {
+                        let receipt = ChannelReceiveReceipt {
+                            status: ChannelReceiveStatus::DuplicateSuppressed,
+                            platform: options.platform,
+                            account_id: Some(account_id.clone()),
+                            channel_id: options.channel_id,
+                            user_id: options.user_id,
+                            session_key: step.session_key.clone(),
+                            queue_id: None,
+                            inbound_canonical_id: inbound_canonical_id.clone(),
+                            duplicate_sibling_of: duplicate_sibling_of.clone(),
+                            outbound_count: 0,
+                            reason:
+                                "duplicate inbound provider event suppressed before queue effects"
+                                    .to_string(),
+                        };
+                        append_json_line(&receipts_file, &receipt)?;
+                        append_harness_log(
+                            &options.harness_home,
+                            &HarnessLogEvent::new(
+                                options.now_ms,
+                                HarnessLogLevel::Info,
+                                "channel",
+                                "channel.receive.duplicate",
+                                receipt.reason.clone(),
+                            )
+                            .session_key(Some(step.session_key.clone()))
+                            .agent_id(turn.agent.as_ref().map(|agent| agent.id.clone()))
+                            .channel(
+                                receipt.platform.clone(),
+                                receipt.channel_id.clone(),
+                                receipt.user_id.clone(),
+                            ),
+                        )?;
+                        return Ok(ChannelReceiveReport {
+                            schema: CHANNEL_RECEIVE_SCHEMA,
+                            harness_home: options.harness_home,
+                            platform: receipt.platform.clone(),
+                            account_id: receipt.account_id.clone(),
+                            channel_id: receipt.channel_id.clone(),
+                            user_id: receipt.user_id.clone(),
+                            session_key: step.session_key,
+                            status: ChannelReceiveStatus::DuplicateSuppressed,
+                            step_action: step.action,
+                            command_name,
+                            queue_id: None,
+                            inbound_canonical_id,
+                            duplicate_sibling_of,
+                            outbox_file,
+                            receipts_file,
+                            command_apply: None,
+                            queue_enqueue: None,
+                            outbound_messages: Vec::new(),
+                            receipt,
+                            warnings,
+                        });
+                    }
+                }
             }
             Err(error) => return Err(error),
         }
     }
 
+    let mut new_claim_failure_guard = if command_name.as_deref() == Some("new") {
+        claim_file
+            .as_ref()
+            .map(|path| {
+                NewIngressClaimFailureGuard::new(path, &options.harness_home, options.now_ms)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    #[cfg(test)]
+    if command_name.as_deref() == Some("new")
+        && channel_state_dir
+            .join("test-failpoints")
+            .join("new-ingress-after-claim")
+            .is_file()
+    {
+        return Err(io::Error::other(
+            "injected /new handler failure after ingress claim acquisition",
+        ));
+    }
     let (status, command_apply, queue_enqueue, outbound_messages, queue_id, reason) =
         match step.action {
             ChannelStepAction::ReplyOnly => {
@@ -520,6 +725,13 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
                 )
             }
         };
+
+    if let Some(path) = claim_file.as_ref() {
+        complete_ingress_claim(path, queue_id.as_deref(), options.now_ms)?;
+    }
+    if let Some(guard) = new_claim_failure_guard.as_mut() {
+        guard.disarm();
+    }
 
     let receipt = ChannelReceiveReceipt {
         status,
@@ -873,62 +1085,469 @@ fn ingress_claim_file(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn create_ingress_claim(
-    path: &Path,
+fn ingress_claim_identity(
     inbound_canonical_id: &str,
     platform: &str,
-    account_id: Option<String>,
+    account_id: Option<&str>,
     channel_id: &str,
     user_id: &str,
-    agent_id: Option<String>,
+    agent_id: Option<&str>,
     event_kind: &str,
     event_id: &str,
-    now_ms: i64,
-) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let record = IngressClaimRecord {
-        schema: INGRESS_CLAIM_SCHEMA.to_string(),
+    command_name: Option<&str>,
+    session_key: Option<&str>,
+) -> io::Result<IngressClaimIdentity> {
+    let lane_digest = match (account_id, agent_id) {
+        (Some(account_id), Some(agent_id)) => Some(
+            crate::ChannelStateLane::new(
+                platform,
+                Some(account_id),
+                channel_id,
+                user_id,
+                agent_id,
+            )?
+            .exact_lane_digest(),
+        ),
+        _ => None,
+    };
+    Ok(IngressClaimIdentity {
         inbound_canonical_id: inbound_canonical_id.to_string(),
         platform: platform.to_string(),
-        account_id,
+        account_id: account_id.map(str::to_string),
         channel_id: channel_id.to_string(),
         user_id: user_id.to_string(),
-        agent_id,
+        agent_id: agent_id.map(str::to_string),
         event_kind: event_kind.to_string(),
         event_id: event_id.to_string(),
-        first_seen_at_ms: now_ms,
-        expires_at_ms: now_ms.saturating_add(INGRESS_CLAIM_TTL_MS),
-        queue_id: None,
-    };
-    let bytes = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    std::io::Write::write_all(&mut file, &bytes)
+        command_name: command_name.map(str::to_string),
+        session_key: session_key.map(str::to_string),
+        lane_digest,
+    })
+}
+
+fn create_ingress_claim(
+    path: &Path,
+    identity: &IngressClaimIdentity,
+    now_ms: i64,
+) -> io::Result<()> {
+    crate::logging::with_jsonl_append_lock(path, || {
+        let owner_process_id = i64::from(std::process::id());
+        let owner_process_start_time_ms =
+            crate::loop_health::process_start_time_ms_for_pid(owner_process_id);
+        let record = IngressClaimRecord {
+            schema: INGRESS_CLAIM_SCHEMA.to_string(),
+            inbound_canonical_id: identity.inbound_canonical_id.clone(),
+            platform: identity.platform.clone(),
+            account_id: identity.account_id.clone(),
+            channel_id: identity.channel_id.clone(),
+            user_id: identity.user_id.clone(),
+            agent_id: identity.agent_id.clone(),
+            event_kind: identity.event_kind.clone(),
+            event_id: identity.event_id.clone(),
+            command_name: identity.command_name.clone(),
+            session_key: identity.session_key.clone(),
+            lane_digest: identity.lane_digest.clone(),
+            first_seen_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(INGRESS_CLAIM_TTL_MS),
+            queue_id: None,
+            initial_owner_process_id: Some(owner_process_id),
+            initial_owner_process_start_time_ms: owner_process_start_time_ms,
+            owner_process_id: Some(owner_process_id),
+            owner_process_start_time_ms,
+            recovery_count: 0,
+            last_recovered_at_ms: None,
+            completed_at_ms: None,
+            retryable_after_failure: false,
+            last_failed_at_ms: None,
+        };
+        let bytes = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()
+    })
 }
 
 fn read_ingress_claim_queue_id(path: &Path) -> io::Result<Option<String>> {
-    let bytes = fs::read(path)?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    Ok(value
-        .get("queueId")
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string))
+    crate::logging::with_jsonl_append_lock(path, || Ok(read_ingress_claim_record(path)?.queue_id))
 }
 
 fn update_ingress_claim_queue_id(path: &Path, queue_id: &str) -> io::Result<()> {
-    let bytes = fs::read(path)?;
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "queueId".to_string(),
-            serde_json::Value::String(queue_id.to_string()),
-        );
+    crate::logging::with_jsonl_append_lock(path, || {
+        let mut record = read_ingress_claim_record(path)?;
+        record.queue_id = Some(queue_id.to_string());
+        crate::write_json_atomic(path, &record)
+    })
+}
+
+fn complete_ingress_claim(
+    path: &Path,
+    queue_id: Option<&str>,
+    completed_at_ms: i64,
+) -> io::Result<()> {
+    crate::logging::with_jsonl_append_lock(path, || {
+        let mut record = read_ingress_claim_record(path)?;
+        if let Some(queue_id) = queue_id {
+            record.queue_id = Some(queue_id.to_string());
+        }
+        record.completed_at_ms = Some(completed_at_ms);
+        crate::write_json_atomic(path, &record)
+    })
+}
+
+fn ingress_claim_matches_identity(
+    record: &IngressClaimRecord,
+    expected: &IngressClaimIdentity,
+) -> bool {
+    expected.command_name.as_deref() == Some("new")
+        && expected.account_id.is_some()
+        && expected.agent_id.is_some()
+        && expected
+            .session_key
+            .as_deref()
+            .is_some_and(|session_key| !session_key.trim().is_empty())
+        && expected.lane_digest.is_some()
+        && record.schema == INGRESS_CLAIM_SCHEMA
+        && record.inbound_canonical_id == expected.inbound_canonical_id
+        && record.platform == expected.platform
+        && record.account_id == expected.account_id
+        && record.channel_id == expected.channel_id
+        && record.user_id == expected.user_id
+        && record.agent_id == expected.agent_id
+        && record.event_kind == expected.event_kind
+        && record.event_id == expected.event_id
+        && record.command_name == expected.command_name
+        && record.session_key == expected.session_key
+        && record.lane_digest == expected.lane_digest
+}
+
+fn recover_orphaned_ingress_claim(
+    path: &Path,
+    harness_home: &Path,
+    expected_identity: &IngressClaimIdentity,
+    now_ms: i64,
+) -> io::Result<IngressClaimRecovery> {
+    crate::logging::with_jsonl_append_lock(path, || {
+        let mut record = read_ingress_claim_record(path)?;
+        if !ingress_claim_matches_identity(&record, expected_identity) {
+            // The claim path is only a compact hash projection. Never let a
+            // collision, stale request, or route/session drift recover and
+            // apply a different `/new` under another event's claim.
+            return Ok(IngressClaimRecovery::Duplicate { queue_id: None });
+        }
+        if record.completed_at_ms.is_some() || record.queue_id.is_some() {
+            return Ok(IngressClaimRecovery::Duplicate {
+                queue_id: record.queue_id,
+            });
+        }
+        if !record.retryable_after_failure && ingress_claim_owner_is_active(&record) {
+            return Ok(IngressClaimRecovery::Duplicate {
+                queue_id: record.queue_id,
+            });
+        }
+        if ingress_claim_has_durable_new_transition(harness_home, &record)? {
+            // The transition intent is the durable effect boundary. Its
+            // reconciler owns every later closure/state/ack crash window, so a
+            // provider retry must not synthesize a second `/new` from the
+            // already-advanced channel state.
+            record.schema = INGRESS_CLAIM_SCHEMA.to_string();
+            record.completed_at_ms = Some(now_ms);
+            crate::write_json_atomic(path, &record)?;
+            return Ok(IngressClaimRecovery::Duplicate { queue_id: None });
+        }
+
+        let owner_process_id = i64::from(std::process::id());
+        record.schema = INGRESS_CLAIM_SCHEMA.to_string();
+        record.owner_process_id = Some(owner_process_id);
+        record.owner_process_start_time_ms =
+            crate::loop_health::process_start_time_ms_for_pid(owner_process_id);
+        record.recovery_count = record.recovery_count.saturating_add(1);
+        record.last_recovered_at_ms = Some(now_ms);
+        record.retryable_after_failure = false;
+        crate::write_json_atomic(path, &record)?;
+        Ok(IngressClaimRecovery::Recovered)
+    })
+}
+
+fn settle_failed_new_ingress_claim(
+    path: &Path,
+    harness_home: &Path,
+    authority: &IngressClaimFailureAuthority,
+    failed_at_ms: i64,
+) -> io::Result<()> {
+    #[cfg(test)]
+    if harness_home
+        .join("state")
+        .join("channels")
+        .join("test-failpoints")
+        .join("new-ingress-claim-settle")
+        .is_file()
+    {
+        return Err(io::Error::other(
+            "injected new ingress claim settlement failure",
+        ));
     }
-    crate::write_json_atomic(path, &value)
+    crate::logging::with_jsonl_append_lock(path, || {
+        let mut record = read_ingress_claim_record(path)?;
+        if record.completed_at_ms.is_some() || record.queue_id.is_some() {
+            return Ok(());
+        }
+        let exact_authority_matches = record.inbound_canonical_id == authority.inbound_canonical_id
+            && record.owner_process_id == Some(authority.owner_process_id)
+            && record.owner_process_start_time_ms == authority.owner_process_start_time_ms
+            && record.recovery_count == authority.recovery_count;
+        if !exact_authority_matches {
+            // A retrying or overlapping handler now owns this claim. A stale
+            // unwind must not expose that successor as retryable.
+            return Ok(());
+        }
+
+        if ingress_claim_has_durable_new_transition(harness_home, &record)? {
+            // A durable transition is already the effect boundary. Mark the
+            // ingress claim complete and let transition reconciliation append
+            // the deterministic acknowledgement instead of replaying `/new`.
+            record.completed_at_ms = Some(failed_at_ms);
+            record.retryable_after_failure = false;
+            return crate::write_json_atomic(path, &record);
+        }
+
+        record.retryable_after_failure = true;
+        record.last_failed_at_ms = Some(failed_at_ms);
+        crate::write_json_atomic(path, &record)
+    })
+}
+
+#[derive(Clone)]
+struct FailedNewIngressClaimRetry {
+    path: PathBuf,
+    harness_home: PathBuf,
+    authority: IngressClaimFailureAuthority,
+    failed_at_ms: i64,
+    attempts: u32,
+}
+
+const FAILED_NEW_INGRESS_CLAIM_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+static FAILED_NEW_INGRESS_CLAIM_RETRY_SENDER: OnceLock<
+    Result<mpsc::Sender<FailedNewIngressClaimRetry>, String>,
+> = OnceLock::new();
+
+fn failed_new_ingress_claim_retry_sender()
+-> io::Result<&'static mpsc::Sender<FailedNewIngressClaimRetry>> {
+    match FAILED_NEW_INGRESS_CLAIM_RETRY_SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("new-ingress-claim-settlement-retry".to_string())
+            .spawn(move || failed_new_ingress_claim_retry_worker(receiver))
+            .map(|_| sender)
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(sender) => Ok(sender),
+        Err(error) => Err(io::Error::other(format!(
+            "new ingress claim retry worker could not start: {error}"
+        ))),
+    }
+}
+
+fn failed_new_ingress_claim_retry_worker(receiver: mpsc::Receiver<FailedNewIngressClaimRetry>) {
+    let mut pending = VecDeque::new();
+    loop {
+        if pending.is_empty() {
+            match receiver.recv() {
+                Ok(retry) => pending.push_back(retry),
+                Err(_) => return,
+            }
+        }
+        pending.extend(receiver.try_iter());
+        let attempt_count = pending.len();
+        for _ in 0..attempt_count {
+            let Some(retry) = pending.pop_front() else {
+                break;
+            };
+            if let Err(error) = settle_failed_new_ingress_claim(
+                &retry.path,
+                &retry.harness_home,
+                &retry.authority,
+                retry.failed_at_ms,
+            ) {
+                let mut retry = retry;
+                retry.attempts = retry.attempts.saturating_add(1);
+                if retry.attempts >= FAILED_NEW_INGRESS_CLAIM_RETRY_MAX_ATTEMPTS {
+                    fail_closed_new_ingress_owner_generation(
+                        &retry.harness_home,
+                        &format!(
+                            "failed /new ingress settlement stayed unavailable after {} worker attempts: {error}",
+                            retry.attempts
+                        ),
+                    );
+                } else {
+                    pending.push_back(retry);
+                }
+            }
+        }
+        if !pending.is_empty() {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn fail_closed_new_ingress_owner_generation(harness_home: &Path, reason: &str) {
+    let marker_dir = harness_home
+        .join("state")
+        .join("channels")
+        .join("ingress-claim-fatal-generation");
+    let marker = marker_dir.join(format!("{}.txt", std::process::id()));
+    let _ = fs::create_dir_all(&marker_dir);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&marker)
+    {
+        let message = format!(
+            "gateway generation must terminate because failed /new ingress ownership cannot be durably exposed as retryable: {reason}\n"
+        );
+        let _ = std::io::Write::write_all(&mut file, message.as_bytes());
+        let _ = file.sync_all();
+    }
+    eprintln!(
+        "fatal gateway generation: failed /new ingress claim settlement cannot retry; marker={}: {reason}",
+        marker.display()
+    );
+    #[cfg(not(test))]
+    std::process::abort();
+}
+
+fn settle_or_retry_failed_new_ingress_claim(
+    path: &Path,
+    harness_home: &Path,
+    authority: &IngressClaimFailureAuthority,
+    failed_at_ms: i64,
+) {
+    for attempt in 0..3 {
+        match settle_failed_new_ingress_claim(path, harness_home, authority, failed_at_ms) {
+            Ok(()) => return,
+            Err(_) if attempt < 2 => thread::sleep(Duration::from_millis(25)),
+            Err(_) => break,
+        }
+    }
+    let retry = FailedNewIngressClaimRetry {
+        path: path.to_path_buf(),
+        harness_home: harness_home.to_path_buf(),
+        authority: authority.clone(),
+        failed_at_ms,
+        attempts: 0,
+    };
+    #[cfg(test)]
+    if harness_home
+        .join("state")
+        .join("channels")
+        .join("test-failpoints")
+        .join("new-ingress-claim-retry-dispatch")
+        .is_file()
+    {
+        fail_closed_new_ingress_owner_generation(
+            harness_home,
+            "injected failed /new ingress retry dispatch failure",
+        );
+        return;
+    }
+    let dispatch = failed_new_ingress_claim_retry_sender().and_then(|sender| {
+        sender
+            .send(retry)
+            .map_err(|error| io::Error::other(error.to_string()))
+    });
+    if let Err(error) = dispatch {
+        // Same-process provider retries are intentionally suppressed until
+        // retryability is durable. If that write cannot be retried, only a
+        // dead owner generation can safely unblock recovery.
+        fail_closed_new_ingress_owner_generation(harness_home, &error.to_string());
+    }
+}
+
+fn ingress_claim_has_durable_new_transition(
+    harness_home: &Path,
+    record: &IngressClaimRecord,
+) -> io::Result<bool> {
+    if record.command_name.as_deref() != Some("new") {
+        return Ok(false);
+    }
+    let (Some(account_id), Some(agent_id), Some(old_session_key)) = (
+        record.account_id.as_deref(),
+        record.agent_id.as_deref(),
+        record.session_key.as_deref(),
+    ) else {
+        return Ok(false);
+    };
+    let lane = crate::ChannelStateLane::new(
+        &record.platform,
+        Some(account_id),
+        &record.channel_id,
+        &record.user_id,
+        agent_id,
+    )?;
+    let intents_file = crate::channel_session_transition_intents_file(harness_home.to_path_buf());
+    let file = match fs::File::open(&intents_file) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let intent: crate::ChannelSessionTransitionIntentV1 = serde_json::from_str(&line).map_err(
+            |error| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "channel session transition intent line {} is invalid while recovering ingress: {error}",
+                        index + 1
+                    ),
+                )
+            },
+        )?;
+        if intent.command == crate::ChannelSessionTransitionCommandV1::New
+            && intent.lane_digest == lane.exact_lane_digest()
+            && intent.old_session_key == old_session_key
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn read_ingress_claim_record(path: &Path) -> io::Result<IngressClaimRecord> {
+    let bytes = fs::read(path)?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("ingress claim at {} is invalid: {error}", path.display()),
+        )
+    })
+}
+
+fn ingress_claim_owner_is_active(record: &IngressClaimRecord) -> bool {
+    let Some(process_id) = record.owner_process_id else {
+        // Legacy claims did not carry an owner instance. Fail closed rather
+        // than treating an in-flight old-binary claim as abandoned.
+        return true;
+    };
+    if crate::loop_health::process_alive_for_pid(process_id) == Some(false) {
+        return false;
+    }
+    match (
+        record.owner_process_start_time_ms,
+        crate::loop_health::process_start_time_ms_for_pid(process_id),
+    ) {
+        (Some(expected), Some(observed)) => expected == observed,
+        // If the OS cannot expose the start time, a live PID remains the
+        // conservative answer. New claims normally record both values.
+        _ => true,
+    }
 }
 
 fn cleanup_expired_ingress_claims(
@@ -1394,33 +2013,22 @@ mod tests {
         )
         .unwrap();
         let claim_file = ingress_claim_file(&channel_state_dir, "discord", &canonical_id);
-
-        create_ingress_claim(
-            &claim_file,
+        let identity = ingress_claim_identity(
             &canonical_id,
             "discord",
-            Some("discord-main".to_string()),
+            Some("discord-main"),
             "dm-42",
             "user-7",
-            Some("main".to_string()),
+            Some("main"),
             "message",
             "provider-msg-race",
-            1000,
+            None,
+            Some("discord:dm-42:user-7:main"),
         )
         .unwrap();
-        let second = create_ingress_claim(
-            &claim_file,
-            &canonical_id,
-            "discord",
-            Some("discord-main".to_string()),
-            "dm-42",
-            "user-7",
-            Some("main".to_string()),
-            "message",
-            "provider-msg-race",
-            1001,
-        )
-        .unwrap_err();
+
+        create_ingress_claim(&claim_file, &identity, 1000).unwrap();
+        let second = create_ingress_claim(&claim_file, &identity, 1001).unwrap_err();
 
         assert_eq!(second.kind(), ErrorKind::AlreadyExists);
         let record: IngressClaimRecord =
@@ -1429,6 +2037,835 @@ mod tests {
         assert_eq!(record.first_seen_at_ms, 1000);
         assert_eq!(record.expires_at_ms, 1000 + INGRESS_CLAIM_TTL_MS);
         assert_eq!(record.queue_id, None);
+        assert_eq!(
+            record.initial_owner_process_id,
+            Some(i64::from(std::process::id()))
+        );
+        assert_eq!(record.owner_process_id, Some(i64::from(std::process::id())));
+        assert_eq!(record.recovery_count, 0);
+        assert_eq!(record.completed_at_ms, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_new_claim_is_retryable_after_handler_unwinds_while_process_stays_alive() {
+        let root = temp_root(
+            "failed_new_claim_is_retryable_after_handler_unwinds_while_process_stays_alive",
+        );
+        let harness_home = root.join(".agent-harness");
+        let channel_state_dir = harness_home.join("state").join("channels");
+        let canonical_id = inbound_canonical_id(
+            "telegram",
+            Some("telegram-main"),
+            "dm-42",
+            "user-7",
+            Some("main"),
+            Some("update"),
+            Some("provider-update-failed-new"),
+        )
+        .unwrap();
+        let claim_file = ingress_claim_file(&channel_state_dir, "telegram", &canonical_id);
+        let identity = ingress_claim_identity(
+            &canonical_id,
+            "telegram",
+            Some("telegram-main"),
+            "dm-42",
+            "user-7",
+            Some("main"),
+            "update",
+            "provider-update-failed-new",
+            Some("new"),
+            Some("telegram:dm-42:user-7:main"),
+        )
+        .unwrap();
+        create_ingress_claim(&claim_file, &identity, 1000).unwrap();
+
+        {
+            let _failure_guard =
+                NewIngressClaimFailureGuard::new(&claim_file, &harness_home, 1001).unwrap();
+        }
+        let failed = read_ingress_claim_record(&claim_file).unwrap();
+        assert_eq!(failed.owner_process_id, Some(i64::from(std::process::id())));
+        assert!(ingress_claim_owner_is_active(&failed));
+        assert!(failed.retryable_after_failure);
+        assert_eq!(failed.last_failed_at_ms, Some(1001));
+
+        assert!(matches!(
+            recover_orphaned_ingress_claim(&claim_file, &harness_home, &identity, 1002).unwrap(),
+            IngressClaimRecovery::Recovered
+        ));
+        let recovered = read_ingress_claim_record(&claim_file).unwrap();
+        assert!(!recovered.retryable_after_failure);
+        assert_eq!(
+            recovered.initial_owner_process_id,
+            Some(i64::from(std::process::id()))
+        );
+        assert_eq!(recovered.recovery_count, 1);
+        assert_eq!(recovered.last_recovered_at_ms, Some(1002));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_new_claim_settlement_retries_until_same_process_recovery_is_visible() {
+        let root = temp_root("failed_new_claim_settlement_retries");
+        let harness_home = root.join(".agent-harness");
+        let channel_state_dir = harness_home.join("state").join("channels");
+        let canonical_id = inbound_canonical_id(
+            "discord",
+            Some("default"),
+            "channel-42",
+            "user-7",
+            Some("main"),
+            Some("message"),
+            Some("provider-message-settle-retry"),
+        )
+        .unwrap();
+        let claim_file = ingress_claim_file(&channel_state_dir, "discord", &canonical_id);
+        let identity = ingress_claim_identity(
+            &canonical_id,
+            "discord",
+            Some("default"),
+            "channel-42",
+            "user-7",
+            Some("main"),
+            "message",
+            "provider-message-settle-retry",
+            Some("new"),
+            Some("discord:channel-42:user-7:main"),
+        )
+        .unwrap();
+        create_ingress_claim(&claim_file, &identity, 1000).unwrap();
+        let failpoint = channel_state_dir
+            .join("test-failpoints")
+            .join("new-ingress-claim-settle");
+        fs::create_dir_all(failpoint.parent().unwrap()).unwrap();
+        fs::write(&failpoint, "fail").unwrap();
+        let guard = NewIngressClaimFailureGuard::new(&claim_file, &harness_home, 1001).unwrap();
+        drop(guard);
+        assert!(
+            !read_ingress_claim_record(&claim_file)
+                .unwrap()
+                .retryable_after_failure,
+            "failed persistence must not be mistaken for a durable retryable claim"
+        );
+
+        fs::remove_file(&failpoint).unwrap();
+        for _ in 0..100 {
+            if read_ingress_claim_record(&claim_file)
+                .unwrap()
+                .retryable_after_failure
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            read_ingress_claim_record(&claim_file)
+                .unwrap()
+                .retryable_after_failure,
+            "process-owned settlement retry did not expose the failed handler"
+        );
+        assert!(matches!(
+            recover_orphaned_ingress_claim(&claim_file, &harness_home, &identity, 1002).unwrap(),
+            IngressClaimRecovery::Recovered
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_retry_executes_new_after_transient_same_process_settlement_failure() {
+        let root = temp_root("provider_retry_executes_new_after_settlement_failure");
+        let source = write_receive_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let channel_state_dir = harness_home.join("state").join("channels");
+        let old_session = crate::turns::bind_session_key_to_account(
+            "telegram:dm-42:user-7:main",
+            "telegram",
+            "telegram-main",
+            "dm-42",
+            "user-7",
+            Some("main"),
+        );
+        let canonical_id = inbound_canonical_id(
+            "telegram",
+            Some("telegram-main"),
+            "dm-42",
+            "user-7",
+            Some("main"),
+            Some("update"),
+            Some("provider-update-same-process-retry"),
+        )
+        .unwrap();
+        let claim_file = ingress_claim_file(&channel_state_dir, "telegram", &canonical_id);
+        let failpoints = channel_state_dir.join("test-failpoints");
+        fs::create_dir_all(&failpoints).unwrap();
+        fs::write(failpoints.join("new-ingress-after-claim"), "fail").unwrap();
+        fs::write(failpoints.join("new-ingress-claim-settle"), "fail").unwrap();
+        let options = ChannelReceiveOptions {
+            source: source.clone(),
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills.clone(),
+            platform: "telegram".to_string(),
+            account_id: Some("telegram-main".to_string()),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: Some(old_session.clone()),
+            message: "/new".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some("update".to_string()),
+            inbound_event_id: Some("provider-update-same-process-retry".to_string()),
+            skill_limit: 3,
+            now_ms: 1000,
+        };
+        let first_error = receive_channel_message(options.clone()).unwrap_err();
+        assert!(first_error.to_string().contains("after ingress claim"));
+        assert!(
+            !read_ingress_claim_record(&claim_file)
+                .unwrap()
+                .retryable_after_failure
+        );
+
+        fs::remove_file(failpoints.join("new-ingress-after-claim")).unwrap();
+        fs::remove_file(failpoints.join("new-ingress-claim-settle")).unwrap();
+        for _ in 0..100 {
+            if read_ingress_claim_record(&claim_file)
+                .unwrap()
+                .retryable_after_failure
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let mut retry_options = options;
+        retry_options.now_ms = 1002;
+        let recovered = receive_channel_message(retry_options).unwrap();
+        assert_eq!(recovered.status, ChannelReceiveStatus::CommandApplied);
+        assert_eq!(recovered.outbound_messages.len(), 1);
+        assert!(
+            recovered
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("recovered orphaned /new ingress claim"))
+        );
+        let completed = read_ingress_claim_record(&claim_file).unwrap();
+        assert_eq!(completed.recovery_count, 1);
+        assert_eq!(completed.completed_at_ms, Some(1002));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_new_claim_failure_guard_cannot_mark_successor_owner_retryable() {
+        let root = temp_root("stale_new_claim_failure_guard");
+        let harness_home = root.join(".agent-harness");
+        let channel_state_dir = harness_home.join("state").join("channels");
+        let canonical_id = inbound_canonical_id(
+            "discord",
+            Some("default"),
+            "channel-42",
+            "user-7",
+            Some("main"),
+            Some("message"),
+            Some("provider-message-stale-guard"),
+        )
+        .unwrap();
+        let claim_file = ingress_claim_file(&channel_state_dir, "discord", &canonical_id);
+        let identity = ingress_claim_identity(
+            &canonical_id,
+            "discord",
+            Some("default"),
+            "channel-42",
+            "user-7",
+            Some("main"),
+            "message",
+            "provider-message-stale-guard",
+            Some("new"),
+            Some("discord:channel-42:user-7:main"),
+        )
+        .unwrap();
+        create_ingress_claim(&claim_file, &identity, 1000).unwrap();
+        let guard = NewIngressClaimFailureGuard::new(&claim_file, &harness_home, 1001).unwrap();
+        crate::logging::with_jsonl_append_lock(&claim_file, || {
+            let mut successor = read_ingress_claim_record(&claim_file)?;
+            successor.recovery_count = successor.recovery_count.saturating_add(1);
+            successor.last_recovered_at_ms = Some(1001);
+            crate::write_json_atomic(&claim_file, &successor)
+        })
+        .unwrap();
+        drop(guard);
+
+        let successor = read_ingress_claim_record(&claim_file).unwrap();
+        assert_eq!(successor.recovery_count, 1);
+        assert!(
+            !successor.retryable_after_failure,
+            "stale unwind authority must not expose an overlapping successor"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_new_claim_retry_dispatch_failure_requires_gateway_generation_termination() {
+        let root = temp_root("failed_new_claim_retry_dispatch_failure");
+        let harness_home = root.join(".agent-harness");
+        let channel_state_dir = harness_home.join("state").join("channels");
+        let canonical_id = inbound_canonical_id(
+            "discord",
+            Some("default"),
+            "channel-42",
+            "user-7",
+            Some("main"),
+            Some("message"),
+            Some("provider-message-dispatch-failure"),
+        )
+        .unwrap();
+        let claim_file = ingress_claim_file(&channel_state_dir, "discord", &canonical_id);
+        let identity = ingress_claim_identity(
+            &canonical_id,
+            "discord",
+            Some("default"),
+            "channel-42",
+            "user-7",
+            Some("main"),
+            "message",
+            "provider-message-dispatch-failure",
+            Some("new"),
+            Some("discord:channel-42:user-7:main"),
+        )
+        .unwrap();
+        create_ingress_claim(&claim_file, &identity, 1000).unwrap();
+        let failpoints = channel_state_dir.join("test-failpoints");
+        fs::create_dir_all(&failpoints).unwrap();
+        fs::write(failpoints.join("new-ingress-claim-settle"), "fail").unwrap();
+        fs::write(failpoints.join("new-ingress-claim-retry-dispatch"), "fail").unwrap();
+        let guard = NewIngressClaimFailureGuard::new(&claim_file, &harness_home, 1001).unwrap();
+        drop(guard);
+
+        let markers = fs::read_dir(channel_state_dir.join("ingress-claim-fatal-generation"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(markers.len(), 1);
+        assert!(
+            fs::read_to_string(markers[0].path())
+                .unwrap()
+                .contains("injected failed /new ingress retry dispatch failure")
+        );
+        assert!(
+            !read_ingress_claim_record(&claim_file)
+                .unwrap()
+                .retryable_after_failure
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persistent_failed_new_claim_settlement_requires_gateway_generation_termination() {
+        let root = temp_root("persistent_failed_new_claim_settlement");
+        let harness_home = root.join(".agent-harness");
+        let channel_state_dir = harness_home.join("state").join("channels");
+        let canonical_id = inbound_canonical_id(
+            "discord",
+            Some("default"),
+            "channel-42",
+            "user-7",
+            Some("main"),
+            Some("message"),
+            Some("provider-message-persistent-settlement"),
+        )
+        .unwrap();
+        let claim_file = ingress_claim_file(&channel_state_dir, "discord", &canonical_id);
+        let identity = ingress_claim_identity(
+            &canonical_id,
+            "discord",
+            Some("default"),
+            "channel-42",
+            "user-7",
+            Some("main"),
+            "message",
+            "provider-message-persistent-settlement",
+            Some("new"),
+            Some("discord:channel-42:user-7:main"),
+        )
+        .unwrap();
+        create_ingress_claim(&claim_file, &identity, 1000).unwrap();
+        let failpoint = channel_state_dir
+            .join("test-failpoints")
+            .join("new-ingress-claim-settle");
+        fs::create_dir_all(failpoint.parent().unwrap()).unwrap();
+        fs::write(&failpoint, "fail").unwrap();
+        let guard = NewIngressClaimFailureGuard::new(&claim_file, &harness_home, 1001).unwrap();
+        drop(guard);
+
+        let marker_dir = channel_state_dir.join("ingress-claim-fatal-generation");
+        let marker = marker_dir.join(format!("{}.txt", std::process::id()));
+        for _ in 0..100 {
+            if marker.is_file() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            fs::read_to_string(&marker)
+                .unwrap()
+                .contains("stayed unavailable")
+        );
+        assert!(
+            !read_ingress_claim_record(&claim_file)
+                .unwrap()
+                .retryable_after_failure
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_new_claim_guard_capture_requires_gateway_generation_termination() {
+        let root = temp_root("failed_new_claim_guard_capture");
+        let harness_home = root.join(".agent-harness");
+        let channel_state_dir = harness_home.join("state").join("channels");
+        let canonical_id = inbound_canonical_id(
+            "discord",
+            Some("default"),
+            "channel-42",
+            "user-7",
+            Some("main"),
+            Some("message"),
+            Some("provider-message-guard-capture"),
+        )
+        .unwrap();
+        let claim_file = ingress_claim_file(&channel_state_dir, "discord", &canonical_id);
+        let identity = ingress_claim_identity(
+            &canonical_id,
+            "discord",
+            Some("default"),
+            "channel-42",
+            "user-7",
+            Some("main"),
+            "message",
+            "provider-message-guard-capture",
+            Some("new"),
+            Some("discord:channel-42:user-7:main"),
+        )
+        .unwrap();
+        create_ingress_claim(&claim_file, &identity, 1000).unwrap();
+        let failpoint = channel_state_dir
+            .join("test-failpoints")
+            .join("new-ingress-claim-guard-capture");
+        fs::create_dir_all(failpoint.parent().unwrap()).unwrap();
+        fs::write(&failpoint, "fail").unwrap();
+
+        let error = NewIngressClaimFailureGuard::new(&claim_file, &harness_home, 1001).unwrap_err();
+        assert!(error.to_string().contains("guard capture failure"));
+        let markers = fs::read_dir(channel_state_dir.join("ingress-claim-fatal-generation"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(markers.len(), 1);
+        assert!(
+            fs::read_to_string(markers[0].path())
+                .unwrap()
+                .contains("failed to arm /new unwind authority")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orphaned_new_claim_recovery_requires_exact_immutable_identity() {
+        let root = temp_root("orphaned_new_claim_recovery_requires_exact_immutable_identity");
+        let harness_home = root.join(".agent-harness");
+        let channel_state_dir = harness_home.join("state").join("channels");
+        let old_session = crate::turns::bind_session_key_to_account(
+            "telegram:dm-42:user-7:main",
+            "telegram",
+            "telegram-main",
+            "dm-42",
+            "user-7",
+            Some("main"),
+        );
+        let canonical_id = inbound_canonical_id(
+            "telegram",
+            Some("telegram-main"),
+            "dm-42",
+            "user-7",
+            Some("main"),
+            Some("update"),
+            Some("provider-update-identity-bound"),
+        )
+        .unwrap();
+        let claim_file = ingress_claim_file(&channel_state_dir, "telegram", &canonical_id);
+        let identity = ingress_claim_identity(
+            &canonical_id,
+            "telegram",
+            Some("telegram-main"),
+            "dm-42",
+            "user-7",
+            Some("main"),
+            "update",
+            "provider-update-identity-bound",
+            Some("new"),
+            Some(old_session.as_str()),
+        )
+        .unwrap();
+        create_ingress_claim(&claim_file, &identity, 1000).unwrap();
+        let mut orphan = read_ingress_claim_record(&claim_file).unwrap();
+        orphan.owner_process_id = Some(i64::MAX);
+        orphan.owner_process_start_time_ms = Some(1);
+        crate::write_json_atomic(&claim_file, &orphan).unwrap();
+
+        let assert_mismatch_is_suppressed = |expected: &IngressClaimIdentity| {
+            assert!(matches!(
+                recover_orphaned_ingress_claim(&claim_file, &harness_home, expected, 1001,)
+                    .unwrap(),
+                IngressClaimRecovery::Duplicate { queue_id: None }
+            ));
+            let unchanged = read_ingress_claim_record(&claim_file).unwrap();
+            assert_eq!(unchanged.owner_process_id, Some(i64::MAX));
+            assert_eq!(unchanged.recovery_count, 0);
+            assert_eq!(unchanged.last_recovered_at_ms, None);
+            assert_eq!(unchanged.completed_at_ms, None);
+        };
+
+        let mut mismatched_session = identity.clone();
+        mismatched_session.session_key = Some(format!("{old_session}:different"));
+        assert_mismatch_is_suppressed(&mismatched_session);
+
+        let mut mismatched_platform = identity.clone();
+        mismatched_platform.platform = "discord".to_string();
+        assert_mismatch_is_suppressed(&mismatched_platform);
+
+        let mismatched_account = ingress_claim_identity(
+            &canonical_id,
+            "telegram",
+            Some("telegram-secondary"),
+            "dm-42",
+            "user-7",
+            Some("main"),
+            "update",
+            "provider-update-identity-bound",
+            Some("new"),
+            Some(old_session.as_str()),
+        )
+        .unwrap();
+        assert_ne!(mismatched_account.lane_digest, identity.lane_digest);
+        assert_mismatch_is_suppressed(&mismatched_account);
+
+        let mut mismatched_channel = identity.clone();
+        mismatched_channel.channel_id = "dm-other".to_string();
+        assert_mismatch_is_suppressed(&mismatched_channel);
+
+        let mut mismatched_user = identity.clone();
+        mismatched_user.user_id = "user-other".to_string();
+        assert_mismatch_is_suppressed(&mismatched_user);
+
+        let mismatched_agent = ingress_claim_identity(
+            &canonical_id,
+            "telegram",
+            Some("telegram-main"),
+            "dm-42",
+            "user-7",
+            Some("side"),
+            "update",
+            "provider-update-identity-bound",
+            Some("new"),
+            Some(old_session.as_str()),
+        )
+        .unwrap();
+        assert_ne!(mismatched_agent.lane_digest, identity.lane_digest);
+        assert_mismatch_is_suppressed(&mismatched_agent);
+
+        let mut mismatched_lane_digest = identity.clone();
+        mismatched_lane_digest.lane_digest = Some("sha256:different".to_string());
+        assert_mismatch_is_suppressed(&mismatched_lane_digest);
+
+        let mut mismatched_command = identity.clone();
+        mismatched_command.command_name = Some("stop".to_string());
+        assert_mismatch_is_suppressed(&mismatched_command);
+
+        let mut mismatched_event_kind = identity.clone();
+        mismatched_event_kind.event_kind = "message".to_string();
+        assert_mismatch_is_suppressed(&mismatched_event_kind);
+
+        let mut mismatched_event_id = identity.clone();
+        mismatched_event_id.event_id = "provider-update-other".to_string();
+        assert_mismatch_is_suppressed(&mismatched_event_id);
+
+        let mut mismatched_canonical_id = identity.clone();
+        mismatched_canonical_id.inbound_canonical_id = "inbound:v1:different".to_string();
+        assert_mismatch_is_suppressed(&mismatched_canonical_id);
+
+        assert!(matches!(
+            recover_orphaned_ingress_claim(&claim_file, &harness_home, &identity, 1002).unwrap(),
+            IngressClaimRecovery::Recovered
+        ));
+        let recovered = read_ingress_claim_record(&claim_file).unwrap();
+        assert_eq!(
+            recovered.owner_process_id,
+            Some(i64::from(std::process::id()))
+        );
+        assert_eq!(recovered.recovery_count, 1);
+        assert_eq!(recovered.last_recovered_at_ms, Some(1002));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orphaned_new_claim_before_transition_intent_is_recovered_once() {
+        let root = temp_root("orphaned_new_claim_before_transition_intent_is_recovered_once");
+        let source = write_receive_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let channel_state_dir = harness_home.join("state").join("channels");
+        let canonical_id = inbound_canonical_id(
+            "telegram",
+            Some("telegram-main"),
+            "dm-42",
+            "user-7",
+            Some("main"),
+            Some("update"),
+            Some("provider-update-orphaned-new"),
+        )
+        .unwrap();
+        let claim_file = ingress_claim_file(&channel_state_dir, "telegram", &canonical_id);
+        let old_session = crate::turns::bind_session_key_to_account(
+            "telegram:dm-42:user-7:main",
+            "telegram",
+            "telegram-main",
+            "dm-42",
+            "user-7",
+            Some("main"),
+        );
+        let identity = ingress_claim_identity(
+            &canonical_id,
+            "telegram",
+            Some("telegram-main"),
+            "dm-42",
+            "user-7",
+            Some("main"),
+            "update",
+            "provider-update-orphaned-new",
+            Some("new"),
+            Some(old_session.as_str()),
+        )
+        .unwrap();
+        create_ingress_claim(&claim_file, &identity, 1000).unwrap();
+        let mut orphan = read_ingress_claim_record(&claim_file).unwrap();
+        orphan.owner_process_id = Some(i64::MAX);
+        orphan.owner_process_start_time_ms = Some(1);
+        crate::write_json_atomic(&claim_file, &orphan).unwrap();
+
+        let recovered = receive_channel_message(ChannelReceiveOptions {
+            source: source.clone(),
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills.clone(),
+            platform: "telegram".to_string(),
+            account_id: Some("telegram-main".to_string()),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: Some(old_session.clone()),
+            message: "/new".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some("update".to_string()),
+            inbound_event_id: Some("provider-update-orphaned-new".to_string()),
+            skill_limit: 3,
+            now_ms: 1001,
+        })
+        .unwrap();
+
+        assert_eq!(recovered.status, ChannelReceiveStatus::CommandApplied);
+        assert_eq!(recovered.outbound_messages.len(), 1);
+        assert!(
+            recovered
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("recovered orphaned /new ingress claim"))
+        );
+        let completed = read_ingress_claim_record(&claim_file).unwrap();
+        assert_eq!(
+            completed.initial_owner_process_id,
+            Some(i64::from(std::process::id()))
+        );
+        assert_eq!(completed.recovery_count, 1);
+        assert_eq!(completed.last_recovered_at_ms, Some(1001));
+        assert_eq!(completed.completed_at_ms, Some(1001));
+        assert_eq!(
+            fs::read_to_string(&recovered.outbox_file)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let duplicate = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: Some("telegram-main".to_string()),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: Some(old_session),
+            message: "/new".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some("update".to_string()),
+            inbound_event_id: Some("provider-update-orphaned-new".to_string()),
+            skill_limit: 3,
+            now_ms: 1002,
+        })
+        .unwrap();
+        assert_eq!(duplicate.status, ChannelReceiveStatus::DuplicateSuppressed);
+        assert_eq!(
+            fs::read_to_string(&duplicate.outbox_file)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orphaned_new_claim_with_durable_transition_is_not_reapplied() {
+        let root = temp_root("orphaned_new_claim_with_durable_transition_is_not_reapplied");
+        let source = write_receive_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let channel_state_dir = harness_home.join("state").join("channels");
+        let lane =
+            ChannelStateLane::new("telegram", Some("telegram-main"), "dm-42", "user-7", "main")
+                .unwrap();
+        let old_session = crate::turns::bind_session_key_to_account(
+            "telegram:dm-42:user-7:main",
+            "telegram",
+            "telegram-main",
+            "dm-42",
+            "user-7",
+            Some("main"),
+        );
+        let frozen_new_session = crate::turns::bind_session_key_to_account(
+            "telegram:dm-42:user-7:main:session-frozen",
+            "telegram",
+            "telegram-main",
+            "dm-42",
+            "user-7",
+            Some("main"),
+        );
+        let canonical_id = inbound_canonical_id(
+            "telegram",
+            Some("telegram-main"),
+            "dm-42",
+            "user-7",
+            Some("main"),
+            Some("update"),
+            Some("provider-update-intent-exists"),
+        )
+        .unwrap();
+        let claim_file = ingress_claim_file(&channel_state_dir, "telegram", &canonical_id);
+        let identity = ingress_claim_identity(
+            &canonical_id,
+            "telegram",
+            Some("telegram-main"),
+            "dm-42",
+            "user-7",
+            Some("main"),
+            "update",
+            "provider-update-intent-exists",
+            Some("new"),
+            Some(old_session.as_str()),
+        )
+        .unwrap();
+        create_ingress_claim(&claim_file, &identity, 1000).unwrap();
+        let prepared = crate::prepare_channel_session_transition(
+            crate::PrepareChannelSessionTransitionOptionsV1 {
+                harness_home: harness_home.clone(),
+                command: crate::ChannelSessionTransitionCommandV1::New,
+                lane_digest: lane.exact_lane_digest(),
+                old_session_key: old_session.clone(),
+                proposed_new_session_key: Some(frozen_new_session),
+                topic: None,
+                reason: Some("test durable transition before ingress completion".to_string()),
+                now_ms: 1001,
+            },
+        )
+        .unwrap();
+        let mut orphan = read_ingress_claim_record(&claim_file).unwrap();
+        orphan.owner_process_id = Some(i64::MAX);
+        orphan.owner_process_start_time_ms = Some(1);
+        crate::write_json_atomic(&claim_file, &orphan).unwrap();
+        let mut mismatched_transition_request = identity.clone();
+        mismatched_transition_request.session_key = Some(format!(
+            "{}:different",
+            identity.session_key.as_deref().unwrap()
+        ));
+        assert!(matches!(
+            recover_orphaned_ingress_claim(
+                &claim_file,
+                &harness_home,
+                &mismatched_transition_request,
+                1002,
+            )
+            .unwrap(),
+            IngressClaimRecovery::Duplicate { queue_id: None }
+        ));
+        let still_orphaned = read_ingress_claim_record(&claim_file).unwrap();
+        assert_eq!(still_orphaned.completed_at_ms, None);
+        assert_eq!(still_orphaned.recovery_count, 0);
+
+        let duplicate = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: Some("telegram-main".to_string()),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: Some(old_session),
+            message: "/new".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some("update".to_string()),
+            inbound_event_id: Some("provider-update-intent-exists".to_string()),
+            skill_limit: 3,
+            now_ms: 1002,
+        })
+        .unwrap();
+
+        assert_eq!(duplicate.status, ChannelReceiveStatus::DuplicateSuppressed);
+        let completed = read_ingress_claim_record(&claim_file).unwrap();
+        assert_eq!(completed.recovery_count, 0);
+        assert_eq!(completed.completed_at_ms, Some(1002));
+        let intents = fs::read_to_string(crate::channel_session_transition_intents_file(
+            &harness_home,
+        ))
+        .unwrap();
+        assert_eq!(intents.lines().count(), 1);
+        assert!(intents.contains(&prepared.intent.transition_id));
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .is_file(),
+            "ingress duplicate suppression must leave ack recovery to the transition reconciler"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

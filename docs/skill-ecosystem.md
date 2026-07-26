@@ -6,7 +6,7 @@ Agent Harness Core treats skills as runtime state, not static notes. A skill is 
 
 The current source contract provides scoped discovery, deterministic eligibility and selection receipts, bounded prompt delivery, proposal-mediated mutation, guarded apply, reversible lifecycle operations, and checksum-locked packs. Those mechanisms are the auditable foundation for a broader product direction: **Adaptive Skill Intelligence**.
 
-That direction treats a skill as procedural memory that can improve through verified experience. It adds task-local competence roles, minimal sufficient disclosure, stable virtual-session revision manifests, contextual beliefs about applicability, reliability, contribution, and cost, independent cost-aware evaluation, relationship-first consolidation, and progressively authorized promotion and rollback.
+That direction treats a skill as procedural memory that can improve through verified experience. It adds task-local competence roles, minimal sufficient disclosure, stable virtual-session revision manifests, contextual beliefs about applicability, reliability, contribution, and cost, independent cost-aware evaluation, relationship-first consolidation, and progressively evidenced autonomous promotion and rollback.
 
 The distinction is intentional. Current sections below describe implemented source behavior. [Adaptive Skill Intelligence](adaptive-skill-intelligence.md) describes the target architecture and measurement contract; the [web essay](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/) presents the same direction for a broader audience. Neither is a claim that outcome-linked autonomous evolution is fully implemented or enabled.
 
@@ -14,7 +14,7 @@ The distinction is intentional. Current sections below describe implemented sour
 |---|---|
 | Exact eligibility, lexical/FTS scoring, selection receipts, and bounded delivery | Role-first retrieval with calibrated abstention and adaptive minimal disclosure |
 | Selection, usage, proposal, apply, lifecycle, and pack records | Joined task effects and outcomes with attribution and contextual uncertainty |
-| Proposal-only synthesis by default and guarded explicit apply | Per-task evidence, periodic reflection, independent evaluation, and progressive autonomy |
+| Proposal-mediated trace plus guarded autonomous synthesis/apply by default | Per-task evidence, periodic reflection, independent evaluation, and progressively broader autonomous mutation |
 | Reversible archive/restore and checksum validation | Versioned topology, conflict resolution, consolidation, promotion, and exact downgrade |
 
 ## Discovery And Selection
@@ -29,9 +29,9 @@ Prompt assembly includes a stable skill catalog with id, description, category, 
 
 ## Learning And Quality Gates
 
-Skill mutation remains proposal-mediated, and guarded apply is an explicitly authorized path. Create, patch, replace, and archive proposals are recorded under `state/learning/skill-proposals.jsonl`; operator-approved and explicitly authorized worker apply both use checksum validation, a per-target lock, backup creation, approved-root checks, and receipts before writing.
+Skill mutation remains proposal-mediated for traceability, but the proposal is not a mandatory human approval queue. Create, patch, replace, and archive proposals are recorded under `state/learning/skill-proposals.jsonl`; guarded autonomous and operator-triggered apply both use checksum validation, a per-target lock, backup creation, approved-root checks, and receipts before writing.
 
-`skill-synthesize` defaults to proposal-only. The runtime self-improvement hook can enqueue `skill_synthesis` worker jobs for complex successful turns that had no selected skill, and those jobs synthesize an agent-created skill proposal without applying it unless both worker apply authorization fields are present. CLI mutation requires `--apply`; guarded apply then uses the same lint/guard/checksum/backup pipeline.
+`skill-synthesize` and the runtime self-improvement hook default to guarded autonomous review/apply for agent-created skills. A complex successful turn that had no selected skill can enqueue a `skill_synthesis` worker job with explicit current-policy fields, persist the proposal and decision trace, and apply only when every lint, guard, checksum, target-lock, backup, and approved-root gate passes. Unsafe candidates are blocked or quarantined. `--propose-only` and `learning.skillSynthesis.mode = "propose-only"` remain explicit non-mutating modes; legacy worker payloads without policy fields also remain non-mutating for upgrade safety.
 
 Quality gates are additive:
 
@@ -45,8 +45,28 @@ Quality gates are additive:
 
 The curator lifecycle tracks active, stale, archived, and pinned skills in `state/skills/skill-lifecycle.json`. Archive is a reversible directory move into `.archive/`; it is not deletion.
 
+Idle-gated curation fences on current open runtime/cron work, unreconciled runtime leases, and pending, leased, running, or retryable-failed worker jobs. Append-only historical queue totals, including terminal and durably parked rows, remain visible diagnostics but do not permanently block autonomous maintenance.
+
 Skill packs use checksum manifests and an install lockfile. Import verifies manifest hashes fail-closed, applies guard policy by trust level, and installs under `skills/packs/<packId>/`. Removal is lockfile-driven and validates every path before deletion.
 
 ## Public Compatibility
 
 The schema registry documents every public receipt and state file used by the skill ecosystem. Additive fields remain v1-compatible. Breaking changes require a new schema version, a reader for the prior version, and migration evidence.
+
+## Shortest Upgrade Path
+
+The next product slice is deliberately narrow:
+
+1. freeze a versioned skill card and deterministic catalog digest;
+2. inventory and rebaseline the existing library without changing serving;
+3. run a role-first matcher in shadow mode against a reviewed replay corpus;
+4. join routing and delivery to exact virtual-session outcomes and cost;
+5. activate one reversible exact cohort only when the comparison shows value;
+6. close one selected-skill improvement loop through held-out replay, canary,
+   promotion, re-selection, and exact restore.
+
+This order establishes attribution before optimization and rollback before broader autonomy.
+Queue-store migration, warm process pools, native MCP, cross-platform packaging, broad knowledge
+graphs, and unattended structural consolidation are not prerequisites unless current measurements
+show that they block this slice. The [roadmap](agent-harness-core-roadmap-backlog.md) records the
+exit conditions and the continuous stability rails.

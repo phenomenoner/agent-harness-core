@@ -343,18 +343,18 @@ Use it when a turn involves:
 5. Prefer narrow replacement over broad append-only growth. Remove stale or contradictory guidance when the new version supersedes it.
 6. Include verification notes for risky procedures, especially live operations, autonomous apply, provider routing, memory, channel identity, or supervisor control.
 
-## Proposal Review And Explicit Apply
+## Trace, Autonomous Review, And Apply
 
-Skill synthesis defaults to a reviewable proposal. Apply is a separate explicitly authorized path through the same structured pipeline:
+Skill synthesis always records a reviewable proposal trace, then defaults to guarded autonomous review and apply. Proposal-only is an explicit non-mutating opt-out:
 
 1. Generate or receive a proposal with target path, expected checksum when replacing, body checksum, and source evidence.
 2. Run lint before apply. Block malformed frontmatter, missing identity, unsupported operation shape, or trigger collisions.
 3. Run guard before apply. Block dangerous instructions, credential capture, prompt-injection patterns, or unrelated control-plane changes.
-4. Approve, quarantine, or block through an explicit decision receipt.
-5. Apply approved changes through the same checksum and backup/archive path used by operator-approved changes.
+4. Approve, quarantine, or block through an autonomous decision receipt.
+5. Apply approved changes through the same checksum and backup/archive path used by operator-triggered changes.
 6. Record usage and apply receipts so later doctor/status checks can explain what happened.
 
-`skill-synthesize` is proposal-only by default. `--apply` is an explicit operator mutation request; worker execution additionally requires `applyAuthorized=true` and `proposeOnly=false`.
+`skill-synthesize` defaults to guarded autonomous apply; `--propose-only` explicitly preserves the trace without mutation. Normal runtime synthesis jobs carry `applyAuthorized=true` and `proposeOnly=false`. Legacy or externally constructed jobs that omit both fields remain non-mutating so an upgrade cannot reinterpret queued historical work.
 
 ## Lifecycle Rules
 

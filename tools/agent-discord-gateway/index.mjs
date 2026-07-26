@@ -28,6 +28,7 @@ function parseArgs(argv) {
     gatewayUrl: DISCORD_GATEWAY_URL,
     maxMessages: 0,
     stopFile: null,
+    suppressLoopHeartbeat: false,
     probe: false,
     writeReceipt: false,
     dmPollFallback: process.env.DISCORD_DM_POLL_FALLBACK !== "0",
@@ -69,6 +70,8 @@ function parseArgs(argv) {
     } else if (flag === "--stop-file") {
       i += 1;
       args.stopFile = requiredValue(argv, i, flag);
+    } else if (flag === "--suppress-loop-heartbeat") {
+      args.suppressLoopHeartbeat = true;
     } else if (flag === "--no-dm-poll-fallback") {
       args.dmPollFallback = false;
     } else if (flag === "--dm-poll-ms") {
@@ -820,10 +823,7 @@ function runHarnessForEvent(args, payload) {
   if (args.codexExe) {
     cliArgs.push("--codex-exe", args.codexExe);
   }
-  const result = childProcess.spawnSync(args.harnessCli, cliArgs, {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const result = childProcess.spawnSync(args.harnessCli, cliArgs, harnessChildProcessOptions());
   removeTempEventFile(eventFile);
   if (result.stdout) {
     writeGatewayLog(args, "harness-stdout", { bytes: Buffer.byteLength(result.stdout, "utf8") });
@@ -832,6 +832,14 @@ function runHarnessForEvent(args, payload) {
     writeGatewayLog(args, "harness-stderr", { bytes: Buffer.byteLength(result.stderr, "utf8") });
   }
   return { status: result.status ?? 1 };
+}
+
+export function harnessChildProcessOptions() {
+  return {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  };
 }
 
 function writeTempEventFile(payload) {
@@ -856,7 +864,10 @@ function writeGatewayLog(args, event, payload) {
   fs.appendFileSync(logFile, `${JSON.stringify({ event, ...payload })}\n`);
 }
 
-function writeLoopHeartbeat(args, status, detail) {
+export function writeLoopHeartbeat(args, status, detail) {
+  if (args.suppressLoopHeartbeat) {
+    return false;
+  }
   const dir = path.join(args.harnessHome, "state", "supervisor", "loop-heartbeats");
   fs.mkdirSync(dir, { recursive: true });
   const heartbeat = {
@@ -869,6 +880,7 @@ function writeLoopHeartbeat(args, status, detail) {
     processId: process.pid,
   };
   fs.writeFileSync(path.join(dir, "discord-gateway-loop.json"), `${JSON.stringify(heartbeat, null, 2)}\n`);
+  return true;
 }
 
 async function main() {

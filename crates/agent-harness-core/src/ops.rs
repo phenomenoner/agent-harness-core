@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::Command;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -15,7 +17,7 @@ use crate::{
         LIVE_CONTROL_TOKEN_SCHEMA, LiveControlAction, LiveControlTokenRecord,
         LiveControlTokenStatus, LiveControlTokenValidation, env_live_control_token,
         hash_live_control_token, is_live_agent_session_env, is_live_harness_home,
-        live_control_tokens_file, validate_live_control_token,
+        live_control_tokens_file, validate_exact_live_control_token, validate_live_control_token,
     },
 };
 
@@ -26,9 +28,17 @@ const OPS_CUTOVER_APPROVAL_SCHEMA: &str = "agent-harness.ops-cutover-approval.v1
 const OPS_CUTOVER_APPLY_SCHEMA: &str = "agent-harness.ops-cutover-apply.v1";
 const OPS_CUTOVER_STATUS_SCHEMA: &str = "agent-harness.ops-cutover-status.v1";
 const OPS_CONTROL_RECEIPT_SCHEMA: &str = "agent-harness.ops-control-receipt.v1";
+const SUPERVISOR_SERVICE_STATE_SCHEMA: &str = "agent-harness.supervisor-service-state.v1";
+const SUPERVISOR_RECONCILE_KEEPER_STATE_SCHEMA: &str =
+    "agent-harness.supervisor-reconcile-keeper.v1";
+const LOOP_HEARTBEAT_SCHEMA: &str = "agent-harness.loop-heartbeat.v1";
 const DEFAULT_BACKUP_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_LIVE_CONTROL_TOKEN_TTL_SECONDS: i64 = 15 * 60;
-const DIRECT_SUPERVISOR_STOP_COMPONENTS: &[&str] = &[
+const RECONCILE_KEEPER_STOP_COMPONENT: &str = "supervisor-reconcile";
+// Scheduled-task control historically also wrote the direct supervisor markers.
+// Keep that fallback for backward compatibility, but never use it as the desired
+// topology for reconcile-managed ownership.
+const LEGACY_SCHEDULED_DIRECT_STOP_COMPONENTS: &[&str] = &[
     "cron-scheduler-loop",
     "discord-gateway-loop",
     "discord-outbox-loop",
@@ -38,6 +48,19 @@ const DIRECT_SUPERVISOR_STOP_COMPONENTS: &[&str] = &[
     "telegram-loop-xiaoxiaoli",
     "worker-loop",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpsSupervisorOwnershipMode {
+    ScheduledTask,
+    ReconcileManaged,
+}
+
+#[derive(Debug, Clone)]
+struct OpsStopFileDiscovery {
+    ownership_mode: OpsSupervisorOwnershipMode,
+    stop_files: Vec<OpsStopFileStatus>,
+    mutation_safe: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpsBackupOptions {
@@ -142,6 +165,37 @@ pub struct OpsStopFileStatus {
     pub component: String,
     pub stop_file: PathBuf,
     pub present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpsKeeperPlanOwnerEvidence {
+    pub state_file: PathBuf,
+    pub owner_kind: String,
+    pub process_field: String,
+    pub process_id: i64,
+    pub process_alive: Option<bool>,
+    pub process_instance_matches: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpsKeeperPlanPreflightReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub ready: bool,
+    pub reason: String,
+    pub stop_files: Vec<OpsStopFileStatus>,
+    pub live_owners: Vec<OpsKeeperPlanOwnerEvidence>,
+    pub blockers: Vec<String>,
+}
+
+pub fn path_targets_live_harness_home(path: &Path) -> bool {
+    is_live_harness_home(path)
+        || fs::canonicalize(path)
+            .ok()
+            .as_deref()
+            .is_some_and(is_live_harness_home)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,7 +593,7 @@ pub fn collect_ops_cutover_status(
     };
     let env_token = env_live_control_token();
     let live_control = match options.action {
-        Some(action) => Some(validate_live_control_token(
+        Some(action) => Some(validate_exact_live_control_token(
             &options.harness_home,
             options
                 .live_control_token
@@ -574,11 +628,15 @@ pub fn collect_ops_cutover_status(
 }
 
 pub fn record_ops_control(options: OpsControlOptions) -> io::Result<OpsControlReport> {
-    let stop_files = discover_stop_files(&options.harness_home)?;
+    let requested_reason = options.reason.clone();
+    let receipt_file = options
+        .harness_home
+        .join("state")
+        .join("ops")
+        .join("control-receipts.jsonl");
     let mut live_control = None;
     if options.action != OpsControlAction::Status
-        && is_live_agent_session_env()
-        && is_live_harness_home(&options.harness_home)
+        && path_targets_live_harness_home(&options.harness_home)
     {
         let action = match options.action {
             OpsControlAction::Stop => LiveControlAction::Stop,
@@ -593,78 +651,172 @@ pub fn record_ops_control(options: OpsControlOptions) -> io::Result<OpsControlRe
         let validation =
             validate_live_control_token(&options.harness_home, token, action, options.now_ms)?;
         if validation.status != LiveControlTokenStatus::Valid {
-            let receipt_file = options
-                .harness_home
-                .join("state")
-                .join("ops")
-                .join("control-receipts.jsonl");
+            let (discovery, discovery_errors) =
+                discover_stop_files_for_control(&options.harness_home);
+            let mut reason = format!(
+                "destructive control against a live harness home requires a valid token: {}",
+                validation.reason
+            );
+            if !discovery_errors.is_empty() {
+                reason.push_str("; control topology readback warnings: ");
+                reason.push_str(&discovery_errors.join("; "));
+            }
             let report = OpsControlReport {
                 schema: OPS_CONTROL_RECEIPT_SCHEMA,
                 harness_home: options.harness_home,
                 action: options.action,
                 receipt_file: receipt_file.clone(),
                 status: "blocked-live-control".to_string(),
-                reason: format!(
-                    "live gateway control from a live agent session requires a valid token: {}",
-                    validation.reason
-                ),
-                stop_files,
+                reason,
+                stop_files: discovery.stop_files,
                 live_control: Some(validation),
                 at_ms: options.now_ms,
             };
-            append_json_line(&receipt_file, &report)?;
             return Ok(report);
         }
         live_control = Some(validation);
     }
+
+    let mut mutation_errors = Vec::new();
+    let keeper_evidence_before = reconcile_keeper_evidence_exists(&options.harness_home);
+    if options.action == OpsControlAction::Stop && keeper_evidence_before {
+        let reason = requested_reason
+            .as_deref()
+            .unwrap_or("root keeper hold committed before child topology discovery");
+        if let Err(error) = write_supervisor_stop_marker(
+            &options.harness_home,
+            RECONCILE_KEEPER_STOP_COMPONENT,
+            reason,
+            options.now_ms,
+        ) {
+            mutation_errors.push(format!(
+                "failed to precommit the supervisor-reconcile root hold: {error}"
+            ));
+        }
+    }
+
+    let (discovery, discovery_errors) = discover_stop_files_for_control(&options.harness_home);
+    mutation_errors.extend(discovery_errors);
+    let initial_ownership_mode = discovery.ownership_mode;
+    let initial_mutation_safe = discovery.mutation_safe;
+    let stop_files = discovery.stop_files;
     match options.action {
         OpsControlAction::Stop => {
-            for stop in &stop_files {
-                if let Some(parent) = stop.stop_file.parent() {
-                    fs::create_dir_all(parent)?;
+            if initial_mutation_safe {
+                for stop in ordered_control_targets(
+                    &stop_files,
+                    options.action,
+                    initial_ownership_mode == OpsSupervisorOwnershipMode::ReconcileManaged,
+                ) {
+                    let reason = requested_reason
+                        .as_deref()
+                        .unwrap_or("stop files created; loops will exit at their next poll");
+                    let result = write_supervisor_stop_marker_at(
+                        &stop.stop_file,
+                        &stop.component,
+                        reason,
+                        options.now_ms,
+                    );
+                    if let Err(error) = result {
+                        mutation_errors.push(format!(
+                            "failed to create stop marker for `{}` at {}: {error}",
+                            stop.component,
+                            stop.stop_file.display()
+                        ));
+                    }
                 }
-                let reason = options
-                    .reason
-                    .as_deref()
-                    .unwrap_or("stop files created; loops will exit at their next poll");
-                let stop_file = serde_json::json!({
-                    "schema": "agent-harness.supervisor-stop-file.v1",
-                    "serviceId": stop.component,
-                    "reason": reason,
-                    "createdBy": "ops-control",
-                    "createdAtMs": options.now_ms,
-                    "persistent": true
-                });
-                crate::write_json_atomic(&stop.stop_file, &stop_file)?;
+                signal_stop_wake_lanes(&options.harness_home, &stop_files);
+            } else {
+                mutation_errors.push(
+                    "refused to create child stop markers because canonical supervisor service-state validation failed"
+                        .to_string(),
+                );
             }
-            signal_stop_wake_lanes(&options.harness_home, &stop_files);
         }
         OpsControlAction::Start => {
-            for stop in &stop_files {
-                match fs::remove_file(&stop.stop_file) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
+            if mutation_errors.is_empty() {
+                for stop in ordered_control_targets(
+                    &stop_files,
+                    options.action,
+                    initial_ownership_mode == OpsSupervisorOwnershipMode::ReconcileManaged,
+                ) {
+                    if initial_ownership_mode == OpsSupervisorOwnershipMode::ReconcileManaged
+                        && stop.component == RECONCILE_KEEPER_STOP_COMPONENT
+                        && !mutation_errors.is_empty()
+                    {
+                        mutation_errors.push(
+                            "retained supervisor-reconcile stop marker because one or more child stop markers could not be cleared"
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    match fs::remove_file(&stop.stop_file) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => mutation_errors.push(format!(
+                            "failed to clear stop marker for `{}` at {}: {error}",
+                            stop.component,
+                            stop.stop_file.display()
+                        )),
+                    }
+                }
+            } else if initial_ownership_mode == OpsSupervisorOwnershipMode::ReconcileManaged {
+                mutation_errors.push(
+                    "refused to clear any stop marker because control topology validation failed"
+                        .to_string(),
+                );
+            }
+            if initial_ownership_mode == OpsSupervisorOwnershipMode::ReconcileManaged
+                && !mutation_errors.is_empty()
+            {
+                if let Err(error) = write_supervisor_stop_marker(
+                    &options.harness_home,
+                    RECONCILE_KEEPER_STOP_COMPONENT,
+                    "start remains fenced because one or more control targets failed validation or mutation",
+                    options.now_ms,
+                ) {
+                    mutation_errors.push(format!(
+                        "failed to preserve the supervisor-reconcile root hold after partial start: {error}"
+                    ));
                 }
             }
         }
         OpsControlAction::Status => {}
     }
-    let after = discover_stop_files(&options.harness_home)?;
-    let receipt_file = options
-        .harness_home
-        .join("state")
-        .join("ops")
-        .join("control-receipts.jsonl");
+    let (after_discovery, after_errors) = discover_stop_files_for_control(&options.harness_home);
+    mutation_errors.extend(
+        after_errors
+            .into_iter()
+            .map(|error| format!("post-mutation topology readback: {error}")),
+    );
+    let target_set_unchanged = initial_ownership_mode == after_discovery.ownership_mode
+        && same_stop_target_set(&stop_files, &after_discovery.stop_files);
+    let after = if target_set_unchanged {
+        after_discovery.stop_files
+    } else {
+        refresh_stop_file_statuses(&stop_files)
+    };
     let status = match options.action {
-        OpsControlAction::Stop if after.iter().all(|stop| stop.present) => "stop-requested",
-        OpsControlAction::Start if after.iter().all(|stop| !stop.present) => "start-ready",
+        OpsControlAction::Stop
+            if mutation_errors.is_empty()
+                && target_set_unchanged
+                && after.iter().all(|stop| stop.present) =>
+        {
+            "stop-requested"
+        }
+        OpsControlAction::Start
+            if mutation_errors.is_empty()
+                && target_set_unchanged
+                && after.iter().all(|stop| !stop.present) =>
+        {
+            "start-ready"
+        }
         OpsControlAction::Status => "observed",
         OpsControlAction::Stop => "partial-stop-request",
         OpsControlAction::Start => "partial-start-ready",
     }
     .to_string();
-    let reason = options.reason.unwrap_or_else(|| match options.action {
+    let mut reason = requested_reason.unwrap_or_else(|| match options.action {
         OpsControlAction::Stop => {
             "stop files created; loops will exit at their next poll".to_string()
         }
@@ -674,6 +826,13 @@ pub fn record_ops_control(options: OpsControlOptions) -> io::Result<OpsControlRe
         }
         OpsControlAction::Status => "supervisor stop-file status observed".to_string(),
     });
+    if !target_set_unchanged {
+        reason.push_str("; supervisor control target set changed during the operation");
+    }
+    if !mutation_errors.is_empty() {
+        reason.push_str("; ");
+        reason.push_str(&mutation_errors.join("; "));
+    }
     let report = OpsControlReport {
         schema: OPS_CONTROL_RECEIPT_SCHEMA,
         harness_home: options.harness_home,
@@ -687,6 +846,870 @@ pub fn record_ops_control(options: OpsControlOptions) -> io::Result<OpsControlRe
     };
     append_json_line(&receipt_file, &report)?;
     Ok(report)
+}
+
+/// Read-only cutover preflight for replacing the live Windows reconcile-keeper
+/// plan. A valid token is intentionally checked by the CLI before this helper
+/// runs; this report proves that the current root and every derived/observed
+/// child lane are held and that no state-bound keeper or child owner is alive.
+pub fn collect_ops_keeper_plan_preflight(harness_home: &Path) -> OpsKeeperPlanPreflightReport {
+    let (discovery, discovery_errors) = discover_stop_files_for_control(harness_home);
+    let mut blockers = discovery_errors;
+    if discovery.ownership_mode != OpsSupervisorOwnershipMode::ReconcileManaged {
+        blockers.push(
+            "live keeper-plan promotion requires reconcile-managed supervisor topology".to_string(),
+        );
+    }
+    if discovery.stop_files.is_empty() {
+        blockers.push("current supervisor topology has no provable stop targets".to_string());
+    }
+    if !discovery
+        .stop_files
+        .iter()
+        .any(|entry| entry.component == RECONCILE_KEEPER_STOP_COMPONENT)
+    {
+        blockers.push("supervisor-reconcile root hold is absent from current topology".to_string());
+    }
+    for entry in &discovery.stop_files {
+        if !entry.present {
+            blockers.push(format!(
+                "current topology is not held: missing `{}` stop marker at {}",
+                entry.component,
+                entry.stop_file.display()
+            ));
+        }
+    }
+
+    let supervisor_dir = harness_home.join("state").join("supervisor");
+    let mut live_owners = Vec::new();
+    validate_expected_keeper_plan_owner_states(harness_home, &discovery.stop_files, &mut blockers);
+    inspect_keeper_plan_owner_state(
+        &supervisor_dir.join("reconcile-keeper.json"),
+        "reconcile-keeper",
+        &mut live_owners,
+        &mut blockers,
+    );
+    for (directory, owner_kind) in [
+        (supervisor_dir.join("services"), "service-owner"),
+        (supervisor_dir.join("loop-heartbeats"), "loop-heartbeat"),
+    ] {
+        inspect_keeper_plan_owner_directory(
+            &directory,
+            owner_kind,
+            &mut live_owners,
+            &mut blockers,
+        );
+    }
+    if let Err(error) = inspect_target_home_process_table(harness_home, &mut blockers) {
+        blockers.push(format!(
+            "independent Windows process-table scan failed closed: {error}"
+        ));
+    }
+
+    let ready = blockers.is_empty() && live_owners.is_empty();
+    let reason = if ready {
+        "current reconcile topology is fully held and no keeper or child owner is alive".to_string()
+    } else {
+        let mut reasons = blockers.clone();
+        reasons.extend(live_owners.iter().map(|owner| {
+            format!(
+                "{} `{}` still references a live or unprovable process instance {} via {}",
+                owner.owner_kind,
+                owner.state_file.display(),
+                owner.process_id,
+                owner.process_field
+            )
+        }));
+        reasons.join("; ")
+    };
+    OpsKeeperPlanPreflightReport {
+        schema: "agent-harness.ops-keeper-plan-preflight.v1",
+        harness_home: harness_home.to_path_buf(),
+        ready,
+        reason,
+        stop_files: discovery.stop_files,
+        live_owners,
+        blockers,
+    }
+}
+
+fn validate_expected_keeper_plan_owner_states(
+    harness_home: &Path,
+    stop_files: &[OpsStopFileStatus],
+    blockers: &mut Vec<String>,
+) {
+    let supervisor_dir = harness_home.join("state").join("supervisor");
+    let keeper_file = supervisor_dir.join("reconcile-keeper.json");
+    validate_expected_keeper_state(harness_home, &keeper_file, blockers);
+
+    let expected_services = stop_files
+        .iter()
+        .filter(|entry| entry.component != RECONCILE_KEEPER_STOP_COMPONENT)
+        .map(|entry| entry.component.as_str())
+        .collect::<BTreeSet<_>>();
+    for service_id in expected_services {
+        validate_expected_service_state(
+            &supervisor_dir
+                .join("services")
+                .join(format!("{service_id}.json")),
+            service_id,
+            blockers,
+        );
+        validate_expected_heartbeat_state(
+            &supervisor_dir
+                .join("loop-heartbeats")
+                .join(format!("{service_id}.json")),
+            service_id,
+            blockers,
+        );
+    }
+}
+
+fn read_expected_owner_state(
+    state_file: &Path,
+    owner_kind: &str,
+    service_id: Option<&str>,
+    blockers: &mut Vec<String>,
+) -> Option<Value> {
+    let bytes = match fs::read(state_file) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match service_id {
+                Some(service_id) => blockers.push(format!(
+                    "missing expected {owner_kind} state for `{service_id}` at {}",
+                    state_file.display()
+                )),
+                None => blockers.push(format!(
+                    "missing expected {owner_kind} state at {}",
+                    state_file.display()
+                )),
+            }
+            return None;
+        }
+        Err(error) => {
+            blockers.push(format!(
+                "failed to read expected {owner_kind} state at {}: {error}",
+                state_file.display()
+            ));
+            return None;
+        }
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) if value.is_object() => Some(value),
+        Ok(_) => {
+            blockers.push(format!(
+                "{owner_kind} state must be a JSON object at {}",
+                state_file.display()
+            ));
+            None
+        }
+        Err(error) => {
+            blockers.push(format!(
+                "{owner_kind} state is invalid JSON at {}: {error}",
+                state_file.display()
+            ));
+            None
+        }
+    }
+}
+
+fn validate_required_state_schema(
+    state: &Value,
+    expected_schema: &str,
+    owner_kind: &str,
+    state_file: &Path,
+    blockers: &mut Vec<String>,
+) {
+    match state.get("schema").and_then(Value::as_str) {
+        Some(schema) if schema == expected_schema => {}
+        Some(schema) => blockers.push(format!(
+            "{owner_kind} state schema `{schema}` does not match expected `{expected_schema}` at {}",
+            state_file.display()
+        )),
+        None => blockers.push(format!(
+            "{owner_kind} state is missing required `schema` at {}",
+            state_file.display()
+        )),
+    }
+}
+
+fn validate_required_state_service_id(
+    state: &Value,
+    expected_service_id: &str,
+    owner_kind: &str,
+    state_file: &Path,
+    blockers: &mut Vec<String>,
+) {
+    match state.get("serviceId").and_then(Value::as_str) {
+        Some(service_id) if service_id == expected_service_id => {}
+        Some(service_id) => blockers.push(format!(
+            "{owner_kind} state serviceId `{service_id}` does not match expected `{expected_service_id}` at {}",
+            state_file.display()
+        )),
+        None => blockers.push(format!(
+            "{owner_kind} state is missing required `serviceId` at {}",
+            state_file.display()
+        )),
+    }
+}
+
+fn validate_typed_quiescent_state(
+    state: &Value,
+    disposition_field: &str,
+    owner_kind: &str,
+    state_file: &Path,
+    blockers: &mut Vec<String>,
+) {
+    match state.get(disposition_field).and_then(Value::as_str) {
+        Some(disposition)
+            if matches!(
+                disposition.to_ascii_lowercase().as_str(),
+                "stopped" | "dead" | "closed"
+            ) => {}
+        Some(disposition) => blockers.push(format!(
+            "{owner_kind} state `{disposition_field}` disposition `{disposition}` is not quiescent at {}",
+            state_file.display()
+        )),
+        None => blockers.push(format!(
+            "{owner_kind} state is missing typed quiescent `{disposition_field}` at {}",
+            state_file.display()
+        )),
+    }
+}
+
+fn validate_owner_process_identity(
+    state: &Value,
+    owner_kind: &str,
+    state_file: &Path,
+    blockers: &mut Vec<String>,
+) {
+    let process_id = state
+        .get("processId")
+        .filter(|value| !value.is_null())
+        .or_else(|| state.get("pid").filter(|value| !value.is_null()));
+    if let (Some(process_id), Some(pid)) = (
+        state.get("processId").filter(|value| !value.is_null()),
+        state.get("pid").filter(|value| !value.is_null()),
+    ) {
+        if process_id.as_i64().is_none()
+            || pid.as_i64().is_none()
+            || process_id.as_i64() != pid.as_i64()
+        {
+            blockers.push(format!(
+                "{owner_kind} state has conflicting or non-integer `processId`/`pid` owner identity at {}",
+                state_file.display()
+            ));
+        }
+    }
+    let process_start = state
+        .get("processStartTimeMs")
+        .filter(|value| !value.is_null());
+    match (process_id, process_start) {
+        (Some(process_id), Some(process_start))
+            if process_id.as_i64().is_some_and(|value| value > 0)
+                && process_start.as_i64().is_some() => {}
+        (None, None) => {}
+        (Some(_), Some(_)) => blockers.push(format!(
+            "{owner_kind} state has non-integer or non-positive owner process identity at {}",
+            state_file.display()
+        )),
+        _ => blockers.push(format!(
+            "{owner_kind} state has an unprovable owner identity because process id and `processStartTimeMs` are not paired at {}",
+            state_file.display()
+        )),
+    }
+}
+
+fn validate_expected_keeper_state(
+    harness_home: &Path,
+    state_file: &Path,
+    blockers: &mut Vec<String>,
+) {
+    let Some(state) = read_expected_owner_state(state_file, "reconcile-keeper", None, blockers)
+    else {
+        return;
+    };
+    validate_required_state_schema(
+        &state,
+        SUPERVISOR_RECONCILE_KEEPER_STATE_SCHEMA,
+        "reconcile-keeper",
+        state_file,
+        blockers,
+    );
+    validate_typed_quiescent_state(&state, "status", "reconcile-keeper", state_file, blockers);
+    let expected_stop_file = crate::loop_health::supervisor_stop_file_path(
+        harness_home,
+        RECONCILE_KEEPER_STOP_COMPONENT,
+    );
+    match state.get("stopFile").and_then(Value::as_str) {
+        Some(stop_file)
+            if normalized_process_path(Path::new(stop_file))
+                == normalized_process_path(&expected_stop_file) => {}
+        Some(stop_file) => blockers.push(format!(
+            "reconcile-keeper state stopFile `{stop_file}` does not match expected `{}` at {}",
+            expected_stop_file.display(),
+            state_file.display()
+        )),
+        None => blockers.push(format!(
+            "reconcile-keeper state is missing required `stopFile` identity at {}",
+            state_file.display()
+        )),
+    }
+    if state.get("holdRequested").and_then(Value::as_bool) != Some(true) {
+        blockers.push(format!(
+            "reconcile-keeper state does not prove `holdRequested=true` at {}",
+            state_file.display()
+        ));
+    }
+    validate_owner_process_identity(&state, "reconcile-keeper", state_file, blockers);
+}
+
+fn validate_expected_service_state(
+    state_file: &Path,
+    service_id: &str,
+    blockers: &mut Vec<String>,
+) {
+    let Some(state) =
+        read_expected_owner_state(state_file, "service-owner", Some(service_id), blockers)
+    else {
+        return;
+    };
+    validate_required_state_schema(
+        &state,
+        SUPERVISOR_SERVICE_STATE_SCHEMA,
+        "service-owner",
+        state_file,
+        blockers,
+    );
+    validate_required_state_service_id(&state, service_id, "service-owner", state_file, blockers);
+    validate_typed_quiescent_state(&state, "actualState", "service-owner", state_file, blockers);
+    validate_owner_process_identity(&state, "service-owner", state_file, blockers);
+}
+
+fn validate_expected_heartbeat_state(
+    state_file: &Path,
+    service_id: &str,
+    blockers: &mut Vec<String>,
+) {
+    let Some(state) =
+        read_expected_owner_state(state_file, "loop-heartbeat", Some(service_id), blockers)
+    else {
+        return;
+    };
+    validate_required_state_schema(
+        &state,
+        LOOP_HEARTBEAT_SCHEMA,
+        "loop-heartbeat",
+        state_file,
+        blockers,
+    );
+    validate_required_state_service_id(&state, service_id, "loop-heartbeat", state_file, blockers);
+    match state.get("name").and_then(Value::as_str) {
+        Some(name) if name == service_id => {}
+        Some(name) => blockers.push(format!(
+            "loop-heartbeat state name `{name}` does not match expected `{service_id}` at {}",
+            state_file.display()
+        )),
+        None => blockers.push(format!(
+            "loop-heartbeat state is missing required `name` identity at {}",
+            state_file.display()
+        )),
+    }
+    validate_typed_quiescent_state(&state, "status", "loop-heartbeat", state_file, blockers);
+    validate_owner_process_identity(&state, "loop-heartbeat", state_file, blockers);
+}
+
+fn normalized_process_path(path: &Path) -> String {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut normalized = resolved.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = normalized.strip_prefix("//?/UNC/") {
+        normalized = format!("//{rest}");
+    } else if let Some(rest) = normalized.strip_prefix("//?/") {
+        normalized = rest.to_string();
+    }
+    while normalized.len() > 3 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    if cfg!(windows) {
+        normalized.make_ascii_lowercase();
+    }
+    normalized
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsProcessObservation {
+    process_id: i64,
+    parent_process_id: i64,
+    name: String,
+    executable_path: Option<String>,
+    command_line: Option<String>,
+}
+
+#[cfg(windows)]
+fn inspect_target_home_process_table(
+    harness_home: &Path,
+    blockers: &mut Vec<String>,
+) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const PROCESS_QUERY_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$Rows = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+  Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine)
+ConvertTo-Json -InputObject $Rows -Compress -Depth 3
+"#;
+
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            PROCESS_QUERY_SCRIPT,
+        ])
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to launch Get-CimInstance: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Get-CimInstance exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|error| format!("process-table JSON was not UTF-8: {error}"))?;
+    let value: Value = serde_json::from_str(text.trim_start_matches('\u{feff}').trim())
+        .map_err(|error| format!("process-table JSON was invalid: {error}"))?;
+    let rows = match value {
+        Value::Array(rows) => rows,
+        Value::Null => Vec::new(),
+        row @ Value::Object(_) => vec![row],
+        _ => return Err("process-table JSON was not an object array".to_string()),
+    };
+    let processes = rows
+        .into_iter()
+        .filter_map(|row| {
+            let process_id = row.get("ProcessId").and_then(Value::as_i64)?;
+            Some(WindowsProcessObservation {
+                process_id,
+                parent_process_id: row
+                    .get("ParentProcessId")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                name: row
+                    .get("Name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                executable_path: row
+                    .get("ExecutablePath")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                command_line: row
+                    .get("CommandLine")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let normalized_home = normalized_process_path(harness_home);
+    let pinned_paths = keeper_plan_pinned_process_paths(harness_home);
+    append_target_home_process_blockers(
+        &normalized_home,
+        &processes,
+        &pinned_paths,
+        i64::from(std::process::id()),
+        blockers,
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn append_target_home_process_blockers(
+    normalized_home: &str,
+    processes: &[WindowsProcessObservation],
+    pinned_paths: &[String],
+    current_process_id: i64,
+    blockers: &mut Vec<String>,
+) {
+    let executable_root = format!("{normalized_home}/");
+    let roots = processes
+        .iter()
+        .filter(|process| {
+            // The caller remains alive until this scan returns, so its PID
+            // identifies the exact current generation and cannot be reused
+            // within this snapshot. It is the read-only observer, not a
+            // surviving deployment owner.
+            if process.process_id == current_process_id {
+                return false;
+            }
+            if !process.name.eq_ignore_ascii_case("agent-harness.exe") {
+                return false;
+            }
+            let executable_is_deployment_owned = process
+                .executable_path
+                .as_deref()
+                .map(|path| normalized_process_path(Path::new(path)))
+                .is_some_and(|path| path.starts_with(&executable_root));
+            let command_targets_home = process
+                .command_line
+                .as_deref()
+                .is_some_and(|line| command_line_targets_home(line, &normalized_home));
+            executable_is_deployment_owned || command_targets_home
+        })
+        .map(|process| process.process_id)
+        .collect::<BTreeSet<_>>();
+
+    let mut deployment_processes = roots.clone();
+    loop {
+        let before = deployment_processes.len();
+        for process in processes {
+            if process.process_id != current_process_id
+                && deployment_processes.contains(&process.parent_process_id)
+            {
+                deployment_processes.insert(process.process_id);
+            }
+        }
+        if deployment_processes.len() == before {
+            break;
+        }
+    }
+
+    for process in processes {
+        if process.process_id == current_process_id {
+            continue;
+        }
+        if roots.contains(&process.process_id) {
+            blockers.push(format!(
+                "independent Windows process table found target-home-bound agent-harness process pid={}",
+                process.process_id
+            ));
+        } else if deployment_processes.contains(&process.process_id) {
+            blockers.push(format!(
+                "independent Windows process table found target-home-bound descendant process pid={} parentPid={}",
+                process.process_id, process.parent_process_id
+            ));
+        } else if process_matches_pinned_path(process, &pinned_paths) {
+            blockers.push(format!(
+                "independent Windows process table found a pinned gateway/Codex process pid={}",
+                process.process_id
+            ));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn inspect_target_home_process_table(
+    _harness_home: &Path,
+    _blockers: &mut Vec<String>,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn keeper_plan_pinned_process_paths(harness_home: &Path) -> Vec<String> {
+    let plan_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("windows-reconcile-keeper")
+        .join("keeper-plan.json");
+    let Ok(bytes) = fs::read(plan_file) else {
+        return Vec::new();
+    };
+    let Ok(plan) = serde_json::from_slice::<Value>(&bytes) else {
+        return Vec::new();
+    };
+    if let Some(plan_home) = plan.get("harnessHome").and_then(Value::as_str)
+        && normalized_process_path(Path::new(plan_home)) != normalized_process_path(harness_home)
+    {
+        return Vec::new();
+    }
+    let Some(args) = plan
+        .pointer("/action/argumentVector")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for flag in ["--node-exe", "--gateway-script", "--codex-exe"] {
+        if let Some(path) = args.windows(2).find_map(|pair| {
+            (pair[0].as_str() == Some(flag))
+                .then(|| pair[1].as_str())
+                .flatten()
+        }) {
+            paths.push(normalized_process_path(Path::new(path)));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+#[cfg(windows)]
+fn process_matches_pinned_path(
+    process: &WindowsProcessObservation,
+    pinned_paths: &[String],
+) -> bool {
+    if pinned_paths.is_empty() {
+        return false;
+    }
+    if process
+        .executable_path
+        .as_deref()
+        .map(|path| normalized_process_path(Path::new(path)))
+        .is_some_and(|path| pinned_paths.contains(&path))
+    {
+        return true;
+    }
+    process.command_line.as_deref().is_some_and(|line| {
+        command_line_argument_groups(line).into_iter().any(|args| {
+            args.iter().any(|arg| {
+                let normalized = normalized_process_path(Path::new(arg.trim_matches('"')));
+                pinned_paths.contains(&normalized)
+            })
+        })
+    })
+}
+
+#[cfg(windows)]
+fn command_line_targets_home(command_line: &str, normalized_home: &str) -> bool {
+    command_line_argument_groups(command_line)
+        .into_iter()
+        .any(|args| {
+            args.windows(2).any(|pair| {
+                matches!(pair[0].as_str(), "--harness-home" | "--target-home")
+                    && normalized_process_path(Path::new(pair[1].trim_matches('"')))
+                        == normalized_home
+            }) || args.iter().any(|arg| {
+                ["--harness-home=", "--target-home="]
+                    .iter()
+                    .find_map(|prefix| arg.strip_prefix(prefix))
+                    .is_some_and(|path| {
+                        normalized_process_path(Path::new(path.trim_matches('"')))
+                            == normalized_home
+                    })
+            })
+        })
+}
+
+#[cfg(windows)]
+fn command_line_argument_groups(command_line: &str) -> Vec<Vec<String>> {
+    let outer = split_windows_command_line(command_line);
+    let mut groups = vec![outer.clone()];
+    for argument in outer {
+        if argument.contains("--harness-home")
+            || argument.contains("--target-home")
+            || argument.contains("--node-exe")
+            || argument.contains("--gateway-script")
+            || argument.contains("--codex-exe")
+        {
+            let nested = split_windows_command_line(&argument);
+            if nested.len() > 1 {
+                groups.push(nested);
+            }
+        }
+    }
+    groups
+}
+
+#[cfg(windows)]
+fn split_windows_command_line(command_line: &str) -> Vec<String> {
+    let characters = command_line.chars().collect::<Vec<_>>();
+    let mut arguments = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        while index < characters.len() && characters[index].is_whitespace() {
+            index += 1;
+        }
+        if index == characters.len() {
+            break;
+        }
+        let mut argument = String::new();
+        let mut quoted = false;
+        while index < characters.len() {
+            let mut backslashes = 0;
+            while index < characters.len() && characters[index] == '\\' {
+                backslashes += 1;
+                index += 1;
+            }
+            if index < characters.len() && characters[index] == '"' {
+                argument.extend(std::iter::repeat_n('\\', backslashes / 2));
+                if backslashes % 2 == 0 {
+                    quoted = !quoted;
+                } else {
+                    argument.push('"');
+                }
+                index += 1;
+                continue;
+            }
+            argument.extend(std::iter::repeat_n('\\', backslashes));
+            if index == characters.len() || (!quoted && characters[index].is_whitespace()) {
+                break;
+            }
+            argument.push(characters[index]);
+            index += 1;
+        }
+        arguments.push(argument);
+        while index < characters.len() && characters[index].is_whitespace() {
+            index += 1;
+        }
+    }
+    arguments
+}
+
+fn inspect_keeper_plan_owner_directory(
+    directory: &Path,
+    owner_kind: &str,
+    live_owners: &mut Vec<OpsKeeperPlanOwnerEvidence>,
+    blockers: &mut Vec<String>,
+) {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            blockers.push(format!(
+                "failed to enumerate {owner_kind} state at {}: {error}",
+                directory.display()
+            ));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                blockers.push(format!(
+                    "failed to enumerate one {owner_kind} state at {}: {error}",
+                    directory.display()
+                ));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("json") {
+            inspect_keeper_plan_owner_state(&path, owner_kind, live_owners, blockers);
+        }
+    }
+}
+
+fn inspect_keeper_plan_owner_state(
+    state_file: &Path,
+    owner_kind: &str,
+    live_owners: &mut Vec<OpsKeeperPlanOwnerEvidence>,
+    blockers: &mut Vec<String>,
+) {
+    let bytes = match fs::read(state_file) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            blockers.push(format!(
+                "failed to read {owner_kind} state at {}: {error}",
+                state_file.display()
+            ));
+            return;
+        }
+    };
+    let value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            blockers.push(format!(
+                "{owner_kind} state is invalid JSON at {}: {error}",
+                state_file.display()
+            ));
+            return;
+        }
+    };
+    let recorded_start = value.get("processStartTimeMs").and_then(Value::as_i64);
+    let primary_process = value
+        .get("processId")
+        .and_then(Value::as_i64)
+        .map(|process_id| ("processId", process_id))
+        .or_else(|| {
+            value
+                .get("pid")
+                .and_then(Value::as_i64)
+                .map(|process_id| ("pid", process_id))
+        });
+    let mut candidates = Vec::new();
+    if let Some(candidate) = primary_process {
+        candidates.push(candidate);
+    }
+    for field in ["supervisorPid", "parentPid"] {
+        if let Some(process_id) = value.get(field).and_then(Value::as_i64) {
+            candidates.push((field, process_id));
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    for (field, process_id) in candidates {
+        if process_id <= 0 {
+            continue;
+        }
+        let process_alive = crate::loop_health::process_alive_for_pid(process_id);
+        let process_instance_matches = if field == "processId" || field == "pid" {
+            recorded_start.map(|expected| {
+                crate::loop_health::process_start_time_ms_for_pid(process_id) == Some(expected)
+            })
+        } else {
+            None
+        };
+        let blocks = match (process_alive, process_instance_matches) {
+            (Some(false), _) => false,
+            (Some(true), Some(false)) => false,
+            (Some(true), _) | (None, _) => true,
+        };
+        if blocks {
+            live_owners.push(OpsKeeperPlanOwnerEvidence {
+                state_file: state_file.to_path_buf(),
+                owner_kind: owner_kind.to_string(),
+                process_field: field.to_string(),
+                process_id,
+                process_alive,
+                process_instance_matches,
+            });
+        }
+    }
+}
+
+fn write_supervisor_stop_marker(
+    harness_home: &Path,
+    component: &str,
+    reason: &str,
+    now_ms: i64,
+) -> io::Result<()> {
+    let stop_file = crate::loop_health::supervisor_stop_file_path(harness_home, component);
+    write_supervisor_stop_marker_at(&stop_file, component, reason, now_ms)
+}
+
+fn write_supervisor_stop_marker_at(
+    stop_file_path: &Path,
+    component: &str,
+    reason: &str,
+    now_ms: i64,
+) -> io::Result<()> {
+    if let Some(parent) = stop_file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::write_json_atomic(
+        stop_file_path,
+        &serde_json::json!({
+            "schema": "agent-harness.supervisor-stop-file.v1",
+            "serviceId": component,
+            "reason": reason,
+            "createdBy": "ops-control",
+            "createdAtMs": now_ms,
+            "persistent": true
+        }),
+    )
 }
 
 fn signal_stop_wake_lanes(harness_home: &Path, stop_files: &[OpsStopFileStatus]) {
@@ -783,7 +1806,252 @@ fn should_skip_backup_path(path: &Path) -> bool {
     })
 }
 
-fn discover_stop_files(harness_home: &Path) -> io::Result<Vec<OpsStopFileStatus>> {
+fn discover_stop_files(harness_home: &Path) -> io::Result<OpsStopFileDiscovery> {
+    if let Some(config) = read_ops_harness_config(harness_home)? {
+        let reconcile_managed = config
+            .get("supervisor")
+            .and_then(|value| value.get("manageAllLoops"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if reconcile_managed {
+            let mut stops = crate::supervisor_topology::derive_supervisor_topology(
+                &config,
+                &crate::supervisor_topology::SupervisorTopologyOverrides::default(),
+            )?
+            .into_iter()
+            .map(|(component, _)| {
+                let stop_file =
+                    crate::loop_health::supervisor_stop_file_path(harness_home, &component);
+                stop_file_status(component, stop_file)
+            })
+            .collect::<Vec<_>>();
+            stops.push(stop_file_status(
+                RECONCILE_KEEPER_STOP_COMPONENT.to_string(),
+                crate::loop_health::supervisor_stop_file_path(
+                    harness_home,
+                    RECONCILE_KEEPER_STOP_COMPONENT,
+                ),
+            ));
+            return Ok(OpsStopFileDiscovery {
+                ownership_mode: OpsSupervisorOwnershipMode::ReconcileManaged,
+                stop_files: normalize_stop_files(stops),
+                mutation_safe: true,
+            });
+        }
+    }
+
+    discover_scheduled_task_stop_files(harness_home)
+}
+
+fn discover_stop_files_for_control(harness_home: &Path) -> (OpsStopFileDiscovery, Vec<String>) {
+    let keeper_evidence = reconcile_keeper_evidence_exists(harness_home);
+    let mut errors = Vec::new();
+    let mut discovery = match discover_stop_files(harness_home) {
+        Ok(discovery) => discovery,
+        Err(error) => {
+            errors.push(format!(
+                "failed to derive current supervisor control topology: {error}"
+            ));
+            match discover_scheduled_task_stop_files(harness_home) {
+                Ok(discovery) => discovery,
+                Err(fallback_error) => {
+                    errors.push(format!(
+                        "failed to derive scheduled-task fallback control topology: {fallback_error}"
+                    ));
+                    OpsStopFileDiscovery {
+                        ownership_mode: OpsSupervisorOwnershipMode::ScheduledTask,
+                        stop_files: Vec::new(),
+                        mutation_safe: true,
+                    }
+                }
+            }
+        }
+    };
+
+    if discovery.ownership_mode == OpsSupervisorOwnershipMode::ReconcileManaged || keeper_evidence {
+        let (observed, observed_errors) = discover_observed_reconcile_stop_files(harness_home);
+        discovery.stop_files.extend(observed);
+        if !observed_errors.is_empty() {
+            discovery.mutation_safe = false;
+        }
+        errors.extend(observed_errors);
+    }
+    if keeper_evidence {
+        discovery.ownership_mode = OpsSupervisorOwnershipMode::ReconcileManaged;
+        discovery.stop_files.push(stop_file_status(
+            RECONCILE_KEEPER_STOP_COMPONENT.to_string(),
+            crate::loop_health::supervisor_stop_file_path(
+                harness_home,
+                RECONCILE_KEEPER_STOP_COMPONENT,
+            ),
+        ));
+    }
+    discovery.stop_files = normalize_stop_files(discovery.stop_files);
+    (discovery, errors)
+}
+
+fn reconcile_keeper_evidence_exists(harness_home: &Path) -> bool {
+    let supervisor = harness_home.join("state").join("supervisor");
+    [
+        supervisor.join("reconcile-keeper.json"),
+        supervisor
+            .join("windows-reconcile-keeper")
+            .join("keeper-plan.json"),
+        supervisor
+            .join("windows-reconcile-keeper")
+            .join("readback-latest.json"),
+        crate::loop_health::supervisor_stop_file_path(
+            harness_home,
+            RECONCILE_KEEPER_STOP_COMPONENT,
+        ),
+    ]
+    .iter()
+    .any(|path| path.is_file())
+}
+
+fn discover_observed_reconcile_stop_files(
+    harness_home: &Path,
+) -> (Vec<OpsStopFileStatus>, Vec<String>) {
+    let services_dir = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("services");
+    let entries = match fs::read_dir(&services_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return (Vec::new(), Vec::new());
+        }
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![format!(
+                    "failed to read observed supervisor service identities from {}: {error}",
+                    services_dir.display()
+                )],
+            );
+        }
+    };
+    let mut stops = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!(
+                    "failed to enumerate an observed supervisor service state: {error}"
+                ));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // `write_json_atomic` stages service state beside the canonical file as
+        // `.<name>.json.<pid>.<time>.<sequence>.tmp` and may also leave its
+        // `.atomic.lock` visible during replacement. Only `<service-id>.json`
+        // is authoritative supervisor topology; transient siblings must never
+        // become control targets or turn a safe stop into a partial receipt.
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let value = match fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<Value>(&text) {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.push(format!(
+                        "observed supervisor service state is invalid JSON at {}: {error}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            },
+            Err(error) => {
+                errors.push(format!(
+                    "failed to read observed supervisor service state at {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+
+        let schema = value.get("schema").and_then(Value::as_str);
+        let service_id = value.get("serviceId").and_then(Value::as_str);
+        let mut contract_valid = true;
+        match schema {
+            Some(schema) if schema == SUPERVISOR_SERVICE_STATE_SCHEMA => {}
+            Some(schema) => {
+                errors.push(format!(
+                    "observed supervisor service state schema `{schema}` does not match expected `{SUPERVISOR_SERVICE_STATE_SCHEMA}` at {}",
+                    path.display()
+                ));
+                contract_valid = false;
+            }
+            None => {
+                errors.push(format!(
+                    "observed supervisor service state is missing required `schema` at {}",
+                    path.display()
+                ));
+                contract_valid = false;
+            }
+        }
+        if service_id.is_none() {
+            errors.push(format!(
+                "observed supervisor service state is missing required `serviceId` at {}",
+                path.display()
+            ));
+            contract_valid = false;
+        }
+        if !contract_valid {
+            continue;
+        }
+        let service_id = service_id.expect("required serviceId was validated");
+        let Some(file_stem) = path.file_stem().and_then(|name| name.to_str()) else {
+            errors.push(format!(
+                "observed supervisor service state filename has no safe UTF-8 identity at {}",
+                path.display()
+            ));
+            continue;
+        };
+        if file_stem != service_id {
+            errors.push(format!(
+                "observed supervisor service identity `{service_id}` does not match state filename `{file_stem}` at {}",
+                path.display()
+            ));
+            continue;
+        }
+        if let Err(error) = crate::supervisor_topology::validate_supervisor_service_id(service_id) {
+            errors.push(format!(
+                "ignored unsafe observed supervisor service identity in {}: {error}",
+                path.display()
+            ));
+            continue;
+        }
+        stops.push(stop_file_status(
+            service_id.to_string(),
+            crate::loop_health::supervisor_stop_file_path(harness_home, service_id),
+        ));
+    }
+    (stops, errors)
+}
+
+fn read_ops_harness_config(harness_home: &Path) -> io::Result<Option<Value>> {
+    let Some(config_file) = crate::config::harness_config_candidates(harness_home)
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
+        return Ok(None);
+    };
+    let text = fs::read_to_string(&config_file)?;
+    serde_json::from_str(&text).map(Some).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid JSON in {}: {error}", config_file.display()),
+        )
+    })
+}
+
+fn discover_scheduled_task_stop_files(harness_home: &Path) -> io::Result<OpsStopFileDiscovery> {
     let mut stops = Vec::new();
     let plan_file = harness_home
         .join("state")
@@ -811,7 +2079,7 @@ fn discover_stop_files(harness_home: &Path) -> io::Result<Vec<OpsStopFileStatus>
     }
 
     let direct_stop_dir = harness_home.join("state").join("supervisor").join("stop");
-    for component in DIRECT_SUPERVISOR_STOP_COMPONENTS {
+    for component in LEGACY_SCHEDULED_DIRECT_STOP_COMPONENTS {
         stops.push(stop_file_status(
             (*component).to_string(),
             direct_stop_dir.join(format!("{component}.stop")),
@@ -850,6 +2118,14 @@ fn discover_stop_files(harness_home: &Path) -> io::Result<Vec<OpsStopFileStatus>
             Err(error) => return Err(error),
         }
     }
+    Ok(OpsStopFileDiscovery {
+        ownership_mode: OpsSupervisorOwnershipMode::ScheduledTask,
+        stop_files: normalize_stop_files(stops),
+        mutation_safe: true,
+    })
+}
+
+fn normalize_stop_files(mut stops: Vec<OpsStopFileStatus>) -> Vec<OpsStopFileStatus> {
     stops.sort_by(|left, right| {
         left.component
             .cmp(&right.component)
@@ -858,7 +2134,48 @@ fn discover_stop_files(harness_home: &Path) -> io::Result<Vec<OpsStopFileStatus>
     stops.dedup_by(|left, right| {
         left.component == right.component && left.stop_file == right.stop_file
     });
-    Ok(stops)
+    stops
+}
+
+fn refresh_stop_file_statuses(stops: &[OpsStopFileStatus]) -> Vec<OpsStopFileStatus> {
+    stops
+        .iter()
+        .map(|stop| stop_file_status(stop.component.clone(), stop.stop_file.clone()))
+        .collect()
+}
+
+fn same_stop_target_set(left: &[OpsStopFileStatus], right: &[OpsStopFileStatus]) -> bool {
+    let targets = |stops: &[OpsStopFileStatus]| {
+        stops
+            .iter()
+            .map(|stop| (stop.component.clone(), stop.stop_file.clone()))
+            .collect::<BTreeSet<_>>()
+    };
+    targets(left) == targets(right)
+}
+
+fn ordered_control_targets(
+    stop_files: &[OpsStopFileStatus],
+    action: OpsControlAction,
+    reconcile_managed: bool,
+) -> Vec<&OpsStopFileStatus> {
+    let mut targets = stop_files.iter().collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        let keeper_rank = |component: &str| match (reconcile_managed, action) {
+            (true, OpsControlAction::Stop) => {
+                usize::from(component != RECONCILE_KEEPER_STOP_COMPONENT)
+            }
+            (true, OpsControlAction::Start) => {
+                usize::from(component == RECONCILE_KEEPER_STOP_COMPONENT)
+            }
+            _ => 0,
+        };
+        keeper_rank(&left.component)
+            .cmp(&keeper_rank(&right.component))
+            .then_with(|| left.component.cmp(&right.component))
+            .then_with(|| left.stop_file.cmp(&right.stop_file))
+    });
+    targets
 }
 
 fn stop_file_status(component: String, stop_file: PathBuf) -> OpsStopFileStatus {
@@ -966,6 +2283,11 @@ mod tests {
             .join("supervisor")
             .join("windows-scheduled-tasks");
         fs::create_dir_all(supervisor.join("stop")).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"supervisor":{"manageAllLoops":false}}"#,
+        )
+        .unwrap();
         let stop_file = supervisor.join("stop").join("worker-loop.stop");
         fs::write(
             supervisor.join("supervisor-plan.json"),
@@ -987,6 +2309,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(stop.status, "stop-requested");
+        assert!(
+            stop.stop_files
+                .iter()
+                .all(|entry| entry.component != RECONCILE_KEEPER_STOP_COMPONENT)
+        );
         let scheduled_worker_stop = stop
             .stop_files
             .iter()
@@ -1027,6 +2354,1253 @@ mod tests {
         assert!(start.stop_files.iter().all(|entry| !entry.present));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_home_ops_control_requires_token_from_an_ordinary_shell() {
+        let root = temp_root("live_home_ops_control_requires_token_from_an_ordinary_shell");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "supervisor": {
+                    "manageAllLoops": true,
+                    "runtimeLoop": { "enabled": true },
+                    "workerLoop": { "enabled": false },
+                    "cronSchedulerLoop": { "enabled": false },
+                    "progressDeliveryLoop": { "enabled": false },
+                    "ledgerMaintenanceLoop": { "enabled": false },
+                    "telegramLoop": { "enabled": false },
+                    "discordOutboxLoop": { "enabled": false },
+                    "discordGatewayLoop": { "enabled": false }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        for token in [None, Some("not-a-live-control-token".to_string())] {
+            let blocked = record_ops_control(OpsControlOptions {
+                harness_home: harness_home.clone(),
+                action: OpsControlAction::Stop,
+                reason: None,
+                live_control_token: token,
+                now_ms: 1000,
+            })
+            .unwrap();
+            assert_eq!(blocked.status, "blocked-live-control");
+            assert!(
+                blocked
+                    .reason
+                    .contains("destructive control against a live harness home")
+            );
+            assert!(blocked.stop_files.iter().all(|entry| !entry.present));
+            assert!(
+                !blocked.receipt_file.exists(),
+                "invalid live-control authorization must not create even an ops receipt"
+            );
+        }
+
+        let stop_request = record_ops_cutover_request(OpsCutoverRequestOptions {
+            harness_home: harness_home.clone(),
+            action: LiveControlAction::Stop,
+            summary: Some("authorize exact stop".to_string()),
+            candidate_binary: None,
+            staging_home: None,
+            test_notes: vec!["normal-shell bypass regression".to_string()],
+            now_ms: 1001,
+        })
+        .unwrap();
+        let stop_approval = record_ops_cutover_approval(OpsCutoverApproveOptions {
+            harness_home: harness_home.clone(),
+            ticket_id: stop_request.ticket_id,
+            action: LiveControlAction::Stop,
+            issued_to: Some("operator".to_string()),
+            ttl_seconds: Some(60),
+            reason: None,
+            now_ms: 1002,
+        })
+        .unwrap();
+        let stop_token = stop_approval.token.unwrap();
+        let stopped = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: Some(stop_token.clone()),
+            now_ms: 1003,
+        })
+        .unwrap();
+        assert_eq!(stopped.status, "stop-requested");
+        assert!(stopped.stop_files.iter().all(|entry| entry.present));
+
+        let wrong_action = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Start,
+            reason: None,
+            live_control_token: Some(stop_token),
+            now_ms: 1004,
+        })
+        .unwrap();
+        assert_eq!(wrong_action.status, "blocked-live-control");
+        assert!(wrong_action.stop_files.iter().all(|entry| entry.present));
+
+        let cutover_request = record_ops_cutover_request(OpsCutoverRequestOptions {
+            harness_home: harness_home.clone(),
+            action: LiveControlAction::Cutover,
+            summary: Some("authorize guarded start".to_string()),
+            candidate_binary: None,
+            staging_home: None,
+            test_notes: vec!["cutover token covers start".to_string()],
+            now_ms: 1005,
+        })
+        .unwrap();
+        let cutover_approval = record_ops_cutover_approval(OpsCutoverApproveOptions {
+            harness_home: harness_home.clone(),
+            ticket_id: cutover_request.ticket_id,
+            action: LiveControlAction::Cutover,
+            issued_to: Some("operator".to_string()),
+            ttl_seconds: Some(60),
+            reason: None,
+            now_ms: 1006,
+        })
+        .unwrap();
+        let started = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Start,
+            reason: None,
+            live_control_token: cutover_approval.token,
+            now_ms: 1007,
+        })
+        .unwrap();
+        assert_eq!(started.status, "start-ready");
+        assert!(started.stop_files.iter().all(|entry| !entry.present));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn keeper_plan_preflight_requires_every_hold_and_no_live_owner() {
+        let root = temp_root("keeper_plan_preflight_requires_hold_and_no_owner");
+        let harness_home = root.join(".agent-harness");
+        write_runtime_only_preflight_config(&harness_home);
+
+        let unheld = collect_ops_keeper_plan_preflight(&harness_home);
+        assert!(!unheld.ready);
+        assert!(unheld.live_owners.is_empty());
+        assert!(
+            unheld
+                .reason
+                .contains("current topology is not held: missing")
+        );
+
+        for component in [RECONCILE_KEEPER_STOP_COMPONENT, "runtime-loop"] {
+            write_supervisor_stop_marker(&harness_home, component, "fixture hold", 1000).unwrap();
+        }
+        let missing_state = collect_ops_keeper_plan_preflight(&harness_home);
+        assert!(!missing_state.ready);
+        assert!(
+            missing_state
+                .reason
+                .contains("missing expected reconcile-keeper state")
+        );
+        assert!(
+            missing_state
+                .reason
+                .contains("missing expected service-owner state for `runtime-loop`")
+        );
+        assert!(
+            missing_state
+                .reason
+                .contains("missing expected loop-heartbeat state for `runtime-loop`")
+        );
+
+        write_quiescent_preflight_owner_states(&harness_home, &["runtime-loop"]);
+        let held = collect_ops_keeper_plan_preflight(&harness_home);
+        assert!(held.ready, "{}", held.reason);
+        assert_eq!(held.stop_files.len(), 2);
+
+        let state_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("reconcile-keeper.json");
+        let process_id = i64::from(std::process::id());
+        crate::write_json_atomic(
+            &state_file,
+            &serde_json::json!({
+                "schema": "agent-harness.supervisor-reconcile-keeper.v1",
+                "status": "running",
+                "stopFile": crate::loop_health::supervisor_stop_file_path(
+                    &harness_home,
+                    RECONCILE_KEEPER_STOP_COMPONENT
+                ),
+                "holdRequested": true,
+                "pid": process_id,
+                "processStartTimeMs":
+                    crate::loop_health::process_start_time_ms_for_pid(process_id)
+                        .expect("current process start time")
+            }),
+        )
+        .unwrap();
+        let running = collect_ops_keeper_plan_preflight(&harness_home);
+        assert!(!running.ready);
+        assert_eq!(running.live_owners.len(), 1);
+        assert_eq!(running.live_owners[0].owner_kind, "reconcile-keeper");
+        assert_eq!(running.live_owners[0].process_id, process_id);
+        assert_eq!(running.live_owners[0].process_instance_matches, Some(true));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn keeper_plan_preflight_rejects_semantically_empty_expected_state() {
+        let root = temp_root("keeper_plan_preflight_rejects_semantically_empty_state");
+        let harness_home = root.join(".agent-harness");
+        write_runtime_only_preflight_config(&harness_home);
+        for component in [RECONCILE_KEEPER_STOP_COMPONENT, "runtime-loop"] {
+            write_supervisor_stop_marker(&harness_home, component, "fixture hold", 1000).unwrap();
+        }
+        write_quiescent_preflight_owner_states(&harness_home, &["runtime-loop"]);
+
+        let heartbeat_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("loop-heartbeats")
+            .join("runtime-loop.json");
+        fs::write(&heartbeat_file, b"{}").unwrap();
+        let empty_heartbeat = collect_ops_keeper_plan_preflight(&harness_home);
+        assert!(!empty_heartbeat.ready);
+        assert!(
+            empty_heartbeat
+                .reason
+                .contains("loop-heartbeat state is missing required `schema`")
+        );
+        assert!(
+            empty_heartbeat
+                .reason
+                .contains("loop-heartbeat state is missing required `serviceId`")
+        );
+        assert!(
+            empty_heartbeat
+                .reason
+                .contains("loop-heartbeat state is missing typed quiescent `status`")
+        );
+
+        write_quiescent_preflight_owner_states(&harness_home, &["runtime-loop"]);
+        let keeper_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("reconcile-keeper.json");
+        fs::write(&keeper_file, b"{}").unwrap();
+        let empty_keeper = collect_ops_keeper_plan_preflight(&harness_home);
+        assert!(!empty_keeper.ready);
+        assert!(
+            empty_keeper
+                .reason
+                .contains("reconcile-keeper state is missing required `schema`")
+        );
+        assert!(
+            empty_keeper
+                .reason
+                .contains("reconcile-keeper state is missing typed quiescent `status`")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn keeper_plan_preflight_detects_real_target_home_bound_process_survivor() {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let root = temp_root("keeper_plan_preflight_detects_target_home_process");
+        let harness_home = root.join(".agent-harness");
+        write_runtime_only_preflight_config(&harness_home);
+        for component in [RECONCILE_KEEPER_STOP_COMPONENT, "runtime-loop"] {
+            write_supervisor_stop_marker(&harness_home, component, "fixture hold", 1000).unwrap();
+        }
+        write_quiescent_preflight_owner_states(&harness_home, &["runtime-loop"]);
+        let clean = collect_ops_keeper_plan_preflight(&harness_home);
+        assert!(clean.ready, "{}", clean.reason);
+
+        let fake_bin = harness_home.join("bin").join("current");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_harness = fake_bin.join("agent-harness.exe");
+        let windows_dir = PathBuf::from(std::env::var_os("WINDIR").expect("WINDIR"));
+        fs::copy(
+            windows_dir
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"),
+            &fake_harness,
+        )
+        .unwrap();
+        let marker = format!(
+            "Start-Sleep -Seconds 30 # --harness-home \"{}\"",
+            harness_home.display()
+        );
+        let mut command = Command::new(&fake_harness);
+        command
+            .args(["-NoProfile", "-Command"])
+            .arg(marker)
+            .creation_flags(CREATE_NO_WINDOW);
+        let mut child = command.spawn().expect("spawn target-home-bound fixture");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "target-home-bound fixture exited before process-table replay"
+        );
+
+        let survivor = collect_ops_keeper_plan_preflight(&harness_home);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!survivor.ready);
+        assert!(survivor.reason.contains(
+            "independent Windows process table found target-home-bound agent-harness process"
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // Contract: I26 live keeper-plan promotion must not reject the exact
+    // read-only CLI generation performing its own independent process scan.
+    // Source: a held live-plan attempt observed the current agent-harness CLI
+    // plus its Get-CimInstance descendants as target-home survivors.
+    // Fails on: treating the scanner root as a deployment owner recursively
+    // promotes its diagnostic descendants into the blocking process tree.
+    // Asserts: only the exact caller tree is ignored; a second target-home
+    // process, its descendant, and a pinned process in the caller tree remain
+    // blockers.
+    #[cfg(windows)]
+    #[test]
+    fn keeper_plan_process_scan_excludes_only_exact_caller_diagnostics() {
+        let normalized_home = normalized_process_path(Path::new(r"C:\fixtures\held-agent-harness"));
+        let harness_executable = r"C:\fixtures\held-agent-harness\bin\current\agent-harness.exe";
+        let pinned_node = normalized_process_path(Path::new(r"C:\tools\node.exe"));
+        let current_process_id = 41_000;
+        let processes = vec![
+            WindowsProcessObservation {
+                process_id: current_process_id,
+                parent_process_id: 40_999,
+                name: "agent-harness.exe".to_string(),
+                executable_path: Some(harness_executable.to_string()),
+                command_line: Some(format!(
+                    r#""{harness_executable}" supervisor-keeper-plan --harness-home "C:\fixtures\held-agent-harness""#
+                )),
+            },
+            WindowsProcessObservation {
+                process_id: 41_001,
+                parent_process_id: current_process_id,
+                name: "powershell.exe".to_string(),
+                executable_path: Some(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+                ),
+                command_line: Some(
+                    "powershell.exe -NoProfile -Command Get-CimInstance Win32_Process".to_string(),
+                ),
+            },
+            WindowsProcessObservation {
+                process_id: 41_002,
+                parent_process_id: 41_001,
+                name: "conhost.exe".to_string(),
+                executable_path: Some(r"C:\Windows\System32\conhost.exe".to_string()),
+                command_line: None,
+            },
+            WindowsProcessObservation {
+                process_id: 41_003,
+                parent_process_id: current_process_id,
+                name: "node.exe".to_string(),
+                executable_path: Some(r"C:\tools\node.exe".to_string()),
+                command_line: Some(r#""C:\tools\node.exe" gateway.mjs"#.to_string()),
+            },
+            WindowsProcessObservation {
+                process_id: 42_000,
+                parent_process_id: 40_999,
+                name: "agent-harness.exe".to_string(),
+                executable_path: Some(harness_executable.to_string()),
+                command_line: Some(format!(
+                    r#""{harness_executable}" supervisor-run --harness-home "C:\fixtures\held-agent-harness""#
+                )),
+            },
+            WindowsProcessObservation {
+                process_id: 42_001,
+                parent_process_id: 42_000,
+                name: "worker-child.exe".to_string(),
+                executable_path: Some(r"C:\tools\worker-child.exe".to_string()),
+                command_line: None,
+            },
+        ];
+        let mut blockers = Vec::new();
+
+        append_target_home_process_blockers(
+            &normalized_home,
+            &processes,
+            &[pinned_node],
+            current_process_id,
+            &mut blockers,
+        );
+
+        assert_eq!(
+            blockers,
+            vec![
+                "independent Windows process table found a pinned gateway/Codex process pid=41003",
+                "independent Windows process table found target-home-bound agent-harness process pid=42000",
+                "independent Windows process table found target-home-bound descendant process pid=42001 parentPid=42000",
+            ]
+        );
+    }
+
+    #[test]
+    fn keeper_plan_preflight_fails_closed_on_corrupt_owner_state() {
+        let root = temp_root("keeper_plan_preflight_corrupt_owner_state");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("services"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            br#"{"supervisor":{"manageAllLoops":true}}"#,
+        )
+        .unwrap();
+        for component in [
+            RECONCILE_KEEPER_STOP_COMPONENT,
+            "cron-scheduler-loop",
+            "discord-gateway-loop",
+            "discord-outbox-loop",
+            "ledger-maintenance-loop",
+            "progress-delivery-loop",
+            "runtime-loop",
+            "telegram-loop",
+            "worker-loop",
+        ] {
+            write_supervisor_stop_marker(&harness_home, component, "fixture hold", 1000).unwrap();
+        }
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("services")
+                .join("runtime-loop.json"),
+            b"{not-json}",
+        )
+        .unwrap();
+
+        let report = collect_ops_keeper_plan_preflight(&harness_home);
+        assert!(!report.ready);
+        assert!(
+            report
+                .reason
+                .contains("service-owner state is invalid JSON")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // Contract: I26 reconcile-managed control follows the configured desired topology.
+    // Source: GitHub issue #17, reduced to a hermetic config/file-state replay.
+    // Fails on: the legacy eight-component fallback omits ledger maintenance.
+    // Asserts: stop/status/start cover every configured child plus the reconcile keeper.
+    #[test]
+    fn ops_control_reconcile_managed_targets_follow_configured_topology() {
+        let root = temp_root("ops_control_reconcile_managed_targets_follow_configured_topology");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "supervisor": {
+                    "manageAllLoops": true,
+                    "telegramLoops": [
+                        {
+                            "enabled": true,
+                            "serviceId": "telegram-loop-xiaoxiaoli",
+                            "telegramAccount": "xiaoxiaoli"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let expected = vec![
+            "cron-scheduler-loop",
+            "discord-gateway-loop",
+            "discord-outbox-loop",
+            "ledger-maintenance-loop",
+            "progress-delivery-loop",
+            "runtime-loop",
+            "supervisor-reconcile",
+            "telegram-loop",
+            "telegram-loop-xiaoxiaoli",
+            "worker-loop",
+        ];
+        let stop = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: None,
+            now_ms: 1000,
+        })
+        .unwrap();
+        assert_eq!(stop.status, "stop-requested");
+        assert_eq!(
+            stop.stop_files
+                .iter()
+                .map(|entry| entry.component.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(stop.stop_files.iter().all(|entry| entry.present));
+        assert!(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("stop")
+                .join("ledger-maintenance-loop.stop")
+                .is_file()
+        );
+        assert!(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("stop")
+                .join("supervisor-reconcile.stop")
+                .is_file()
+        );
+
+        let status = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Status,
+            reason: None,
+            live_control_token: None,
+            now_ms: 1001,
+        })
+        .unwrap();
+        assert_eq!(status.status, "observed");
+        assert_eq!(
+            status
+                .stop_files
+                .iter()
+                .map(|entry| entry.component.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(status.stop_files.iter().all(|entry| entry.present));
+
+        let start = record_ops_control(OpsControlOptions {
+            harness_home,
+            action: OpsControlAction::Start,
+            reason: None,
+            live_control_token: None,
+            now_ms: 1002,
+        })
+        .unwrap();
+        assert_eq!(start.status, "start-ready");
+        assert_eq!(start.stop_files.len(), expected.len());
+        assert!(start.stop_files.iter().all(|entry| !entry.present));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ops_control_reconcile_managed_targets_honor_overrides_and_telegram_accounts() {
+        let root = temp_root(
+            "ops_control_reconcile_managed_targets_honor_overrides_and_telegram_accounts",
+        );
+        let harness_home = root.join("harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "supervisor": {
+                    "manageAllLoops": true,
+                    "services": [
+                        {
+                            "enabled": true,
+                            "serviceId": "runtime-loop",
+                            "serviceKind": "runtime",
+                            "args": [],
+                            "priority": "critical",
+                            "restartDelayMs": 1000,
+                            "heartbeatTimeoutMs": 120000
+                        },
+                        {
+                            "enabled": false,
+                            "serviceId": "ledger-maintenance-loop",
+                            "serviceKind": "ledger-maintenance",
+                            "args": [],
+                            "priority": "low",
+                            "restartDelayMs": 1000,
+                            "heartbeatTimeoutMs": 120000
+                        }
+                    ],
+                    "runtimeLoop": { "enabled": false },
+                    "workerLoop": { "enabled": true },
+                    "cronSchedulerLoop": { "enabled": false },
+                    "progressDeliveryLoop": { "enabled": true },
+                    "ledgerMaintenanceLoop": { "enabled": false },
+                    "telegramLoop": { "enabled": false },
+                    "discordOutboxLoop": { "enabled": true },
+                    "discordGatewayLoop": { "enabled": false },
+                    "telegramLoops": [
+                        { "enabled": true, "account": "North Desk" },
+                        { "enabled": true, "serviceId": "telegram-loop-blue" },
+                        { "enabled": false, "serviceId": "telegram-loop-disabled" }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stop = record_ops_control(OpsControlOptions {
+            harness_home,
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: None,
+            now_ms: 1000,
+        })
+        .unwrap();
+        assert_eq!(stop.status, "stop-requested");
+        assert_eq!(
+            stop.stop_files
+                .iter()
+                .map(|entry| entry.component.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "discord-outbox-loop",
+                "progress-delivery-loop",
+                "runtime-loop",
+                "supervisor-reconcile",
+                "telegram-loop-blue",
+                "telegram-loop-north-desk",
+                "worker-loop",
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // Contract: partial live-control mutation must produce a fail-closed receipt.
+    // Source: GitHub issue #17 acceptance case, with one deterministic blocked marker.
+    // Fails on: the first filesystem error aborts without recording partial control.
+    // Asserts: the receipt is partial and the reconcile keeper remains held on failed start.
+    #[test]
+    fn ops_control_reconcile_managed_receipt_fails_closed_on_partial_mutation() {
+        let root =
+            temp_root("ops_control_reconcile_managed_receipt_fails_closed_on_partial_mutation");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "supervisor": {
+                    "manageAllLoops": true,
+                    "runtimeLoop": { "enabled": true },
+                    "workerLoop": { "enabled": false },
+                    "cronSchedulerLoop": { "enabled": false },
+                    "progressDeliveryLoop": { "enabled": false },
+                    "ledgerMaintenanceLoop": { "enabled": true },
+                    "telegramLoop": { "enabled": false },
+                    "discordOutboxLoop": { "enabled": false },
+                    "discordGatewayLoop": { "enabled": false }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let blocked_target = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("ledger-maintenance-loop.stop");
+        fs::create_dir_all(&blocked_target).unwrap();
+
+        let stop = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: None,
+            now_ms: 1000,
+        })
+        .unwrap();
+        assert_eq!(stop.status, "partial-stop-request");
+        assert_eq!(stop.stop_files.len(), 3);
+        assert!(
+            stop.stop_files
+                .iter()
+                .find(|entry| entry.component == "runtime-loop")
+                .is_some_and(|entry| entry.present)
+        );
+        assert!(
+            stop.stop_files
+                .iter()
+                .find(|entry| entry.component == "ledger-maintenance-loop")
+                .is_some_and(|entry| !entry.present)
+        );
+        assert!(stop.receipt_file.is_file());
+
+        let start = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Start,
+            reason: None,
+            live_control_token: None,
+            now_ms: 1001,
+        })
+        .unwrap();
+        assert_eq!(start.status, "partial-start-ready");
+        assert!(
+            start
+                .stop_files
+                .iter()
+                .find(|entry| entry.component == RECONCILE_KEEPER_STOP_COMPONENT)
+                .is_some_and(|entry| entry.present)
+        );
+        assert!(
+            start
+                .reason
+                .contains("retained supervisor-reconcile stop marker")
+        );
+        assert!(
+            crate::loop_health::supervisor_stop_file_path(
+                &harness_home,
+                RECONCILE_KEEPER_STOP_COMPONENT
+            )
+            .is_file(),
+            "partial start must preserve or recreate the global keeper hold"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ops_control_stop_precommits_keeper_hold_when_config_is_malformed() {
+        let root = temp_root("ops_control_stop_precommits_keeper_hold_on_bad_config");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper"),
+        )
+        .unwrap();
+        fs::write(harness_home.join("harness-config.json"), b"{not-json}").unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper")
+                .join("keeper-plan.json"),
+            b"{}",
+        )
+        .unwrap();
+        let services = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services).unwrap();
+        fs::write(
+            services.join("custom-loop.json"),
+            br#"{"schema":"agent-harness.supervisor-service-state.v1","serviceId":"custom-loop"}"#,
+        )
+        .unwrap();
+
+        let report = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "partial-stop-request");
+        assert!(report.reason.contains("invalid JSON"));
+        for component in [RECONCILE_KEEPER_STOP_COMPONENT, "custom-loop"] {
+            assert!(
+                crate::loop_health::supervisor_stop_file_path(&harness_home, component).is_file(),
+                "missing fail-safe stop marker for {component}"
+            );
+        }
+        let keeper_marker: Value = serde_json::from_slice(
+            &fs::read(crate::loop_health::supervisor_stop_file_path(
+                &harness_home,
+                RECONCILE_KEEPER_STOP_COMPONENT,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(keeper_marker["createdAtMs"], 2000);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ops_control_start_refuses_all_clears_when_topology_is_invalid() {
+        let root = temp_root("ops_control_start_refuses_invalid_topology");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper"),
+        )
+        .unwrap();
+        fs::write(harness_home.join("harness-config.json"), b"{not-json}").unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper")
+                .join("keeper-plan.json"),
+            b"{}",
+        )
+        .unwrap();
+        for component in [RECONCILE_KEEPER_STOP_COMPONENT, "runtime-loop"] {
+            write_supervisor_stop_marker(&harness_home, component, "fixture", 1000).unwrap();
+        }
+
+        let report = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Start,
+            reason: None,
+            live_control_token: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "partial-start-ready");
+        assert!(report.reason.contains("refused to clear any stop marker"));
+        for component in [RECONCILE_KEEPER_STOP_COMPONENT, "runtime-loop"] {
+            assert!(
+                crate::loop_health::supervisor_stop_file_path(&harness_home, component).is_file()
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ops_control_start_refuses_all_clears_when_observed_identity_is_malformed() {
+        let root = temp_root("ops_control_start_refuses_malformed_observed_identity");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            br#"{"supervisor":{"manageAllLoops":true}}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper")
+                .join("keeper-plan.json"),
+            b"{}",
+        )
+        .unwrap();
+        let services = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services).unwrap();
+        fs::write(services.join("custom-loop.json"), b"{not-json}").unwrap();
+        for component in [RECONCILE_KEEPER_STOP_COMPONENT, "runtime-loop"] {
+            write_supervisor_stop_marker(&harness_home, component, "fixture", 1000).unwrap();
+        }
+
+        let report = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Start,
+            reason: None,
+            live_control_token: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "partial-start-ready");
+        assert!(
+            report
+                .reason
+                .contains("observed supervisor service state is invalid JSON")
+        );
+        assert!(report.reason.contains("refused to clear any stop marker"));
+        for component in [RECONCILE_KEEPER_STOP_COMPONENT, "runtime-loop"] {
+            assert!(
+                crate::loop_health::supervisor_stop_file_path(&harness_home, component).is_file()
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // Contract: canonical supervisor service-state records are an identity/schema
+    // boundary and may not authorize mutations when their required fields are absent.
+    // Source: independent release review of reconcile-managed stop/start discovery.
+    // Fails on: filename fallback treats `{}` as a valid observed service identity.
+    // Asserts: discovery reports both missing fields and stop commits only the root hold.
+    #[test]
+    fn ops_control_stop_rejects_canonical_service_state_missing_contract_fields() {
+        let root =
+            temp_root("ops_control_stop_rejects_canonical_service_state_missing_contract_fields");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            br#"{"supervisor":{"manageAllLoops":true}}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper")
+                .join("keeper-plan.json"),
+            b"{}",
+        )
+        .unwrap();
+        let services = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services).unwrap();
+        fs::write(services.join("custom-loop.json"), b"{}").unwrap();
+
+        let report = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "partial-stop-request");
+        assert!(report.reason.contains("required `schema`"));
+        assert!(report.reason.contains("required `serviceId`"));
+        assert!(
+            report
+                .reason
+                .contains("refused to create child stop markers")
+        );
+        assert!(
+            crate::loop_health::supervisor_stop_file_path(
+                &harness_home,
+                RECONCILE_KEEPER_STOP_COMPONENT
+            )
+            .is_file(),
+            "the root hold must still be precommitted before unsafe discovery"
+        );
+        for component in ["runtime-loop", "custom-loop"] {
+            assert!(
+                !crate::loop_health::supervisor_stop_file_path(&harness_home, component).is_file(),
+                "semantic corruption must not authorize a child hold mutation for {component}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // Contract: a canonical service-state schema mismatch fences both child and
+    // root hold clearing.
+    // Source: independent release review of reconcile-managed stop/start discovery.
+    // Fails on: `schema` is ignored and Start clears every observed hold.
+    // Asserts: discovery reports the mismatch and no existing hold is cleared.
+    #[test]
+    fn ops_control_start_rejects_canonical_service_state_wrong_schema() {
+        let root = temp_root("ops_control_start_rejects_canonical_service_state_wrong_schema");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            br#"{"supervisor":{"manageAllLoops":true}}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper")
+                .join("keeper-plan.json"),
+            b"{}",
+        )
+        .unwrap();
+        let services = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services).unwrap();
+        fs::write(
+            services.join("custom-loop.json"),
+            br#"{"schema":"agent-harness.supervisor-service-state.v0","serviceId":"custom-loop"}"#,
+        )
+        .unwrap();
+        for component in [
+            RECONCILE_KEEPER_STOP_COMPONENT,
+            "runtime-loop",
+            "custom-loop",
+        ] {
+            write_supervisor_stop_marker(&harness_home, component, "fixture", 1000).unwrap();
+        }
+
+        let report = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Start,
+            reason: None,
+            live_control_token: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "partial-start-ready");
+        assert!(report.reason.contains(
+            "schema `agent-harness.supervisor-service-state.v0` does not match expected `agent-harness.supervisor-service-state.v1`"
+        ));
+        assert!(report.reason.contains("refused to clear any stop marker"));
+        for component in [
+            RECONCILE_KEEPER_STOP_COMPONENT,
+            "runtime-loop",
+            "custom-loop",
+        ] {
+            assert!(
+                crate::loop_health::supervisor_stop_file_path(&harness_home, component).is_file(),
+                "schema corruption must preserve the existing hold for {component}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // Contract: atomic-write staging files are not authoritative supervisor topology.
+    // Source: the Windows keeper stop replay observed a valid atomic temp file between
+    // write and rename while the canonical service state remained present.
+    // Fails on: every regular file in the services directory is parsed as canonical state.
+    // Asserts: only canonical `<service-id>.json` files influence fail-closed control.
+    #[test]
+    fn ops_control_ignores_atomic_service_state_temp_files() {
+        let root = temp_root("ops_control_ignores_atomic_service_state_temp_files");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            br#"{"supervisor":{"manageAllLoops":true}}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper")
+                .join("keeper-plan.json"),
+            b"{}",
+        )
+        .unwrap();
+        let services = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services).unwrap();
+        let canonical = br#"{"schema":"agent-harness.supervisor-service-state.v1","serviceId":"telegram-loop"}"#;
+        fs::write(services.join("telegram-loop.json"), canonical).unwrap();
+        fs::write(
+            services.join(".telegram-loop.json.4242.2000.1.tmp"),
+            canonical,
+        )
+        .unwrap();
+
+        let report = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "stop-requested", "{}", report.reason);
+        assert_eq!(
+            report
+                .stop_files
+                .iter()
+                .filter(|entry| entry.component == "telegram-loop")
+                .count(),
+            1
+        );
+        for component in [RECONCILE_KEEPER_STOP_COMPONENT, "telegram-loop"] {
+            assert!(
+                crate::loop_health::supervisor_stop_file_path(&harness_home, component).is_file()
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ops_control_rejects_canonical_service_state_identity_mismatch() {
+        let root = temp_root("ops_control_rejects_canonical_service_state_identity_mismatch");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            br#"{"supervisor":{"manageAllLoops":true}}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("windows-reconcile-keeper")
+                .join("keeper-plan.json"),
+            b"{}",
+        )
+        .unwrap();
+        let services = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services).unwrap();
+        fs::write(
+            services.join("telegram-loop.json"),
+            br#"{"schema":"agent-harness.supervisor-service-state.v1","serviceId":"discord-gateway-loop"}"#,
+        )
+        .unwrap();
+
+        let report = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "partial-stop-request");
+        assert!(report.reason.contains(
+            "observed supervisor service identity `discord-gateway-loop` does not match state filename `telegram-loop`"
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ops_control_preserves_old_keeper_and_observed_children_after_mode_switch() {
+        let root = temp_root("ops_control_preserves_keeper_after_mode_switch");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            br#"{"supervisor":{"manageAllLoops":false}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(harness_home.join("state").join("supervisor")).unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("reconcile-keeper.json"),
+            b"{}",
+        )
+        .unwrap();
+        let services = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services).unwrap();
+        fs::write(
+            services.join("retired-custom-loop.json"),
+            br#"{"schema":"agent-harness.supervisor-service-state.v1","serviceId":"retired-custom-loop"}"#,
+        )
+        .unwrap();
+
+        let report = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "stop-requested");
+        for component in [RECONCILE_KEEPER_STOP_COMPONENT, "retired-custom-loop"] {
+            assert!(
+                crate::loop_health::supervisor_stop_file_path(&harness_home, component).is_file()
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ops_control_reconcile_keeper_orders_stop_before_children_and_start_after_children() {
+        let stop_dir = PathBuf::from("state").join("supervisor").join("stop");
+        let targets = vec![
+            stop_file_status("worker-loop".to_string(), stop_dir.join("worker-loop.stop")),
+            stop_file_status(
+                RECONCILE_KEEPER_STOP_COMPONENT.to_string(),
+                stop_dir.join("supervisor-reconcile.stop"),
+            ),
+            stop_file_status(
+                "runtime-loop".to_string(),
+                stop_dir.join("runtime-loop.stop"),
+            ),
+        ];
+
+        assert_eq!(
+            ordered_control_targets(&targets, OpsControlAction::Stop, true)
+                .into_iter()
+                .map(|target| target.component.as_str())
+                .collect::<Vec<_>>(),
+            vec!["supervisor-reconcile", "runtime-loop", "worker-loop"]
+        );
+        assert_eq!(
+            ordered_control_targets(&targets, OpsControlAction::Start, true)
+                .into_iter()
+                .map(|target| target.component.as_str())
+                .collect::<Vec<_>>(),
+            vec!["runtime-loop", "worker-loop", "supervisor-reconcile"]
+        );
     }
 
     #[test]
@@ -1108,6 +3682,80 @@ mod tests {
     }
 
     #[test]
+    fn cutover_status_requires_the_exact_requested_action() {
+        let root = temp_root("cutover_status_requires_the_exact_requested_action");
+        let harness_home = root.join("harness");
+        let cutover_request = record_ops_cutover_request(OpsCutoverRequestOptions {
+            harness_home: harness_home.clone(),
+            action: LiveControlAction::Cutover,
+            summary: Some("broader cutover grant".to_string()),
+            candidate_binary: None,
+            staging_home: None,
+            test_notes: vec![],
+            now_ms: 1000,
+        })
+        .unwrap();
+        let cutover_approval = record_ops_cutover_approval(OpsCutoverApproveOptions {
+            harness_home: harness_home.clone(),
+            ticket_id: cutover_request.ticket_id,
+            action: LiveControlAction::Cutover,
+            issued_to: Some("operator".to_string()),
+            ttl_seconds: Some(60),
+            reason: None,
+            now_ms: 1001,
+        })
+        .unwrap();
+
+        let broader = collect_ops_cutover_status(OpsCutoverStatusOptions {
+            harness_home: harness_home.clone(),
+            action: Some(LiveControlAction::Restart),
+            live_control_token: cutover_approval.token,
+            now_ms: 1002,
+        })
+        .unwrap();
+        assert_eq!(broader.status, "blocked");
+        assert_eq!(
+            broader.live_control.unwrap().status,
+            LiveControlTokenStatus::Invalid
+        );
+
+        let restart_request = record_ops_cutover_request(OpsCutoverRequestOptions {
+            harness_home: harness_home.clone(),
+            action: LiveControlAction::Restart,
+            summary: Some("exact restart grant".to_string()),
+            candidate_binary: None,
+            staging_home: None,
+            test_notes: vec![],
+            now_ms: 1003,
+        })
+        .unwrap();
+        let restart_approval = record_ops_cutover_approval(OpsCutoverApproveOptions {
+            harness_home: harness_home.clone(),
+            ticket_id: restart_request.ticket_id,
+            action: LiveControlAction::Restart,
+            issued_to: Some("operator".to_string()),
+            ttl_seconds: Some(60),
+            reason: None,
+            now_ms: 1004,
+        })
+        .unwrap();
+        let exact = collect_ops_cutover_status(OpsCutoverStatusOptions {
+            harness_home: harness_home.clone(),
+            action: Some(LiveControlAction::Restart),
+            live_control_token: restart_approval.token,
+            now_ms: 1005,
+        })
+        .unwrap();
+        assert_eq!(exact.status, "ready");
+        assert_eq!(
+            exact.live_control.unwrap().status,
+            LiveControlTokenStatus::Valid
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn cutover_approval_requires_existing_matching_request() {
         let root = temp_root("cutover_approval_requires_existing_matching_request");
         let harness_home = root.join("harness");
@@ -1160,5 +3808,78 @@ mod tests {
             "agent-harness-ops-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn write_runtime_only_preflight_config(harness_home: &Path) {
+        fs::create_dir_all(harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "supervisor": {
+                    "manageAllLoops": true,
+                    "runtimeLoop": { "enabled": true },
+                    "workerLoop": { "enabled": false },
+                    "cronSchedulerLoop": { "enabled": false },
+                    "progressDeliveryLoop": { "enabled": false },
+                    "ledgerMaintenanceLoop": { "enabled": false },
+                    "telegramLoop": { "enabled": false },
+                    "discordOutboxLoop": { "enabled": false },
+                    "discordGatewayLoop": { "enabled": false }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_quiescent_preflight_owner_states(harness_home: &Path, services: &[&str]) {
+        let supervisor_dir = harness_home.join("state").join("supervisor");
+        let stop_file = crate::loop_health::supervisor_stop_file_path(
+            harness_home,
+            RECONCILE_KEEPER_STOP_COMPONENT,
+        );
+        crate::write_json_atomic(
+            &supervisor_dir.join("reconcile-keeper.json"),
+            &serde_json::json!({
+                "schema": "agent-harness.supervisor-reconcile-keeper.v1",
+                "status": "stopped",
+                "stopFile": stop_file,
+                "holdRequested": true,
+                "pid": null,
+                "processStartTimeMs": null
+            }),
+        )
+        .unwrap();
+        for service_id in services {
+            crate::write_json_atomic(
+                &supervisor_dir
+                    .join("services")
+                    .join(format!("{service_id}.json")),
+                &serde_json::json!({
+                    "schema": "agent-harness.supervisor-service-state.v1",
+                    "serviceId": service_id,
+                    "status": "stopped",
+                    "actualState": "stopped",
+                    "pid": null,
+                    "processId": null,
+                    "processStartTimeMs": null
+                }),
+            )
+            .unwrap();
+            crate::write_json_atomic(
+                &supervisor_dir
+                    .join("loop-heartbeats")
+                    .join(format!("{service_id}.json")),
+                &serde_json::json!({
+                    "schema": "agent-harness.loop-heartbeat.v1",
+                    "name": service_id,
+                    "serviceId": service_id,
+                    "status": "stopped",
+                    "processId": null,
+                    "processStartTimeMs": null
+                }),
+            )
+            .unwrap();
+        }
     }
 }

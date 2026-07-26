@@ -1,5 +1,220 @@
 # Changelog
 
+## v0.13.0 - 2026-07-26
+
+### Added
+
+- Added a user-scoped Windows reconcile keeper as a compatibility and rollback topology. Generated
+  plans bind the exact task path, principal, executable and tool digests, contained workspaces,
+  hold state, and fresh process identity. One same-user logon trigger plus one indefinite
+  one-minute time trigger provide bounded recovery under `IgnoreNew`.
+- Added guarded keeper plan, install, start, stop, readback, and uninstall workflows with
+  disabled-first task registration, atomic generation promotion, transactional stale-task restore,
+  and a retained prior-generation rollback package.
+- Added durable continuation fencing and reconciliation-error overlays. Restart recovery can
+  reconstruct exact legacy Goal authority, quarantine malformed or colliding records without
+  blocking unrelated lanes, and settle every recoverably identified suppressed parent once.
+- Added public workspace and build-output boundaries: task-created worktrees stay below
+  `.worktrees/`, Cargo output stays below `target/`, scratch evidence stays below `.debug/`, and
+  ancestor Git markers or externally managed skill repositories are never used as project output.
+- Added an exact-lane child-cleanup fence for queue-backed Windows app-server execution. The
+  suspended root joins a preconfigured kill-on-close Job at process creation, binds exact
+  PID/start-generation evidence before resume, and retains lane ownership until root-reaped and
+  Job-empty cleanup proof is durable.
+- Added one shared non-interactive process-launch policy. Windows Rust children request
+  `CREATE_NO_WINDOW`, the Discord Node gateway requests `windowsHide`, and generated PowerShell
+  runners request hidden window style. Interactive operator authentication and the
+  console/control-break boundary test remain explicit exceptions.
+- Added a manifest-bound hidden Task Scheduler adapter for the root keeper. It verifies the keeper
+  plan, its own script hash, and the canonical binary hash, then starts the keeper with
+  `CreateNoWindow=true`, waits synchronously, and returns the keeper exit code.
+- Added a standalone supervisor master with compatibility, observe, and direct-owner modes.
+  Windows direct ownership holds one exclusive OS lease, enters a
+  kill-on-close Job before child creation, directly retains service handles, and writes
+  generation-bound master, service, event, and stopped-state import evidence. Observe mode remains
+  non-owning; unsupported hosts reject direct ownership before state mutation. Linux process
+  identity now uses `/proc` liveness/start-generation evidence and Unix ownership leases, without
+  claiming Linux direct-owner containment.
+
+### Changed
+
+- An exact current-owned authorized Goal now receives bounded continuation when no explicit
+  `goalAutonomy` block exists. Explicit observe or disabled policy remains an opt-out and parks
+  visibly without a runnable lease.
+- Ordinary same-lane user input takes priority at the next scheduler checkpoint over an unleased
+  autonomous continuation. An already leased turn remains bounded by explicit `/steer`, `/stop`,
+  and `/new` control semantics.
+- Reconcile-managed compatibility operation now derives reconcile, readiness, health, and guarded
+  stop/start from one canonical topology. Per-child Scheduled Task plans are rejected for a
+  deployment home; developer staging remains contained and explicit.
+- Reconcile-launched supervisor parents detach from the caller's console and process group. The
+  keeper remains the desired-state/reconciliation authority, while each `supervisor-run` process
+  retains the actual service-child handle and per-service restart loop.
+- The supported Windows topology now uses a thin operating-system launch adapter, one Rust
+  `supervisor-master`, and directly owned service children. The reconcile keeper plus one
+  intermediate `supervisor-run` owner per service remains a migration and rollback topology.
+  Provider gateways remain data-plane children rather than control-plane masters.
+- Compatibility reconcile and per-service supervisors now hold shared handles to the same
+  deployment ownership lease used exclusively by the standalone master. Runtime ownership-mode or
+  config-generation drift is revalidated before external-effect spawns, and desired service input
+  cannot replace authoritative harness-home, service, executable, ownership, or generation values.
+- Skill learning now treats a proposal as an immutable trace and rollback input rather than a
+  mandatory human approval queue. Selected-skill improvement and new agent-created synthesis
+  default to guarded autonomous review/apply; lint, guard, exact target/checksum, backup, and
+  receipts remain mandatory, and `propose-only` is an explicit opt-out. Legacy queued worker jobs
+  without policy fields remain non-mutating so an upgrade cannot reinterpret historical work.
+- Keeper recovery no longer relies on Task Scheduler restart-on-failure semantics. The periodic
+  trigger is authoritative; restart-on-failure remains a defense-in-depth setting.
+- Runtime classes now coordinate bounded capacity only. Durable execution ownership remains bound
+  to the exact agent, platform, account, channel, user, and session lane, and the class metadata
+  lock is released before prompt, skill, context, workspace, or backend preparation begins.
+- Current-owned active Codex Goals adopt same-thread native continuation under the exact lease.
+  Authoritative blocked, paused, needs-user, terminal, and bounded-yield outcomes close the current
+  execution boundary without treating a blocked Goal as completed.
+- V1 keeps `needs-user` as the rollback-compatible stored carrier for both concrete Goal response
+  requirements and visible Goal parks. Progress presentation now joins the source-closure kind and
+  reason: observe/policy denial and pause/blocked render as Goal parked, typed Goal response
+  requirements render as Goal input/authority/authentication, and only connector approval retains
+  the connector-approval presentation.
+- `/new` ingress recovery now distinguishes immutable initial ownership from current recovery
+  ownership. A handler that unwinds before writing a transition intent can make the same provider
+  event retryable even while the shared gateway process remains alive; a durable transition intent
+  instead converges through the idempotent reconciler acknowledgement.
+
+### Fixed
+
+- Keeper readiness no longer reuses a timestamp captured before a slow status scan. Freshness is
+  sampled at the keeper observation boundary, so a heartbeat refreshed during collection cannot
+  be misclassified as stale merely because its calculated age is temporarily negative.
+- Runtime-worker reconciliation now preserves the exact terminal-control source. Quarantine,
+  scoped-stop, and queue-skip suppression terminalize the child and atomically quarantine a
+  waiting coordinator without publishing an auto-resumable mailbox; the watchdog rechecks wait
+  state before creating a resume intent, and ambiguous suppression remains unresolved.
+- Idle-gated skill curation no longer treats append-only historical terminal or durably parked
+  queue totals as active work. Current open runtime/cron work, unreconciled leases, and active or
+  retryable worker jobs still fence autonomous maintenance.
+- A successful unfinished Goal can no longer be silently parked merely because configuration omits
+  `goalAutonomy`; exact current authority either admits the bounded child or produces a durable,
+  provider-visible park/failure disposition.
+- New user messages can no longer remain indefinitely queued behind a stale committed or enqueued
+  Goal continuation. Human-input generation, current Goal projection, closure, supersession, lane,
+  session, and backend authority are revalidated before enqueue and again after lease acquisition.
+- Keeper health no longer passes on an empty topology, stale cached task observation, mismatched
+  process instance, wrong action/trigger count, partial inventory, unexpected owner, or incomplete
+  stopped/start transaction.
+- Windows PowerShell 5.1 plan parsing no longer converts the deterministic ISO trigger boundary
+  into locale-formatted invalid XML, collapses singleton task actions into null readback, rejects
+  SID-equivalent Task Scheduler account aliases, or fails a guarded stop when the crashed keeper
+  leaves an empty initial process tree.
+- Guarded reconcile stop/start now treats only canonical `<service-id>.json` files as authoritative
+  observed topology. Same-directory atomic-write temp and lock files cannot create a false partial
+  control receipt, while malformed or identity-mismatched canonical state still fails closed.
+- Reconcile no longer starts another `supervisor-run` merely because the current service child is
+  in restart backoff. Service state now preserves the supervisor PID plus exact OS start identity
+  separately from the child attempt; a live exact owner fences duplicates, while PID reuse or
+  unproved identity still permits recovery.
+- Live-control validation is bound to the exact target home and action in every shell, rather than
+  inheriting authority from a process environment flag or accepting a structurally incomplete
+  receipt.
+- Transient runtime-class lock contention no longer appears as operator cancellation or `Stopped.`;
+  it is retryable backpressure. Failures after durable lease acquisition release the exact queue
+  lease on fresh preparation and both requested and automatic prepared-item resume, even before
+  the outer runtime pipeline owns its normal lease guard. Prepare and pipeline cleanup compare the
+  complete acquisition owner, so a stale owner cannot remove a successor lease for the same queue.
+- Provider-terminal completion now terminates and waits for a lingering app-server child process
+  before releasing the exact queue lease, preventing a completed tool turn from retaining channel
+  ownership.
+- Windows app-server failure paths can no longer expose an uncontained process between spawn and
+  Job assignment, clear a fence before process-tree cleanup is proven, or leave a same-process lane
+  permanently blocked after a transient proof-write/remove failure. Cleanup retries are
+  idempotent and stale authority cannot clear a successor. Unproven Job termination, root exit, or
+  Job emptiness, persistent proof-retry exhaustion, and retry-dispatch failure each record fatal
+  generation evidence and terminate the owning runtime generation for supervised dead-owner
+  recovery.
+- Account-aware `/new` acknowledgement recovery no longer mutates a stale legacy channel-state
+  file, loses the provider acknowledgement after a committed transition, or leaves an alive
+  gateway's failed handler claim permanently non-retryable.
+- A transient `/new` ingress-unwind lock or write failure no longer leaves the event
+  duplicate-suppressed behind the same live gateway. Settlement retries with exact canonical
+  event, owner PID/start, and recovery-generation authority; a stale guard cannot mutate a
+  successor, and unavailable retry dispatch terminates the gateway generation for dead-owner
+  recovery.
+- Delivery status now reads the committed delivery index rather than a bounded receipt tail, so an
+  old delivered row cannot reappear as pending after receipt history grows.
+- Concurrent OperationPlan mutations now share a per-plan transaction lock. Stored open-item
+  limits and dependency-cycle rejection are checked before any item, event, receipt, or version
+  write.
+- Live keeper-plan promotion now requires canonical typed quiescent state for the keeper, every
+  expected service owner, and every expected loop heartbeat; missing state is no longer accepted as
+  proof that the topology is stopped.
+- Live keeper-plan promotion now accepts only an exact `restart` grant from
+  `AGENT_HARNESS_LIVE_CONTROL_TOKEN`. Generated live keeper scripts no longer accept or forward the
+  raw token in PowerShell or child-process arguments; start and failure-containment stop inherit it
+  only through the process environment.
+- Supervised loop children, Node gateway/sidecar processes, background worker and memory bridge
+  commands, diagnostic helpers, and test-owned PowerShell/cmd processes no longer allocate visible
+  Windows console windows by default.
+
+### Security
+
+- Live task mutation revalidates the exact task path, task definition, same-user principal,
+  action-specific authorization, plan digest, process identity, and target home immediately before
+  every external mutation.
+- Generated keeper scripts are checksum-locked and self-checked. Stop and uninstall paths close the
+  exact keeper process tree, including pinned Node descendants, without granting authority over a
+  foreign task or unrelated process.
+- The same-user Scheduled Task boundary is an operational ownership guard, not a hostile same-user
+  security boundary. Strong isolation still requires a distinct principal, ACLs, or a privileged
+  broker.
+
+### Compatibility
+
+- Existing Goal continuation intent statuses remain readable. New terminal revocation is recorded
+  in a separate fence ledger so older readers can parse the original v1 intent records; rollback
+  must still drain or quarantine open new-format work before an older binary starts.
+- Direct `.cmd` and `.bat` Codex invocation remains supported by the atomic Windows launcher using
+  system `cmd.exe` and conservative argument escaping. The new Job-at-create hard process-tree
+  containment claim is Windows-only; other operating systems retain their prior bounded child
+  cleanup behavior.
+- The keeper uses an interactive, limited same-user task. Its logon and periodic triggers recover
+  the root while that user session is available; it does not claim pre-logon or through-logoff
+  always-on service semantics.
+- The root task contains one thin PowerShell launch adapter in addition to the functional keeper
+  process. The adapter has no topology or restart authority; it exists to provide a hidden,
+  no-console creation boundary while preserving synchronous Task Scheduler exit/restart semantics.
+
+### Verification
+
+- Added restart and authority scenarios for implicit Goal continuation, explicit opt-out, legacy
+  reconstruction, terminal and superseded races, post-lease fencing, malformed/colliding ledgers,
+  exactly-once settlement, and same-lane human-input priority.
+- Added Windows replay coverage for prearm/bind/atomic-spawn failures, real descendant-tree
+  termination, transient cleanup-proof persistence/removal, fatal retry-dispatch fallback, direct
+  batch argument round trips, exact-lane-only backpressure after expiry, monotonic proof
+  validation, ABA rejection, and dead/reused process-generation restart recovery.
+- Added hermetic Windows keeper scenarios for exact task ownership, migration, atomic registration,
+  fresh dual-trigger readback, PowerShell 5.1 normalization, transaction rollback, generation
+  promotion, empty and non-empty descendant closure, empty-topology rejection, and target-bound
+  live-control gates. Control-plane replay also covers transient atomic service-state siblings and
+  identity-mismatched canonical service state.
+- Added a real Windows child-console probe (`GetConsoleWindow() == 0`), a hidden root-adapter
+  contract test, complete keeper and CLI module runs, Node child-launch coverage, and process-table
+  sampling during the Windows suites showing no visible console-class windows.
+- Added 13 serial Windows standalone-master process scenarios for direct parentage without
+  intermediary supervisors, singleton exclusion, child crash and live-but-hung heartbeat
+  replacement, crash-loop breaker stability, partial-start containment, clean drain followed by a
+  second generation, runtime mode-flip drain, hostile identity-argument rejection, observe-only
+  side effects, abrupt-master direct-child and multi-level gateway-tree cleanup, and zero visible
+  top-level windows. Native Linux all-target compilation, Unix lease exclusion, stopped-state
+  import, fail-before-mutation, and `/proc` identity tests also pass; Linux direct lifecycle and
+  macOS parity remain open release gates.
+- A guarded Windows deployment of the release candidate passed independent review, stopped-state
+  migration, one-master/direct-child process readback, restart and health checks, rollback
+  readiness, and exact-lane Telegram and Discord provider delivery. The thin Task Scheduler adapter
+  remained the only operating-system host process above the Rust master. This evidence does not
+  claim Linux or macOS direct-owner parity, promotion of the exact tagged artifact, or a
+  long-duration T4 endurance soak.
+
 ## v0.12.0 - 2026-07-22
 
 ### Added
@@ -271,7 +486,7 @@
 
 - Added focused regressions for skill selection, synthesis worker enqueue, autonomous apply, lint/guard gates, lifecycle, packs, doctor, nudge counters, and the closed-loop selection -> synthesis/apply -> re-selection scenario.
 - Passed `cargo fmt --all -- --check` and the full workspace test suite in a staging target directory before tagging.
-- This tag is a checkpoint release: local operator cutover verification passed its initial read-only checks, while the remaining passive live-confirmation and soak windows continue under local operator observation.
+- This tag recorded source and initial operator cutover verification; longer passive observation remained a separate evidence tier.
 
 ## v0.6.1 - 2026-07-08
 
@@ -316,8 +531,8 @@
   message-too-long mapping, channel terminal receipt precedence, structured
   interrupted tool-use receipts, safe-rerun classification, prompt-context
   injection, runtime interruption outbox wording, and quality catalogs.
-- Passed `cargo fmt --all -- --check`, `cargo check --workspace`, and full
-  `cargo test --workspace -- --test-threads=1` in Round18 staging target dirs.
+- Passed `cargo fmt --all -- --check`, `cargo check --workspace`, and the full
+  serial workspace test suite in isolated staging output.
 - Promoted the candidate through guarded live cutover and a controlled Telegram
   post-cutover smoke with clean worker/outbox/supervisor readback.
 
@@ -842,7 +1057,9 @@ contract.
 ### Pending Live Evidence
 
 - Seven-day queue shadow parity summary.
-- WinSW/service-wrapper restart, ordered shutdown, and reboot proof.
+- Current-user Task Scheduler logon/recovery and ordered-shutdown proof; a
+  service-wrapper proof is required only if pre-login or through-logoff
+  availability becomes an explicit product requirement.
 - Telegram/Discord/OpenRouter live smoke receipts.
 - Live secret migration/rotation into the encrypted vault.
 - Network-backed dependency advisory audit.

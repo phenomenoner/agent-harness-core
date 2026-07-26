@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
+#[cfg(windows)]
+use crate::process_launch::configure_noninteractive_command;
 use crate::runtime_receipt_history::{
     find_runtime_queue_terminal_history, read_runtime_queue_terminal_history_summary,
 };
@@ -128,9 +130,10 @@ pub fn collect_resource_exhaustion_readback(
 
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("wevtutil")
-            .args(&command[1..])
-            .output();
+        let mut child_command = std::process::Command::new("wevtutil");
+        child_command.args(&command[1..]);
+        configure_noninteractive_command(&mut child_command);
+        let output = child_command.output();
         let output = match output {
             Ok(output) => output,
             Err(error) => {

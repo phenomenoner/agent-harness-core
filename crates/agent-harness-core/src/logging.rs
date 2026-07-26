@@ -433,7 +433,7 @@ impl JsonAtomicWriteLock {
                     return Ok(Self { path: lock_path });
                 }
                 Err(error) if lock_acquire_error_is_busy(&error) => {
-                    remove_stale_lock(&lock_path, JSON_ATOMIC_WRITE_LOCK_STALE_MS)?;
+                    remove_stale_json_atomic_lock(&lock_path)?;
                     let elapsed = start.elapsed().map_err(io::Error::other)?.as_millis();
                     if elapsed >= JSON_ATOMIC_WRITE_LOCK_TIMEOUT_MS {
                         return Err(io::Error::new(
@@ -561,7 +561,7 @@ fn remove_stale_jsonl_lock(lock_path: &Path) -> io::Result<()> {
     // by a process we can still prove is alive.  If the owner is dead, recover
     // the orphan immediately; malformed/unknown lock files retain the legacy
     // age-based fallback.
-    if let Some(owner_pid) = jsonl_append_lock_owner_pid(lock_path) {
+    if let Some(owner_pid) = lock_owner_pid(lock_path) {
         match process_alive_for_pid(owner_pid) {
             Some(true) => return Ok(()),
             Some(false) => {
@@ -579,7 +579,30 @@ fn remove_stale_jsonl_lock(lock_path: &Path) -> io::Result<()> {
     remove_stale_lock(lock_path, JSONL_APPEND_LOCK_STALE_MS)
 }
 
-fn jsonl_append_lock_owner_pid(lock_path: &Path) -> Option<i64> {
+fn remove_stale_json_atomic_lock(lock_path: &Path) -> io::Result<()> {
+    // Atomic JSON replacement uses the same PID-bearing lock envelope as JSONL
+    // append. A master crash can strand a fresh lock, so age-only recovery would
+    // make the host adapter fail repeatedly before the 30-second stale horizon.
+    // Recover immediately only when the recorded owner is positively dead.
+    if let Some(owner_pid) = lock_owner_pid(lock_path) {
+        match process_alive_for_pid(owner_pid) {
+            Some(true) => return Ok(()),
+            Some(false) => {
+                match fs::remove_file(lock_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) if lock_acquire_error_is_busy(&error) => {}
+                    Err(error) => return Err(error),
+                }
+                return Ok(());
+            }
+            None => {}
+        }
+    }
+    remove_stale_lock(lock_path, JSON_ATOMIC_WRITE_LOCK_STALE_MS)
+}
+
+fn lock_owner_pid(lock_path: &Path) -> Option<i64> {
     let text = fs::read_to_string(lock_path).ok()?;
     text.lines().find_map(|line| {
         line.strip_prefix("pid=")
@@ -859,6 +882,22 @@ mod tests {
                 .ends_with(".tmp")
         }));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_json_atomic_recovers_fresh_lock_owned_by_dead_process() {
+        let root = temp_root("write_json_atomic_recovers_dead_owner_lock");
+        let path = root.join("state").join("example.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lock = json_atomic_write_lock_path(&path);
+        fs::write(&lock, "pid=999999971\n").unwrap();
+
+        write_json_atomic(&path, &serde_json::json!({"value": "recovered"})).unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["value"], "recovered");
+        assert!(!lock.exists());
         let _ = fs::remove_dir_all(root);
     }
 

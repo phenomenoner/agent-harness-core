@@ -94,6 +94,11 @@ fn discord_active_goal_observe_replay_parks_visibly_instead_of_silent_success() 
     .unwrap();
     assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
     let queue_id = receive.queue_id.expect("source queue id");
+    fs::write(
+        harness_home.join("harness-config.json"),
+        br#"{"goalAutonomy":{"mode":"observe"}}"#,
+    )
+    .unwrap();
     let codex_home = root.join("codex-home");
     fs::create_dir_all(&codex_home).unwrap();
     fs::write(codex_home.join("auth.json"), "{}").unwrap();
@@ -353,6 +358,11 @@ fn discord_active_goal_authority_conflict_parks_visibly_instead_of_silent_succes
     })
     .unwrap();
     let seed_queue_id = seed_receive.queue_id.expect("seed queue id");
+    fs::write(
+        harness_home.join("harness-config.json"),
+        br#"{"goalAutonomy":{"mode":"observe"}}"#,
+    )
+    .unwrap();
     let seed_report = run_runtime_queue_once(RuntimeRunOnceOptions {
         harness_home: harness_home.clone(),
         queue_id: Some(seed_queue_id.clone()),
@@ -442,7 +452,9 @@ fn discord_active_goal_authority_conflict_parks_visibly_instead_of_silent_succes
     ));
     assert_eq!(
         report.receipt.source_closure_reason.as_deref(),
-        Some("goal-transition-needs-authority")
+        Some(
+            "goal-transition-needs-authority: goal-correlated work cannot transition because exact authority is Conflict"
+        )
     );
     assert!(report.receipt.child_queue_id.is_none());
     assert!(report.receipt.continuation_link.is_none());
@@ -526,6 +538,11 @@ fn discord_active_goal_authority_conflict_fences_shell_recovery_child() {
     })
     .unwrap();
     let seed_queue_id = seed_receive.queue_id.expect("seed queue id");
+    fs::write(
+        harness_home.join("harness-config.json"),
+        br#"{"goalAutonomy":{"mode":"observe"}}"#,
+    )
+    .unwrap();
     let seed_report = run_runtime_queue_once(RuntimeRunOnceOptions {
         harness_home: harness_home.clone(),
         queue_id: Some(seed_queue_id),
@@ -607,7 +624,9 @@ fn discord_active_goal_authority_conflict_fences_shell_recovery_child() {
     );
     assert_eq!(
         report.receipt.source_closure_reason.as_deref(),
-        Some("goal-transition-needs-authority")
+        Some(
+            "goal-transition-needs-authority: goal-correlated work cannot transition because exact authority is Conflict"
+        )
     );
     assert!(report.receipt.child_queue_id.is_none());
     assert!(report.receipt.continuation_link.is_none());
@@ -697,29 +716,33 @@ fn active_goal_policy_matrix_preserves_exact_closure_on_discord_and_telegram() {
         })
         .unwrap();
         let queue_id = receive.queue_id.expect("source queue id");
-        if policy != "observe" {
-            let mode = if policy == "disabled" {
-                "disabled"
-            } else {
-                "active"
-            };
-            let lane_digest = if admits_child {
+        let mode = if policy == "disabled" {
+            "disabled"
+        } else if policy == "observe" {
+            "observe"
+        } else {
+            "active"
+        };
+        let lane_digests = if mode == "active" {
+            vec![if admits_child {
                 exact_full_lane_digest(&harness_home, &queue_id)
             } else {
                 "0".repeat(64)
-            };
-            fs::write(
-                harness_home.join("harness-config.json"),
-                serde_json::to_vec_pretty(&serde_json::json!({
-                    "goalAutonomy": {
-                        "mode": mode,
-                        "activeLaneDigests": [lane_digest]
-                    }
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        }
+            }]
+        } else {
+            Vec::new()
+        };
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "goalAutonomy": {
+                    "mode": mode,
+                    "activeLaneDigests": lane_digests
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let codex_home = root.join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
         fs::write(codex_home.join("auth.json"), "{}").unwrap();
@@ -988,9 +1011,11 @@ fn active_goal_shell_drift_replay_recovers_once_then_parks_visibly() {
         } else {
             assert_eq!(report.receipt.status, RuntimeRunOnceStatus::NeedsUser);
             let expected_reason = match expected {
-                "budget-park" => "shell-recovery-budget-exhausted",
-                "effect-fence-park" => "shell-recovery-external-effect-fenced",
-                _ => "goal-autonomy-observe",
+                "budget-park" => "shell-recovery-budget-exhausted-after-fresh-runtime-continuation",
+                "effect-fence-park" => {
+                    "shell-recovery-fenced-by-external-effect-or-mutation-evidence"
+                }
+                _ => "goal autonomy defaults to observation-only behavior",
             };
             assert_eq!(
                 report.receipt.source_closure_reason.as_deref(),

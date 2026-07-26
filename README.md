@@ -7,7 +7,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](rust-toolchain.toml)
 [![Edition 2024](https://img.shields.io/badge/edition-2024-red.svg)](Cargo.toml)
-[![Version 0.11.0](https://img.shields.io/badge/version-0.11.0-blue.svg)](crates/agent-harness-core/Cargo.toml)
+[![Version 0.13.0](https://img.shields.io/badge/version-0.13.0-blue.svg)](crates/agent-harness-core/Cargo.toml)
 [![Platform: Windows-first](https://img.shields.io/badge/platform-Windows--first-0078d4.svg)](#faq)
 [![Status: Pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](CHANGELOG.md)
 
@@ -51,9 +51,9 @@ Prefer the long-form story? The [project website](https://phenomenoner.github.io
 | 🤖 **Model-agnostic routing** | Codex app-server executes turns; OpenRouter routing switches any conversation to e.g. `anthropic/claude-sonnet-4` with one `/model` command. Provider-specific Codex homes keep OpenRouter config out of the default Codex/OAuth path; secrets are checked at preflight, never written to disk. |
 | 🧭 **Capability-aware reasoning** | The v0.8.0 model catalog resolves the exact provider/model capability surface instead of assuming one global effort list. `/think` and `/reasoning` are aliases for one last-write-wins setting. Exact `max` is the highest currently known legal GPT-5.6 effort; unknown future names are accepted only when that exact route advertises them. Exact `ultra` is filtered and rejected, never advertised or configured as an effort. |
 | 🧩 **Per-agent runtime context** | Every configured agent can use its own OpenClaw-style model and eight-file static prompt inventory, with fallback aliases and deletion tombstones. Canonical prompt manifests are keyed by the exact virtual-session lane and Codex backend generation, while dynamic memory recall remains a separate per-turn context source. |
-| 🕸️ **Master-owned delegation** | A master agent can assign a different provider/model/effort policy to every child. Child terminals enter a bounded, actually redacted, exact-owner mailbox with opaque artifact pointers; child progress, final text, and errors stay internal, and only a lease-owning master continuation can acknowledge results and create user-facing output. |
+| 🕸️ **Master-owned delegation** | A master agent can assign a different provider/model/effort policy to every child. Ordinary child terminals enter a bounded, actually redacted, exact-owner mailbox with opaque artifact pointers; terminal-controlled quarantine closes the waiting coordinator without creating a resumable mailbox. Child progress, final text, and errors stay internal, and only a lease-owning master continuation can acknowledge valid results and create user-facing output. |
 | 🧠 **Memory-aware** | OpenClaw-compatible memory hooks (recall, lifecycle capture, store proposals) with vector recall over imported SQLite embeddings — integrated via adapters, not forks. |
-| 📦 **Skills as runtime state** | Versioned, indexed `SKILL.md` runbooks are matched per turn and injected once per session via an injection ledger. Shadow runtime receipts observe matching and outcomes with zero serving-side effects; generated skills are proposal-only by default, and guarded apply requires explicit operator authorization. |
+| 📦 **Skills as runtime state** | Versioned, indexed `SKILL.md` runbooks are matched per turn and injected once per session via an injection ledger. Shadow runtime receipts observe matching and outcomes with zero serving-side effects. Generated agent-created skills always leave a proposal/decision trace and default to guarded autonomous apply; unsafe changes are blocked or quarantined, while `--propose-only` remains an explicit non-mutating mode. |
 | 🌐 **Policy-owned web search** | Codex built-in web search defaults to cached mode. Explicit freshness intent may request live search; sensitive, offline, and replay contexts force it disabled. Sandbox selection never changes the web-search policy implicitly. |
 | 🔑 **Operator-owned backend auth** | Provider-scoped Codex homes isolate credentials. Account inspection, browser/device-code/API-key login, cancel/logout/refresh/restart reconciliation, and `needs-operator-auth` defer/resume stay on operator-only CLI surfaces; ordinary agent turns never receive credential material. |
 | 🪶 **Minimal dependencies** | Six crates: `serde`, `serde_json`, `ureq`, `rusqlite`, `ring`, `base64`. No tokio, no async runtime, no clap. Synchronous Rust you can read in an afternoon and audit forever. |
@@ -64,7 +64,7 @@ Prefer the long-form story? The [project website](https://phenomenoner.github.io
 
 Agent Harness Core is extending skills from matched runbooks into an **evidence-governed procedural learning system**. The target is an agent that combines external guidance with verified task experience, reflects on what worked under which conditions, and accumulates reusable individual capability without turning every transcript or popular workflow into permanent prompt text.
 
-The design uses competence-role retrieval, minimal sufficient disclosure, virtual-session revision manifests, contextual and uncertainty-aware skill beliefs, cost-aware evaluation, and reversible promotion. Existing selection receipts, proposal-mediated mutation, guards, and lifecycle controls are the foundation; outcome-linked learning, consolidation, and progressively autonomous promotion remain a product direction, not a claim that the complete loop is active. Read [Adaptive Skill Intelligence](docs/adaptive-skill-intelligence.md) or the [web essay](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/) for the rationale, architecture, measurement model, and delivery boundary.
+The design uses competence-role retrieval, minimal sufficient disclosure, virtual-session revision manifests, contextual and uncertainty-aware skill beliefs, cost-aware evaluation, and reversible promotion. Existing selection receipts, proposal-mediated trace, guarded autonomous mutation, and lifecycle controls are the foundation; outcome-linked learning, consolidation, and full-lifecycle autonomous promotion remain a product direction, not a claim that the complete loop is active. Human intervention is an escalation for concrete technical or safety blockers, not the default learning path. Read [Adaptive Skill Intelligence](docs/adaptive-skill-intelligence.md) or the [web essay](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/) for the rationale, architecture, measurement model, and delivery boundary.
 
 ## How It Works
 
@@ -112,6 +112,36 @@ Final delivery and terminal progress are correlated explicitly. Runtime receipts
 source final is required, explicitly not delivered, or not applicable, and record whether the
 canonical final was appended, already present, or safely reused. Terminal progress does not release
 on another queue or lane's delivery evidence.
+
+### v0.13.0 durable goals and direct service ownership
+
+Version 0.13.0 makes unfinished Goals restart-safe under their original exact-lane authority. A
+successful but unfinished turn can continue in bounded slices; explicit pause, block, input,
+authentication, supersession, stop, and terminal states remain authoritative. New same-lane user
+input takes priority before an unleased autonomous slice, while a leased slice still obeys the
+explicit `/steer`, `/stop`, and `/new` boundaries.
+
+On Windows, the supported standalone process shape is intentionally thin:
+
+```text
+Task Scheduler or another thin OS host adapter
+└─ one Rust supervisor-master
+   └─ N directly owned service children
+```
+
+The OS adapter verifies and launches; it does not own topology, restarts, routing, or service
+state. The Rust master holds the exclusive deployment lease, directly retains every configured
+service child, contains the process tree with Windows Jobs, owns restart/backoff/drain decisions,
+and writes generation-bound state. The previous reconcile keeper plus per-service
+`supervisor-run` shape remains a compatibility and rollback path rather than the recommended
+Windows topology. Provider gateways are data-plane children; they never become the control-plane
+master.
+
+The same release also changes agent-created skill synthesis from a mandatory approval queue to a
+traceable guarded path: proposals, lint, guard, exact target/checksum checks, backups, receipts,
+quarantine, and rollback remain mandatory, while `--propose-only` is the explicit non-mutating
+mode. Outcome-linked routing, attribution, consolidation, and broader autonomous promotion are the
+next measured product slice, not a shipped completeness claim.
 
 ### v0.10.0 continuity and external-effect boundary
 
@@ -194,7 +224,7 @@ One binary, `agent-harness`, grouped into clear families:
 
 ## Project Status
 
-Version **0.11.0** is the current checkpoint release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
+Version **0.13.0** is the current release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
 
 See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md) for what's done, gated, and next.
 
@@ -222,7 +252,7 @@ See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness
 Any model Codex app-server can drive: OpenAI models natively, and the whole OpenRouter catalog (Anthropic Claude, Google Gemini, Meta Llama, …) via `/model openrouter/<provider-model-id>`. Switching models is a chat command, not a redeploy; OpenRouter routes use an isolated Codex home so they do not contaminate the default OpenAI/Codex route.
 
 **Does it run on Linux or macOS?**
-The core library and CLI are portable Rust, but the project is currently **Windows-first**: the supervisor planner targets Windows Task Scheduler and runtime lease locking uses exclusive Windows file handles. Cross-platform supervision is on the roadmap.
+The core library and CLI are portable Rust, but deployed supervision is currently **Windows-first**. Windows direct-owner mode holds one exclusive OS lease, directly retains service children, and uses kill-on-close Job containment; the older reconcile-managed shape remains available for compatibility and rollback. Linux has native `/proc` liveness/start-generation evidence plus shared/exclusive Unix ownership leases, and the workspace compiles there, but direct ownership fails before state mutation because process-group containment, signal drain/escalation, and host recovery are not implemented. macOS has not received equivalent native lifecycle evidence. Windows Service Control Manager, systemd, and launchd remain planned thin host adapters around the same master engine; Task Scheduler is the currently validated Windows adapter, not the cross-platform control plane.
 
 **Do I need Telegram or Discord?**
 No. Every pipeline stage is a CLI command — you can enqueue, run, and inspect agent turns entirely from a terminal or your own scheduler.

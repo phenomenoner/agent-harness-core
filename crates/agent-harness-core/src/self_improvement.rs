@@ -60,7 +60,7 @@ impl Default for SelfImprovementReviewConfig {
             daily_cap: SELF_IMPROVEMENT_DEFAULT_DAILY_CAP,
             max_selected_skills: SELF_IMPROVEMENT_DEFAULT_MAX_SELECTED_SKILLS,
             skill_synthesis_enabled: true,
-            skill_synthesis_autonomous_apply: false,
+            skill_synthesis_autonomous_apply: true,
             skill_synthesis_daily_cap: SKILL_SYNTHESIS_DEFAULT_DAILY_CAP,
             skill_synthesis_min_tool_calls: SKILL_SYNTHESIS_DEFAULT_MIN_TOOL_CALLS,
             skill_synthesis_min_assistant_chars: SKILL_SYNTHESIS_DEFAULT_MIN_ASSISTANT_CHARS,
@@ -150,54 +150,53 @@ pub fn load_self_improvement_review_config(
             return Ok(config);
         }
     };
-    let Some(section) = value
+    if let Some(section) = value
         .get("learning")
         .and_then(|learning| learning.get("selfImprovementReview"))
         .and_then(Value::as_object)
-    else {
-        return Ok(config);
-    };
-    if let Some(enabled) = section.get("enabled").and_then(Value::as_bool) {
-        config.enabled = enabled;
-    }
-    if let Some(notify) = section.get("notify").and_then(Value::as_bool) {
-        config.notify = notify;
-    }
-    if let Some(mode) = section
-        .get("mode")
-        .or_else(|| section.get("applyMode"))
-        .and_then(Value::as_str)
     {
-        if matches!(
-            mode.trim().to_ascii_lowercase().as_str(),
-            "off" | "disabled"
-        ) {
-            config.enabled = false;
-        } else {
-            config.mode = match normalize_mode(mode) {
-                Some(mode) => mode,
-                None => {
-                    config.warnings.push(format!(
-                        "unknown selfImprovementReview mode `{mode}`; using dispatch-and-replace"
-                    ));
-                    SelfImprovementReviewMode::DispatchAndReplace
-                }
-            };
+        if let Some(enabled) = section.get("enabled").and_then(Value::as_bool) {
+            config.enabled = enabled;
         }
-    }
-    if let Some(cap) = section
-        .get("dailyCap")
-        .or_else(|| section.get("dailyJobCap"))
-        .and_then(Value::as_u64)
-    {
-        config.daily_cap = usize::try_from(cap)
-            .unwrap_or(SELF_IMPROVEMENT_DEFAULT_DAILY_CAP)
-            .max(1);
-    }
-    if let Some(max_selected) = section.get("maxSelectedSkills").and_then(Value::as_u64) {
-        config.max_selected_skills = usize::try_from(max_selected)
-            .unwrap_or(SELF_IMPROVEMENT_DEFAULT_MAX_SELECTED_SKILLS)
-            .max(1);
+        if let Some(notify) = section.get("notify").and_then(Value::as_bool) {
+            config.notify = notify;
+        }
+        if let Some(mode) = section
+            .get("mode")
+            .or_else(|| section.get("applyMode"))
+            .and_then(Value::as_str)
+        {
+            if matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "off" | "disabled"
+            ) {
+                config.enabled = false;
+            } else {
+                config.mode = match normalize_mode(mode) {
+                    Some(mode) => mode,
+                    None => {
+                        config.warnings.push(format!(
+                            "unknown selfImprovementReview mode `{mode}`; using dispatch-and-replace"
+                        ));
+                        SelfImprovementReviewMode::DispatchAndReplace
+                    }
+                };
+            }
+        }
+        if let Some(cap) = section
+            .get("dailyCap")
+            .or_else(|| section.get("dailyJobCap"))
+            .and_then(Value::as_u64)
+        {
+            config.daily_cap = usize::try_from(cap)
+                .unwrap_or(SELF_IMPROVEMENT_DEFAULT_DAILY_CAP)
+                .max(1);
+        }
+        if let Some(max_selected) = section.get("maxSelectedSkills").and_then(Value::as_u64) {
+            config.max_selected_skills = usize::try_from(max_selected)
+                .unwrap_or(SELF_IMPROVEMENT_DEFAULT_MAX_SELECTED_SKILLS)
+                .max(1);
+        }
     }
     if let Some(section) = value
         .get("learning")
@@ -217,7 +216,7 @@ pub fn load_self_improvement_review_config(
                     config.skill_synthesis_autonomous_apply = true;
                 }
                 other => config.warnings.push(format!(
-                    "unknown skillSynthesis mode `{other}`; using propose-only"
+                    "unknown skillSynthesis mode `{other}`; using guarded autonomous apply"
                 )),
             }
         }
@@ -669,6 +668,34 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.mode, SelfImprovementReviewMode::DispatchAndReplace);
         assert!(config.notify);
+        assert!(config.skill_synthesis_enabled);
+        assert!(config.skill_synthesis_autonomous_apply);
+    }
+
+    #[test]
+    fn skill_synthesis_propose_only_remains_an_explicit_opt_out() {
+        let root = temp_root("skill_synthesis_propose_only_remains_an_explicit_opt_out");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
+            serde_json::to_vec_pretty(&json!({
+                "learning": {
+                    "skillSynthesis": {
+                        "enabled": true,
+                        "mode": "propose-only"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = load_self_improvement_review_config(&harness_home).unwrap();
+        assert!(config.skill_synthesis_enabled);
+        assert!(!config.skill_synthesis_autonomous_apply);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -758,6 +785,28 @@ mod tests {
         assert_eq!(report.target_skill_ids.len(), 1);
         assert!(report.target_skill_ids[0].starts_with("agent-created:"));
         assert!(self_improvement_review_receipts_file(&harness_home).is_file());
+
+        let run = crate::run_worker_once(crate::WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("skill_synthesis".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: 120_000,
+            now_ms: 1001,
+        })
+        .unwrap();
+        assert_eq!(run.status, crate::WorkerRunOnceStatus::Completed);
+        let skill_leaf = report.target_skill_ids[0]
+            .strip_prefix("agent-created:")
+            .unwrap();
+        assert!(
+            harness_home
+                .join("skills")
+                .join("agent-created")
+                .join(skill_leaf)
+                .join(SKILL_FILE_NAME)
+                .is_file()
+        );
+        assert!(crate::skill_autonomous_apply_receipts_file(&harness_home).is_file());
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,15 +1,26 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{
     HarnessGovernedTransitionStatus, HarnessStatusOptions, SkillDoctorStatus, SkillDoctorSummary,
-    collect_harness_status,
+    collect_harness_status, harness_config_candidates,
+    logging::current_log_time_ms,
+    loop_health::{process_alive_for_pid, process_start_time_ms_for_pid},
+    supervisor_topology::{SupervisorTopologyOverrides, derive_supervisor_topology},
 };
 
 const HEALTHZ_SCHEMA: &str = "agent-harness.healthz.v1";
+
+fn effective_health_observation_time_ms(collection_started_ms: i64, observed_now_ms: i64) -> i64 {
+    collection_started_ms.max(observed_now_ms)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthzOptions {
@@ -33,6 +44,8 @@ pub struct HealthzReport {
     pub outbox: HealthzOutbox,
     pub loops: Vec<HealthzLoop>,
     pub supervisor_services: Vec<HealthzSupervisorService>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconcile_keeper: Option<HealthzReconcileKeeper>,
     pub skills: HealthzSkills,
     pub state: HealthzState,
     pub warnings: Vec<String>,
@@ -115,6 +128,31 @@ pub struct HealthzSupervisorService {
     pub observed_only: Option<bool>,
     pub ownership_conflict: bool,
     pub ownership_conflict_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthzReconcileKeeper {
+    pub required: bool,
+    pub plan_file: PathBuf,
+    pub state_file: PathBuf,
+    pub plan_present: bool,
+    pub plan_valid: bool,
+    pub state_matches_plan: bool,
+    pub singleton_lease_held: bool,
+    pub present: bool,
+    pub corrupt: bool,
+    pub parse_error: Option<String>,
+    pub stale: bool,
+    pub age_ms: Option<i64>,
+    pub status: Option<String>,
+    pub process_id: Option<i64>,
+    pub process_alive: Option<bool>,
+    pub process_instance_matches: bool,
+    pub hold_requested: bool,
+    pub auto_reconcile: bool,
+    pub applied: bool,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -243,6 +281,25 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
             }
         })
         .collect();
+    let (supervisor_topology_exact, supervisor_topology_findings) =
+        exact_reconcile_managed_topology(&options.harness_home, &supervisor_services)?;
+    warnings.extend(supervisor_topology_findings);
+    let keeper_observation_ms = current_log_time_ms()
+        .map(|observed_now_ms| {
+            effective_health_observation_time_ms(options.now_ms, observed_now_ms)
+        })
+        .unwrap_or(options.now_ms);
+    let reconcile_keeper = reconcile_keeper_health(
+        &options.harness_home,
+        keeper_observation_ms,
+        options.loop_stale_ms,
+    )?;
+    if reconcile_keeper.as_ref().is_some_and(|keeper| keeper.stale) {
+        warnings.push(
+            "supervisor reconcile keeper is not live; all child loops can disappear together and remain down"
+                .to_string(),
+        );
+    }
     let runtime_loop_unhealthy = loops.iter().any(|item| {
         item.name == "runtime-loop"
             && (item.stale
@@ -302,7 +359,9 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
         .iter()
         .filter(|item| item.name != "progress-delivery-loop")
         .all(|item| !item.stale)
-        && !runtime_loop_unhealthy;
+        && !runtime_loop_unhealthy
+        && supervisor_topology_exact
+        && reconcile_keeper.as_ref().is_none_or(|keeper| !keeper.stale);
     let ready =
         status.ready && live && skills_ready && (!options.require_writable_state || state.writable);
     Ok(HealthzReport {
@@ -330,6 +389,7 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
         },
         loops,
         supervisor_services,
+        reconcile_keeper,
         skills: HealthzSkills {
             ready: skills_ready,
             status: status.skills.status,
@@ -342,6 +402,318 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
         state,
         warnings,
     })
+}
+
+fn exact_reconcile_managed_topology(
+    harness_home: &Path,
+    services: &[HealthzSupervisorService],
+) -> io::Result<(bool, Vec<String>)> {
+    let Some(config_file) = harness_config_candidates(harness_home)
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
+        return Ok((true, Vec::new()));
+    };
+    let config: Value = serde_json::from_slice(&fs::read(&config_file)?).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("harness config is not valid JSON: {error}"),
+        )
+    })?;
+    let reconcile_managed = config
+        .pointer("/supervisor/manageAllLoops")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !reconcile_managed {
+        return Ok((true, Vec::new()));
+    }
+    let expected = derive_supervisor_topology(&config, &SupervisorTopologyOverrides::default())?
+        .into_iter()
+        .map(|(service_id, entry)| (service_id, entry.service_kind))
+        .collect::<BTreeMap<_, _>>();
+    let mut findings = Vec::new();
+    if expected.is_empty() {
+        findings.push(
+            "reconcile-managed shared topology is empty; health cannot pass vacuously".to_string(),
+        );
+    }
+    let mut actual = BTreeMap::new();
+    for service in services {
+        if service.service_id.trim().is_empty() {
+            findings.push("supervisor service inventory contains an empty serviceId".to_string());
+            continue;
+        }
+        if actual
+            .insert(
+                service.service_id.clone(),
+                service.service_kind.clone().unwrap_or_default(),
+            )
+            .is_some()
+        {
+            findings.push(format!(
+                "supervisor service inventory contains duplicate `{}`",
+                service.service_id
+            ));
+        }
+        if service.corrupt
+            || service.observed_only != Some(false)
+            || service.ownership_conflict
+            || service.desired_state.as_deref() != Some("running")
+            || service.stale
+        {
+            findings.push(format!(
+                "supervisor service `{}` is invalid, stale, observed-only, or not deployment-owned desired-running",
+                service.service_id
+            ));
+        }
+    }
+    let expected_ids = expected.keys().cloned().collect::<BTreeSet<_>>();
+    let actual_ids = actual.keys().cloned().collect::<BTreeSet<_>>();
+    let missing = expected_ids
+        .difference(&actual_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        findings.push(format!(
+            "reconcile-managed supervisor inventory is missing: {}",
+            missing.join(", ")
+        ));
+    }
+    let unexpected = actual_ids
+        .difference(&expected_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        findings.push(format!(
+            "reconcile-managed supervisor inventory has unexpected identities: {}",
+            unexpected.join(", ")
+        ));
+    }
+    for (service_id, expected_kind) in &expected {
+        if let Some(actual_kind) = actual.get(service_id)
+            && actual_kind != expected_kind
+        {
+            findings.push(format!(
+                "supervisor service `{service_id}` kind mismatch: expected `{expected_kind}`, found `{actual_kind}`"
+            ));
+        }
+    }
+    Ok((findings.is_empty(), findings))
+}
+
+fn reconcile_keeper_health(
+    harness_home: &Path,
+    now_ms: i64,
+    stale_after_ms: i64,
+) -> io::Result<Option<HealthzReconcileKeeper>> {
+    let supervisor_config = harness_config_candidates(harness_home)
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(fs::read_to_string)
+        .transpose()?
+        .map(|text| {
+            serde_json::from_str::<Value>(&text).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("harness config is not valid JSON: {error}"),
+                )
+            })
+        })
+        .transpose()?
+        .and_then(|config| config.get("supervisor").cloned());
+    let manage_all_loops = supervisor_config
+        .as_ref()
+        .and_then(|supervisor| supervisor.get("manageAllLoops"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ownership_mode = supervisor_config
+        .as_ref()
+        .and_then(|supervisor| supervisor.get("ownershipMode"))
+        .and_then(Value::as_str)
+        .unwrap_or("compatibility");
+    if !manage_all_loops || ownership_mode != "compatibility" {
+        return Ok(None);
+    }
+
+    let state_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("reconcile-keeper.json");
+    let plan_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("windows-reconcile-keeper")
+        .join("keeper-plan.json");
+    let plan_present_on_disk = plan_file.is_file();
+    let text = match fs::read_to_string(&state_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Some(HealthzReconcileKeeper {
+                required: true,
+                plan_file,
+                state_file,
+                plan_present: plan_present_on_disk,
+                plan_valid: false,
+                state_matches_plan: false,
+                singleton_lease_held: false,
+                present: false,
+                corrupt: false,
+                parse_error: None,
+                stale: true,
+                age_ms: None,
+                status: None,
+                process_id: None,
+                process_alive: None,
+                process_instance_matches: false,
+                hold_requested: false,
+                auto_reconcile: false,
+                applied: false,
+                reason: Some("reconcile keeper state is missing".to_string()),
+            }));
+        }
+        Err(error) => return Err(error),
+    };
+    let state = match serde_json::from_str::<Value>(&text) {
+        Ok(state) => state,
+        Err(error) => {
+            return Ok(Some(HealthzReconcileKeeper {
+                required: true,
+                plan_file,
+                state_file,
+                plan_present: plan_present_on_disk,
+                plan_valid: false,
+                state_matches_plan: false,
+                singleton_lease_held: false,
+                present: true,
+                corrupt: true,
+                parse_error: Some(error.to_string()),
+                stale: true,
+                age_ms: None,
+                status: None,
+                process_id: None,
+                process_alive: None,
+                process_instance_matches: false,
+                hold_requested: false,
+                auto_reconcile: false,
+                applied: false,
+                reason: Some("reconcile keeper state is corrupt".to_string()),
+            }));
+        }
+    };
+    let schema_valid = state.get("schema").and_then(Value::as_str)
+        == Some("agent-harness.supervisor-reconcile-keeper.v1");
+    let status = state
+        .get("status")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let process_id = state.get("pid").and_then(Value::as_i64);
+    let process_alive = process_id.and_then(process_alive_for_pid);
+    let recorded_start = state.get("processStartTimeMs").and_then(Value::as_i64);
+    let observed_start = process_id.and_then(process_start_time_ms_for_pid);
+    let process_instance_matches =
+        recorded_start.is_some() && observed_start.is_some() && recorded_start == observed_start;
+    let heartbeat_at_ms = state.get("lastHeartbeatAtMs").and_then(Value::as_i64);
+    let age_ms = heartbeat_at_ms.map(|at_ms| now_ms.saturating_sub(at_ms));
+    let heartbeat_fresh =
+        age_ms.is_some_and(|age_ms| (-10_000..=stale_after_ms.max(0)).contains(&age_ms));
+    let hold_requested = state
+        .get("holdRequested")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || harness_home
+            .join("state/supervisor/stop/supervisor-reconcile.stop")
+            .is_file();
+    let auto_reconcile = state
+        .get("autoReconcile")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let applied = state
+        .get("applied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let plan = fs::read_to_string(&plan_file)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let plan_present = plan_file.is_file();
+    let plan_valid = plan.as_ref().is_some_and(|plan| {
+        plan.get("schema").and_then(Value::as_str)
+            == Some("agent-harness.windows-reconcile-keeper-plan.v1")
+            && crate::supervisor_keeper::validate_live_windows_reconcile_keeper_plan(plan).is_ok()
+    });
+    let state_matches_plan = plan.as_ref().is_some_and(|plan| {
+        state.get("planDigest").and_then(Value::as_str)
+            == plan.get("planDigest").and_then(Value::as_str)
+            && state.get("actionDigest").and_then(Value::as_str)
+                == plan.pointer("/action/digest").and_then(Value::as_str)
+            && state.get("taskName").and_then(Value::as_str)
+                == plan.pointer("/task/name").and_then(Value::as_str)
+            && state.get("leaseFile").and_then(Value::as_str)
+                == plan.get("leaseFile").and_then(Value::as_str)
+            && state.get("ownershipMode").and_then(Value::as_str) == Some("scheduled-task-plan")
+    });
+    let singleton_lease_held = plan
+        .as_ref()
+        .and_then(|plan| plan.get("leaseFile"))
+        .and_then(Value::as_str)
+        .is_some_and(|path| keeper_singleton_lease_is_held(Path::new(path)));
+    let stale = !schema_valid
+        || status.as_deref() != Some("running")
+        || process_alive != Some(true)
+        || !process_instance_matches
+        || !heartbeat_fresh
+        || hold_requested
+        || !auto_reconcile
+        || !applied
+        || !plan_present
+        || !plan_valid
+        || !state_matches_plan
+        || !singleton_lease_held;
+    Ok(Some(HealthzReconcileKeeper {
+        required: true,
+        plan_file,
+        state_file,
+        plan_present,
+        plan_valid,
+        state_matches_plan,
+        singleton_lease_held,
+        present: true,
+        corrupt: !schema_valid,
+        parse_error: (!schema_valid).then(|| "unsupported reconcile keeper schema".to_string()),
+        stale,
+        age_ms,
+        status,
+        process_id,
+        process_alive,
+        process_instance_matches,
+        hold_requested,
+        auto_reconcile,
+        applied,
+        reason: state
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+    }))
+}
+
+#[cfg(windows)]
+fn keeper_singleton_lease_is_held(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(_) => false,
+        Err(error) => matches!(error.raw_os_error(), Some(32) | Some(33)),
+    }
+}
+
+#[cfg(not(windows))]
+fn keeper_singleton_lease_is_held(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn state_health(options: &HealthzOptions) -> io::Result<HealthzState> {
@@ -367,6 +739,26 @@ mod tests {
     use super::*;
     use crate::write_json_atomic;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn reconcile_managed_keeper_health_rejects_empty_service_inventory_without_vacuous_pass() {
+        let root = temp_root("health_exact_topology_empty");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"supervisor":{"manageAllLoops":true}}"#,
+        )
+        .unwrap();
+        let (exact, findings) = exact_reconcile_managed_topology(&harness_home, &[]).unwrap();
+        assert!(!exact);
+        assert!(findings.iter().any(|finding| {
+            finding.contains("missing")
+                && finding.contains("runtime-loop")
+                && finding.contains("discord-gateway-loop")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn healthz_reports_stale_loop_and_queue_depth() {
@@ -929,6 +1321,182 @@ mod tests {
     #[test]
     fn healthz_evaluates_all_canon_monitor_blocks_generically() {
         healthz_surfaces_cron_canon_freshness_warnings();
+    }
+
+    #[test]
+    fn reconcile_managed_health_fails_closed_when_root_keeper_state_is_missing() {
+        let root = temp_root("reconcile_keeper_missing");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("harness-config.json"),
+            r#"{"supervisor":{"manageAllLoops":true,"autoReconcile":true}}"#,
+        )
+        .unwrap();
+
+        let keeper = reconcile_keeper_health(&root, 10_000, 120_000)
+            .unwrap()
+            .unwrap();
+
+        assert!(keeper.required);
+        assert!(!keeper.present);
+        assert!(keeper.stale);
+        assert_eq!(
+            keeper.reason.as_deref(),
+            Some("reconcile keeper state is missing")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_owner_health_does_not_require_compatibility_reconcile_keeper() {
+        let root = temp_root("direct_owner_no_reconcile_keeper");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("harness-config.json"),
+            r#"{"supervisor":{"ownershipMode":"direct-owner","manageAllLoops":true,"autoReconcile":false}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reconcile_keeper_health(&root, 10_000, 120_000).unwrap(),
+            None
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn keeper_observation_time_is_refreshed_after_slow_status_collection() {
+        let collection_started_ms: i64 = 10_000;
+        let observed_at_keeper_read_ms: i64 = 25_000;
+        let heartbeat_at_ms: i64 = 24_000;
+
+        let observation_now_ms =
+            effective_health_observation_time_ms(collection_started_ms, observed_at_keeper_read_ms);
+        let stale_snapshot_age_ms = collection_started_ms.saturating_sub(heartbeat_at_ms);
+        let refreshed_age_ms = observation_now_ms.saturating_sub(heartbeat_at_ms);
+
+        assert!(
+            !(-10_000..=120_000).contains(&stale_snapshot_age_ms),
+            "the pre-scan snapshot must reproduce the false future-heartbeat classification"
+        );
+        assert_eq!(observation_now_ms, observed_at_keeper_read_ms);
+        assert!(
+            (-10_000..=120_000).contains(&refreshed_age_ms),
+            "keeper freshness must be evaluated at the keeper observation boundary"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reconcile_managed_health_requires_a_fresh_exact_live_keeper_process() {
+        let root = temp_root("reconcile_keeper_exact_process");
+        let workspace = root.join("workspace");
+        let runtime_workspace = root.join("runtime-workspace/default");
+        let harness_cli = root.join("bin/current/agent-harness.exe");
+        let codex_executable = root.join("tools/codex/codex.exe");
+        let node_executable = root.join("tools/node/node.exe");
+        let gateway_script = root.join("tools/discord/index.mjs");
+        for directory in [
+            root.as_path(),
+            workspace.as_path(),
+            runtime_workspace.as_path(),
+            harness_cli.parent().unwrap(),
+            codex_executable.parent().unwrap(),
+            node_executable.parent().unwrap(),
+            gateway_script.parent().unwrap(),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(&harness_cli, b"candidate").unwrap();
+        fs::write(&codex_executable, b"codex").unwrap();
+        fs::write(&node_executable, b"node").unwrap();
+        fs::write(&gateway_script, b"gateway").unwrap();
+        fs::write(
+            root.join("harness-config.json"),
+            r#"{"supervisor":{"manageAllLoops":true,"autoReconcile":true}}"#,
+        )
+        .unwrap();
+        let plan =
+            crate::write_windows_reconcile_keeper_plan(crate::WindowsReconcileKeeperPlanOptions {
+                harness_home: root.clone(),
+                source_home: root.clone(),
+                workspace: Some(workspace),
+                runtime_workspace,
+                harness_cli,
+                codex_executable: Some(codex_executable),
+                node_executable: Some(node_executable),
+                discord_gateway_script: Some(gateway_script),
+                user_id: "TEST\\keeper".to_string(),
+                task_name: None,
+                live_deployment: true,
+            })
+            .unwrap();
+        let process_id = i64::from(std::process::id());
+        let process_start_time_ms = process_start_time_ms_for_pid(process_id).unwrap();
+        let _lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .open(&plan.lease_file)
+            .unwrap();
+        write_json_atomic(
+            &root.join("state/supervisor/reconcile-keeper.json"),
+            &serde_json::json!({
+                "schema": "agent-harness.supervisor-reconcile-keeper.v1",
+                "status": "running",
+                "pid": process_id,
+                "processStartTimeMs": process_start_time_ms,
+                "lastHeartbeatAtMs": 50_000,
+                "holdRequested": false,
+                "autoReconcile": true,
+                "applied": true,
+                "planDigest": plan.plan_digest,
+                "actionDigest": plan.action.digest,
+                "taskName": plan.task.name,
+                "leaseFile": plan.lease_file,
+                "ownershipMode": "scheduled-task-plan",
+                "reason": "test keeper"
+            }),
+        )
+        .unwrap();
+
+        let live = reconcile_keeper_health(&root, 60_000, 120_000)
+            .unwrap()
+            .unwrap();
+        assert!(!live.stale);
+        assert_eq!(live.process_alive, Some(true));
+        assert!(live.process_instance_matches);
+        assert!(live.plan_valid);
+        assert!(live.state_matches_plan);
+        assert!(live.singleton_lease_held);
+
+        write_json_atomic(
+            &root.join("state/supervisor/reconcile-keeper.json"),
+            &serde_json::json!({
+                "schema": "agent-harness.supervisor-reconcile-keeper.v1",
+                "status": "running",
+                "pid": process_id,
+                "processStartTimeMs": process_start_time_ms.saturating_sub(1),
+                "lastHeartbeatAtMs": 50_000,
+                "holdRequested": false,
+                "autoReconcile": true,
+                "applied": true,
+                "planDigest": plan.plan_digest,
+                "actionDigest": plan.action.digest,
+                "taskName": plan.task.name,
+                "leaseFile": plan.lease_file,
+                "ownershipMode": "scheduled-task-plan"
+            }),
+        )
+        .unwrap();
+        let mismatched = reconcile_keeper_health(&root, 60_000, 120_000)
+            .unwrap()
+            .unwrap();
+        assert!(mismatched.stale);
+        assert!(!mismatched.process_instance_matches);
+        drop(_lease);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

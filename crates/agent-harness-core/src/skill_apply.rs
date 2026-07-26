@@ -777,6 +777,8 @@ fn replace_file_atomic_target(tmp_path: &Path, path: &Path) -> io::Result<()> {
         ) -> i32;
     }
 
+    let tmp_path = canonical_parent_join(tmp_path)?;
+    let path = canonical_parent_join(path)?;
     let mut tmp: Vec<u16> = tmp_path.as_os_str().encode_wide().collect();
     tmp.push(0);
     let mut target: Vec<u16> = path.as_os_str().encode_wide().collect();
@@ -793,6 +795,23 @@ fn replace_file_atomic_target(tmp_path: &Path, path: &Path) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn canonical_parent_join(path: &Path) -> io::Result<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic replacement path has no parent",
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic replacement path has no file name",
+        )
+    })?;
+    Ok(fs::canonicalize(parent)?.join(file_name))
 }
 
 #[cfg(not(windows))]
@@ -894,6 +913,23 @@ mod tests {
     fn skill_apply_backup_timestamp_label_uses_calendar_format() {
         assert_eq!(timestamp_label(0), "19700101-000000");
         assert_eq!(timestamp_label(1_709_251_199_000), "20240229-235959");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn skill_apply_atomic_create_supports_long_windows_paths() {
+        let root = temp_root("skill_apply_atomic_create_supports_long_windows_paths");
+        let target = root
+            .join("segment-a".repeat(8))
+            .join("segment-b".repeat(8))
+            .join("segment-c".repeat(8))
+            .join("SKILL.md");
+        assert!(target.as_os_str().len() > 260);
+
+        replace_file_atomic(&target, "# Long Path Skill\n").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "# Long Path Skill\n");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

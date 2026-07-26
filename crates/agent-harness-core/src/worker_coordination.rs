@@ -323,6 +323,72 @@ pub fn list_worker_coordinator_waits(
     rows.map(|row| row.map_err(Into::into)).collect()
 }
 
+pub fn quarantine_worker_coordinator_waits_for_child_in_transaction(
+    transaction: &Transaction<'_>,
+    child_job_id: &str,
+    now_ms: i64,
+) -> Result<Vec<String>, WorkerCoordinationError> {
+    validate_identifier("childJobId", child_job_id)?;
+    if now_ms < 0 {
+        return Err(WorkerCoordinationError::InvalidInput(
+            "nowMs must be non-negative".to_string(),
+        ));
+    }
+    initialize_worker_coordination_schema(transaction)?;
+    let active_waits = {
+        let mut statement = transaction.prepare(&format!(
+            "SELECT wait_id, expected_child_job_ids_json, state
+             FROM {WAIT_TABLE}
+             WHERE state IN ('waiting-for-children','resume-scheduled')
+             ORDER BY created_at_ms, wait_id"
+        ))?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut waiting = Vec::new();
+    for (wait_id, child_ids_json, state) in active_waits {
+        let child_ids = serde_json::from_str::<Vec<String>>(&child_ids_json).map_err(|error| {
+            WorkerCoordinationError::InvalidStoredData(format!(
+                "waitId `{wait_id}` has invalid expected child ids: {error}"
+            ))
+        })?;
+        if !child_ids.iter().any(|candidate| candidate == child_job_id) {
+            continue;
+        }
+        match WorkerCoordinatorWaitStateV1::parse(&state)? {
+            WorkerCoordinatorWaitStateV1::WaitingForChildren => waiting.push(wait_id),
+            WorkerCoordinatorWaitStateV1::ResumeScheduled => {
+                return Err(WorkerCoordinationError::Conflict(format!(
+                    "child `{child_job_id}` already belongs to resume-scheduled wait `{wait_id}`"
+                )));
+            }
+            WorkerCoordinatorWaitStateV1::Consumed | WorkerCoordinatorWaitStateV1::Quarantined => {}
+        }
+    }
+    for wait_id in &waiting {
+        let changed = transaction.execute(
+            &format!(
+                "UPDATE {WAIT_TABLE} SET state='quarantined', updated_at_ms=?1
+                 WHERE wait_id=?2 AND state='waiting-for-children' AND resume_intent_id IS NULL"
+            ),
+            params![now_ms, wait_id],
+        )?;
+        if changed != 1 {
+            return Err(WorkerCoordinationError::Conflict(format!(
+                "waitId `{wait_id}` changed while quarantining child `{child_job_id}`"
+            )));
+        }
+    }
+    Ok(waiting)
+}
+
 fn canonical_wait(
     options: &WorkerCoordinatorWaitCreateOptionsV1,
 ) -> Result<WorkerCoordinatorWaitV1, WorkerCoordinationError> {
@@ -577,6 +643,78 @@ mod tests {
         let waits = list_worker_coordinator_waits(&conn).unwrap();
         assert_eq!(waits.len(), 2);
         assert_ne!(waits[0].coordinator_key, waits[1].coordinator_key);
+    }
+
+    #[test]
+    fn quarantining_a_child_atomically_closes_waiting_state_and_refuses_scheduled_resume() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize_worker_coordination_schema(&conn).unwrap();
+        let waiting = WorkerCoordinatorWaitCreateOptionsV1 {
+            wait_id: "wait-quarantine".to_string(),
+            owner: exact_owner("parent-quarantine", "child-source-quarantine"),
+            child_group_id: "group-quarantine".to_string(),
+            expected_child_job_ids: vec!["child-quarantine".to_string(), "child-other".to_string()],
+            now_ms: 1_000,
+        };
+        let scheduled = WorkerCoordinatorWaitCreateOptionsV1 {
+            wait_id: "wait-scheduled".to_string(),
+            owner: exact_owner("parent-scheduled", "child-source-scheduled"),
+            child_group_id: "group-scheduled".to_string(),
+            expected_child_job_ids: vec!["child-scheduled".to_string()],
+            now_ms: 1_000,
+        };
+        for options in [&waiting, &scheduled] {
+            let tx = conn.transaction().unwrap();
+            persist_waiting_for_children_in_transaction(&tx, options).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let tx = conn.transaction().unwrap();
+        let quarantined = quarantine_worker_coordinator_waits_for_child_in_transaction(
+            &tx,
+            "child-quarantine",
+            1_100,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(quarantined, vec!["wait-quarantine"]);
+        assert_eq!(
+            load_worker_coordinator_wait(&conn, "wait-quarantine")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkerCoordinatorWaitStateV1::Quarantined
+        );
+
+        let tx = conn.transaction().unwrap();
+        mark_worker_coordinator_resume_scheduled_in_transaction(
+            &tx,
+            "wait-scheduled",
+            "intent-scheduled",
+            1_200,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let tx = conn.transaction().unwrap();
+        let error = quarantine_worker_coordinator_waits_for_child_in_transaction(
+            &tx,
+            "child-scheduled",
+            1_300,
+        )
+        .unwrap_err();
+        assert!(matches!(error, WorkerCoordinationError::Conflict(_)));
+        drop(tx);
+        let scheduled_after = load_worker_coordinator_wait(&conn, "wait-scheduled")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            scheduled_after.state,
+            WorkerCoordinatorWaitStateV1::ResumeScheduled
+        );
+        assert_eq!(
+            scheduled_after.resume_intent_id.as_deref(),
+            Some("intent-scheduled")
+        );
     }
 
     fn exact_owner(parent_queue_id: &str, source_queue_id: &str) -> ExactWorkerResultOwnerV1 {

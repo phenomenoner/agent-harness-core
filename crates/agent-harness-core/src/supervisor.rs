@@ -73,6 +73,12 @@ pub fn write_windows_supervisor_plan(
     options: WindowsSupervisorPlanOptions,
 ) -> io::Result<WindowsSupervisorPlanReport> {
     let harness_home = absolutize_path(&options.harness_home)?;
+    if crate::live_control::is_live_harness_home(&harness_home) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "per-service Windows Scheduled Task plans are developer-staging only; live .agent-harness deployments require the single reconcile keeper",
+        ));
+    }
     let source_home = absolutize_path(&options.source_home)?;
     let workspace = options
         .workspace
@@ -108,6 +114,15 @@ pub fn write_windows_supervisor_plan(
             .join("supervisor")
             .join("windows-scheduled-tasks"),
     };
+    if output_dir == harness_home || !output_dir.starts_with(&harness_home) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "developer-staging supervisor plan output must be contained below harness home {}",
+                harness_home.display()
+            ),
+        ));
+    }
     let scripts_dir = output_dir.join("scripts");
     let stop_dir = harness_home.join("state").join("supervisor").join("stop");
     let log_dir = harness_home.join("state").join("logs").join("supervisor");
@@ -962,7 +977,7 @@ fn install_script_body(tasks: &[WindowsSupervisorTask], description: &str) -> St
     body.push_str(
         ")\n\
          foreach ($Task in $Tasks) {\n\
-           $Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (\"-NoProfile -ExecutionPolicy Bypass -File `\"{0}`\"\" -f $Task.Script)\n\
+           $Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (\"-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `\"{0}`\"\" -f $Task.Script)\n\
            $Trigger = New-ScheduledTaskTrigger -AtLogOn\n\
            $Settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries\n\
            Register-ScheduledTask -TaskName $Task.Name -Action $Action -Trigger $Trigger -Settings $Settings -Description $Task.Description -Force | Out-Null\n\
@@ -1240,10 +1255,95 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn live_harness_home_rejects_legacy_per_service_task_plan() {
+        let root = temp_root("live_harness_home_rejects_legacy_per_service_task_plan");
+        let harness_home = root.join(".agent-harness");
+        let error = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
+            harness_home: harness_home.clone(),
+            source_home: harness_home.clone(),
+            workspace: None,
+            runtime_workspace: None,
+            harness_cli: root.join("target").join("debug").join("agent-harness.exe"),
+            codex_executable: None,
+            node_executable: PathBuf::from("node"),
+            discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
+            agent_id: None,
+            output_dir: None,
+            task_prefix: "AgentHarness".to_string(),
+            include_runtime: true,
+            runtime_workers: 1,
+            include_worker: true,
+            include_cron_scheduler: true,
+            include_progress: true,
+            include_ledger_maintenance: true,
+            include_telegram: true,
+            include_discord: true,
+            idle_ms: 1_000,
+            runtime_timeout_ms: 1_800_000,
+            runtime_idle_timeout_ms: 300_000,
+            max_consecutive_errors: 5,
+            telegram_poll_timeout_seconds: 1,
+            telegram_max_updates: 10,
+            telegram_outbox_limit: 20,
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("single reconcile keeper"));
+        assert!(!harness_home.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn developer_staging_supervisor_plan_rejects_output_escape_without_writes() {
+        let root = temp_root("developer_staging_supervisor_plan_rejects_output_escape");
+        let harness_home = root.join("harness-staging");
+        let escaped_output = root.join("escaped-supervisor-output");
+        let error = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
+            harness_home: harness_home.clone(),
+            source_home: harness_home.clone(),
+            workspace: None,
+            runtime_workspace: None,
+            harness_cli: root.join("agent-harness.exe"),
+            codex_executable: None,
+            node_executable: PathBuf::from("node"),
+            discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
+            agent_id: None,
+            output_dir: Some(escaped_output.clone()),
+            task_prefix: "AgentHarness".to_string(),
+            include_runtime: false,
+            runtime_workers: 1,
+            include_worker: false,
+            include_cron_scheduler: true,
+            include_progress: false,
+            include_ledger_maintenance: false,
+            include_telegram: false,
+            include_discord: false,
+            idle_ms: 1_000,
+            runtime_timeout_ms: 1_800_000,
+            runtime_idle_timeout_ms: 300_000,
+            max_consecutive_errors: 5,
+            telegram_poll_timeout_seconds: 1,
+            telegram_max_updates: 10,
+            telegram_outbox_limit: 20,
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("contained below harness home"));
+        assert!(!harness_home.exists());
+        assert!(!escaped_output.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn writes_windows_supervisor_scripts_and_receipt() {
         let root = temp_root("writes_windows_supervisor_scripts_and_receipt");
-        let harness_home = root.join(".agent-harness");
-        let output_dir = root.join("supervisor");
+        let harness_home = root.join("harness-staging");
+        let output_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("windows-scheduled-tasks");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("codex.cmd"), "").unwrap();
         let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
@@ -1277,6 +1377,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.tasks.len(), 7);
+        assert!(report.output_dir.starts_with(&harness_home));
         assert!(report.receipt_file.is_file());
         assert!(
             report
@@ -1397,8 +1498,11 @@ mod tests {
     fn plan_includes_enabled_configured_telegram_loop_with_ledger_maintenance() {
         let root =
             temp_root("plan_includes_enabled_configured_telegram_loop_with_ledger_maintenance");
-        let harness_home = root.join(".agent-harness");
-        let output_dir = root.join("supervisor");
+        let harness_home = root.join("harness-staging");
+        let output_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("windows-scheduled-tasks");
         fs::create_dir_all(&harness_home).unwrap();
         fs::write(
             harness_home.join("harness-config.json"),
@@ -1484,7 +1588,7 @@ mod tests {
     #[cfg(windows)]
     fn runtime_plan_fails_closed_without_deployment_owned_codex() {
         let root = temp_root("runtime_plan_fails_closed_without_deployment_owned_codex");
-        let harness_home = root.join(".agent-harness");
+        let harness_home = root.join("harness-staging");
         fs::create_dir_all(&harness_home).unwrap();
 
         let error = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
@@ -1497,7 +1601,12 @@ mod tests {
             node_executable: PathBuf::from("node"),
             discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
             agent_id: Some("main".to_string()),
-            output_dir: Some(root.join("supervisor")),
+            output_dir: Some(
+                harness_home
+                    .join("state")
+                    .join("supervisor")
+                    .join("windows-scheduled-tasks"),
+            ),
             task_prefix: "AgentHarness".to_string(),
             include_runtime: true,
             runtime_workers: 1,
@@ -1526,8 +1635,11 @@ mod tests {
     #[cfg(windows)]
     fn defaults_unpinned_codex_to_repo_local_windows_executable() {
         let root = temp_root("defaults_unpinned_codex_to_repo_local_windows_executable");
-        let harness_home = root.join(".agent-harness");
-        let output_dir = root.join("supervisor");
+        let harness_home = root.join("harness-staging");
+        let output_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("windows-scheduled-tasks");
         let harness_cli = root.join("target").join("debug").join("agent-harness.exe");
         let codex_exe = root
             .join(".tools")
@@ -1541,11 +1653,12 @@ mod tests {
             .join("codex.exe");
         fs::create_dir_all(codex_exe.parent().unwrap()).unwrap();
         fs::write(&codex_exe, "").unwrap();
+        let expected_codex_exe = fs::canonicalize(&codex_exe).unwrap();
 
         let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
             harness_home: harness_home.clone(),
-            source_home: harness_home,
-            workspace: Some(root.join(".agent-harness").join("workspace")),
+            source_home: harness_home.clone(),
+            workspace: Some(root.join("harness-staging").join("workspace")),
             runtime_workspace: None,
             harness_cli,
             codex_executable: None,
@@ -1588,7 +1701,7 @@ mod tests {
             let script = fs::read_to_string(output_dir.join("scripts").join(script_name)).unwrap();
             assert!(script.contains("--codex-exe"), "{script_name}: {script}");
             assert!(
-                script.contains(&codex_exe.display().to_string()),
+                script.contains(&expected_codex_exe.display().to_string()),
                 "{script_name}: {script}"
             );
         }
@@ -1599,7 +1712,7 @@ mod tests {
     #[test]
     fn warns_when_source_home_is_retired_openclaw() {
         let root = temp_root("warns_when_source_home_is_retired_openclaw");
-        let harness_home = root.join(".agent-harness");
+        let harness_home = root.join("harness-staging");
         let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
             harness_home: harness_home.clone(),
             source_home: root.join(".openclaw"),
@@ -1610,7 +1723,12 @@ mod tests {
             node_executable: PathBuf::from("node"),
             discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
             agent_id: None,
-            output_dir: Some(root.join("supervisor")),
+            output_dir: Some(
+                harness_home
+                    .join("state")
+                    .join("supervisor")
+                    .join("windows-scheduled-tasks"),
+            ),
             task_prefix: "AgentHarness".to_string(),
             include_runtime: false,
             runtime_workers: 1,
@@ -1646,7 +1764,7 @@ mod tests {
         let harness_home = root.join(".openclaw");
         let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
             harness_home: harness_home.clone(),
-            source_home: harness_home,
+            source_home: harness_home.clone(),
             workspace: None,
             runtime_workspace: None,
             harness_cli: root.join("agent-harness.exe"),
@@ -1654,7 +1772,12 @@ mod tests {
             node_executable: PathBuf::from("node"),
             discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
             agent_id: None,
-            output_dir: Some(root.join("supervisor")),
+            output_dir: Some(
+                harness_home
+                    .join("state")
+                    .join("supervisor")
+                    .join("windows-scheduled-tasks"),
+            ),
             task_prefix: "AgentHarness".to_string(),
             include_runtime: false,
             runtime_workers: 1,
@@ -1687,8 +1810,11 @@ mod tests {
     #[test]
     fn defaults_runtime_workspace_to_harness_home() {
         let root = temp_root("defaults_runtime_workspace_to_harness_home");
-        let harness_home = root.join(".agent-harness");
-        let output_dir = root.join("supervisor");
+        let harness_home = root.join("harness-staging");
+        let output_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("windows-scheduled-tasks");
         let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
             harness_home: harness_home.clone(),
             source_home: harness_home.clone(),
@@ -1736,8 +1862,11 @@ mod tests {
     #[test]
     fn warns_for_legacy_runtime_workspace_without_rewriting_existing_artifacts() {
         let root = temp_root("warns_for_legacy_runtime_workspace");
-        let harness_home = root.join(".agent-harness");
-        let output_dir = root.join("supervisor");
+        let harness_home = root.join("harness-staging");
+        let output_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("windows-scheduled-tasks");
         let scripts_dir = output_dir.join("scripts");
         let session_dir = harness_home.join("agents").join("main").join("sessions");
         fs::create_dir_all(&scripts_dir).unwrap();

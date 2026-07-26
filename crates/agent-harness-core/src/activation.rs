@@ -2,11 +2,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::Command;
 
 use serde::Serialize;
 use serde_json::Value;
 
+#[cfg(windows)]
+use crate::process_launch::configure_noninteractive_command;
 use crate::{
     WorkerStatusOptions,
     codex_runtime::{
@@ -16,9 +22,15 @@ use crate::{
     collect_worker_status,
     config::{HarnessConfigValidationStatus, harness_config_candidates, validate_harness_config},
     logging::current_log_time_ms,
-    loop_health::{process_alive_for_pid, read_supervisor_stop_file},
+    loop_health::{
+        process_alive_for_pid, process_start_time_ms_for_pid, read_supervisor_stop_file,
+    },
     probe_harness_log_writable,
+    supervisor_topology::{SupervisorTopologyOverrides, derive_supervisor_topology},
 };
+
+#[cfg(test)]
+use crate::supervisor_topology::supervisor_loop_service_kind;
 
 const ACTIVATION_READINESS_SCHEMA: &str = "agent-harness.activation-readiness.v1";
 const LOOP_HEARTBEAT_STALE_MS: i64 = 120_000;
@@ -694,7 +706,7 @@ fn check_runtime_loop(harness_home: &Path, checks: &mut Vec<ActivationReadinessC
                     ),
                 )),
                 Some(errors) => {
-                    if let Some(heartbeat_detail) =
+                    if let Some((heartbeat_status, heartbeat_detail)) =
                         live_loop_heartbeat_detail(harness_home, "runtime-loop")
                     {
                         let detail = if stop_reason.contains("stop file") {
@@ -710,6 +722,8 @@ fn check_runtime_loop(harness_home: &Path, checks: &mut Vec<ActivationReadinessC
                         };
                         if stop_reason.contains("stop file") {
                             checks.push(pass("runtime-loop", detail));
+                        } else if heartbeat_status == "safe-mode" {
+                            checks.push(fail("runtime-loop", detail));
                         } else {
                             checks.push(warn("runtime-loop", detail));
                         }
@@ -757,7 +771,7 @@ fn check_runtime_loop(harness_home: &Path, checks: &mut Vec<ActivationReadinessC
     }
 }
 
-fn live_loop_heartbeat_detail(harness_home: &Path, name: &str) -> Option<String> {
+fn live_loop_heartbeat_detail(harness_home: &Path, name: &str) -> Option<(String, String)> {
     let stop_file = read_supervisor_stop_file(harness_home, name).ok()?;
     if stop_file.present {
         return None;
@@ -807,9 +821,12 @@ fn live_loop_heartbeat_detail(harness_home: &Path, name: &str) -> Option<String>
     let age_detail = age_ms
         .map(|age_ms| format!("ageMs={age_ms}"))
         .unwrap_or_else(|| "ageMs=-".to_string());
-    Some(format!(
-        "{name} heartbeat is live at {}: status={status}, {age_detail}, detail={detail}",
-        path.display()
+    Some((
+        status.to_string(),
+        format!(
+            "{name} heartbeat is live at {}: status={status}, {age_detail}, detail={detail}",
+            path.display()
+        ),
     ))
 }
 
@@ -864,140 +881,9 @@ fn check_codex_launch_probe(harness_home: &Path, checks: &mut Vec<ActivationRead
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupervisorReadinessMode {
     ReconcileManaged,
+    DirectOwner,
+    Observe,
     ScheduledTask,
-}
-
-fn configured_loop_enabled(supervisor: &Value, key: &str, all: bool) -> bool {
-    supervisor
-        .get(key)
-        .and_then(|value| value.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(all)
-}
-
-fn supervisor_loop_service_kind(service_id: &str) -> &'static str {
-    match service_id {
-        "runtime-loop" => "runtime",
-        "worker-loop" => "worker",
-        "cron-scheduler-loop" => "cron",
-        "progress-delivery-loop" => "progress-delivery",
-        "ledger-maintenance-loop" => "ledger-maintenance",
-        "telegram-loop" => "telegram-ingress",
-        "discord-outbox-loop" => "final-outbox",
-        "discord-gateway-loop" => "discord-gateway",
-        service_id if service_id.starts_with("telegram-loop") => "telegram-ingress",
-        _ => "loop",
-    }
-}
-
-fn supervisor_service_id_suffix(value: &str) -> String {
-    let mut suffix = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    while suffix.contains("--") {
-        suffix = suffix.replace("--", "-");
-    }
-    suffix.trim_matches('-').to_string()
-}
-
-fn reconcile_managed_expected_services(config: &Value) -> io::Result<BTreeMap<String, String>> {
-    let supervisor = config.get("supervisor").unwrap_or(&Value::Null);
-    let all = supervisor
-        .get("manageAllLoops")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut expected = BTreeMap::new();
-
-    if let Some(raw_services) = supervisor.get("services") {
-        let services = serde_json::from_value::<
-            Vec<crate::supervisor_inventory::SupervisorInventoryServiceConfig>,
-        >(raw_services.clone())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        for service in services {
-            if service.enabled {
-                expected.insert(service.service_id, service.service_kind);
-            }
-        }
-    }
-
-    let mut insert_default = |service_id: &str| {
-        expected.insert(
-            service_id.to_string(),
-            supervisor_loop_service_kind(service_id).to_string(),
-        );
-    };
-    for (key, service_id) in [
-        ("runtimeLoop", "runtime-loop"),
-        ("workerLoop", "worker-loop"),
-    ] {
-        if configured_loop_enabled(supervisor, key, all) {
-            insert_default(service_id);
-        }
-    }
-    let cron_enabled = supervisor
-        .get("cronSchedulerLoop")
-        .and_then(|value| value.get("enabled"))
-        .and_then(Value::as_bool)
-        .or_else(|| {
-            config
-                .get("cronScheduler")
-                .and_then(|value| value.get("enabled"))
-                .and_then(Value::as_bool)
-        })
-        .unwrap_or(all);
-    if cron_enabled {
-        insert_default("cron-scheduler-loop");
-    }
-    for (key, service_id) in [
-        ("progressDeliveryLoop", "progress-delivery-loop"),
-        ("ledgerMaintenanceLoop", "ledger-maintenance-loop"),
-        ("telegramLoop", "telegram-loop"),
-    ] {
-        if configured_loop_enabled(supervisor, key, all) {
-            insert_default(service_id);
-        }
-    }
-    if let Some(telegram_loops) = supervisor.get("telegramLoops").and_then(Value::as_array) {
-        for entry in telegram_loops {
-            if !entry
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true)
-            {
-                continue;
-            }
-            let service_id = entry
-                .get("serviceId")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-                .or_else(|| {
-                    entry
-                        .get("account")
-                        .or_else(|| entry.get("telegramAccount"))
-                        .and_then(Value::as_str)
-                        .map(supervisor_service_id_suffix)
-                        .map(|suffix| format!("telegram-loop-{suffix}"))
-                })
-                .unwrap_or_else(|| "telegram-loop".to_string());
-            insert_default(&service_id);
-        }
-    }
-    for (key, service_id) in [
-        ("discordOutboxLoop", "discord-outbox-loop"),
-        ("discordGatewayLoop", "discord-gateway-loop"),
-    ] {
-        if configured_loop_enabled(supervisor, key, all) {
-            insert_default(service_id);
-        }
-    }
-    Ok(expected)
 }
 
 fn supervisor_readiness_mode(
@@ -1015,14 +901,217 @@ fn supervisor_readiness_mode(
         .and_then(|value| value.get("manageAllLoops"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    Ok(if manage_all_loops {
-        (
-            SupervisorReadinessMode::ReconcileManaged,
-            reconcile_managed_expected_services(&config)?,
+    let ownership_mode = supervisor
+        .and_then(|value| value.get("ownershipMode"))
+        .and_then(Value::as_str)
+        .unwrap_or("compatibility");
+    let expected = || -> io::Result<BTreeMap<String, String>> {
+        Ok(
+            derive_supervisor_topology(&config, &SupervisorTopologyOverrides::default())?
+                .into_iter()
+                .map(|(service_id, entry)| (service_id, entry.service_kind))
+                .collect(),
         )
+    };
+    Ok(if ownership_mode == "direct-owner" {
+        (SupervisorReadinessMode::DirectOwner, expected()?)
+    } else if ownership_mode == "observe" {
+        (SupervisorReadinessMode::Observe, expected()?)
+    } else if ownership_mode != "compatibility" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported supervisor.ownershipMode={ownership_mode}"),
+        ));
+    } else if manage_all_loops {
+        (SupervisorReadinessMode::ReconcileManaged, expected()?)
     } else {
         (SupervisorReadinessMode::ScheduledTask, BTreeMap::new())
     })
+}
+
+fn check_direct_owner_supervisor(
+    harness_home: &Path,
+    expected_services: &BTreeMap<String, String>,
+    checks: &mut Vec<ActivationReadinessCheck>,
+) {
+    let master_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("master")
+        .join("master-state.json");
+    let master = match read_json_value(&master_file) {
+        Ok(value) => value,
+        Err(error) => {
+            checks.push(fail(
+                "supervisor-plan",
+                format!(
+                    "direct-owner master state is unavailable at {}: {error}",
+                    master_file.display()
+                ),
+            ));
+            return;
+        }
+    };
+    let mut invalid = Vec::new();
+    let generation_id = master
+        .get("generationId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let master_pid = master.get("pid").and_then(Value::as_i64);
+    let master_start = master.get("processStartTimeMs").and_then(Value::as_i64);
+    let master_heartbeat = master.get("lastHeartbeatAtMs").and_then(Value::as_i64);
+    let now_ms = match current_log_time_ms() {
+        Ok(now_ms) => now_ms,
+        Err(error) => {
+            invalid.push(format!("could not evaluate master heartbeat age: {error}"));
+            0
+        }
+    };
+    if master.get("schema").and_then(Value::as_str)
+        != Some(crate::supervisor_master::SUPERVISOR_MASTER_STATE_SCHEMA)
+        || master.get("mode").and_then(Value::as_str) != Some("direct-owner")
+        || master.get("phase").and_then(Value::as_str) != Some("running")
+        || generation_id.is_none()
+        || master.get("containment").and_then(Value::as_str) != Some("tree-kill-on-owner-exit")
+    {
+        invalid
+            .push("master state is not a running, contained direct-owner generation".to_string());
+    }
+    if master_pid.and_then(process_alive_for_pid) != Some(true)
+        || master_pid.and_then(process_start_time_ms_for_pid) != master_start
+    {
+        invalid.push("master process identity is not exact and live".to_string());
+    }
+    if !master_heartbeat.is_some_and(|at_ms| {
+        now_ms >= at_ms && now_ms.saturating_sub(at_ms) <= LOOP_HEARTBEAT_STALE_MS
+    }) {
+        invalid.push("master heartbeat is missing, future-dated, or stale".to_string());
+    }
+
+    let expected_ids = expected_services.keys().cloned().collect::<BTreeSet<_>>();
+    let reported_ids = master
+        .get("serviceIds")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    if expected_ids.is_empty() {
+        invalid.push("configured direct-owner desired-service inventory is empty".to_string());
+    } else if reported_ids != expected_ids {
+        invalid.push(format!(
+            "master serviceIds mismatch: expected {}, observed {}",
+            expected_ids.iter().cloned().collect::<Vec<_>>().join(", "),
+            reported_ids.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if master.get("desiredServiceCount").and_then(Value::as_u64)
+        != u64::try_from(expected_ids.len()).ok()
+    {
+        invalid.push("master desiredServiceCount does not match configured topology".to_string());
+    }
+
+    let services_dir = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("services");
+    let mut actual_ids = BTreeSet::new();
+    match fs::read_dir(&services_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        invalid.push(format!("service directory entry is unreadable: {error}"));
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                let value = match read_json_value(&path) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        invalid.push(format!("{}: {error}", path.display()));
+                        continue;
+                    }
+                };
+                let Some(service_id) = value
+                    .get("serviceId")
+                    .and_then(Value::as_str)
+                    .filter(|service_id| !service_id.is_empty())
+                else {
+                    invalid.push(format!("{} has no serviceId", path.display()));
+                    continue;
+                };
+                actual_ids.insert(service_id.to_string());
+                let expected_kind = expected_services.get(service_id).map(String::as_str);
+                let expected_file_name = format!("{service_id}.json");
+                let process_id = value.get("processId").and_then(Value::as_i64);
+                let process_start = value.get("processStartTimeMs").and_then(Value::as_i64);
+                let valid = value.get("schema").and_then(Value::as_str)
+                    == Some("agent-harness.supervisor-service-state.v1")
+                    && path.file_name().and_then(|name| name.to_str())
+                        == Some(expected_file_name.as_str())
+                    && value.get("serviceKind").and_then(Value::as_str) == expected_kind
+                    && value.get("desiredState").and_then(Value::as_str) == Some("running")
+                    && value.get("actualState").and_then(Value::as_str) == Some("running")
+                    && value.get("launchOwner").and_then(Value::as_str)
+                        == Some(crate::supervisor_master::STANDALONE_MASTER_LAUNCH_OWNER)
+                    && value.get("observedOnly").and_then(Value::as_bool) == Some(false)
+                    && value.get("masterGenerationId").and_then(Value::as_str) == generation_id
+                    && value.get("supervisorPid").and_then(Value::as_i64) == master_pid
+                    && value.get("parentPid").and_then(Value::as_i64) == master_pid
+                    && value
+                        .get("supervisorProcessStartTimeMs")
+                        .and_then(Value::as_i64)
+                        == master_start
+                    && process_id.and_then(process_alive_for_pid) == Some(true)
+                    && process_id.and_then(process_start_time_ms_for_pid) == process_start;
+                if !valid {
+                    invalid.push(format!(
+                        "{} is not an exact live child of the current direct-owner generation",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Err(error) => invalid.push(format!(
+            "could not inspect direct-owner service inventory {}: {error}",
+            services_dir.display()
+        )),
+    }
+    if actual_ids != expected_ids {
+        invalid.push(format!(
+            "direct-owner canonical service inventory mismatch: expected {}, observed {}",
+            expected_ids.iter().cloned().collect::<Vec<_>>().join(", "),
+            actual_ids.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    if invalid.is_empty() {
+        checks.push(pass(
+            "supervisor-plan",
+            format!(
+                "direct-owner master generation {} has {} exact live direct child service(s)",
+                generation_id.expect("validated master generation"),
+                expected_services.len()
+            ),
+        ));
+    } else {
+        checks.push(fail(
+            "supervisor-plan",
+            format!(
+                "direct-owner supervisor is not activation-ready: {}",
+                invalid.join("; ")
+            ),
+        ));
+    }
 }
 
 fn check_reconcile_managed_supervisor(
@@ -1030,6 +1119,7 @@ fn check_reconcile_managed_supervisor(
     expected_services: &BTreeMap<String, String>,
     checks: &mut Vec<ActivationReadinessCheck>,
 ) {
+    check_reconcile_keeper(harness_home, checks);
     let services_dir = harness_home
         .join("state")
         .join("supervisor")
@@ -1037,7 +1127,7 @@ fn check_reconcile_managed_supervisor(
     let entries = match fs::read_dir(&services_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            checks.push(warn(
+            checks.push(fail(
                 "supervisor-plan",
                 format!(
                     "reconcile-managed supervisor has no desired-service inventory at {}",
@@ -1047,7 +1137,7 @@ fn check_reconcile_managed_supervisor(
             return;
         }
         Err(error) => {
-            checks.push(warn(
+            checks.push(fail(
                 "supervisor-plan",
                 format!(
                     "could not inspect reconcile-managed supervisor inventory {}: {error}",
@@ -1150,7 +1240,7 @@ fn check_reconcile_managed_supervisor(
         } else {
             invalid.join("; ")
         };
-        checks.push(warn(
+        checks.push(fail(
             "supervisor-plan",
             format!(
                 "reconcile-managed supervisor inventory is not ready at {}: {detail}",
@@ -1169,6 +1259,498 @@ fn check_reconcile_managed_supervisor(
     }
 }
 
+fn check_reconcile_keeper(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    check_reconcile_keeper_with_refresh(harness_home, checks, true);
+}
+
+fn check_reconcile_keeper_with_refresh(
+    harness_home: &Path,
+    checks: &mut Vec<ActivationReadinessCheck>,
+    refresh_task_scheduler: bool,
+) {
+    let mut invalid = Vec::new();
+    let auto_reconcile = harness_config_candidates(harness_home)
+        .into_iter()
+        .find(|path| path.is_file())
+        .and_then(|path| read_json_value(&path).ok())
+        .and_then(|config| {
+            config
+                .get("supervisor")
+                .and_then(|value| value.get("autoReconcile"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false);
+    if !auto_reconcile {
+        invalid.push(
+            "reconcile-managed ownership requires supervisor.autoReconcile=true and one OS-owned keeper"
+                .to_string(),
+        );
+    }
+
+    let stop_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("stop")
+        .join("supervisor-reconcile.stop");
+    if stop_file.exists() {
+        invalid.push(format!(
+            "global reconcile keeper hold is present at {}",
+            stop_file.display()
+        ));
+    }
+
+    let plan_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("windows-reconcile-keeper")
+        .join("keeper-plan.json");
+    let observation_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("windows-reconcile-keeper")
+        .join("readback-latest.json");
+    let state_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("reconcile-keeper.json");
+
+    let plan = match read_json_value(&plan_file) {
+        Ok(value)
+            if value.get("schema").and_then(Value::as_str)
+                == Some("agent-harness.windows-reconcile-keeper-plan.v1") =>
+        {
+            Some(value)
+        }
+        Ok(_) => {
+            invalid.push(format!(
+                "keeper plan schema is invalid at {}",
+                plan_file.display()
+            ));
+            None
+        }
+        Err(error) => {
+            invalid.push(format!(
+                "keeper plan is unavailable at {}: {error}",
+                plan_file.display()
+            ));
+            None
+        }
+    };
+    let expected_query_nonce = if refresh_task_scheduler
+        && plan.as_ref().is_some_and(|value| {
+            value.get("deploymentMode").and_then(Value::as_str) == Some("live")
+        }) {
+        match refresh_reconcile_keeper_observation(plan.as_ref().unwrap()) {
+            Ok(nonce) => nonce,
+            Err(error) => {
+                invalid.push(format!(
+                    "keeper Task Scheduler query-time refresh failed: {error}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let observation = match read_json_value(&observation_file) {
+        Ok(value)
+            if value.get("schema").and_then(Value::as_str)
+                == Some("agent-harness.windows-reconcile-keeper-observation.v1") =>
+        {
+            Some(value)
+        }
+        Ok(_) => {
+            invalid.push(format!(
+                "keeper task readback schema is invalid at {}",
+                observation_file.display()
+            ));
+            None
+        }
+        Err(error) => {
+            invalid.push(format!(
+                "keeper task readback is unavailable at {}: {error}",
+                observation_file.display()
+            ));
+            None
+        }
+    };
+    if let (Some(plan), Some(observation)) = (&plan, &observation) {
+        let planned_scheduler_action = plan.get("schedulerAction").or_else(|| plan.get("action"));
+        if let Err(error) =
+            crate::supervisor_keeper::validate_live_windows_reconcile_keeper_plan(plan)
+        {
+            invalid.push(format!(
+                "keeper live deployment path contract failed: {error}"
+            ));
+        }
+        let now_ms = current_log_time_ms().unwrap_or_default();
+        let observation_age_ms = observation
+            .get("observedAtMs")
+            .and_then(Value::as_i64)
+            .map(|observed_at_ms| now_ms.saturating_sub(observed_at_ms));
+        if !observation_age_ms
+            .is_some_and(|age_ms| (-10_000..=LOOP_HEARTBEAT_STALE_MS).contains(&age_ms))
+        {
+            invalid.push("keeper task readback is missing, stale, or from the future".to_string());
+        }
+        if !keeper_observation_matches_query_nonce(observation, expected_query_nonce.as_deref()) {
+            invalid.push(
+                "keeper task readback was not produced by this query-time Task Scheduler refresh"
+                    .to_string(),
+            );
+        }
+        let plan_digest = plan.get("planDigest").and_then(Value::as_str);
+        if observation.get("planDigest").and_then(Value::as_str) != plan_digest {
+            invalid.push("keeper task readback does not match the current plan digest".to_string());
+        }
+        if observation.get("actionDigest").and_then(Value::as_str)
+            != plan.pointer("/action/digest").and_then(Value::as_str)
+        {
+            invalid
+                .push("keeper task readback does not match the current action digest".to_string());
+        }
+        if observation.pointer("/task/exists").and_then(Value::as_bool) != Some(true)
+            || observation
+                .pointer("/task/enabled")
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            invalid.push("keeper scheduled task is missing or disabled".to_string());
+        }
+        if observation.pointer("/task/state").and_then(Value::as_str) != Some("Running") {
+            invalid.push("keeper scheduled task is not Running".to_string());
+        }
+        if !crate::supervisor_keeper::keeper_task_identity_matches(plan, observation) {
+            invalid.push("keeper scheduled task identity is foreign or stale".to_string());
+        }
+        if observation
+            .pointer("/executable/digestMatches")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            invalid.push("keeper task executable digest does not match its plan".to_string());
+        }
+        let scheduler_action_matches = planned_scheduler_action.is_some_and(|action| {
+            observation
+                .pointer("/action/execute")
+                .and_then(Value::as_str)
+                == action.get("executable").and_then(Value::as_str)
+                && observation
+                    .pointer("/action/arguments")
+                    .and_then(Value::as_str)
+                    == action.get("arguments").and_then(Value::as_str)
+                && observation
+                    .pointer("/action/workingDirectory")
+                    .and_then(Value::as_str)
+                    == action.get("workingDirectory").and_then(Value::as_str)
+        });
+        if !scheduler_action_matches {
+            invalid.push(
+                "keeper task action does not match the planned scheduler executable, arguments, or working directory"
+                    .to_string(),
+            );
+        }
+        for (observed_pointer, planned_pointer, label) in [
+            ("/task/name", "/task/name", "task name"),
+            (
+                "/principal/userId",
+                "/task/principal/userId",
+                "principal user",
+            ),
+            (
+                "/principal/logonType",
+                "/task/principal/logonType",
+                "principal logon type",
+            ),
+            (
+                "/principal/runLevel",
+                "/task/principal/runLevel",
+                "principal run level",
+            ),
+            ("/trigger/userId", "/task/trigger/userId", "trigger user"),
+            (
+                "/trigger/recoveryStartBoundary",
+                "/task/trigger/recoveryStartBoundary",
+                "recovery trigger start boundary",
+            ),
+            (
+                "/trigger/recoveryInterval",
+                "/task/trigger/recoveryInterval",
+                "recovery trigger interval",
+            ),
+            (
+                "/settings/multipleInstances",
+                "/task/settings/multipleInstances",
+                "multiple-instance policy",
+            ),
+            (
+                "/settings/restartInterval",
+                "/task/settings/restartInterval",
+                "restart interval",
+            ),
+            (
+                "/settings/executionTimeLimit",
+                "/task/settings/executionTimeLimit",
+                "execution time limit",
+            ),
+        ] {
+            if observation
+                .pointer(observed_pointer)
+                .and_then(Value::as_str)
+                != plan.pointer(planned_pointer).and_then(Value::as_str)
+            {
+                invalid.push(format!("keeper task {label} does not match its plan"));
+            }
+        }
+        if observation
+            .pointer("/trigger/triggerType")
+            .and_then(Value::as_str)
+            != Some("MSFT_TaskLogonTrigger")
+            || observation
+                .pointer("/trigger/recoveryTriggerType")
+                .and_then(Value::as_str)
+                != Some("MSFT_TaskTimeTrigger")
+            || plan.pointer("/task/trigger/kind").and_then(Value::as_str) != Some("AtLogOn")
+            || plan
+                .pointer("/task/trigger/recoveryKind")
+                .and_then(Value::as_str)
+                != Some("Time")
+        {
+            invalid.push(
+                "keeper task triggers are not the planned same-user logon and recovery triggers"
+                    .to_string(),
+            );
+        }
+        if observation.pointer("/action/count").and_then(Value::as_u64) != Some(1)
+            || observation
+                .pointer("/trigger/count")
+                .and_then(Value::as_u64)
+                != Some(2)
+            || observation
+                .pointer("/trigger/logonCount")
+                .and_then(Value::as_u64)
+                != Some(1)
+            || observation
+                .pointer("/trigger/recoveryCount")
+                .and_then(Value::as_u64)
+                != Some(1)
+            || observation.pointer("/trigger/recoveryDuration")
+                != plan.pointer("/task/trigger/recoveryDuration")
+            || observation
+                .pointer("/trigger/recoveryStopAtDurationEnd")
+                .and_then(Value::as_bool)
+                != plan
+                    .pointer("/task/trigger/recoveryStopAtDurationEnd")
+                    .and_then(Value::as_bool)
+            || observation
+                .pointer("/settings/restartCount")
+                .and_then(Value::as_u64)
+                != plan
+                    .pointer("/task/settings/restartCount")
+                    .and_then(Value::as_u64)
+            || observation
+                .pointer("/settings/startWhenAvailable")
+                .and_then(Value::as_bool)
+                != plan
+                    .pointer("/task/settings/startWhenAvailable")
+                    .and_then(Value::as_bool)
+            || observation
+                .pointer("/settings/disallowStartIfOnBatteries")
+                .and_then(Value::as_bool)
+                == plan
+                    .pointer("/task/settings/allowStartOnBatteries")
+                    .and_then(Value::as_bool)
+            || observation
+                .pointer("/settings/stopIfGoingOnBatteries")
+                .and_then(Value::as_bool)
+                != plan
+                    .pointer("/task/settings/stopIfGoingOnBatteries")
+                    .and_then(Value::as_bool)
+        {
+            invalid.push(
+                "keeper task actions, triggers, or settings do not match the recovery plan"
+                    .to_string(),
+            );
+        }
+    }
+
+    match read_json_value(&state_file) {
+        Ok(state) => {
+            let process_id = state.get("pid").and_then(Value::as_i64);
+            let recorded_start = state.get("processStartTimeMs").and_then(Value::as_i64);
+            let observed_start = process_id.and_then(process_start_time_ms_for_pid);
+            let heartbeat_at = state.get("lastHeartbeatAtMs").and_then(Value::as_i64);
+            let now_ms = current_log_time_ms().unwrap_or_default();
+            let heartbeat_fresh = heartbeat_at
+                .map(|at_ms| now_ms.saturating_sub(at_ms))
+                .is_some_and(|age_ms| (-10_000..=LOOP_HEARTBEAT_STALE_MS).contains(&age_ms));
+            let planned_stop_file = plan
+                .as_ref()
+                .and_then(|plan| plan.get("stopFile"))
+                .and_then(Value::as_str);
+            let planned_lease_file = plan
+                .as_ref()
+                .and_then(|plan| plan.get("leaseFile"))
+                .and_then(Value::as_str);
+            let planned_plan_digest = plan
+                .as_ref()
+                .and_then(|plan| plan.get("planDigest"))
+                .and_then(Value::as_str);
+            let planned_action_digest = plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/action/digest"))
+                .and_then(Value::as_str);
+            let planned_task_name = plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/task/name"))
+                .and_then(Value::as_str);
+            let observed_keeper = observation
+                .as_ref()
+                .and_then(|observation| observation.pointer("/runtime/keeperState"));
+            let observed_exact_owner = observed_keeper.is_some_and(|observed| {
+                observed.get("pid").and_then(Value::as_i64) == process_id
+                    && observed.get("processStartTimeMs").and_then(Value::as_i64) == recorded_start
+                    && observed.get("planDigest").and_then(Value::as_str) == planned_plan_digest
+                    && observed.get("actionDigest").and_then(Value::as_str) == planned_action_digest
+            });
+            let lease_path = planned_lease_file.map(PathBuf::from);
+            if state.get("schema").and_then(Value::as_str)
+                != Some("agent-harness.supervisor-reconcile-keeper.v1")
+                || state.get("status").and_then(Value::as_str) != Some("running")
+                || state.get("holdRequested").and_then(Value::as_bool) != Some(false)
+                || state.get("autoReconcile").and_then(Value::as_bool) != Some(true)
+                || state.get("applied").and_then(Value::as_bool) != Some(true)
+                || state.get("stopFile").and_then(Value::as_str) != planned_stop_file
+                || state.get("leaseFile").and_then(Value::as_str) != planned_lease_file
+                || state.get("planDigest").and_then(Value::as_str) != planned_plan_digest
+                || state.get("actionDigest").and_then(Value::as_str) != planned_action_digest
+                || state.get("taskName").and_then(Value::as_str) != planned_task_name
+                || state.get("ownershipMode").and_then(Value::as_str) != Some("scheduled-task-plan")
+                || process_id.and_then(process_alive_for_pid) != Some(true)
+                || recorded_start
+                    .zip(observed_start)
+                    .is_none_or(|(left, right)| left != right)
+                || !heartbeat_fresh
+                || !observed_exact_owner
+                || !lease_path
+                    .as_deref()
+                    .is_some_and(keeper_singleton_lease_is_held)
+            {
+                invalid.push(format!(
+                    "keeper runtime state is not fresh/live with an exact process instance at {}",
+                    state_file.display()
+                ));
+            }
+        }
+        Err(error) => invalid.push(format!(
+            "keeper runtime state is unavailable at {}: {error}",
+            state_file.display()
+        )),
+    }
+
+    if invalid.is_empty() {
+        checks.push(pass(
+            "supervisor-reconcile-keeper",
+            format!(
+                "registered task, plan digest, executable, hold, and live keeper process agree at {}",
+                state_file.display()
+            ),
+        ));
+    } else {
+        checks.push(fail("supervisor-reconcile-keeper", invalid.join("; ")));
+    }
+}
+
+fn keeper_observation_matches_query_nonce(
+    observation: &Value,
+    expected_query_nonce: Option<&str>,
+) -> bool {
+    expected_query_nonce
+        .is_none_or(|nonce| observation.get("queryNonce").and_then(Value::as_str) == Some(nonce))
+}
+
+#[cfg(windows)]
+fn refresh_reconcile_keeper_observation(plan: &Value) -> io::Result<Option<String>> {
+    let readback = plan
+        .get("scripts")
+        .and_then(Value::as_array)
+        .and_then(|scripts| {
+            scripts
+                .iter()
+                .find(|script| script.get("name").and_then(Value::as_str) == Some("readback"))
+        })
+        .and_then(|script| script.get("path"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "readback script is missing"))?;
+    if !readback.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("readback script is unavailable at {}", readback.display()),
+        ));
+    }
+    let nonce = format!(
+        "activation-{}-{}",
+        std::process::id(),
+        current_log_time_ms().unwrap_or_default()
+    );
+    let system_root = env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SystemRoot is unavailable"))?;
+    let powershell = system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let mut command = Command::new(&powershell);
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&readback)
+        .args(["-QueryNonce", &nonce]);
+    configure_noninteractive_command(&mut command);
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "readback script failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(Some(nonce))
+}
+
+#[cfg(not(windows))]
+fn refresh_reconcile_keeper_observation(_plan: &Value) -> io::Result<Option<String>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Task Scheduler refresh is only available on Windows",
+    ))
+}
+
+#[cfg(windows)]
+fn keeper_singleton_lease_is_held(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(_) => false,
+        Err(error) => matches!(error.raw_os_error(), Some(32) | Some(33)),
+    }
+}
+
+#[cfg(not(windows))]
+fn keeper_singleton_lease_is_held(path: &Path) -> bool {
+    path.is_file()
+}
+
 fn check_supervisor_plan(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
     let path = harness_home
         .join("state")
@@ -1177,59 +1759,90 @@ fn check_supervisor_plan(harness_home: &Path, checks: &mut Vec<ActivationReadine
         .join("supervisor-plan.json");
     match supervisor_readiness_mode(harness_home) {
         Ok((SupervisorReadinessMode::ReconcileManaged, expected_service_ids)) => {
-            check_reconcile_managed_supervisor(harness_home, &expected_service_ids, checks)
+            check_reconcile_managed_supervisor(harness_home, &expected_service_ids, checks);
+            check_loop_heartbeats_for(
+                harness_home,
+                checks,
+                expected_service_ids.keys().map(String::as_str),
+            );
         }
-        Ok((SupervisorReadinessMode::ScheduledTask, _)) => match read_json_value(&path) {
-            Ok(value) => {
-                let task_count = value
-                    .get("tasks")
-                    .and_then(Value::as_array)
-                    .map(Vec::len)
-                    .unwrap_or(0);
-                if task_count > 0 {
-                    checks.push(pass(
-                        "supervisor-plan",
-                        format!(
-                            "found {task_count} scheduled task plan(s) at {}",
-                            path.display()
-                        ),
-                    ));
-                } else {
-                    checks.push(warn(
-                        "supervisor-plan",
-                        format!("supervisor plan has no tasks at {}", path.display()),
-                    ));
+        Ok((SupervisorReadinessMode::DirectOwner, expected_service_ids)) => {
+            check_direct_owner_supervisor(harness_home, &expected_service_ids, checks);
+            check_loop_heartbeats_for(
+                harness_home,
+                checks,
+                expected_service_ids.keys().map(String::as_str),
+            );
+        }
+        Ok((SupervisorReadinessMode::Observe, _)) => checks.push(fail(
+            "supervisor-plan",
+            "supervisor.ownershipMode=observe is deliberately non-owning and cannot satisfy activation readiness",
+        )),
+        Ok((SupervisorReadinessMode::ScheduledTask, _)) => {
+            match read_json_value(&path) {
+                Ok(value) => {
+                    let task_count = value
+                        .get("tasks")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    if task_count > 0 {
+                        checks.push(pass(
+                            "supervisor-plan",
+                            format!(
+                                "found {task_count} scheduled task plan(s) at {}",
+                                path.display()
+                            ),
+                        ));
+                    } else {
+                        checks.push(warn(
+                            "supervisor-plan",
+                            format!("supervisor plan has no tasks at {}", path.display()),
+                        ));
+                    }
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+                    "supervisor-plan",
+                    format!(
+                        "not found yet: {}; run supervisor-plan before service handoff",
+                        path.display()
+                    ),
+                )),
+                Err(error) => checks.push(fail(
+                    "supervisor-plan",
+                    format!("could not read supervisor plan {}: {error}", path.display()),
+                )),
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
-                "supervisor-plan",
-                format!(
-                    "not found yet: {}; run supervisor-plan before service handoff",
-                    path.display()
-                ),
-            )),
-            Err(error) => checks.push(fail(
-                "supervisor-plan",
-                format!("could not read supervisor plan {}: {error}", path.display()),
-            )),
-        },
+            check_loop_heartbeats(harness_home, checks);
+        }
         Err(error) => checks.push(fail(
             "supervisor-plan",
             format!("could not resolve supervisor readiness mode from harness config: {error}"),
         )),
     }
-    check_loop_heartbeats(harness_home, checks);
 }
 
 fn check_loop_heartbeats(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
-    for name in [
-        "runtime-loop",
-        "progress-delivery-loop",
-        "telegram-loop",
-        "discord-outbox-loop",
-        "discord-gateway-loop",
-        "worker-loop",
-    ] {
+    check_loop_heartbeats_for(
+        harness_home,
+        checks,
+        [
+            "runtime-loop",
+            "progress-delivery-loop",
+            "telegram-loop",
+            "discord-outbox-loop",
+            "discord-gateway-loop",
+            "worker-loop",
+        ],
+    );
+}
+
+fn check_loop_heartbeats_for<'a>(
+    harness_home: &Path,
+    checks: &mut Vec<ActivationReadinessCheck>,
+    names: impl IntoIterator<Item = &'a str>,
+) {
+    for name in names {
         check_loop_heartbeat(harness_home, checks, name);
     }
 }
@@ -1403,7 +2016,8 @@ fn check_loop_heartbeat(
                     base_detail
                 };
                 if name == "runtime-loop"
-                    && age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS)
+                    && (status == "safe-mode"
+                        || age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS))
                 {
                     checks.push(fail(check_name, detail));
                 } else {
@@ -3120,13 +3734,13 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
 
         assert!(live_safe_mode_report.checks.iter().any(|check| {
             check.name == "runtime-loop"
-                && check.status == ActivationReadinessStatus::Warn
+                && check.status == ActivationReadinessStatus::Fail
                 && check.detail.contains("superseded by live heartbeat")
                 && check.detail.contains("status=safe-mode")
         }));
         assert!(live_safe_mode_report.checks.iter().any(|check| {
             check.name == "runtime-loop-heartbeat"
-                && check.status == ActivationReadinessStatus::Warn
+                && check.status == ActivationReadinessStatus::Fail
                 && check.detail.contains("safe-mode")
         }));
 
@@ -3262,8 +3876,339 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
         }
     }
 
+    #[cfg(windows)]
     #[test]
-    fn readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan() {
+    fn direct_owner_readiness_requires_exact_live_master_generation_and_child() {
+        let root = temp_root("direct-owner-readiness");
+        let harness_home = root.join(".agent-harness");
+        let master_dir = harness_home.join("state").join("supervisor").join("master");
+        let services_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&master_dir).unwrap();
+        fs::create_dir_all(&services_dir).unwrap();
+        let now_ms = current_log_time_ms().unwrap();
+        let pid = i64::from(std::process::id());
+        let process_start_time_ms = process_start_time_ms_for_pid(pid).unwrap();
+        crate::write_json_atomic(
+            &master_dir.join("master-state.json"),
+            &serde_json::json!({
+                "schema": crate::supervisor_master::SUPERVISOR_MASTER_STATE_SCHEMA,
+                "mode": "direct-owner",
+                "phase": "running",
+                "generationId": "master-generation-1",
+                "pid": pid,
+                "processStartTimeMs": process_start_time_ms,
+                "containment": "tree-kill-on-owner-exit",
+                "desiredServiceCount": 1,
+                "serviceIds": ["runtime-loop"],
+                "lastHeartbeatAtMs": now_ms,
+            }),
+        )
+        .unwrap();
+        crate::write_json_atomic(
+            &services_dir.join("runtime-loop.json"),
+            &serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "runtime-loop",
+                "serviceKind": "runtime",
+                "generationId": "master-generation-1:runtime-loop:1",
+                "masterGenerationId": "master-generation-1",
+                "processId": pid,
+                "processStartTimeMs": process_start_time_ms,
+                "supervisorPid": pid,
+                "supervisorProcessStartTimeMs": process_start_time_ms,
+                "parentPid": pid,
+                "desiredState": "running",
+                "actualState": "running",
+                "launchOwner": crate::supervisor_master::STANDALONE_MASTER_LAUNCH_OWNER,
+                "observedOnly": false,
+            }),
+        )
+        .unwrap();
+        let expected = BTreeMap::from([("runtime-loop".to_string(), "runtime".to_string())]);
+        let mut checks = Vec::new();
+        check_direct_owner_supervisor(&harness_home, &expected, &mut checks);
+        assert!(checks.iter().any(|check| {
+            check.name == "supervisor-plan"
+                && check.status == ActivationReadinessStatus::Pass
+                && check.detail.contains("1 exact live direct child")
+        }));
+
+        let mut master = read_json_value(&master_dir.join("master-state.json")).unwrap();
+        master["lastHeartbeatAtMs"] = Value::from(now_ms - LOOP_HEARTBEAT_STALE_MS - 1);
+        crate::write_json_atomic(&master_dir.join("master-state.json"), &master).unwrap();
+        let mut stale_checks = Vec::new();
+        check_direct_owner_supervisor(&harness_home, &expected, &mut stale_checks);
+        assert!(stale_checks.iter().any(|check| {
+            check.name == "supervisor-plan"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("master heartbeat")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn observe_ownership_mode_is_explicitly_not_activation_ready() {
+        let root = temp_root("observe-not-activation-ready");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{
+              "supervisor": {
+                "enabled": true,
+                "manageAllLoops": false,
+                "autoReconcile": false,
+                "ownershipMode": "observe"
+              }
+            }"#,
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_supervisor_plan(&harness_home, &mut checks);
+        assert!(checks.iter().any(|check| {
+            check.name == "supervisor-plan"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("deliberately non-owning")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reconcile_keeper_readiness_requires_current_task_and_exact_live_process() {
+        let root = temp_root("reconcile_keeper_readiness_exact");
+        let harness_home = root.join(".agent-harness");
+        let workspace = harness_home.join("workspace");
+        let runtime_workspace = harness_home.join("runtime-workspace/default");
+        let harness_cli = harness_home.join("bin/current/agent-harness.exe");
+        let codex_executable = harness_home.join("tools/codex/codex.exe");
+        let node_executable = harness_home.join("tools/node/node.exe");
+        let gateway_script = harness_home.join("tools/discord/index.mjs");
+        for directory in [
+            &harness_home,
+            &workspace,
+            &runtime_workspace,
+            harness_cli.parent().unwrap(),
+            codex_executable.parent().unwrap(),
+            node_executable.parent().unwrap(),
+            gateway_script.parent().unwrap(),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"supervisor":{"manageAllLoops":true,"autoReconcile":true}}"#,
+        )
+        .unwrap();
+        fs::write(&harness_cli, b"candidate").unwrap();
+        fs::write(&codex_executable, b"codex").unwrap();
+        fs::write(&node_executable, b"node").unwrap();
+        fs::write(&gateway_script, b"gateway").unwrap();
+        let plan =
+            crate::write_windows_reconcile_keeper_plan(crate::WindowsReconcileKeeperPlanOptions {
+                harness_home: harness_home.clone(),
+                source_home: harness_home.clone(),
+                workspace: Some(workspace),
+                runtime_workspace,
+                harness_cli,
+                codex_executable: Some(codex_executable),
+                node_executable: Some(node_executable),
+                discord_gateway_script: Some(gateway_script),
+                user_id: "TEST\\keeper-user".to_string(),
+                task_name: None,
+                live_deployment: true,
+            })
+            .unwrap();
+        let now_ms = current_log_time_ms().unwrap();
+        let process_id = i64::from(std::process::id());
+        let process_start_time_ms = process_start_time_ms_for_pid(process_id).unwrap();
+        let keeper_state = serde_json::json!({
+            "schema": "agent-harness.supervisor-reconcile-keeper.v1",
+            "status": "running",
+            "pid": process_id,
+            "processStartTimeMs": process_start_time_ms,
+            "lastHeartbeatAtMs": now_ms,
+            "holdRequested": false,
+            "autoReconcile": true,
+            "applied": true,
+            "stopFile": plan.stop_file,
+            "leaseFile": plan.lease_file,
+            "planDigest": plan.plan_digest,
+            "actionDigest": plan.action.digest,
+            "taskName": plan.task.name,
+            "ownershipMode": "scheduled-task-plan"
+        });
+        crate::write_json_atomic(
+            &plan.observation_file,
+            &serde_json::json!({
+                "schema": "agent-harness.windows-reconcile-keeper-observation.v1",
+                "planDigest": plan.plan_digest,
+                "actionDigest": plan.action.digest,
+                "observedAtMs": now_ms,
+                "task": {
+                    "path": plan.task.path,
+                    "observedPath": plan.task.path,
+                    "name": plan.task.name,
+                    "description": plan.task.description,
+                    "exists": true,
+                    "enabled": true,
+                    "state": "Running"
+                },
+                "principal": {
+                    "userId": plan.task.principal.user_id,
+                    "logonType": plan.task.principal.logon_type,
+                    "runLevel": plan.task.principal.run_level
+                },
+                "action": {
+                    "count": 1,
+                    "execute": plan.scheduler_action.executable,
+                    "arguments": plan.scheduler_action.arguments,
+                    "workingDirectory": plan.scheduler_action.working_directory
+                },
+                "trigger": {
+                    "count": 2,
+                    "logonCount": 1,
+                    "recoveryCount": 1,
+                    "userId": plan.task.trigger.user_id,
+                    "triggerType": "MSFT_TaskLogonTrigger",
+                    "recoveryTriggerType": "MSFT_TaskTimeTrigger",
+                    "recoveryStartBoundary": plan.task.trigger.recovery_start_boundary,
+                    "recoveryInterval": plan.task.trigger.recovery_interval,
+                    "recoveryDuration": plan.task.trigger.recovery_duration,
+                    "recoveryStopAtDurationEnd": plan.task.trigger.recovery_stop_at_duration_end
+                },
+                "settings": {
+                    "multipleInstances": plan.task.settings.multiple_instances,
+                    "restartCount": plan.task.settings.restart_count,
+                    "restartInterval": plan.task.settings.restart_interval,
+                    "startWhenAvailable": plan.task.settings.start_when_available,
+                    "disallowStartIfOnBatteries": !plan.task.settings.allow_start_on_batteries,
+                    "stopIfGoingOnBatteries": plan.task.settings.stop_if_going_on_batteries,
+                    "executionTimeLimit": plan.task.settings.execution_time_limit
+                },
+                "runtime": {"keeperState": keeper_state},
+                "executable": {"digestMatches": true}
+            }),
+        )
+        .unwrap();
+        crate::write_json_atomic(&plan.state_file, &keeper_state).unwrap();
+        let _lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .open(&plan.lease_file)
+            .unwrap();
+
+        let mut checks = Vec::new();
+        check_reconcile_keeper_with_refresh(&harness_home, &mut checks, false);
+        assert!(checks.iter().any(|check| {
+            check.name == "supervisor-reconcile-keeper"
+                && check.status == ActivationReadinessStatus::Pass
+        }));
+
+        let mut observation = read_json_value(&plan.observation_file).unwrap();
+        observation["action"]["arguments"] = Value::String("visible-or-stale-action".to_string());
+        crate::write_json_atomic(&plan.observation_file, &observation).unwrap();
+        let mut stale_scheduler_action_checks = Vec::new();
+        check_reconcile_keeper_with_refresh(
+            &harness_home,
+            &mut stale_scheduler_action_checks,
+            false,
+        );
+        assert!(stale_scheduler_action_checks.iter().any(|check| {
+            check.name == "supervisor-reconcile-keeper"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("planned scheduler")
+        }));
+
+        observation["action"]["arguments"] = Value::String(plan.scheduler_action.arguments.clone());
+        observation["trigger"]["recoveryInterval"] = Value::String("PT2M".to_string());
+        crate::write_json_atomic(&plan.observation_file, &observation).unwrap();
+        let mut stale_recovery_trigger_checks = Vec::new();
+        check_reconcile_keeper_with_refresh(
+            &harness_home,
+            &mut stale_recovery_trigger_checks,
+            false,
+        );
+        assert!(stale_recovery_trigger_checks.iter().any(|check| {
+            check.name == "supervisor-reconcile-keeper"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("recovery trigger")
+        }));
+
+        observation["trigger"]["recoveryInterval"] =
+            Value::String(plan.task.trigger.recovery_interval.to_string());
+        observation["task"]["enabled"] = Value::Bool(false);
+        crate::write_json_atomic(&plan.observation_file, &observation).unwrap();
+        let mut disabled_checks = Vec::new();
+        check_reconcile_keeper_with_refresh(&harness_home, &mut disabled_checks, false);
+        assert!(disabled_checks.iter().any(|check| {
+            check.name == "supervisor-reconcile-keeper"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("missing or disabled")
+        }));
+
+        observation["task"]["enabled"] = Value::Bool(true);
+        observation["task"]["state"] = Value::String("Ready".to_string());
+        crate::write_json_atomic(&plan.observation_file, &observation).unwrap();
+        let mut ready_not_running_checks = Vec::new();
+        check_reconcile_keeper_with_refresh(&harness_home, &mut ready_not_running_checks, false);
+        assert!(ready_not_running_checks.iter().any(|check| {
+            check.name == "supervisor-reconcile-keeper"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("not Running")
+        }));
+
+        observation["task"]["state"] = Value::String("Running".to_string());
+        observation["actionDigest"] = Value::String("stale-action-digest".to_string());
+        crate::write_json_atomic(&plan.observation_file, &observation).unwrap();
+        let mut stale_action_checks = Vec::new();
+        check_reconcile_keeper_with_refresh(&harness_home, &mut stale_action_checks, false);
+        assert!(stale_action_checks.iter().any(|check| {
+            check.name == "supervisor-reconcile-keeper"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("current action digest")
+        }));
+
+        observation["actionDigest"] = Value::String(plan.action.digest.clone());
+        observation["observedAtMs"] = Value::from(now_ms - LOOP_HEARTBEAT_STALE_MS - 1);
+        crate::write_json_atomic(&plan.observation_file, &observation).unwrap();
+        let mut expired_readback_checks = Vec::new();
+        check_reconcile_keeper_with_refresh(&harness_home, &mut expired_readback_checks, false);
+        assert!(expired_readback_checks.iter().any(|check| {
+            check.name == "supervisor-reconcile-keeper"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("readback is missing, stale")
+        }));
+
+        drop(_lease);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn keeper_readback_nonce_rejects_old_start_or_logon_observation_replay() {
+        let observation = serde_json::json!({
+            "schema": "agent-harness.windows-reconcile-keeper-observation.v1",
+            "queryNonce": "old-start-or-logon-query"
+        });
+        assert!(!keeper_observation_matches_query_nonce(
+            &observation,
+            Some("current-activation-query")
+        ));
+        assert!(keeper_observation_matches_query_nonce(
+            &observation,
+            Some("old-start-or-logon-query")
+        ));
+        assert!(keeper_observation_matches_query_nonce(&observation, None));
+    }
+
+    #[test]
+    fn keeper_readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan() {
         let root =
             temp_root("readiness_accepts_reconcile_managed_inventory_without_scheduled_task_plan");
         let harness_home = root.join(".agent-harness");
@@ -3328,7 +4273,7 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
     }
 
     #[test]
-    fn readiness_warns_when_reconcile_managed_inventory_is_absent() {
+    fn keeper_readiness_fails_when_reconcile_managed_inventory_is_absent() {
         let root = temp_root("readiness_warns_when_reconcile_managed_inventory_is_absent");
         let harness_home = root.join(".agent-harness");
         fs::create_dir_all(&harness_home).unwrap();
@@ -3348,7 +4293,7 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
 
         assert!(report.checks.iter().any(|check| {
             check.name == "supervisor-plan"
-                && check.status == ActivationReadinessStatus::Warn
+                && check.status == ActivationReadinessStatus::Fail
                 && check
                     .detail
                     .contains("reconcile-managed supervisor has no desired-service inventory")
@@ -3358,7 +4303,7 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
     }
 
     #[test]
-    fn readiness_warns_when_reconcile_managed_inventory_omits_configured_service() {
+    fn keeper_readiness_fails_when_reconcile_managed_inventory_omits_configured_service() {
         let root =
             temp_root("readiness_warns_when_reconcile_managed_inventory_omits_configured_service");
         let harness_home = root.join(".agent-harness");
@@ -3398,7 +4343,7 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
 
         assert!(report.checks.iter().any(|check| {
             check.name == "supervisor-plan"
-                && check.status == ActivationReadinessStatus::Warn
+                && check.status == ActivationReadinessStatus::Fail
                 && check
                     .detail
                     .contains("missing configured desired service(s): discord-gateway-loop")
@@ -3408,7 +4353,7 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
     }
 
     #[test]
-    fn readiness_uses_reconcile_mode_when_manage_all_loops_true_and_supervisor_disabled() {
+    fn keeper_readiness_uses_reconcile_mode_when_manage_all_loops_true_and_supervisor_disabled() {
         let root = temp_root(
             "readiness_uses_reconcile_mode_when_manage_all_loops_true_and_supervisor_disabled",
         );
@@ -3443,7 +4388,7 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
     }
 
     #[test]
-    fn readiness_matches_reconcile_config_overrides_and_service_kinds() {
+    fn keeper_readiness_matches_reconcile_config_overrides_and_service_kinds() {
         let root = temp_root("readiness_matches_reconcile_config_overrides_and_service_kinds");
         let harness_home = root.join(".agent-harness");
         let services_dir = harness_home
@@ -3514,7 +4459,7 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
     }
 
     #[test]
-    fn readiness_fails_closed_for_invalid_reconcile_service_records() {
+    fn keeper_readiness_fails_closed_for_invalid_reconcile_service_records() {
         for case in [
             "wrong-kind",
             "missing-kind",
@@ -3569,7 +4514,7 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
             assert!(
                 report.checks.iter().any(|check| {
                     check.name == "supervisor-plan"
-                        && check.status == ActivationReadinessStatus::Warn
+                        && check.status == ActivationReadinessStatus::Fail
                         && check.detail.contains("inventory is not ready")
                 }),
                 "case {case} must fail closed: {:?}",
