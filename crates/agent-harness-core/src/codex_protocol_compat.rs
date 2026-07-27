@@ -8,8 +8,8 @@ use crate::REQUIRED_CODEX_BACKEND_VERSION;
 
 pub const CODEX_PROTOCOL_COMPATIBILITY_SCHEMA: &str =
     "agent-harness.codex-protocol-compatibility.v1";
-const CODEX_0_144_5_FIXTURE: &str =
-    include_str!("../tests/fixtures/round20/codex-0.144.5-protocol.json");
+const CODEX_0_145_0_FIXTURE: &str =
+    include_str!("../tests/fixtures/codex-protocol/codex-0.145.0-protocol.json");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,10 +22,11 @@ pub struct CodexProtocolCompatibilityReportV1 {
     pub server_request_count: usize,
     pub observed_model_context_window: u64,
     pub compact_resume_race_owned_by_harness: bool,
+    pub required_mcp_status_verified: bool,
 }
 
-pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolCompatibilityReportV1> {
-    let fixture: Value = serde_json::from_str(CODEX_0_144_5_FIXTURE).map_err(io::Error::other)?;
+pub fn validate_codex_0_145_0_protocol_fixture() -> io::Result<CodexProtocolCompatibilityReportV1> {
+    let fixture: Value = serde_json::from_str(CODEX_0_145_0_FIXTURE).map_err(io::Error::other)?;
     require_string(&fixture, "/schema", CODEX_PROTOCOL_COMPATIBILITY_SCHEMA)?;
     require_string(&fixture, "/codexVersion", REQUIRED_CODEX_BACKEND_VERSION)?;
     let requests = require_array(&fixture, "/requests")?;
@@ -54,10 +55,11 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
         "model/list",
         "config/read",
         "modelProvider/capabilities/read",
+        "mcpServerStatus/list",
     ] {
         if !request_methods.contains(method) {
             return Err(io::Error::other(format!(
-                "0.144.5 fixture is missing request method {method}"
+                "0.145.0 fixture is missing request method {method}"
             )));
         }
     }
@@ -65,7 +67,7 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
     let initialize = responses
         .iter()
         .find(|value| value.get("id").and_then(Value::as_i64) == Some(0))
-        .ok_or_else(|| io::Error::other("0.144.5 fixture has no initialize response"))?;
+        .ok_or_else(|| io::Error::other("0.145.0 fixture has no initialize response"))?;
     if !initialize
         .pointer("/result/userAgent")
         .and_then(Value::as_str)
@@ -82,7 +84,7 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
     let account_read = responses
         .iter()
         .find(|value| value.get("id").and_then(Value::as_i64) == Some(7))
-        .ok_or_else(|| io::Error::other("0.144.5 fixture has no account/read response"))?;
+        .ok_or_else(|| io::Error::other("0.145.0 fixture has no account/read response"))?;
     if account_read.pointer("/result/account") != Some(&Value::Null)
         || account_read
             .pointer("/result/requiresOpenaiAuth")
@@ -97,7 +99,7 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
         .iter()
         .find(|value| value.get("id").and_then(Value::as_i64) == Some(15))
         .ok_or_else(|| {
-            io::Error::other("0.144.5 fixture has no model provider capability response")
+            io::Error::other("0.145.0 fixture has no model provider capability response")
         })?;
     if provider_capability
         .pointer("/result/webSearch")
@@ -108,13 +110,36 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
             "model provider capability fixture omitted webSearch=true",
         ));
     }
+    let mcp_status = responses
+        .iter()
+        .find(|value| value.get("id").and_then(Value::as_i64) == Some(16))
+        .ok_or_else(|| io::Error::other("0.145.0 fixture has no MCP status response"))?;
+    let required_mcp_status_verified = mcp_status.pointer("/result/nextCursor")
+        == Some(&Value::Null)
+        && mcp_status
+            .pointer("/result/data/0/name")
+            .and_then(Value::as_str)
+            == Some("generic-mock")
+        && mcp_status
+            .pointer("/result/data/0/tools/echo/inputSchema/type")
+            .and_then(Value::as_str)
+            == Some("object")
+        && mcp_status
+            .pointer("/result/data/0/tools/echo/outputSchema/type")
+            .and_then(Value::as_str)
+            == Some("object");
+    if !required_mcp_status_verified {
+        return Err(io::Error::other(
+            "MCP status fixture omitted the bounded page or exact tool schemas",
+        ));
+    }
 
     let usage_event = notifications
         .iter()
         .find(|value| {
             value.get("method").and_then(Value::as_str) == Some("thread/tokenUsage/updated")
         })
-        .ok_or_else(|| io::Error::other("0.144.5 fixture has no token-usage notification"))?;
+        .ok_or_else(|| io::Error::other("0.145.0 fixture has no token-usage notification"))?;
     let observed_model_context_window = model_context_window_from_protocol_event(usage_event)
         .ok_or_else(|| io::Error::other("modelContextWindow was lost from token-usage fixture"))?;
     if observed_model_context_window != 258_400 {
@@ -135,7 +160,7 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
             .any(|value| value.get("method").and_then(Value::as_str) == Some(method))
         {
             return Err(io::Error::other(format!(
-                "0.144.5 fixture is missing notification method {method}"
+                "0.145.0 fixture is missing notification method {method}"
             )));
         }
     }
@@ -143,14 +168,14 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
         value.pointer("/params/item/type").and_then(Value::as_str) == Some("webSearch")
     });
     if web_item.is_none() {
-        return Err(io::Error::other("0.144.5 fixture has no webSearch item"));
+        return Err(io::Error::other("0.145.0 fixture has no webSearch item"));
     }
     let elicitation = server_requests
         .iter()
         .find(|value| {
             value.get("method").and_then(Value::as_str) == Some("mcpServer/elicitation/request")
         })
-        .ok_or_else(|| io::Error::other("0.144.5 fixture has no MCP elicitation request"))?;
+        .ok_or_else(|| io::Error::other("0.145.0 fixture has no MCP elicitation request"))?;
     if elicitation
         .pointer("/params/serverName")
         .and_then(Value::as_str)
@@ -182,8 +207,22 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
                 })
     }) {
         return Err(io::Error::other(
-            "0.144.5 fixture has no waitingOnApproval status notification",
+            "0.145.0 fixture has no waitingOnApproval status notification",
         ));
+    }
+    let startup_statuses = notifications
+        .iter()
+        .filter(|value| {
+            value.get("method").and_then(Value::as_str) == Some("mcpServer/startupStatus/updated")
+        })
+        .filter_map(|value| value.pointer("/params/status").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    for status in ["ready", "failed", "cancelled"] {
+        if !startup_statuses.contains(status) {
+            return Err(io::Error::other(format!(
+                "0.145.0 fixture is missing MCP startup status {status}"
+            )));
+        }
     }
 
     let compact_resume_race_owned_by_harness = fixture
@@ -200,11 +239,11 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
         ));
     }
 
-    if CODEX_0_144_5_FIXTURE.contains("sk-")
-        || CODEX_0_144_5_FIXTURE.contains("accessToken")
-        || CODEX_0_144_5_FIXTURE.contains("authUrl")
-        || CODEX_0_144_5_FIXTURE.contains("verificationUrl")
-        || CODEX_0_144_5_FIXTURE.contains("discord")
+    if CODEX_0_145_0_FIXTURE.contains("sk-")
+        || CODEX_0_145_0_FIXTURE.contains("accessToken")
+        || CODEX_0_145_0_FIXTURE.contains("authUrl")
+        || CODEX_0_145_0_FIXTURE.contains("verificationUrl")
+        || CODEX_0_145_0_FIXTURE.contains("discord")
     {
         return Err(io::Error::other(
             "protocol compatibility fixture contains forbidden credential/private material",
@@ -220,6 +259,7 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
         server_request_count: server_requests.len(),
         observed_model_context_window,
         compact_resume_race_owned_by_harness,
+        required_mcp_status_verified,
     })
 }
 
@@ -263,14 +303,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_0_144_5_protocol_fixture_covers_cross_cutting_contracts() {
-        let report = validate_codex_0_144_5_protocol_fixture().unwrap();
-        assert_eq!(report.codex_version, "0.144.5");
+    fn exact_0_145_0_protocol_fixture_covers_cross_cutting_contracts() {
+        let report = validate_codex_0_145_0_protocol_fixture().unwrap();
+        assert_eq!(report.codex_version, "0.145.0");
         assert_eq!(report.observed_model_context_window, 258_400);
         assert!(report.compact_resume_race_owned_by_harness);
-        assert!(report.request_count >= 16);
-        assert!(report.response_count >= 11);
-        assert!(report.notification_count >= 6);
+        assert!(report.required_mcp_status_verified);
+        assert!(report.request_count >= 17);
+        assert!(report.response_count >= 12);
+        assert!(report.notification_count >= 10);
         assert!(report.server_request_count >= 1);
     }
 

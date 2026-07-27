@@ -174,6 +174,7 @@ pub struct CronRun {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CronRunSummary {
+    pub scan_complete: bool,
     pub total: usize,
     pub active: usize,
     pub terminal: usize,
@@ -206,6 +207,18 @@ pub fn cron_run_id(
         normalize_key_part(entry_id),
         scheduled_for_ms
     )
+}
+
+pub(crate) fn cron_run_worker_idempotency_key(run: &CronRun) -> String {
+    let base = format!(
+        "cron-scheduler:{}:{}:{}:{}",
+        run.source_kind, run.source_id, run.entry_id, run.scheduled_for_ms
+    );
+    if run.attempt > 0 {
+        format!("{base}:attempt:{}", run.attempt)
+    } else {
+        base
+    }
 }
 
 pub fn cron_runs_db_file(harness_home: impl AsRef<Path>) -> PathBuf {
@@ -284,61 +297,121 @@ pub fn get_cron_run_by_slot(
     find_run_by_slot(&conn, source_kind, source_id, entry_id, scheduled_for_ms)
 }
 
+pub(crate) fn get_cron_run_by_id(
+    harness_home: impl AsRef<Path>,
+    run_id: &str,
+) -> io::Result<Option<CronRun>> {
+    let db_file = init_cron_run_store(harness_home)?;
+    let conn = Connection::open(db_file).map_err(io::Error::other)?;
+    find_run_by_id(&conn, run_id)
+}
+
 pub fn mark_cron_run_worker_enqueued(
     harness_home: impl AsRef<Path>,
     run_id: &str,
+    expected_attempt: i64,
     worker_job_id: &str,
     now_ms: i64,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let db_file = init_cron_run_store(harness_home)?;
     let conn = Connection::open(db_file).map_err(io::Error::other)?;
-    conn.execute(
-        "UPDATE cron_runs SET status=?1, worker_job_id=?2, updated_at_ms=?3 WHERE run_id=?4 AND status NOT IN ('succeeded','failed-terminal','canceled','expired','skipped','quarantined')",
-        params![CronRunStatus::WorkerEnqueued.as_str(), worker_job_id, now_ms, run_id],
+    let rows = conn
+        .execute(
+            "UPDATE cron_runs
+         SET status=?1, worker_job_id=?2, updated_at_ms=?3
+         WHERE run_id=?4
+           AND attempt=?5
+           AND (
+             (status IN ('admitted','retry-pending') AND worker_job_id IS NULL)
+             OR (status='worker-enqueued' AND worker_job_id=?2)
+           )",
+            params![
+                CronRunStatus::WorkerEnqueued.as_str(),
+                worker_job_id,
+                now_ms,
+                run_id,
+                expected_attempt
+            ],
+        )
+        .map_err(io::Error::other)?;
+    Ok(rows == 1)
+}
+
+pub(crate) fn cron_run_has_exact_worker_link(
+    harness_home: impl AsRef<Path>,
+    run_id: &str,
+    expected_attempt: i64,
+    worker_job_id: &str,
+) -> io::Result<bool> {
+    let db_file = init_cron_run_store(harness_home)?;
+    let conn = Connection::open(db_file).map_err(io::Error::other)?;
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM cron_runs
+           WHERE run_id=?1 AND attempt=?2 AND worker_job_id=?3
+         )",
+        params![run_id, expected_attempt, worker_job_id],
+        |row| row.get::<_, bool>(0),
     )
-    .map_err(io::Error::other)?;
-    Ok(())
+    .map_err(io::Error::other)
 }
 
 pub fn mark_cron_run_runtime_enqueued(
     harness_home: impl AsRef<Path>,
     run_id: &str,
+    expected_attempt: i64,
+    worker_job_id: &str,
     runtime_queue_id: &str,
     now_ms: i64,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let db_file = init_cron_run_store(harness_home)?;
     let conn = Connection::open(db_file).map_err(io::Error::other)?;
-    conn.execute(
-        "UPDATE cron_runs SET status=?1, runtime_queue_id=?2, updated_at_ms=?3 WHERE run_id=?4 AND status NOT IN ('succeeded','failed-terminal','canceled','expired','skipped','quarantined')",
-        params![
-            CronRunStatus::RuntimeEnqueued.as_str(),
-            runtime_queue_id,
-            now_ms,
-            run_id
-        ],
-    )
-    .map_err(io::Error::other)?;
-    Ok(())
+    let rows = conn
+        .execute(
+            "UPDATE cron_runs
+         SET status=?1, runtime_queue_id=?2, updated_at_ms=?3
+         WHERE run_id=?4
+           AND attempt=?5
+           AND worker_job_id=?6
+           AND status IN ('worker-enqueued','runtime-enqueued','runtime-running','retry-pending')",
+            params![
+                CronRunStatus::RuntimeEnqueued.as_str(),
+                runtime_queue_id,
+                now_ms,
+                run_id,
+                expected_attempt,
+                worker_job_id,
+            ],
+        )
+        .map_err(io::Error::other)?;
+    Ok(rows == 1)
 }
 
 pub fn mark_cron_run_worker_status(
     harness_home: impl AsRef<Path>,
     run_id: &str,
+    expected_attempt: i64,
+    worker_job_id: &str,
     worker_status: &str,
     reason: &str,
     now_ms: i64,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let Some(status) = cron_status_from_worker_status(worker_status) else {
-        return Ok(());
+        return Ok(false);
     };
     let db_file = init_cron_run_store(harness_home)?;
     let conn = Connection::open(&db_file).map_err(io::Error::other)?;
     let Some(run) = find_run_by_id(&conn, run_id)? else {
-        return Ok(());
+        return Ok(false);
     };
     let terminal = !status.is_active();
-    conn.execute(
-        "UPDATE cron_runs SET status=?1, failure_reason=?2, finished_at_ms=?3, updated_at_ms=?4 WHERE run_id=?5 AND status NOT IN ('succeeded','failed-terminal','canceled','expired','skipped','quarantined')",
+    let rows = conn.execute(
+        "UPDATE cron_runs
+         SET status=?1, failure_reason=?2, finished_at_ms=?3, updated_at_ms=?4
+         WHERE run_id=?5
+           AND attempt=?6
+           AND worker_job_id=?7
+           AND status NOT IN ('succeeded','failed-terminal','canceled','expired','skipped','quarantined','admission-blocked')",
         params![
             status.as_str(),
             if status == CronRunStatus::WorkerEnqueued {
@@ -349,13 +422,134 @@ pub fn mark_cron_run_worker_status(
             terminal.then_some(now_ms),
             now_ms,
             run_id,
+            expected_attempt,
+            worker_job_id,
         ],
     )
     .map_err(io::Error::other)?;
-    if status == CronRunStatus::FailedTerminal {
+    if rows == 1 && status == CronRunStatus::FailedTerminal {
         maybe_quarantine_after_failure(&conn, &run.agent_id, &run.entry_id, reason, now_ms)?;
     }
-    Ok(())
+    Ok(rows == 1)
+}
+
+pub(crate) fn stale_unlinked_admitted_cron_runs(
+    harness_home: impl AsRef<Path>,
+    updated_before_ms: i64,
+) -> io::Result<Vec<CronRun>> {
+    let db_file = init_cron_run_store(harness_home)?;
+    let conn = Connection::open(db_file).map_err(io::Error::other)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT * FROM cron_runs
+             WHERE status='admitted'
+               AND worker_job_id IS NULL
+               AND updated_at_ms <= ?1
+             ORDER BY updated_at_ms ASC, run_id ASC",
+        )
+        .map_err(io::Error::other)?;
+    let rows = stmt
+        .query_map(params![updated_before_ms], row_to_cron_run)
+        .map_err(io::Error::other)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)
+}
+
+pub(crate) fn expire_unlinked_admitted_cron_run(
+    harness_home: impl AsRef<Path>,
+    run_id: &str,
+    expected_attempt: i64,
+    updated_before_ms: i64,
+    reason: &str,
+    now_ms: i64,
+) -> io::Result<bool> {
+    let db_file = init_cron_run_store(harness_home)?;
+    let conn = Connection::open(db_file).map_err(io::Error::other)?;
+    let rows = conn
+        .execute(
+            "UPDATE cron_runs
+             SET status=?1, failure_reason=?2, finished_at_ms=?3, updated_at_ms=?3
+             WHERE run_id=?4
+               AND attempt=?5
+               AND status='admitted'
+               AND worker_job_id IS NULL
+               AND updated_at_ms <= ?6",
+            params![
+                CronRunStatus::Expired.as_str(),
+                reason,
+                now_ms,
+                run_id,
+                expected_attempt,
+                updated_before_ms,
+            ],
+        )
+        .map_err(io::Error::other)?;
+    Ok(rows == 1)
+}
+
+pub(crate) fn block_unlinked_admitted_cron_run(
+    harness_home: impl AsRef<Path>,
+    run_id: &str,
+    expected_attempt: i64,
+    updated_before_ms: i64,
+    reason: &str,
+    now_ms: i64,
+) -> io::Result<bool> {
+    let db_file = init_cron_run_store(harness_home)?;
+    let conn = Connection::open(db_file).map_err(io::Error::other)?;
+    let rows = conn
+        .execute(
+            "UPDATE cron_runs
+             SET status=?1, failure_reason=?2, finished_at_ms=?3, updated_at_ms=?3,
+                 quarantined=1
+             WHERE run_id=?4
+               AND attempt=?5
+               AND status='admitted'
+               AND worker_job_id IS NULL
+               AND updated_at_ms <= ?6",
+            params![
+                CronRunStatus::AdmissionBlocked.as_str(),
+                reason,
+                now_ms,
+                run_id,
+                expected_attempt,
+                updated_before_ms,
+            ],
+        )
+        .map_err(io::Error::other)?;
+    Ok(rows == 1)
+}
+
+pub(crate) fn block_linked_cron_run_identity(
+    harness_home: impl AsRef<Path>,
+    run_id: &str,
+    expected_attempt: i64,
+    worker_job_id: &str,
+    reason: &str,
+    now_ms: i64,
+) -> io::Result<bool> {
+    let db_file = init_cron_run_store(harness_home)?;
+    let conn = Connection::open(db_file).map_err(io::Error::other)?;
+    let rows = conn
+        .execute(
+            "UPDATE cron_runs
+             SET status=?1, failure_reason=?2, finished_at_ms=?3, updated_at_ms=?3,
+                 quarantined=1
+             WHERE run_id=?4
+               AND attempt=?5
+               AND worker_job_id=?6
+               AND status IN ('admitted','worker-enqueued','runtime-enqueued','runtime-running','retry-pending')",
+            params![
+                CronRunStatus::AdmissionBlocked.as_str(),
+                reason,
+                now_ms,
+                run_id,
+                expected_attempt,
+                worker_job_id,
+            ],
+        )
+        .map_err(io::Error::other)?;
+    Ok(rows == 1)
 }
 
 pub fn mark_cron_run_runtime_status_by_queue_id(
@@ -373,7 +567,7 @@ pub fn mark_cron_run_runtime_status_by_queue_id(
     let status = cron_status_from_runtime_status(run_once_status);
     let terminal = !status.is_active();
     conn.execute(
-        "UPDATE cron_runs SET status=?1, failure_reason=?2, finished_at_ms=?3, updated_at_ms=?4 WHERE run_id=?5 AND runtime_queue_id=?6 AND status NOT IN ('succeeded','failed-terminal','canceled','expired','skipped','quarantined')",
+        "UPDATE cron_runs SET status=?1, failure_reason=?2, finished_at_ms=?3, updated_at_ms=?4 WHERE run_id=?5 AND runtime_queue_id=?6 AND status NOT IN ('succeeded','failed-terminal','canceled','expired','skipped','quarantined','admission-blocked')",
         params![
             status.as_str(),
             if status == CronRunStatus::Succeeded {
@@ -456,19 +650,20 @@ pub fn cron_run_worker_dispatch_blocker(
     if let Some(blocker) = cron_run_control_blocker(&conn, &run)? {
         return Ok(Some(blocker));
     }
-    if let Some(linked_job_id) = run.worker_job_id.as_deref()
-        && linked_job_id != worker_job_id
-    {
-        return Ok(Some(format!(
-            "cron run `{}` is linked to worker job `{linked_job_id}`, not `{worker_job_id}`",
-            run.run_id
-        )));
-    }
-    if run.status == CronRunStatus::RetryPending && run.worker_job_id.is_none() {
-        return Ok(Some(format!(
-            "cron run `{}` is pending scheduler retry and is not linked to worker job `{worker_job_id}`",
-            run.run_id
-        )));
+    match run.worker_job_id.as_deref() {
+        Some(linked_job_id) if linked_job_id == worker_job_id => {}
+        Some(linked_job_id) => {
+            return Ok(Some(format!(
+                "cron run `{}` is linked to worker job `{linked_job_id}`, not `{worker_job_id}`",
+                run.run_id
+            )));
+        }
+        None => {
+            return Ok(Some(format!(
+                "cron run `{}` is not durably linked to worker job `{worker_job_id}`",
+                run.run_id
+            )));
+        }
     }
     Ok(None)
 }
@@ -560,13 +755,36 @@ pub fn list_cron_runs(options: CronRunListOptions) -> io::Result<CronRunListRepo
 }
 
 pub fn collect_cron_run_summary(harness_home: impl AsRef<Path>) -> io::Result<CronRunListReport> {
-    list_cron_runs(CronRunListOptions {
+    let mut report = list_cron_runs(CronRunListOptions {
         harness_home: harness_home.as_ref().to_path_buf(),
         agent_id: None,
         entry_id: None,
         status: None,
         limit: 200,
-    })
+    })?;
+    let conn = Connection::open(&report.database).map_err(io::Error::other)?;
+    report.summary = summarize_complete_cron_store(&conn)?;
+    Ok(report)
+}
+
+pub(crate) fn active_worker_linked_cron_runs(
+    harness_home: impl AsRef<Path>,
+) -> io::Result<Vec<CronRun>> {
+    let db_file = init_cron_run_store(harness_home)?;
+    let conn = Connection::open(&db_file).map_err(io::Error::other)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT * FROM cron_runs
+             WHERE status IN ('admitted','worker-enqueued','runtime-enqueued','runtime-running','retry-pending')
+               AND worker_job_id IS NOT NULL
+             ORDER BY updated_at_ms ASC, run_id ASC",
+        )
+        .map_err(io::Error::other)?;
+    let rows = stmt
+        .query_map([], row_to_cron_run)
+        .map_err(io::Error::other)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)
 }
 
 pub fn control_cron_run(options: CronRunControlOptions) -> io::Result<CronRunControlReport> {
@@ -588,13 +806,67 @@ pub fn control_cron_run(options: CronRunControlOptions) -> io::Result<CronRunCon
         }
         CronRunControlAction::Retry => {
             if let Some(run_id) = options.run_id.as_deref() {
+                let Some(run) = find_run_by_id(&conn, run_id)? else {
+                    warnings.push(format!("retry run `{run_id}` was not found"));
+                    return Ok(CronRunControlReport {
+                        schema: CRON_RUN_STORE_SCHEMA,
+                        harness_home: options.harness_home,
+                        database: db_file,
+                        action: options.action,
+                        affected: 0,
+                        reason: options.reason.clone(),
+                        warnings,
+                    });
+                };
+                if let Some(worker_job_id) = run.worker_job_id.as_deref() {
+                    match crate::workers::worker_job_is_active(
+                        &options.harness_home,
+                        worker_job_id,
+                    )? {
+                        Some(true) => {
+                            warnings.push(format!(
+                                "retry rejected because linked worker job `{worker_job_id}` is still active"
+                            ));
+                            return Ok(CronRunControlReport {
+                                schema: CRON_RUN_STORE_SCHEMA,
+                                harness_home: options.harness_home,
+                                database: db_file,
+                                action: options.action,
+                                affected: 0,
+                                reason: options.reason.clone(),
+                                warnings,
+                            });
+                        }
+                        None => {
+                            warnings.push(format!(
+                                "retry rejected because linked worker job `{worker_job_id}` could not be verified"
+                            ));
+                            return Ok(CronRunControlReport {
+                                schema: CRON_RUN_STORE_SCHEMA,
+                                harness_home: options.harness_home,
+                                database: db_file,
+                                action: options.action,
+                                affected: 0,
+                                reason: options.reason.clone(),
+                                warnings,
+                            });
+                        }
+                        Some(false) => {}
+                    }
+                }
                 conn.execute(
-                    "UPDATE cron_runs SET status=?1, runtime_queue_id=NULL, worker_job_id=NULL, started_at_ms=NULL, lease_expires_at_ms=NULL, finished_at_ms=NULL, failure_reason=?2, attempt=attempt+1, updated_at_ms=?3 WHERE run_id=?4",
+                    "UPDATE cron_runs
+                     SET status=?1, runtime_queue_id=NULL, worker_job_id=NULL,
+                         started_at_ms=NULL, lease_expires_at_ms=NULL,
+                         finished_at_ms=NULL, failure_reason=?2,
+                         attempt=attempt+1, updated_at_ms=?3
+                     WHERE run_id=?4 AND attempt=?5",
                     params![
                         CronRunStatus::RetryPending.as_str(),
                         options.reason,
                         options.now_ms,
-                        run_id
+                        run_id,
+                        run.attempt,
                     ],
                 )
                 .map_err(io::Error::other)?
@@ -787,6 +1059,47 @@ fn summarize_cron_runs(runs: &[CronRun]) -> CronRunSummary {
         }
     }
     summary
+}
+
+fn summarize_complete_cron_store(conn: &Connection) -> io::Result<CronRunSummary> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT status, agent_id, quarantined, COUNT(*)
+             FROM cron_runs
+             GROUP BY status, agent_id, quarantined",
+        )
+        .map_err(io::Error::other)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(io::Error::other)?;
+    let mut summary = CronRunSummary {
+        scan_complete: true,
+        ..CronRunSummary::default()
+    };
+    for row in rows {
+        let (status_raw, agent_id, quarantined, count_raw) = row.map_err(io::Error::other)?;
+        let count = usize::try_from(count_raw).map_err(io::Error::other)?;
+        let status = CronRunStatus::from_str_lossy(&status_raw);
+        summary.total = summary.total.saturating_add(count);
+        *summary.by_status.entry(status_raw).or_insert(0) += count;
+        if status.is_active() {
+            summary.active = summary.active.saturating_add(count);
+            *summary.by_agent_active.entry(agent_id).or_insert(0) += count;
+        } else {
+            summary.terminal = summary.terminal.saturating_add(count);
+        }
+        if quarantined || status == CronRunStatus::Quarantined {
+            summary.quarantined = summary.quarantined.saturating_add(count);
+        }
+    }
+    Ok(summary)
 }
 
 fn cron_run_control_blocker(conn: &Connection, run: &CronRun) -> io::Result<Option<String>> {
@@ -1023,8 +1336,27 @@ mod tests {
         .unwrap();
         assert_eq!(first.run_id, second.run_id);
 
-        mark_cron_run_worker_enqueued(&harness_home, &first.run_id, "worker-1", 3001).unwrap();
-        mark_cron_run_runtime_enqueued(&harness_home, &first.run_id, "runtime-1", 3002).unwrap();
+        assert!(
+            mark_cron_run_worker_enqueued(
+                &harness_home,
+                &first.run_id,
+                first.attempt,
+                "worker-1",
+                3001,
+            )
+            .unwrap()
+        );
+        assert!(
+            mark_cron_run_runtime_enqueued(
+                &harness_home,
+                &first.run_id,
+                first.attempt,
+                "worker-1",
+                "runtime-1",
+                3002,
+            )
+            .unwrap()
+        );
         mark_cron_run_runtime_status_by_queue_id(
             &harness_home,
             "runtime-1",
@@ -1059,8 +1391,28 @@ mod tests {
             })
             .unwrap();
             let queue_id = format!("runtime-{slot}");
-            mark_cron_run_runtime_enqueued(&harness_home, &run.run_id, &queue_id, 3000 + slot)
-                .unwrap();
+            let worker_job_id = format!("worker-{slot}");
+            assert!(
+                mark_cron_run_worker_enqueued(
+                    &harness_home,
+                    &run.run_id,
+                    run.attempt,
+                    &worker_job_id,
+                    2500 + slot,
+                )
+                .unwrap()
+            );
+            assert!(
+                mark_cron_run_runtime_enqueued(
+                    &harness_home,
+                    &run.run_id,
+                    run.attempt,
+                    &worker_job_id,
+                    &queue_id,
+                    3000 + slot,
+                )
+                .unwrap()
+            );
             mark_cron_run_runtime_status_by_queue_id(
                 &harness_home,
                 &queue_id,
@@ -1075,6 +1427,108 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn complete_summary_counts_active_rows_beyond_bounded_page() {
+        let root = temp_root("complete_summary_beyond_page");
+        let harness_home = root.join(".agent-harness");
+        let db_file = init_cron_run_store(&harness_home).unwrap();
+        let mut conn = Connection::open(db_file).unwrap();
+        let transaction = conn.transaction().unwrap();
+        for index in 0..205_i64 {
+            let status = if index == 0 { "admitted" } else { "succeeded" };
+            transaction
+                .execute(
+                    "INSERT INTO cron_runs (
+                        run_id, source_kind, source_id, entry_id, agent_id,
+                        scheduled_for_ms, runtime_class, session_key, session_policy,
+                        status, attempt, max_attempts, created_at_ms, updated_at_ms,
+                        quarantined
+                     ) VALUES (?1, 'native-cron', 'source', ?2, 'main', ?3, 'cron',
+                        ?4, 'one-shot', ?5, 0, 3, ?6, ?6, 0)",
+                    params![
+                        format!("run-{index}"),
+                        format!("entry-{index}"),
+                        1_000 + index,
+                        format!("cron:main:entry-{index}:{}", 1_000 + index),
+                        status,
+                        2_000 + index,
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(conn);
+
+        let report = collect_cron_run_summary(&harness_home).unwrap();
+        assert_eq!(report.runs.len(), 200);
+        assert!(report.summary.scan_complete);
+        assert_eq!(report.summary.total, 205);
+        assert_eq!(report.summary.active, 1);
+        assert_eq!(report.summary.terminal, 204);
+        assert_eq!(report.summary.by_status.get("admitted"), Some(&1));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_link_and_settlement_are_fenced_by_attempt_and_worker() {
+        let root = temp_root("worker_link_attempt_fence");
+        let harness_home = root.join(".agent-harness");
+        let run = admit_cron_run(CronRunAdmitOptions {
+            harness_home: harness_home.clone(),
+            source_kind: "native-cron".to_string(),
+            source_id: "source".to_string(),
+            entry_id: "daily".to_string(),
+            agent_id: "main".to_string(),
+            scheduled_for_ms: 1_234,
+            runtime_class: "cron".to_string(),
+            session_key: "cron:main:daily:1234".to_string(),
+            session_policy: "one-shot".to_string(),
+            max_attempts: 3,
+            now_ms: 2_000,
+        })
+        .unwrap();
+        assert!(
+            mark_cron_run_worker_enqueued(&harness_home, &run.run_id, 0, "worker-old", 2_001,)
+                .unwrap()
+        );
+        assert!(
+            !mark_cron_run_worker_enqueued(&harness_home, &run.run_id, 0, "worker-racer", 2_002,)
+                .unwrap()
+        );
+
+        let conn = Connection::open(cron_runs_db_file(&harness_home)).unwrap();
+        conn.execute(
+            "UPDATE cron_runs SET status='retry-pending', attempt=1, worker_job_id=NULL
+             WHERE run_id=?1 AND attempt=0 AND worker_job_id='worker-old'",
+            params![run.run_id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            mark_cron_run_worker_enqueued(&harness_home, &run.run_id, 1, "worker-new", 2_003,)
+                .unwrap()
+        );
+        assert!(
+            !mark_cron_run_worker_status(
+                &harness_home,
+                &run.run_id,
+                0,
+                "worker-old",
+                "failed-terminal",
+                "late old result",
+                2_004,
+            )
+            .unwrap()
+        );
+        let current = get_cron_run_by_id(&harness_home, &run.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.attempt, 1);
+        assert_eq!(current.worker_job_id.as_deref(), Some("worker-new"));
+        assert_eq!(current.status, CronRunStatus::WorkerEnqueued);
         let _ = fs::remove_dir_all(root);
     }
 }

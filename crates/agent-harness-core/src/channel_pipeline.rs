@@ -7,8 +7,8 @@ use crate::{
     AgentSource, ChannelOutboxPlanOptions, ChannelOutboxPlanReport, ChannelReceiveOptions,
     ChannelReceiveReport, ChannelReceiveStatus, HarnessLogEvent, HarnessLogLevel,
     InboundMediaArtifact, PromptAssemblyOptions, RuntimeRunOnceOptions, RuntimeRunOnceReport,
-    append_harness_log, build_runtime_skill_index, current_log_time_ms, plan_channel_outbox,
-    receive_channel_message, run_runtime_queue_once,
+    append_harness_log, build_runtime_skill_index, command_skill_index, current_log_time_ms,
+    parse_channel_command, plan_channel_outbox, receive_channel_message, run_runtime_queue_once,
 };
 
 const CHANNEL_RUN_ONCE_SCHEMA: &str = "agent-harness.channel-run-once.v1";
@@ -63,7 +63,11 @@ pub enum ChannelRunOnceStatus {
 }
 
 pub fn run_channel_once(options: ChannelRunOnceOptions) -> io::Result<ChannelRunOnceReport> {
-    let skill_index = build_runtime_skill_index(&options.source, &options.harness_home)?;
+    let skill_index = if parse_channel_command(&options.message).is_some() {
+        command_skill_index(&options.source, &options.harness_home)
+    } else {
+        build_runtime_skill_index(&options.source, &options.harness_home)?
+    };
     let receive = receive_channel_message(ChannelReceiveOptions {
         source: options.source,
         runtime_workspace: options.runtime_workspace,
@@ -208,6 +212,50 @@ mod tests {
     #[test]
     fn unknown_slash_command_structured_receipt_no_model_turn() {
         c1_unknown_slash_command_structured_receipt_no_model_turn();
+    }
+
+    #[test]
+    fn status_run_once_bypasses_runtime_skill_index_before_ingress() {
+        let root = temp_root("status_run_once_bypasses_runtime_skill_index_before_ingress");
+        let source = write_channel_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let failpoint = harness_home
+            .join("state")
+            .join("test-failpoints")
+            .join("runtime-skill-index");
+        fs::create_dir_all(failpoint.parent().unwrap()).unwrap();
+        fs::write(&failpoint, b"fail").unwrap();
+
+        let report = run_channel_once(ChannelRunOnceOptions {
+            source,
+            runtime_workspace: None,
+            harness_home,
+            platform: "discord".to_string(),
+            account_id: Some("default".to_string()),
+            channel_id: "dm-1".to_string(),
+            user_id: "user-1".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "/status".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some("discord-message".to_string()),
+            inbound_event_id: Some("status-fast-path".to_string()),
+            skill_limit: 3,
+            now_ms: 1234,
+            codex_executable: None,
+            timeout_ms: 5_000,
+            idle_timeout_ms: 5_000,
+            prompt_options: PromptAssemblyOptions::default(),
+            outbox_limit: 10,
+            run_runtime: true,
+        })
+        .unwrap();
+
+        assert_command_handled_without_model_turn(&report);
+        assert_eq!(report.receive.command_name.as_deref(), Some("status"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

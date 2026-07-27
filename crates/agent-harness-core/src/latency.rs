@@ -13,6 +13,7 @@ use crate::logging::current_log_time_ms;
 const LATENCY_RECEIPT_SCHEMA: &str = "agent-harness.runtime-queue-latency.v1";
 const DEFAULT_LATENCY_RECEIPTS_FILE: &str = "latency-receipts.jsonl";
 const LATENCY_INDEX_FILE: &str = "latency-receipts-index.sqlite";
+const LATENCY_INDEX_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -40,6 +41,15 @@ pub enum LatencyStage {
     OutboxWrite,
     DeliveryAttempt,
     DeliveryDone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MonotonicLatencySpan {
+    PromptBundlePreparation,
+    CodexPlanning,
+    CodexExecution,
+    Terminalization,
 }
 
 pub const DEFAULT_LATENCY_STAGE_ORDER: [LatencyStage; 23] = [
@@ -77,6 +87,17 @@ pub struct LatencyReceipt {
     #[serde(rename = "updatedAtMs")]
     pub updated_at_ms: i64,
     pub stages: BTreeMap<LatencyStage, i64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub derived_stage_sources: BTreeMap<LatencyStage, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub monotonic_spans: BTreeMap<MonotonicLatencySpan, MonotonicLatencySpanReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonotonicLatencySpanReceipt {
+    pub duration_ms: u64,
+    pub recorded_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -93,6 +114,7 @@ pub struct LatencySummary {
     pub queue_id: String,
     pub lane: String,
     pub deltas: Vec<LatencyDelta>,
+    pub out_of_order_deltas: Vec<LatencyDelta>,
     pub missing_stages: Vec<LatencyStage>,
     pub total_ms: Option<i64>,
 }
@@ -150,12 +172,64 @@ pub fn record_latency_stage(
     })
 }
 
+pub fn record_monotonic_latency_span(
+    receipts_file: impl AsRef<Path>,
+    queue_id: &str,
+    lane: &str,
+    span: MonotonicLatencySpan,
+    duration: Duration,
+) -> io::Result<LatencyReceipt> {
+    let receipts_file = receipts_file.as_ref();
+    let recorded_at_ms = current_log_time_ms().unwrap_or(0);
+    let duration_ms = duration.as_millis().min(i64::MAX as u128) as i64;
+    let mut connection = open_latency_index_for_write(receipts_file)?;
+    {
+        let transaction = connection.transaction().map_err(io::Error::other)?;
+        transaction
+            .execute(
+                "INSERT INTO latency_queue_receipts (queue_id, lane, updated_at_ms) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(queue_id) DO UPDATE SET \
+                   lane = CASE \
+                     WHEN latency_queue_receipts.lane = '' THEN excluded.lane \
+                     ELSE latency_queue_receipts.lane \
+                   END, \
+                   updated_at_ms = MAX(latency_queue_receipts.updated_at_ms, excluded.updated_at_ms)",
+                params![queue_id, lane, recorded_at_ms],
+            )
+            .map_err(io::Error::other)?;
+        transaction
+            .execute(
+                "INSERT INTO latency_span_receipts \
+                   (queue_id, span, duration_ms, recorded_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(queue_id, span) DO NOTHING",
+                params![
+                    queue_id,
+                    monotonic_latency_span_key(span),
+                    duration_ms,
+                    recorded_at_ms
+                ],
+            )
+            .map_err(io::Error::other)?;
+        transaction.commit().map_err(io::Error::other)?;
+    }
+
+    read_latest_latency_receipt_from_connection(&connection, queue_id)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("latency receipt disappeared for queue `{queue_id}` after span write"),
+        )
+    })
+}
+
 pub fn read_latest_queue_receipt(
     receipts_file: impl AsRef<Path>,
     queue_id: &str,
 ) -> io::Result<Option<LatencyReceipt>> {
     let receipts_file = receipts_file.as_ref();
-    if let Some(receipt) = read_latest_latency_receipt_from_index(receipts_file, queue_id)? {
+    if let Some(mut receipt) = read_latest_latency_receipt_from_index(receipts_file, queue_id)? {
+        enrich_delivery_done_from_durable_receipts(receipts_file, &mut receipt);
         return Ok(Some(receipt));
     }
 
@@ -178,7 +252,47 @@ pub fn read_latest_queue_receipt(
             }
         }
     }
+    if let Some(receipt) = latest.as_mut() {
+        enrich_delivery_done_from_durable_receipts(receipts_file, receipt);
+    }
     Ok(latest)
+}
+
+fn enrich_delivery_done_from_durable_receipts(receipts_file: &Path, receipt: &mut LatencyReceipt) {
+    if receipt.stages.contains_key(&LatencyStage::DeliveryDone) {
+        return;
+    }
+    let Some(harness_home) = latency_harness_home(receipts_file) else {
+        return;
+    };
+    let channel_dir = harness_home.join("state").join("channels");
+    let mut warnings = Vec::new();
+    let Ok(Some(delivered_at_ms)) =
+        crate::channel_delivery_index::latest_delivered_at_ms_for_source_queue(
+            &channel_dir,
+            &receipt.queue_id,
+            &mut warnings,
+        )
+    else {
+        return;
+    };
+    receipt
+        .stages
+        .insert(LatencyStage::DeliveryDone, delivered_at_ms);
+    receipt.derived_stage_sources.insert(
+        LatencyStage::DeliveryDone,
+        "channel-delivery-receipt-index".to_string(),
+    );
+    receipt.updated_at_ms = receipt.updated_at_ms.max(delivered_at_ms);
+}
+
+fn latency_harness_home(receipts_file: &Path) -> Option<&Path> {
+    (receipts_file.file_name()?.to_str()? == DEFAULT_LATENCY_RECEIPTS_FILE).then_some(())?;
+    let runtime_queue = receipts_file.parent()?;
+    (runtime_queue.file_name()?.to_str()? == "runtime-queue").then_some(())?;
+    let state = runtime_queue.parent()?;
+    (state.file_name()?.to_str()? == "state").then_some(())?;
+    state.parent()
 }
 
 fn latency_index_file(receipts_file: &Path) -> PathBuf {
@@ -192,7 +306,7 @@ fn open_latency_index_for_write(receipts_file: &Path) -> io::Result<Connection> 
     }
     let connection = Connection::open(&index_file).map_err(io::Error::other)?;
     connection
-        .busy_timeout(Duration::ZERO)
+        .busy_timeout(LATENCY_INDEX_BUSY_TIMEOUT)
         .map_err(io::Error::other)?;
     connection
         .execute_batch(
@@ -208,7 +322,16 @@ fn open_latency_index_for_write(receipts_file: &Path) -> io::Result<Connection> 
                 PRIMARY KEY(queue_id, stage)\
             );\
             CREATE INDEX IF NOT EXISTS latency_stage_receipts_by_queue \
-                ON latency_stage_receipts(queue_id, stage);",
+                ON latency_stage_receipts(queue_id, stage);\
+            CREATE TABLE IF NOT EXISTS latency_span_receipts (\
+                queue_id TEXT NOT NULL,\
+                span TEXT NOT NULL,\
+                duration_ms INTEGER NOT NULL,\
+                recorded_at_ms INTEGER NOT NULL,\
+                PRIMARY KEY(queue_id, span)\
+            );\
+            CREATE INDEX IF NOT EXISTS latency_span_receipts_by_queue \
+                ON latency_span_receipts(queue_id, span);",
         )
         .map_err(io::Error::other)?;
     Ok(connection)
@@ -266,12 +389,45 @@ fn read_latest_latency_receipt_from_connection(
         }
     }
 
+    let mut monotonic_spans = BTreeMap::new();
+    let mut statement = connection
+        .prepare(
+            "SELECT span, duration_ms, recorded_at_ms FROM latency_span_receipts \
+             WHERE queue_id = ?1 ORDER BY span ASC",
+        )
+        .map_err(io::Error::other)?;
+    let rows = statement
+        .query_map(params![queue_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(io::Error::other)?;
+    for row in rows {
+        let (span, duration_ms, recorded_at_ms) = row.map_err(io::Error::other)?;
+        if let Ok(span) =
+            serde_json::from_value::<MonotonicLatencySpan>(serde_json::Value::String(span))
+        {
+            monotonic_spans.insert(
+                span,
+                MonotonicLatencySpanReceipt {
+                    duration_ms: duration_ms.max(0) as u64,
+                    recorded_at_ms,
+                },
+            );
+        }
+    }
+
     Ok(Some(LatencyReceipt {
         schema: LATENCY_RECEIPT_SCHEMA.to_string(),
         queue_id: queue_id.to_string(),
         lane,
         updated_at_ms,
         stages,
+        derived_stage_sources: BTreeMap::new(),
+        monotonic_spans,
     }))
 }
 
@@ -303,11 +459,21 @@ fn latency_stage_key(stage: LatencyStage) -> &'static str {
     }
 }
 
+fn monotonic_latency_span_key(span: MonotonicLatencySpan) -> &'static str {
+    match span {
+        MonotonicLatencySpan::PromptBundlePreparation => "prompt-bundle-preparation",
+        MonotonicLatencySpan::CodexPlanning => "codex-planning",
+        MonotonicLatencySpan::CodexExecution => "codex-execution",
+        MonotonicLatencySpan::Terminalization => "terminalization",
+    }
+}
+
 pub fn latency_summary(
     receipt: &LatencyReceipt,
     expected_stages: &[LatencyStage],
 ) -> LatencySummary {
     let mut deltas = Vec::new();
+    let mut out_of_order_deltas = Vec::new();
     let mut present = Vec::new();
 
     for stage in expected_stages {
@@ -319,11 +485,16 @@ pub fn latency_summary(
     for window in present.windows(2) {
         let (from_stage, from_ms) = window[0];
         let (to_stage, to_ms) = window[1];
-        deltas.push(LatencyDelta {
+        let delta = LatencyDelta {
             from_stage,
             to_stage,
             delta_ms: to_ms.saturating_sub(from_ms),
-        });
+        };
+        if to_ms >= from_ms {
+            deltas.push(delta);
+        } else {
+            out_of_order_deltas.push(delta);
+        }
     }
 
     let missing_stages = expected_stages
@@ -342,6 +513,7 @@ pub fn latency_summary(
         queue_id: receipt.queue_id.clone(),
         lane: receipt.lane.clone(),
         deltas,
+        out_of_order_deltas,
         missing_stages,
         total_ms,
     }
@@ -500,6 +672,218 @@ mod tests {
             42
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn latency_record_persists_monotonic_span_without_raw_context() {
+        let root = temp_root("latency_record_persists_monotonic_span_without_raw_context");
+        let file = latency_receipts_file(root.join("harness"));
+
+        let receipt = record_monotonic_latency_span(
+            &file,
+            "queue-span",
+            "interactive",
+            MonotonicLatencySpan::PromptBundlePreparation,
+            Duration::from_millis(487),
+        )
+        .unwrap();
+
+        assert_eq!(
+            receipt.monotonic_spans[&MonotonicLatencySpan::PromptBundlePreparation].duration_ms,
+            487
+        );
+        let index_bytes = fs::read(latency_index_file(&file)).unwrap();
+        let index_text = String::from_utf8_lossy(&index_bytes);
+        assert!(!index_text.contains("prompt text"));
+        assert!(!index_text.contains("discord:"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn latency_summary_never_reports_negative_elapsed_time() {
+        let receipt = LatencyReceipt {
+            schema: LATENCY_RECEIPT_SCHEMA.to_string(),
+            queue_id: "queue-non-causal".to_string(),
+            lane: "discord".to_string(),
+            updated_at_ms: 2_000,
+            stages: BTreeMap::from([
+                (LatencyStage::InboundReceived, 1_000),
+                (LatencyStage::FirstCodexEvent, 1_800),
+                (LatencyStage::FirstProgressEvent, 1_050),
+                (LatencyStage::DeliveryDone, 2_000),
+            ]),
+            derived_stage_sources: BTreeMap::new(),
+            monotonic_spans: BTreeMap::new(),
+        };
+
+        let summary = latency_summary(&receipt, default_latency_stages());
+
+        assert!(summary.deltas.iter().all(|delta| delta.delta_ms >= 0));
+        assert_eq!(summary.out_of_order_deltas.len(), 1);
+        assert_eq!(
+            summary.out_of_order_deltas[0].from_stage,
+            LatencyStage::FirstCodexEvent
+        );
+        assert_eq!(
+            summary.out_of_order_deltas[0].to_stage,
+            LatencyStage::FirstProgressEvent
+        );
+    }
+
+    #[test]
+    fn latency_stage_write_waits_for_a_short_sqlite_writer() {
+        let root = temp_root("latency_stage_write_waits_for_a_short_sqlite_writer");
+        let file = latency_receipts_file(root.join("harness"));
+        let _ = record_latency_stage(
+            &file,
+            "queue-busy",
+            "discord",
+            LatencyStage::InboundReceived,
+            Some(1_000),
+        )
+        .unwrap();
+        let lock = Connection::open(latency_index_file(&file)).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let worker_file = file.clone();
+        let worker = std::thread::spawn(move || {
+            record_latency_stage(
+                worker_file,
+                "queue-busy",
+                "discord",
+                LatencyStage::DeliveryDone,
+                Some(2_000),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        lock.execute_batch("COMMIT").unwrap();
+
+        let receipt = worker.join().unwrap().unwrap();
+        assert_eq!(receipt.stages[&LatencyStage::DeliveryDone], 2_000);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn latency_read_joins_durable_delivery_when_projection_stage_is_missing() {
+        let root =
+            temp_root("latency_read_joins_durable_delivery_when_projection_stage_is_missing");
+        let harness_home = root.join("harness");
+        let file = latency_receipts_file(&harness_home);
+        let _ = record_latency_stage(
+            &file,
+            "queue-delivery-fallback",
+            "discord",
+            LatencyStage::InboundReceived,
+            Some(1_000),
+        )
+        .unwrap();
+        let mut outbound = crate::ChannelOutboundMessage {
+            platform: "discord".to_string(),
+            account_id: Some("default".to_string()),
+            channel_id: "channel-1".to_string(),
+            user_id: "user-1".to_string(),
+            session_key: "session-1".to_string(),
+            delivery_id: None,
+            kind: crate::ChannelOutboundMessageKind::AgentReply,
+            source_queue_id: Some("queue-delivery-fallback".to_string()),
+            source_completion_file: None,
+            text: "final".to_string(),
+            presentation: None,
+            delivery_intent: None,
+            attachments: Vec::new(),
+        };
+        let append = crate::append_channel_outbox_message(&harness_home, &mut outbound).unwrap();
+        crate::record_channel_delivery(crate::ChannelDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            delivery_id: append.delivery_id,
+            status: crate::ChannelDeliveryStatus::Delivered,
+            platform: outbound.platform,
+            account_id: outbound.account_id,
+            channel_id: outbound.channel_id,
+            user_id: outbound.user_id,
+            session_key: outbound.session_key,
+            provider_message_id: Some("provider-message-1".to_string()),
+            error: None,
+            now_ms: 2_000,
+            rendered_units: Vec::new(),
+            presentation: None,
+        })
+        .unwrap();
+
+        let receipt = read_latest_queue_receipt(&file, "queue-delivery-fallback")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.stages[&LatencyStage::DeliveryDone], 2_000);
+        assert_eq!(
+            receipt.derived_stage_sources[&LatencyStage::DeliveryDone],
+            "channel-delivery-receipt-index"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn latency_delivery_join_is_not_limited_by_receipt_history_window() {
+        let root = temp_root("latency_delivery_join_is_not_limited_by_receipt_history_window");
+        let harness_home = root.join("harness");
+        let file = latency_receipts_file(&harness_home);
+        let queue_id = "queue-delivery-beyond-history-window";
+        let _ = record_latency_stage(
+            &file,
+            queue_id,
+            "discord",
+            LatencyStage::InboundReceived,
+            Some(1_000),
+        )
+        .unwrap();
+
+        for index in 0..=64 {
+            let mut outbound = crate::ChannelOutboundMessage {
+                platform: "discord".to_string(),
+                account_id: Some("default".to_string()),
+                channel_id: "channel-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_key: "session-1".to_string(),
+                delivery_id: None,
+                kind: crate::ChannelOutboundMessageKind::AgentReply,
+                source_queue_id: Some(queue_id.to_string()),
+                source_completion_file: None,
+                text: format!("attempt {index}"),
+                presentation: None,
+                delivery_intent: None,
+                attachments: Vec::new(),
+            };
+            let append =
+                crate::append_channel_outbox_message(&harness_home, &mut outbound).unwrap();
+            let delivered = index == 64;
+            crate::record_channel_delivery(crate::ChannelDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                delivery_id: append.delivery_id,
+                status: if delivered {
+                    crate::ChannelDeliveryStatus::Delivered
+                } else {
+                    crate::ChannelDeliveryStatus::Failed
+                },
+                platform: outbound.platform,
+                account_id: outbound.account_id,
+                channel_id: outbound.channel_id,
+                user_id: outbound.user_id,
+                session_key: outbound.session_key,
+                provider_message_id: delivered.then(|| "provider-message-final".to_string()),
+                error: (!delivered).then(|| "retryable fixture".to_string()),
+                now_ms: 2_000 + index,
+                rendered_units: Vec::new(),
+                presentation: None,
+            })
+            .unwrap();
+        }
+
+        let receipt = read_latest_queue_receipt(&file, queue_id).unwrap().unwrap();
+        assert_eq!(receipt.stages[&LatencyStage::DeliveryDone], 2_064);
+        assert_eq!(
+            receipt.derived_stage_sources[&LatencyStage::DeliveryDone],
+            "channel-delivery-receipt-index"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

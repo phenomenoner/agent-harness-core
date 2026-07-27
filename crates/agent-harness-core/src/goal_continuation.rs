@@ -4110,6 +4110,9 @@ mod tests {
                 backend_context_generation: Some(intent.backend_context_generation.clone()),
                 source_thread_id: Some(format!("thread-{}", intent.parent_queue_id)),
                 source_turn_id: Some(format!("turn-{}", intent.parent_queue_id)),
+                backend_goal_ref: Some(format!("goal-{}", intent.parent_queue_id)),
+                correlation_source:
+                    crate::goal_transition::GoalTransitionCorrelationSourceV1::BackendGoal,
                 goal_checksum: Some(intent.goal_checksum.clone()),
                 source_slice_generation: intent.source_slice_generation,
                 decision_generation: intent.decision_generation,
@@ -4853,6 +4856,9 @@ mod tests {
             backend_context_generation: Some("generation-a".to_string()),
             source_thread_id: Some("thread-a".to_string()),
             source_turn_id: Some("turn-a".to_string()),
+            backend_goal_ref: Some("goal-a".to_string()),
+            correlation_source:
+                crate::goal_transition::GoalTransitionCorrelationSourceV1::BackendGoal,
             goal_checksum: Some("checksum-a".to_string()),
             source_slice_generation: 3,
             decision_generation: 4,

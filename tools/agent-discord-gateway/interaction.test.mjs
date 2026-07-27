@@ -6,9 +6,11 @@ import test from "node:test";
 
 import {
   harnessChildProcessOptions,
+  identifyPayload,
   interactionAcknowledgementPayload,
   interactionToMessageText,
   normalizeDiscordComponentAction,
+  runGateway,
   writeLoopHeartbeat,
 } from "./index.mjs";
 
@@ -21,6 +23,98 @@ test("harness child processes suppress Windows console windows", () => {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
+});
+
+test("gateway identify explicitly publishes an online presence", () => {
+  const payload = identifyPayload("test-token", 123);
+
+  assert.deepEqual(payload.presence, {
+    since: null,
+    activities: [],
+    status: "online",
+    afk: false,
+  });
+});
+
+test("gateway hello sends the online presence on the real identify path", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-discord-presence-replay-"));
+  const originalWebSocket = globalThis.WebSocket;
+  const originalToken = process.env.DISCORD_BOT_TOKEN;
+  const sent = [];
+
+  class ReplayWebSocket {
+    constructor() {
+      this.listeners = new Map();
+      queueMicrotask(() => {
+        this.emit("open", {});
+        this.emit("message", {
+          data: JSON.stringify({ op: 10, d: { heartbeat_interval: 60_000 } }),
+        });
+      });
+    }
+
+    addEventListener(name, listener) {
+      const listeners = this.listeners.get(name) ?? [];
+      listeners.push(listener);
+      this.listeners.set(name, listeners);
+    }
+
+    emit(name, event) {
+      for (const listener of this.listeners.get(name) ?? []) {
+        listener(event);
+      }
+    }
+
+    send(payload) {
+      const parsed = JSON.parse(payload);
+      sent.push(parsed);
+      if (parsed.op === 2) {
+        queueMicrotask(() => {
+          this.emit("message", {
+            data: JSON.stringify({
+              op: 0,
+              t: "READY",
+              s: 1,
+              d: {
+                session_id: "session-test",
+                user: { id: "bot-test", username: "presence-test" },
+              },
+            }),
+          });
+          this.close(1000, "replay complete");
+        });
+      }
+    }
+
+    close(code, reason) {
+      this.emit("close", { code, reason });
+    }
+  }
+
+  try {
+    globalThis.WebSocket = ReplayWebSocket;
+    process.env.DISCORD_BOT_TOKEN = "test-token";
+    await runGateway({
+      harnessHome: root,
+      gatewayUrl: "wss://gateway.test",
+      stopFile: null,
+      dmPollFallback: false,
+      maxMessages: 0,
+      suppressLoopHeartbeat: true,
+    });
+
+    const identify = sent.find((payload) => payload.op === 2);
+    assert.equal(identify.d.presence.status, "online");
+    assert.equal(identify.d.presence.afk, false);
+  } finally {
+    globalThis.WebSocket = originalWebSocket;
+    if (originalToken === undefined) {
+      delete process.env.DISCORD_BOT_TOKEN;
+    } else {
+      process.env.DISCORD_BOT_TOKEN = originalToken;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("wrapped gateway does not overwrite the Rust owner's canonical heartbeat", () => {

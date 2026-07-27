@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,9 +31,9 @@ use crate::goal_lineage::{
     GoalProjectionTurnRelationV1, latest_goal_projection_for_queue, run_goal_lineage_doctor,
 };
 use crate::goal_transition::{
-    GoalTransitionAuthority, GoalTransitionDecision, GoalTransitionEventKind, GoalTransitionInput,
-    GoalTransitionReceiptV1, GoalTransitionRelation, GoalTransitionSurface,
-    evaluate_goal_transition, record_goal_transition,
+    GoalTransitionAuthority, GoalTransitionCorrelationSourceV1, GoalTransitionDecision,
+    GoalTransitionEventKind, GoalTransitionInput, GoalTransitionReceiptV1, GoalTransitionRelation,
+    GoalTransitionSurface, evaluate_goal_transition, record_goal_transition,
 };
 use crate::rich_presentation::{
     RichMessagePresentation, RichPresentationAction, RichPresentationActionKind,
@@ -1171,12 +1171,37 @@ fn run_runtime_queue_once_after_prepare(
         }
     }
 
+    let codex_planning_started = Instant::now();
     let plan = plan_codex_runtime(CodexRuntimePlanOptions {
         harness_home: options.harness_home.clone(),
         execution_dir: prepare.receipt.execution_dir.clone(),
         codex_executable: options.codex_executable,
     })?;
     warnings.extend(plan.warnings.clone());
+    if let Some(queue_id) = plan
+        .receipt
+        .queue_id
+        .as_deref()
+        .or(prepare.receipt.queue_id.as_deref())
+    {
+        let lane = plan
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.runtime_class.as_deref())
+            .or(prepare.receipt.runtime_class.as_deref())
+            .unwrap_or("unknown");
+        if let Err(error) = crate::latency::record_monotonic_latency_span(
+            crate::latency::latency_receipts_file(&options.harness_home),
+            queue_id,
+            lane,
+            crate::latency::MonotonicLatencySpan::CodexPlanning,
+            codex_planning_started.elapsed(),
+        ) {
+            warnings.push(format!(
+                "failed to record monotonic Codex planning latency span for `{queue_id}`: {error}"
+            ));
+        }
+    }
 
     if plan.receipt.status == CodexRuntimeReceiptStatus::NoPreparedExecution {
         if let Some(queue_id) = prepare.receipt.queue_id.as_deref()
@@ -1417,6 +1442,7 @@ fn run_runtime_queue_once_after_prepare(
             effective_timeout_ms, effective_idle_timeout_ms
         ));
     }
+    let codex_execution_started = Instant::now();
     let run = run_codex_runtime(CodexRuntimeRunOptions {
         harness_home: options.harness_home.clone(),
         execution_dir: plan.execution_dir.clone(),
@@ -1426,6 +1452,31 @@ fn run_runtime_queue_once_after_prepare(
         progress_context: progress_context.clone(),
     })?;
     warnings.extend(run.warnings.clone());
+    if let Some(queue_id) = run
+        .receipt
+        .queue_id
+        .as_deref()
+        .or(plan.receipt.queue_id.as_deref())
+    {
+        let lane = plan
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.runtime_class.as_deref())
+            .or(prepare.receipt.runtime_class.as_deref())
+            .unwrap_or("unknown");
+        if let Err(error) = crate::latency::record_monotonic_latency_span(
+            crate::latency::latency_receipts_file(&options.harness_home),
+            queue_id,
+            lane,
+            crate::latency::MonotonicLatencySpan::CodexExecution,
+            codex_execution_started.elapsed(),
+        ) {
+            warnings.push(format!(
+                "failed to record monotonic Codex execution latency span for `{queue_id}`: {error}"
+            ));
+        }
+    }
+    let terminalization_started = Instant::now();
     let auth_deferred = run.receipt.status == CodexRuntimeRunStatus::PreflightBlocked
         && run.receipt.reason.contains("needs-operator-auth");
     let queue_failure_attempts = run
@@ -3329,6 +3380,20 @@ fn run_runtime_queue_once_after_prepare(
             ));
         }
     }
+    if let Some(queue_id) = report.receipt.queue_id.as_deref() {
+        let lane = report.receipt.runtime_class.as_deref().unwrap_or("unknown");
+        if let Err(error) = crate::latency::record_monotonic_latency_span(
+            crate::latency::latency_receipts_file(&progress_harness_home),
+            queue_id,
+            lane,
+            crate::latency::MonotonicLatencySpan::Terminalization,
+            terminalization_started.elapsed(),
+        ) {
+            report.warnings.push(format!(
+                "failed to record monotonic terminalization latency span for `{queue_id}`: {error}"
+            ));
+        }
+    }
     write_json_atomic(&report.report_file, &report)?;
     Ok(report)
 }
@@ -4956,7 +5021,42 @@ fn evaluate_runtime_goal_transition(
             authority = GoalTransitionAuthority::Invalid;
         }
     }
-    let hint = authority_context.projection_hint.as_ref();
+    let raw_hint = authority_context.projection_hint.as_ref();
+    let prepared_durable_goal = continuation.campaign_slice_generation.is_some()
+        || run.receipt.work_authority_class == crate::WorkAuthorityClassV1::GoalCampaign;
+    let selected_has_concrete_owned_goal = selected.as_ref().is_some_and(|lineage| {
+        lineage
+            .backend_goal_ref
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && lineage.source_final_eligible
+            && matches!(
+                lineage.turn_relation,
+                GoalProjectionTurnRelationV1::CurrentOwnedTurn
+                    | GoalProjectionTurnRelationV1::ExplicitCampaignContinuation
+            )
+    });
+    let hint_has_concrete_owned_goal = raw_hint.is_some_and(|projection| {
+        projection
+            .backend_goal_ref
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && projection.source_final_eligible
+            && matches!(
+                projection.turn_relation,
+                GoalProjectionTurnRelationV1::CurrentOwnedTurn
+                    | GoalProjectionTurnRelationV1::ExplicitCampaignContinuation
+            )
+    });
+    let goal_correlated =
+        prepared_durable_goal || selected_has_concrete_owned_goal || hint_has_concrete_owned_goal;
+    if !goal_correlated {
+        authority = GoalTransitionAuthority::NotApplicable;
+        selected = None;
+    } else if prepared_durable_goal && authority == GoalTransitionAuthority::NotApplicable {
+        authority = GoalTransitionAuthority::Missing;
+    }
+    let hint = goal_correlated.then_some(raw_hint).flatten();
     if selected.is_none() && hint.is_some() && authority == GoalTransitionAuthority::NotApplicable {
         authority = GoalTransitionAuthority::Missing;
     }
@@ -4995,7 +5095,11 @@ fn evaluate_runtime_goal_transition(
                 GoalProjectionTurnRelationV1::Uncorrelated => GoalTransitionRelation::Unproven,
             })
         })
-        .unwrap_or(GoalTransitionRelation::FreshUnrelatedTurn);
+        .unwrap_or(if prepared_durable_goal {
+            GoalTransitionRelation::CurrentGoalSlice
+        } else {
+            GoalTransitionRelation::FreshUnrelatedTurn
+        });
     let goal_status = selected
         .as_ref()
         .map(|lineage| lineage.goal_status.clone())
@@ -5024,6 +5128,17 @@ fn evaluate_runtime_goal_transition(
         .as_ref()
         .and_then(|lineage| lineage.source_turn_id.clone())
         .or_else(|| hint.and_then(|projection| projection.source_turn_id.clone()));
+    let backend_goal_ref = selected
+        .as_ref()
+        .and_then(|lineage| lineage.backend_goal_ref.clone())
+        .or_else(|| hint.and_then(|projection| projection.backend_goal_ref.clone()));
+    let correlation_source = if backend_goal_ref.is_some() {
+        GoalTransitionCorrelationSourceV1::BackendGoal
+    } else if prepared_durable_goal {
+        GoalTransitionCorrelationSourceV1::DurableContinuation
+    } else {
+        GoalTransitionCorrelationSourceV1::None
+    };
     let goal_checksum = selected
         .as_ref()
         .map(|lineage| lineage.goal_checksum.clone())
@@ -5115,6 +5230,8 @@ fn evaluate_runtime_goal_transition(
         backend_context_generation,
         source_thread_id,
         source_turn_id,
+        backend_goal_ref,
+        correlation_source,
         goal_checksum,
         source_slice_generation,
         decision_generation,
@@ -7462,6 +7579,8 @@ mod tests {
             backend_context_generation: Some("generation-1".to_string()),
             source_thread_id: Some("thread-1".to_string()),
             source_turn_id: Some("turn-1".to_string()),
+            backend_goal_ref: Some("goal-1".to_string()),
+            correlation_source: GoalTransitionCorrelationSourceV1::BackendGoal,
             goal_checksum: Some("sha256:goal".to_string()),
             source_slice_generation: 2,
             decision_generation: 1,
@@ -8150,6 +8269,99 @@ mod tests {
                 &manifest.identity.virtual_session_id,
             )
             .exists()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ordinary_note_with_null_goal_keeps_ordinary_final() {
+        let _guard = env_lock();
+        let root = temp_root("ordinary_note_with_null_goal_keeps_ordinary_final");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "discord".to_string(),
+            account_id: Some("acct-note".to_string()),
+            channel_id: "channel-note".to_string(),
+            user_id: "user-note".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "先筆記，晚點回來處理後續~".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1_234,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.expect("ordinary note queue id");
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id),
+            codex_executable: Some(fake_null_goal_note_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert_eq!(
+            report.receipt.terminal_disposition,
+            Some(crate::RuntimeTerminalDispositionV1::LogicalSuccess)
+        );
+        assert_eq!(
+            report.receipt.source_closure_kind,
+            Some(RuntimeSourceClosureKindV1::OrdinaryFinal)
+        );
+        assert!(report.receipt.child_queue_id.is_none());
+        let outbound = report
+            .outbound_message
+            .as_ref()
+            .expect("ordinary note owns one final");
+        assert_eq!(outbound.text, "Note saved. Pausing here.");
+        assert!(!outbound.text.contains("Goal work is parked safely"));
+        let outbox = fs::read_to_string(report.outbox_file.as_ref().unwrap()).unwrap();
+        let intended_final_rows = outbox
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|row| {
+                row.get("text").and_then(Value::as_str) == Some("Note saved. Pausing here.")
+            })
+            .count();
+        assert_eq!(intended_final_rows, 1);
+        assert!(!outbox.contains("Goal work is parked safely"));
+        let transition: GoalTransitionReceiptV1 = serde_json::from_str(
+            fs::read_to_string(crate::goal_transition_receipts_file(&harness_home))
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            transition.correlation_source,
+            GoalTransitionCorrelationSourceV1::None
+        );
+        assert!(transition.backend_goal_ref.is_none());
+        assert_eq!(
+            transition.relation,
+            GoalTransitionRelation::FreshUnrelatedTurn
         );
 
         let _ = fs::remove_dir_all(root);
@@ -15203,6 +15415,45 @@ while ($true) {
     }
 
     #[cfg(windows)]
+    fn fake_null_goal_note_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-null-goal-note-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-null-goal-note"}}}')
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-null-goal-note","turn":{"id":"turn-null-goal-note","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"thread/goal/updated","params":{"threadId":"thread-null-goal-note","turnId":"turn-null-goal-note","goal":null}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-null-goal-note","turnId":"turn-null-goal-note","item":{"type":"agentMessage","id":"msg-null-goal-note","text":"Note saved. Pausing here.","phase":"final_answer"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-null-goal-note","turn":{"id":"turn-null-goal-note","status":"completed"}}}')
+        [Console]::Out.Flush()
+        break
+    }
+    [Console]::Out.Flush()
+}
+"#,
+        )
+        .unwrap();
+        let cmd = root.join("fake-null-goal-note-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
+    #[cfg(windows)]
     fn fake_lingering_provider_terminal_codex_executable(root: &Path) -> (PathBuf, PathBuf) {
         let script = root.join("fake-lingering-provider-terminal-app-server.ps1");
         let pid_file = root.join("lingering-provider-terminal-app-server.pid");
@@ -16047,6 +16298,42 @@ while IFS= read -r line; do
             printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-pipeline","turn":{"id":"turn-pipeline","kind":"regular"}}}'
             printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-pipeline","turnId":"turn-pipeline","itemId":"msg-pipeline","delta":"Pipeline fake reply."}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-pipeline","turn":{"id":"turn-pipeline","status":"completed"}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    #[cfg(not(windows))]
+    fn fake_null_goal_note_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-null-goal-note-codex");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-null-goal-note"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-null-goal-note","turn":{"id":"turn-null-goal-note","kind":"regular"}}}'
+            printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-null-goal-note","turnId":"turn-null-goal-note","goal":null}}'
+            printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-null-goal-note","turnId":"turn-null-goal-note","item":{"type":"agentMessage","id":"msg-null-goal-note","text":"Note saved. Pausing here.","phase":"final_answer"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-null-goal-note","turn":{"id":"turn-null-goal-note","status":"completed"}}}'
             exit 0
             ;;
     esac

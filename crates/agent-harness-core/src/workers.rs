@@ -3,8 +3,10 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -19,7 +21,7 @@ use crate::runtime_worker::{
     terminal_runtime_queue_hot_receipt_from_index,
 };
 use crate::{
-    AuthorizedExecutionModeSnapshotV2, CronRunSummary, HarnessLogEvent, HarnessLogLevel,
+    AuthorizedExecutionModeSnapshotV2, CronRun, CronRunSummary, HarnessLogEvent, HarnessLogLevel,
     LearningReviewOptions, RuntimeQueueItem, RuntimeQueueItemStatus, RuntimeQueueSource,
     RuntimeQueueSourceKind, SelfImprovementNotificationTarget, SelfImprovementReviewMode,
     SkillApplyOptions, SkillLearningProposalOperation, SkillLearningProposalStatus,
@@ -31,8 +33,14 @@ use crate::{
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
-    create_skill_learning_proposal, cron_run_worker_dispatch_blocker, current_log_time_ms,
-    mark_cron_run_runtime_enqueued, mark_cron_run_worker_status,
+    create_skill_learning_proposal, cron_run_worker_dispatch_blocker,
+    cron_runs::{
+        active_worker_linked_cron_runs, block_linked_cron_run_identity,
+        block_unlinked_admitted_cron_run, cron_run_worker_idempotency_key,
+        expire_unlinked_admitted_cron_run, get_cron_run_by_id, stale_unlinked_admitted_cron_runs,
+    },
+    current_log_time_ms, mark_cron_run_runtime_enqueued, mark_cron_run_worker_enqueued,
+    mark_cron_run_worker_status,
     memory::redact_sensitive,
     memory_backfill::{
         DEFAULT_MEMORY_BACKFILL_BATCH_SIZE, DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
@@ -66,6 +74,8 @@ const WORKER_STATUS_SCHEMA: &str = "agent-harness.worker-status.v1";
 const WORKER_REAP_SCHEMA: &str = "agent-harness.worker-reap-stale.v1";
 const WORKER_CANCEL_SCHEMA: &str = "agent-harness.worker-cancel.v1";
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
+const MIN_RUNNING_LEASE_MS: i64 = 150;
+const CRON_ADMISSION_RECOVERY_GRACE_MS: i64 = 60_000;
 const SHELL_OUTPUT_CAP_BYTES: usize = 16 * 1024;
 const INVALID_STORED_CHILD_POLICY_CODE: &str = "worker.invalid-stored-child-policy";
 const INVALID_STORED_CHILD_POLICY_REASON: &str = "stored child execution policy failed validation";
@@ -468,6 +478,30 @@ pub fn init_worker_store(harness_home: impl AsRef<Path>) -> io::Result<PathBuf> 
     Ok(db_file)
 }
 
+pub(crate) fn worker_job_is_active(
+    harness_home: impl AsRef<Path>,
+    job_id: &str,
+) -> io::Result<Option<bool>> {
+    let db_file = worker_db_file(harness_home);
+    if !db_file.is_file() {
+        return Ok(None);
+    }
+    let conn = Connection::open(db_file).map_err(io::Error::other)?;
+    Ok(find_job_by_id(&conn, job_id)?.map(|job| !job.status.is_terminal()))
+}
+
+pub(crate) fn get_worker_job_by_idempotency_key(
+    harness_home: impl AsRef<Path>,
+    idempotency_key: &str,
+) -> io::Result<Option<WorkerJob>> {
+    let db_file = worker_db_file(harness_home);
+    if !db_file.is_file() {
+        return Ok(None);
+    }
+    let conn = Connection::open(db_file).map_err(io::Error::other)?;
+    find_job_by_idempotency(&conn, idempotency_key)
+}
+
 pub fn enqueue_worker_job(options: WorkerEnqueueOptions) -> io::Result<WorkerEnqueueReport> {
     enqueue_worker_job_v2(WorkerEnqueueOptionsV2 {
         options,
@@ -755,10 +789,21 @@ pub(crate) fn enqueue_worker_job_v4_in_transaction(
 }
 
 pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnceReport> {
+    if options.lease_ms < MIN_RUNNING_LEASE_MS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "worker lease_ms must be at least {MIN_RUNNING_LEASE_MS} for renewable running authority"
+            ),
+        ));
+    }
     let db_file = init_worker_store(&options.harness_home)?;
     let conn = Connection::open(&db_file).map_err(io::Error::other)?;
     quarantine_invalid_stored_child_policies(&conn, options.now_ms)?;
     quarantine_invalid_stored_execution_modes(&conn, options.now_ms)?;
+    reconcile_unlinked_cron_admissions(&options.harness_home, &conn, options.now_ms)?;
+    reconcile_terminal_linked_cron_runs(&options.harness_home, &conn, options.now_ms)?;
+    reap_expired_worker_jobs(&options.harness_home, &conn, options.now_ms)?;
     reconcile_runtime_queued_jobs(&options.harness_home, &conn, options.now_ms)?;
     terminalize_exhausted_pending_jobs(&options.harness_home, &conn, options.now_ms)?;
     let config = load_worker_dispatch_config(&options.harness_home)?;
@@ -796,7 +841,12 @@ pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnc
             result: Some(json!({"skipped": true})),
         };
         persist_execution_result(&conn, &job, &result, options.now_ms)?;
-        sync_cron_run_after_worker_result(&options.harness_home, &job, &result, options.now_ms)?;
+        let _ = sync_cron_run_after_worker_result(
+            &options.harness_home,
+            &job,
+            &result,
+            options.now_ms,
+        )?;
         append_harness_log(
             &options.harness_home,
             &HarnessLogEvent::new(
@@ -821,18 +871,25 @@ pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnc
         });
     }
 
-    set_job_status(
-        &conn,
-        &job.job_id,
-        WorkerJobStatus::Running,
-        options.now_ms,
-        None,
-        None,
-        None,
+    set_job_running(&conn, &job, &options.worker_id, options.now_ms)?;
+    let execution_started = Instant::now();
+    let lease_renewal = RunningWorkerLeaseRenewal::start(
+        db_file.clone(),
+        job.job_id.clone(),
+        options.worker_id.clone(),
+        job.attempt,
+        options.lease_ms,
     )?;
-    let result = normalize_exhausted_retryable_result(
+    let mut result = normalize_exhausted_retryable_result(
         &job,
-        match execute_worker_job(&options.harness_home, &conn, &job, &config, options.now_ms) {
+        match execute_worker_job(
+            &options.harness_home,
+            &conn,
+            &job,
+            &config,
+            options.now_ms,
+            &lease_renewal,
+        ) {
             Ok(result) => result,
             Err(error) => WorkerJobExecutionResult {
                 status: WorkerJobStatus::FailedRetryable,
@@ -843,10 +900,40 @@ pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnc
             },
         },
     );
+    if let Some(renewal_error) = lease_renewal.stop() {
+        result = WorkerJobExecutionResult {
+            status: WorkerJobStatus::FailedTerminal,
+            reason: format!(
+                "worker execution lost exact lease authority; refusing retry: {renewal_error}"
+            ),
+            audit_path: result.audit_path,
+            artifact_refs: result.artifact_refs,
+            result: Some(json!({
+                "status": WorkerJobStatus::FailedTerminal.as_str(),
+                "reason": "exact running lease renewal failed",
+                "renewalError": renewal_error,
+            })),
+        };
+    }
     let terminal = result.status.is_terminal();
     let rescheduled = result.status == WorkerJobStatus::Pending;
-    persist_execution_result(&conn, &job, &result, options.now_ms)?;
-    sync_cron_run_after_worker_result(&options.harness_home, &job, &result, options.now_ms)?;
+    let execution_elapsed_ms =
+        i64::try_from(execution_started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    let completion_now_ms = options.now_ms.saturating_add(execution_elapsed_ms);
+    if !persist_owned_execution_result(&conn, &job, &options.worker_id, &result, completion_now_ms)?
+    {
+        return Err(io::Error::other(format!(
+            "worker result rejected because exact running lease authority changed for job {} attempt {}",
+            job.job_id, job.attempt
+        )));
+    }
+    if !sync_cron_run_after_worker_result(&options.harness_home, &job, &result, completion_now_ms)?
+    {
+        return Err(io::Error::other(format!(
+            "cron run settlement rejected stale worker job {}",
+            job.job_id
+        )));
+    }
     append_harness_log(
         &options.harness_home,
         &HarnessLogEvent::new(
@@ -898,7 +985,82 @@ fn cron_worker_dispatch_blocker_for_job(
     let Some(cron_run_id) = string_path_any(&job.payload, &["cronRunId", "cron_run_id"]) else {
         return Ok(None);
     };
+    let Some(run) = get_cron_run_by_id(harness_home, cron_run_id)? else {
+        return Ok(Some(format!("cron run `{cron_run_id}` does not exist")));
+    };
+    if let Err(reason) = validate_cron_worker_identity(&run, job) {
+        if run.worker_job_id.as_deref() == Some(job.job_id.as_str()) {
+            let _ = block_linked_cron_run_identity(
+                harness_home,
+                &run.run_id,
+                run.attempt,
+                &job.job_id,
+                &reason,
+                current_log_time_ms().unwrap_or(run.updated_at_ms),
+            )?;
+        } else if run.worker_job_id.is_none() {
+            let _ = block_unlinked_admitted_cron_run(
+                harness_home,
+                &run.run_id,
+                run.attempt,
+                i64::MAX,
+                &reason,
+                current_log_time_ms().unwrap_or(run.updated_at_ms),
+            )?;
+        }
+        return Ok(Some(reason));
+    }
     cron_run_worker_dispatch_blocker(harness_home, cron_run_id, &job.job_id)
+}
+
+pub(crate) fn validate_cron_worker_identity(run: &CronRun, job: &WorkerJob) -> Result<(), String> {
+    let expected_key = cron_run_worker_idempotency_key(run);
+    let expected_strings = [
+        ("cronRunId", run.run_id.as_str()),
+        ("sourceKind", run.source_kind.as_str()),
+        ("sourceId", run.source_id.as_str()),
+        ("entryId", run.entry_id.as_str()),
+        ("agentId", run.agent_id.as_str()),
+        ("sessionKey", run.session_key.as_str()),
+        ("sessionPolicy", run.session_policy.as_str()),
+        ("runtimeClass", run.runtime_class.as_str()),
+        ("origin", "cron-scheduler"),
+    ];
+    if job.source.as_deref() != Some("cron-scheduler") {
+        return Err(format!(
+            "cron run `{}` worker `{}` has invalid source envelope",
+            run.run_id, job.job_id
+        ));
+    }
+    if job.idempotency_key.as_deref() != Some(expected_key.as_str()) {
+        return Err(format!(
+            "cron run `{}` worker `{}` has an invalid idempotency key",
+            run.run_id, job.job_id
+        ));
+    }
+    for (field, expected) in expected_strings {
+        if string_path(&job.payload, field) != Some(expected) {
+            return Err(format!(
+                "cron run `{}` worker `{}` has mismatched immutable `{field}` identity",
+                run.run_id, job.job_id
+            ));
+        }
+    }
+    if int_path(&job.payload, "scheduledForMs") != Some(run.scheduled_for_ms) {
+        return Err(format!(
+            "cron run `{}` worker `{}` has mismatched immutable `scheduledForMs` identity",
+            run.run_id, job.job_id
+        ));
+    }
+    let payload_attempt = int_path(&job.payload, "cronRunAttempt")
+        .or_else(|| int_path(&job.payload, "cron_run_attempt"));
+    if payload_attempt != Some(run.attempt) && !(run.attempt == 0 && payload_attempt.is_none()) {
+        return Err(format!(
+            "cron run `{}` worker `{}` has mismatched immutable `cronRunAttempt` identity",
+            run.run_id, job.job_id
+        ));
+    }
+    Ok(())
 }
 
 fn sync_cron_run_after_worker_result(
@@ -906,24 +1068,146 @@ fn sync_cron_run_after_worker_result(
     job: &WorkerJob,
     result: &WorkerJobExecutionResult,
     now_ms: i64,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let Some(cron_run_id) = string_path_any(&job.payload, &["cronRunId", "cron_run_id"]) else {
-        return Ok(());
+        return Ok(true);
     };
     if matches!(
         result.status,
         WorkerJobStatus::Succeeded | WorkerJobStatus::RuntimeQueued
     ) && job.kind != WorkerJobKind::DeterministicShell
     {
-        return Ok(());
+        return Ok(true);
     }
+    let cron_run_attempt = int_path(&job.payload, "cronRunAttempt")
+        .or_else(|| int_path(&job.payload, "cron_run_attempt"))
+        .unwrap_or(0);
     mark_cron_run_worker_status(
         harness_home,
         cron_run_id,
+        cron_run_attempt,
+        &job.job_id,
         result.status.as_str(),
         &result.reason,
         now_ms,
     )
+}
+
+fn reconcile_unlinked_cron_admissions(
+    harness_home: &Path,
+    conn: &Connection,
+    now_ms: i64,
+) -> io::Result<usize> {
+    let cutoff_ms = now_ms.saturating_sub(CRON_ADMISSION_RECOVERY_GRACE_MS);
+    let runs = stale_unlinked_admitted_cron_runs(harness_home, cutoff_ms)?;
+    let mut reconciled = 0usize;
+    for run in runs {
+        let idempotency_key = cron_run_worker_idempotency_key(&run);
+        let Some(job) = find_job_by_idempotency(conn, &idempotency_key)? else {
+            if expire_unlinked_admitted_cron_run(
+                harness_home,
+                &run.run_id,
+                run.attempt,
+                cutoff_ms,
+                "expired stale CronRun admission after exact worker lookup proved zero workers and zero side effects",
+                now_ms,
+            )? {
+                reconciled += 1;
+            }
+            continue;
+        };
+        if let Err(reason) = validate_cron_worker_identity(&run, &job) {
+            if block_unlinked_admitted_cron_run(
+                harness_home,
+                &run.run_id,
+                run.attempt,
+                cutoff_ms,
+                &reason,
+                now_ms,
+            )? {
+                reconciled += 1;
+            }
+            continue;
+        }
+        if !mark_cron_run_worker_enqueued(
+            harness_home,
+            &run.run_id,
+            run.attempt,
+            &job.job_id,
+            now_ms,
+        )? {
+            continue;
+        }
+        let result = WorkerJobExecutionResult {
+            status: job.status,
+            reason: job
+                .result
+                .as_ref()
+                .and_then(|value| string_path_any(value, &["reason", "failureReason"]))
+                .unwrap_or_else(|| job.status.as_str())
+                .to_string(),
+            audit_path: job.audit_path.clone(),
+            artifact_refs: job.artifact_refs.clone(),
+            result: job.result.clone(),
+        };
+        let _ = sync_cron_run_after_worker_result(harness_home, &job, &result, now_ms)?;
+        reconciled += 1;
+    }
+    Ok(reconciled)
+}
+
+fn reconcile_terminal_linked_cron_runs(
+    harness_home: &Path,
+    conn: &Connection,
+    now_ms: i64,
+) -> io::Result<usize> {
+    let active_runs = active_worker_linked_cron_runs(harness_home)?;
+    let mut reconciled = 0usize;
+    for run in active_runs {
+        let worker_job_id = run.worker_job_id.as_deref().ok_or_else(|| {
+            io::Error::other(format!("active CronRun {} lost worker link", run.run_id))
+        })?;
+        let Some(job) = find_job_by_id(conn, worker_job_id)? else {
+            continue;
+        };
+        if let Err(reason) = validate_cron_worker_identity(&run, &job) {
+            if block_linked_cron_run_identity(
+                harness_home,
+                &run.run_id,
+                run.attempt,
+                worker_job_id,
+                &reason,
+                now_ms,
+            )? {
+                reconciled += 1;
+            }
+            continue;
+        }
+        if !job.status.is_terminal() {
+            continue;
+        }
+        let reason = job
+            .result
+            .as_ref()
+            .and_then(|value| string_path_any(value, &["reason", "failureReason"]))
+            .unwrap_or_else(|| job.status.as_str())
+            .to_string();
+        if sync_cron_run_after_worker_result(
+            harness_home,
+            &job,
+            &WorkerJobExecutionResult {
+                status: job.status,
+                reason,
+                audit_path: job.audit_path.clone(),
+                artifact_refs: job.artifact_refs.clone(),
+                result: job.result.clone(),
+            },
+            now_ms,
+        )? {
+            reconciled += 1;
+        }
+    }
+    Ok(reconciled)
 }
 
 pub fn collect_worker_status(options: WorkerStatusOptions) -> io::Result<WorkerStatusReport> {
@@ -1018,9 +1302,7 @@ fn collect_downstream_runtime_status(
         *open_by_runtime_class.entry(runtime_class).or_insert(0) += 1;
         *open_by_origin.entry(origin).or_insert(0) += 1;
     }
-    let cron_runs = collect_cron_run_summary(harness_home)
-        .map(|report| report.summary)
-        .unwrap_or_default();
+    let cron_runs = collect_cron_run_summary(harness_home)?.summary;
     Ok(WorkerDownstreamRuntimeStatus {
         runtime_queue_file,
         open_runtime_items,
@@ -1038,39 +1320,8 @@ pub fn reap_stale_worker_jobs(
     let conn = Connection::open(&db_file).map_err(io::Error::other)?;
     quarantine_invalid_stored_child_policies(&conn, options.now_ms)?;
     quarantine_invalid_stored_execution_modes(&conn, options.now_ms)?;
-    let mut expired_jobs = 0;
-    let mut retryable_jobs = 0;
-    let mut terminal_jobs = 0;
-    let stale = jobs_with_expired_leases(&conn, options.now_ms)?;
-    for job in stale {
-        expired_jobs += 1;
-        if job.attempt < job.max_attempts {
-            retryable_jobs += 1;
-            let next_available = options.now_ms.saturating_add(backoff_ms(job.attempt));
-            conn.execute(
-                "UPDATE jobs SET status=?1, lease_owner=NULL, lease_expires_at_ms=NULL, available_at_ms=?2, updated_at_ms=?3, result_json=?4 WHERE job_id=?5",
-                params![
-                    WorkerJobStatus::Pending.as_str(),
-                    next_available,
-                    options.now_ms,
-                    json!({"reason":"stale lease reaped for retry","previousStatus":job.status.as_str()}).to_string(),
-                    job.job_id,
-                ],
-            )
-            .map_err(io::Error::other)?;
-        } else {
-            terminal_jobs += 1;
-            set_job_status(
-                &conn,
-                &job.job_id,
-                WorkerJobStatus::Expired,
-                options.now_ms,
-                Some(json!({"reason":"stale lease expired after max attempts"})),
-                None,
-                None,
-            )?;
-        }
-    }
+    let (expired_jobs, retryable_jobs, terminal_jobs) =
+        reap_expired_worker_jobs(&options.harness_home, &conn, options.now_ms)?;
     Ok(WorkerReapStaleReport {
         schema: WORKER_REAP_SCHEMA,
         harness_home: options.harness_home,
@@ -1081,20 +1332,123 @@ pub fn reap_stale_worker_jobs(
     })
 }
 
+fn reap_expired_worker_jobs(
+    harness_home: &Path,
+    conn: &Connection,
+    now_ms: i64,
+) -> io::Result<(usize, usize, usize)> {
+    let mut expired_jobs = 0usize;
+    let mut retryable_jobs = 0usize;
+    let mut terminal_jobs = 0usize;
+    let stale = jobs_with_expired_leases(conn, now_ms)?;
+    for job in stale {
+        if job.attempt < job.max_attempts {
+            let next_available = now_ms.saturating_add(backoff_ms(job.attempt));
+            let reason = "stale lease reaped for retry";
+            let rows = conn.execute(
+                "UPDATE jobs SET status=?1, lease_owner=NULL, lease_expires_at_ms=NULL, available_at_ms=?2, updated_at_ms=?3, result_json=?4 WHERE job_id=?5 AND status=?6 AND attempt=?7 AND lease_owner IS ?8 AND lease_expires_at_ms < ?3",
+                params![
+                    WorkerJobStatus::Pending.as_str(),
+                    next_available,
+                    now_ms,
+                    json!({"reason":reason,"previousStatus":job.status.as_str()}).to_string(),
+                    job.job_id,
+                    job.status.as_str(),
+                    job.attempt,
+                    job.lease_owner,
+                ],
+            )
+            .map_err(io::Error::other)?;
+            if rows != 1 {
+                continue;
+            }
+            expired_jobs += 1;
+            retryable_jobs += 1;
+            sync_cron_run_after_worker_result(
+                harness_home,
+                &job,
+                &WorkerJobExecutionResult {
+                    status: WorkerJobStatus::Pending,
+                    reason: reason.to_string(),
+                    audit_path: job.audit_path.clone(),
+                    artifact_refs: job.artifact_refs.clone(),
+                    result: Some(json!({
+                        "reason": reason,
+                        "previousStatus": job.status.as_str(),
+                    })),
+                },
+                now_ms,
+            )?;
+        } else {
+            let reason = "stale lease expired after max attempts";
+            let rows = conn
+                .execute(
+                    "UPDATE jobs SET status=?1, lease_owner=NULL, lease_expires_at_ms=NULL, result_json=?2, updated_at_ms=?3, finished_at_ms=?3 WHERE job_id=?4 AND status=?5 AND attempt=?6 AND lease_owner IS ?7 AND lease_expires_at_ms < ?3",
+                    params![
+                        WorkerJobStatus::Expired.as_str(),
+                        json!({"reason":reason}).to_string(),
+                        now_ms,
+                        job.job_id,
+                        job.status.as_str(),
+                        job.attempt,
+                        job.lease_owner,
+                    ],
+                )
+                .map_err(io::Error::other)?;
+            if rows != 1 {
+                continue;
+            }
+            expired_jobs += 1;
+            terminal_jobs += 1;
+            sync_cron_run_after_worker_result(
+                harness_home,
+                &job,
+                &WorkerJobExecutionResult {
+                    status: WorkerJobStatus::Expired,
+                    reason: reason.to_string(),
+                    audit_path: job.audit_path.clone(),
+                    artifact_refs: job.artifact_refs.clone(),
+                    result: Some(json!({"reason": reason})),
+                },
+                now_ms,
+            )?;
+        }
+    }
+    Ok((expired_jobs, retryable_jobs, terminal_jobs))
+}
+
 pub fn cancel_worker_job(options: WorkerCancelOptions) -> io::Result<WorkerCancelReport> {
     let db_file = init_worker_store(&options.harness_home)?;
     let conn = Connection::open(&db_file).map_err(io::Error::other)?;
+    let job = find_job_by_id(&conn, &options.job_id)?;
+    let reason = options.reason.clone();
     let rows = conn
         .execute(
             "UPDATE jobs SET status=?1, lease_owner=NULL, lease_expires_at_ms=NULL, result_json=?2, updated_at_ms=?3, finished_at_ms=?3 WHERE job_id=?4 AND status NOT IN ('succeeded','failed-terminal','canceled','expired')",
             params![
                 WorkerJobStatus::Canceled.as_str(),
-                json!({"reason": options.reason}).to_string(),
+                json!({"reason": reason}).to_string(),
                 options.now_ms,
                 options.job_id,
             ],
         )
         .map_err(io::Error::other)?;
+    if rows > 0
+        && let Some(job) = job
+    {
+        sync_cron_run_after_worker_result(
+            &options.harness_home,
+            &job,
+            &WorkerJobExecutionResult {
+                status: WorkerJobStatus::Canceled,
+                reason: options.reason.clone(),
+                audit_path: job.audit_path.clone(),
+                artifact_refs: job.artifact_refs.clone(),
+                result: Some(json!({"reason": options.reason})),
+            },
+            options.now_ms,
+        )?;
+    }
     Ok(WorkerCancelReport {
         schema: WORKER_CANCEL_SCHEMA,
         harness_home: options.harness_home,
@@ -1785,9 +2139,12 @@ fn execute_worker_job(
     job: &WorkerJob,
     config: &WorkerDispatchConfig,
     now_ms: i64,
+    lease_authority: &RunningWorkerLeaseRenewal,
 ) -> io::Result<WorkerJobExecutionResult> {
     match job.kind {
-        WorkerJobKind::DeterministicShell => run_deterministic_shell_job(harness_home, job, config),
+        WorkerJobKind::DeterministicShell => {
+            run_deterministic_shell_job(harness_home, job, config, lease_authority)
+        }
         WorkerJobKind::LlmSubagent
         | WorkerJobKind::MasterWakeup
         | WorkerJobKind::CoordinatorResume => queue_llm_worker_turn(harness_home, job, now_ms),
@@ -2095,6 +2452,7 @@ fn run_deterministic_shell_job(
     harness_home: &Path,
     job: &WorkerJob,
     config: &WorkerDispatchConfig,
+    lease_authority: &RunningWorkerLeaseRenewal,
 ) -> io::Result<WorkerJobExecutionResult> {
     let script_path = string_path(&job.payload, "scriptPath")
         .or_else(|| string_path(&job.payload, "script"))
@@ -2175,6 +2533,11 @@ fn run_deterministic_shell_job(
     let mut command = shell_command_for(&script, &argv);
     command.current_dir(&cwd);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     if let Some(env_object) = job.payload.get("env").and_then(Value::as_object) {
         for (key, value) in env_object {
             if is_env_key_allowed(key)
@@ -2187,17 +2550,37 @@ fn run_deterministic_shell_job(
 
     let mut child = command.spawn().map_err(io::Error::other)?;
     #[cfg(windows)]
-    let process_tree_job = WindowsWorkerProcessJob::assign(&child);
-    let timed_out = loop {
+    let process_tree_job = match WindowsWorkerProcessJob::assign(&child) {
+        Ok(process_tree_job) => process_tree_job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!(
+                "failed to arm deterministic-shell process-tree containment: {error}"
+            )));
+        }
+    };
+    let (timed_out, authority_revoked) = loop {
+        if lease_authority.authority_lost() {
+            #[cfg(windows)]
+            terminate_worker_child_process_tree(&mut child, &process_tree_job);
+            #[cfg(unix)]
+            terminate_worker_child_process_tree(&mut child);
+            #[cfg(all(not(windows), not(unix)))]
+            terminate_worker_child_process_tree(&mut child);
+            break (false, true);
+        }
         if child.try_wait().map_err(io::Error::other)?.is_some() {
-            break false;
+            break (false, false);
         }
         if epoch_ms()?.saturating_sub(started) > i64::try_from(timeout_ms).unwrap_or(i64::MAX) {
             #[cfg(windows)]
-            terminate_worker_child_process_tree(&mut child, process_tree_job.as_ref());
-            #[cfg(not(windows))]
+            terminate_worker_child_process_tree(&mut child, &process_tree_job);
+            #[cfg(unix)]
             terminate_worker_child_process_tree(&mut child);
-            break true;
+            #[cfg(all(not(windows), not(unix)))]
+            terminate_worker_child_process_tree(&mut child);
+            break (true, false);
         }
         thread::sleep(Duration::from_millis(50));
     };
@@ -2206,7 +2589,7 @@ fn run_deterministic_shell_job(
     let stdout = capped_string(&output.stdout);
     let stderr = capped_string(&output.stderr);
     let exit_code = output.status.code();
-    let status = if !timed_out && output.status.success() {
+    let status = if !timed_out && !authority_revoked && output.status.success() {
         WorkerJobStatus::Succeeded
     } else if job.attempt < job.max_attempts {
         WorkerJobStatus::FailedRetryable
@@ -2221,6 +2604,7 @@ fn run_deterministic_shell_job(
         "cwd": cwd,
         "exitCode": exit_code,
         "timedOut": timed_out,
+        "authorityRevoked": authority_revoked,
         "durationMs": ended.saturating_sub(started),
         "stdoutPreview": stdout,
         "stderrPreview": stderr,
@@ -2231,7 +2615,9 @@ fn run_deterministic_shell_job(
         &audit_path,
         serde_json::to_vec_pretty(&audit).map_err(io::Error::other)?,
     )?;
-    let reason = if status == WorkerJobStatus::Succeeded {
+    let reason = if authority_revoked {
+        "deterministic shell authority was revoked; owned process tree terminated".to_string()
+    } else if status == WorkerJobStatus::Succeeded {
         "deterministic shell job completed".to_string()
     } else if timed_out {
         "deterministic shell job timed out".to_string()
@@ -2259,21 +2645,41 @@ struct WindowsWorkerProcessJob {
 
 #[cfg(windows)]
 impl WindowsWorkerProcessJob {
-    fn assign(child: &std::process::Child) -> Option<Self> {
+    fn assign(child: &std::process::Child) -> io::Result<Self> {
+        use std::mem::{size_of, zeroed};
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
 
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if handle == 0 {
-                return None;
+                return Err(io::Error::last_os_error());
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                    .expect("job information size fits u32"),
+            ) == 0
+            {
+                let error = io::Error::last_os_error();
+                let _ = CloseHandle(handle);
+                return Err(error);
             }
             if AssignProcessToJobObject(handle, child.as_raw_handle() as isize) == 0 {
+                let error = io::Error::last_os_error();
                 let _ = CloseHandle(handle);
-                return None;
+                return Err(error);
             }
-            Some(Self { handle })
+            Ok(Self { handle })
         }
     }
 
@@ -2300,7 +2706,7 @@ impl Drop for WindowsWorkerProcessJob {
 #[cfg(windows)]
 fn terminate_worker_child_process_tree(
     child: &mut std::process::Child,
-    process_tree_job: Option<&WindowsWorkerProcessJob>,
+    process_tree_job: &WindowsWorkerProcessJob,
 ) {
     let mut command = Command::new("taskkill");
     command
@@ -2309,13 +2715,21 @@ fn terminate_worker_child_process_tree(
         .stderr(Stdio::null());
     configure_noninteractive_command(&mut command);
     let _ = command.status();
-    if let Some(process_tree_job) = process_tree_job {
-        process_tree_job.terminate();
+    process_tree_job.terminate();
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn terminate_worker_child_process_tree(child: &mut std::process::Child) {
+    if let Ok(process_group_id) = i32::try_from(child.id()) {
+        unsafe {
+            let _ = libc::kill(-process_group_id, libc::SIGKILL);
+        }
     }
     let _ = child.kill();
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(unix)))]
 fn terminate_worker_child_process_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
@@ -2479,7 +2893,22 @@ fn queue_llm_worker_turn(
         append_runtime_queue_item_if_missing(&queue_file, &item)?;
     }
     if let Some(cron_run_id) = cron_run_id.as_deref() {
-        mark_cron_run_runtime_enqueued(harness_home, cron_run_id, &queue_id, now_ms)?;
+        let cron_run_attempt = int_path(&job.payload, "cronRunAttempt")
+            .or_else(|| int_path(&job.payload, "cron_run_attempt"))
+            .unwrap_or(0);
+        if !mark_cron_run_runtime_enqueued(
+            harness_home,
+            cron_run_id,
+            cron_run_attempt,
+            &job.job_id,
+            &queue_id,
+            now_ms,
+        )? {
+            return Err(io::Error::other(format!(
+                "CronRun `{cron_run_id}` rejected runtime queue `{queue_id}` from stale worker `{}`",
+                job.job_id
+            )));
+        }
     }
     record_llm_subagent_lifecycle_running(harness_home, job, &queue_id, now_ms)?;
     Ok(WorkerJobExecutionResult {
@@ -2818,17 +3247,24 @@ fn run_watchdog_job(
     }
 
     let next_available = now_ms.saturating_add(backoff_ms(job.attempt));
-    conn.execute(
-        "UPDATE jobs SET status=?1, available_at_ms=?2, lease_owner=NULL, lease_expires_at_ms=NULL, updated_at_ms=?3, result_json=?4 WHERE job_id=?5",
+    let rows = conn.execute(
+        "UPDATE jobs SET status=?1, available_at_ms=?2, lease_owner=NULL, lease_expires_at_ms=NULL, updated_at_ms=?3, result_json=?4 WHERE job_id=?5 AND status='running' AND lease_owner=?6 AND attempt=?7",
         params![
             WorkerJobStatus::Pending.as_str(),
             next_available,
             now_ms,
             json!({"reason":"watchdog waiting for child boundary","childCount":children.len()}).to_string(),
             job.job_id,
+            job.lease_owner,
+            job.attempt,
         ],
     )
     .map_err(io::Error::other)?;
+    if rows != 1 {
+        return Err(io::Error::other(
+            "watchdog lost exact running lease before reschedule",
+        ));
+    }
     Ok(WorkerJobExecutionResult {
         status: WorkerJobStatus::Pending,
         reason: "watchdog rescheduled; no wake policy boundary reached".to_string(),
@@ -3266,19 +3702,27 @@ fn reschedule_watchdog_with_receipt(
     receipt: Value,
 ) -> io::Result<WorkerJobExecutionResult> {
     let next_available = now_ms.saturating_add(backoff_ms(watchdog.attempt));
-    conn.execute(
-        "UPDATE jobs SET status=?1, available_at_ms=?2, lease_owner=NULL,
+    let rows = conn
+        .execute(
+            "UPDATE jobs SET status=?1, available_at_ms=?2, lease_owner=NULL,
                 lease_expires_at_ms=NULL, updated_at_ms=?3, result_json=?4
-         WHERE job_id=?5",
-        params![
-            WorkerJobStatus::Pending.as_str(),
-            next_available,
-            now_ms,
-            json!({"reason": reason, "receipt": receipt}).to_string(),
-            watchdog.job_id,
-        ],
-    )
-    .map_err(io::Error::other)?;
+         WHERE job_id=?5 AND status='running' AND lease_owner=?6 AND attempt=?7",
+            params![
+                WorkerJobStatus::Pending.as_str(),
+                next_available,
+                now_ms,
+                json!({"reason": reason, "receipt": receipt}).to_string(),
+                watchdog.job_id,
+                watchdog.lease_owner,
+                watchdog.attempt,
+            ],
+        )
+        .map_err(io::Error::other)?;
+    if rows != 1 {
+        return Err(io::Error::other(
+            "coordinator watchdog lost exact running lease before reschedule",
+        ));
+    }
     Ok(WorkerJobExecutionResult {
         status: WorkerJobStatus::Pending,
         reason: reason.to_string(),
@@ -3397,6 +3841,189 @@ fn persist_execution_result(
     Ok(())
 }
 
+fn persist_owned_execution_result(
+    conn: &Connection,
+    job: &WorkerJob,
+    worker_id: &str,
+    result: &WorkerJobExecutionResult,
+    now_ms: i64,
+) -> io::Result<bool> {
+    let result = normalize_exhausted_retryable_result(job, result.clone());
+    if result.status == WorkerJobStatus::Pending {
+        let retained: bool = conn
+            .query_row(
+                "SELECT COUNT(*) = 1 FROM jobs WHERE job_id=?1 AND status='pending' AND attempt=?2 AND lease_owner IS NULL AND lease_expires_at_ms IS NULL",
+                params![job.job_id, job.attempt],
+                |row| row.get(0),
+            )
+            .map_err(io::Error::other)?;
+        return Ok(retained);
+    }
+    let status = if result.status == WorkerJobStatus::FailedRetryable {
+        WorkerJobStatus::Pending
+    } else {
+        result.status
+    };
+    let finished_at = status.is_terminal().then_some(now_ms);
+    let available_at = if status == WorkerJobStatus::Pending {
+        now_ms.saturating_add(backoff_ms(job.attempt))
+    } else {
+        job.available_at_ms
+    };
+    let rows = conn
+        .execute(
+            "UPDATE jobs SET status=?1, available_at_ms=?2, lease_owner=NULL, lease_expires_at_ms=NULL, audit_path=?3, result_json=?4, artifact_refs_json=?5, updated_at_ms=?6, finished_at_ms=?7 WHERE job_id=?8 AND status='running' AND lease_owner=?9 AND attempt=?10",
+            params![
+                status.as_str(),
+                available_at,
+                result
+                    .audit_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string()),
+                result.result.as_ref().map(Value::to_string),
+                result.artifact_refs.as_ref().map(Value::to_string),
+                now_ms,
+                finished_at,
+                job.job_id,
+                worker_id,
+                job.attempt,
+            ],
+        )
+        .map_err(io::Error::other)?;
+    Ok(rows == 1)
+}
+
+fn set_job_running(
+    conn: &Connection,
+    job: &WorkerJob,
+    worker_id: &str,
+    now_ms: i64,
+) -> io::Result<()> {
+    let rows = conn
+        .execute(
+            "UPDATE jobs SET status='running', updated_at_ms=?1 WHERE job_id=?2 AND status='leased' AND lease_owner=?3 AND attempt=?4 AND lease_expires_at_ms IS NOT NULL",
+            params![now_ms, job.job_id, worker_id, job.attempt],
+        )
+        .map_err(io::Error::other)?;
+    if rows != 1 {
+        return Err(io::Error::other(format!(
+            "worker job {} attempt {} lost exact lease before running",
+            job.job_id, job.attempt
+        )));
+    }
+    Ok(())
+}
+
+struct RunningWorkerLeaseRenewal {
+    stop_tx: mpsc::Sender<()>,
+    join: thread::JoinHandle<()>,
+    failure: Arc<Mutex<Option<String>>>,
+    authority_lost: Arc<AtomicBool>,
+}
+
+impl RunningWorkerLeaseRenewal {
+    fn start(
+        db_file: PathBuf,
+        job_id: String,
+        worker_id: String,
+        attempt: i64,
+        lease_ms: i64,
+    ) -> io::Result<Self> {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = Arc::clone(&failure);
+        let authority_lost = Arc::new(AtomicBool::new(false));
+        let thread_authority_lost = Arc::clone(&authority_lost);
+        let renewal_interval_ms = u64::try_from((lease_ms / 3).clamp(50, 1_000)).unwrap_or(50);
+        let renewal_busy_timeout_ms = (renewal_interval_ms / 4).clamp(25, 250);
+        let conn = Connection::open(&db_file).map_err(io::Error::other)?;
+        conn.busy_timeout(Duration::from_millis(renewal_busy_timeout_ms))
+            .map_err(io::Error::other)?;
+        let mut known_expires_at_ms: i64 = conn
+            .query_row(
+                "SELECT lease_expires_at_ms FROM jobs WHERE job_id=?1 AND status='running' AND lease_owner=?2 AND attempt=?3",
+                params![job_id, worker_id, attempt],
+                |row| row.get(0),
+            )
+            .map_err(io::Error::other)?;
+        let join = thread::spawn(move || {
+            loop {
+                match stop_rx.recv_timeout(Duration::from_millis(renewal_interval_ms)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                let now_ms = match epoch_ms() {
+                    Ok(now_ms) => now_ms,
+                    Err(error) => {
+                        *thread_failure.lock().expect("lease failure lock") =
+                            Some(format!("read renewal clock: {error}"));
+                        thread_authority_lost.store(true, Ordering::Release);
+                        return;
+                    }
+                };
+                let expires_at_ms = now_ms.saturating_add(lease_ms.max(1));
+                match conn.execute(
+                    "UPDATE jobs SET lease_expires_at_ms=?1, updated_at_ms=?2 WHERE job_id=?3 AND status='running' AND lease_owner=?4 AND attempt=?5",
+                    params![expires_at_ms, now_ms, job_id, worker_id, attempt],
+                ) {
+                    Ok(1) => {
+                        known_expires_at_ms = expires_at_ms;
+                    }
+                    Ok(rows) => {
+                        *thread_failure.lock().expect("lease failure lock") = Some(format!(
+                            "exact lease renewal updated {rows} rows for attempt {attempt}"
+                        ));
+                        thread_authority_lost.store(true, Ordering::Release);
+                        return;
+                    }
+                    Err(error) => {
+                        let transient_contention = error.sqlite_error_code().is_some_and(|code| {
+                            matches!(
+                                code,
+                                rusqlite::ErrorCode::DatabaseBusy
+                                    | rusqlite::ErrorCode::DatabaseLocked
+                            )
+                        });
+                        let safety_margin_ms = i64::try_from(
+                            renewal_interval_ms.saturating_add(renewal_busy_timeout_ms),
+                        )
+                        .unwrap_or(i64::MAX);
+                        if transient_contention
+                            && now_ms.saturating_add(safety_margin_ms) < known_expires_at_ms
+                        {
+                            continue;
+                        }
+                        *thread_failure.lock().expect("lease failure lock") = Some(format!(
+                            "renew exact running lease before safe expiry: {error}"
+                        ));
+                        thread_authority_lost.store(true, Ordering::Release);
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            stop_tx,
+            join,
+            failure,
+            authority_lost,
+        })
+    }
+
+    fn authority_lost(&self) -> bool {
+        self.authority_lost.load(Ordering::Acquire)
+    }
+
+    fn stop(self) -> Option<String> {
+        let _ = self.stop_tx.send(());
+        if self.join.join().is_err() {
+            return Some("running lease renewal thread panicked".to_string());
+        }
+        self.failure.lock().expect("lease failure lock").take()
+    }
+}
+
+#[cfg(test)]
 fn set_job_status(
     conn: &Connection,
     job_id: &str,
@@ -4413,6 +5040,33 @@ mod tests {
     const DEFAULT_LEASE_MS: i64 = 300_000;
 
     #[test]
+    fn worker_running_lease_boundary_rejects_149_and_accepts_150_ms() {
+        let root = temp_root("worker_running_lease_boundary");
+        let harness_home = root.join(".agent-harness");
+        let rejected = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("fixture".to_string()),
+            worker_id: "boundary-worker".to_string(),
+            lease_ms: 149,
+            now_ms: 1_000,
+        })
+        .unwrap_err();
+        assert_eq!(rejected.kind(), io::ErrorKind::InvalidInput);
+        assert!(rejected.to_string().contains("at least 150"));
+
+        let accepted = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("fixture".to_string()),
+            worker_id: "boundary-worker".to_string(),
+            lease_ms: 150,
+            now_ms: 1_000,
+        })
+        .unwrap();
+        assert_eq!(accepted.status, WorkerRunOnceStatus::NoWork);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn worker_store_initializes_resume_intent_schema() {
         let root = temp_root("worker_store_initializes_resume_intent_schema");
         let harness_home = root.join(".agent-harness");
@@ -5199,22 +5853,30 @@ mod tests {
         options.payload = json!({
             "sourceHome": source,
             "sourceWorkspace": workspace,
+            "sourceKind": "native-cron",
+            "sourceId": "source-1",
+            "entryId": "daily",
             "agentId": "agent-a",
             "sessionKey": "cron:agent-a:daily:42",
             "messageText": "run daily cron",
             "runtimeClass": "cron",
             "origin": "cron-scheduler",
             "cronRunId": &cron_run.run_id,
+            "cronRunAttempt": cron_run.attempt,
             "scheduledForMs": 42,
             "platform": "native-cron",
             "sessionPolicy": "one-shot",
             "channelId": "daily",
             "userId": "cron-scheduler"
         });
+        options.idempotency_key =
+            Some(crate::cron_runs::cron_run_worker_idempotency_key(&cron_run));
+        options.source = Some("cron-scheduler".to_string());
         let enqueue = enqueue_worker_job(options).unwrap();
         crate::mark_cron_run_worker_enqueued(
             &harness_home,
             &cron_run.run_id,
+            cron_run.attempt,
             &enqueue.job.job_id,
             1001,
         )
@@ -5908,13 +6570,20 @@ mod tests {
             params![repaired_payload.to_string(), report.job.job_id],
         )
         .unwrap();
+        let retry_available_at_ms: i64 = conn
+            .query_row(
+                "SELECT available_at_ms FROM jobs WHERE job_id=?1",
+                params![report.job.job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         let retried = run_worker_once(WorkerRunOnceOptions {
             harness_home: harness_home.clone(),
             lane: Some("llm".to_string()),
             worker_id: "test-worker-second".to_string(),
             lease_ms: DEFAULT_LEASE_MS,
-            now_ms: 3001,
+            now_ms: retry_available_at_ms,
         })
         .unwrap();
         assert_eq!(retried.status, WorkerRunOnceStatus::Dispatched);
@@ -6269,6 +6938,7 @@ mod tests {
         crate::mark_cron_run_worker_enqueued(
             &harness_home,
             &cron_run.run_id,
+            cron_run.attempt,
             &enqueue.job.job_id,
             1001,
         )
@@ -6336,21 +7006,27 @@ mod tests {
             kind: WorkerJobKind::LlmSubagent,
             lane: Some("llm".to_string()),
             payload: json!({
+                "sourceKind": "native-cron",
+                "sourceId": "source-1",
+                "entryId": "bad-dispatch",
                 "agentId": "agent-a",
                 "sessionKey": "cron:agent-a:bad-dispatch:42",
+                "sessionPolicy": "one-shot",
                 "messageText": "missing source paths",
                 "runtimeClass": "cron",
                 "origin": "cron-scheduler",
                 "cronRunId": &cron_run.run_id,
+                "cronRunAttempt": cron_run.attempt,
+                "scheduledForMs": 42,
                 "platform": "native-cron"
             }),
-            idempotency_key: Some("bad-dispatch".to_string()),
+            idempotency_key: Some(crate::cron_runs::cron_run_worker_idempotency_key(&cron_run)),
             parent_job_id: None,
             job_group_id: None,
             master_agent_id: Some("main".to_string()),
             master_session_key: Some("master".to_string()),
             wake_policy: None,
-            source: Some("test".to_string()),
+            source: Some("cron-scheduler".to_string()),
             priority: 0,
             available_at_ms: Some(1002),
             max_attempts: 3,
@@ -6364,6 +7040,7 @@ mod tests {
         crate::mark_cron_run_worker_enqueued(
             &harness_home,
             &cron_run.run_id,
+            cron_run.attempt,
             &enqueue.job.job_id,
             1001,
         )
@@ -6425,6 +7102,615 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn running_deterministic_shell_retains_and_renews_exact_lease() {
+        let root = temp_root("running_deterministic_shell_retains_and_renews_exact_lease");
+        let harness_home = root.join(".agent-harness");
+        let script_dir = harness_home.join("state").join("workers").join("scripts");
+        fs::create_dir_all(&script_dir).unwrap();
+        let script = write_long_running_script(&script_dir, 900);
+        let now_ms = epoch_ms().unwrap();
+        let mut options = shell_options(&harness_home, "renew-running-lease", now_ms);
+        options.payload = json!({"scriptPath": script, "cwd": script_dir});
+        options.timeout_ms = Some(5_000);
+        let enqueued = enqueue_worker_job(options).unwrap();
+        let job_id = enqueued.job.job_id.clone();
+        let run_home = harness_home.clone();
+        let runner = thread::spawn(move || {
+            run_worker_once(WorkerRunOnceOptions {
+                harness_home: run_home,
+                lane: Some("shell".to_string()),
+                worker_id: "lease-renewal-worker".to_string(),
+                lease_ms: 180,
+                now_ms,
+            })
+            .unwrap()
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let first_lease = loop {
+            let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+            let row = conn.query_row(
+                "SELECT status, lease_owner, lease_expires_at_ms FROM jobs WHERE job_id=?1",
+                params![job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            );
+            if let Ok((status, Some(owner), Some(expires_at_ms))) = row
+                && status == WorkerJobStatus::Running.as_str()
+            {
+                assert_eq!(owner, "lease-renewal-worker");
+                break expires_at_ms;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "running worker job never retained an exact lease"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        thread::sleep(Duration::from_millis(300));
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        let (status, owner, renewed_lease): (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT status, lease_owner, lease_expires_at_ms FROM jobs WHERE job_id=?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, WorkerJobStatus::Running.as_str());
+        assert_eq!(owner.as_deref(), Some("lease-renewal-worker"));
+        assert!(
+            renewed_lease.is_some_and(|value| value > first_lease),
+            "running worker lease did not advance: first={first_lease} renewed={renewed_lease:?}"
+        );
+        drop(conn);
+
+        let completed = runner.join().unwrap();
+        assert_eq!(completed.status, WorkerRunOnceStatus::Completed);
+        let persisted = completed.job.unwrap();
+        assert_eq!(persisted.status, WorkerJobStatus::Succeeded);
+        assert!(persisted.lease_owner.is_none());
+        assert!(persisted.lease_expires_at_ms.is_none());
+        assert!(
+            persisted
+                .finished_at_ms
+                .is_some_and(|finished_at_ms| finished_at_ms > now_ms),
+            "long worker completion reused its iteration-start timestamp"
+        );
+        assert!(
+            persisted.updated_at_ms >= persisted.finished_at_ms.unwrap(),
+            "terminal worker chronology moved backward after lease renewal"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transient_sqlite_contention_retries_before_running_lease_margin() {
+        let root = temp_root("transient_sqlite_contention_retries_before_running_lease_margin");
+        let harness_home = root.join(".agent-harness");
+        let script_dir = harness_home.join("state").join("workers").join("scripts");
+        fs::create_dir_all(&script_dir).unwrap();
+        let script = write_long_running_script(&script_dir, 4_500);
+        let now_ms = epoch_ms().unwrap();
+        let mut options = shell_options(&harness_home, "transient-renewal-contention", now_ms);
+        options.payload = json!({"scriptPath": script, "cwd": script_dir});
+        options.timeout_ms = Some(8_000);
+        let job = enqueue_worker_job(options).unwrap().job;
+        let run_home = harness_home.clone();
+        let runner = thread::spawn(move || {
+            run_worker_once(WorkerRunOnceOptions {
+                harness_home: run_home,
+                lane: Some("shell".to_string()),
+                worker_id: "contention-worker".to_string(),
+                lease_ms: 3_000,
+                now_ms,
+            })
+            .unwrap()
+        });
+        let deadline = SystemTime::now() + Duration::from_secs(3);
+        loop {
+            let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+            let current = find_job_by_id(&conn, &job.job_id).unwrap().unwrap();
+            if current.status == WorkerJobStatus::Running {
+                break;
+            }
+            assert!(
+                SystemTime::now() < deadline,
+                "worker did not enter running before contention test"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let lock_conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        lock_conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        thread::sleep(Duration::from_millis(1_100));
+        lock_conn.execute_batch("COMMIT").unwrap();
+        drop(lock_conn);
+
+        let completed = runner.join().unwrap();
+        assert_eq!(completed.status, WorkerRunOnceStatus::Completed);
+        assert_eq!(
+            completed.job.as_ref().map(|job| job.status),
+            Some(WorkerJobStatus::Succeeded)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_run_once_recovers_an_expired_running_generation_before_new_work() {
+        let root = temp_root("worker_run_once_recovers_expired_running_generation");
+        let harness_home = root.join(".agent-harness");
+        let job = enqueue_worker_job(shell_options(&harness_home, "expired-running", 1_000))
+            .unwrap()
+            .job;
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        conn.execute(
+            "UPDATE jobs SET status='running', attempt=1, lease_owner='dead-generation', lease_expires_at_ms=1001, updated_at_ms=1000 WHERE job_id=?1",
+            params![job.job_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("shell".to_string()),
+            worker_id: "replacement-generation".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 2_000,
+        })
+        .unwrap();
+        assert_eq!(report.status, WorkerRunOnceStatus::NoWork);
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        let (status, owner, expiry, result): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, lease_owner, lease_expires_at_ms, result_json FROM jobs WHERE job_id=?1",
+                params![job.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, WorkerJobStatus::Pending.as_str());
+        assert!(owner.is_none());
+        assert!(expiry.is_none());
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|value| value.contains("stale lease reaped for retry"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn late_old_generation_result_cannot_overwrite_successor() {
+        let root = temp_root("late_old_generation_result_cannot_overwrite_successor");
+        let harness_home = root.join(".agent-harness");
+        let job = enqueue_worker_job(shell_options(&harness_home, "late-old-result", 1_000))
+            .unwrap()
+            .job;
+        let db_file = init_worker_store(&harness_home).unwrap();
+        let conn = Connection::open(&db_file).unwrap();
+        let config = load_worker_dispatch_config(&harness_home).unwrap();
+        let (old_job, _) =
+            lease_next_job(&conn, &config, Some("shell"), "old-generation", 1_001, 100).unwrap();
+        let old_job = old_job.unwrap();
+        set_job_running(&conn, &old_job, "old-generation", 1_001).unwrap();
+        reap_expired_worker_jobs(&harness_home, &conn, 1_102).unwrap();
+        conn.execute(
+            "UPDATE jobs SET available_at_ms=1102 WHERE job_id=?1",
+            params![job.job_id],
+        )
+        .unwrap();
+        let (successor, _) = lease_next_job(
+            &conn,
+            &config,
+            Some("shell"),
+            "new-generation",
+            1_102,
+            1_000,
+        )
+        .unwrap();
+        let successor = successor.unwrap();
+        set_job_running(&conn, &successor, "new-generation", 1_102).unwrap();
+
+        let accepted = persist_owned_execution_result(
+            &conn,
+            &old_job,
+            "old-generation",
+            &WorkerJobExecutionResult {
+                status: WorkerJobStatus::Succeeded,
+                reason: "late old-generation result".to_string(),
+                audit_path: None,
+                artifact_refs: None,
+                result: Some(json!({"oldGeneration": true})),
+            },
+            1_103,
+        )
+        .unwrap();
+        assert!(!accepted);
+        let current = find_job_by_id(&conn, &job.job_id).unwrap().unwrap();
+        assert_eq!(current.status, WorkerJobStatus::Running);
+        assert_eq!(current.attempt, 2);
+        assert_eq!(current.lease_owner.as_deref(), Some("new-generation"));
+        assert!(
+            current
+                .result
+                .as_ref()
+                .is_some_and(|value| !value.to_string().contains("oldGeneration"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancel_worker_job_terminalizes_linked_cron_run() {
+        let root = temp_root("cancel_worker_job_terminalizes_linked_cron_run");
+        let harness_home = root.join(".agent-harness");
+        let cron_run = crate::admit_cron_run(crate::CronRunAdmitOptions {
+            harness_home: harness_home.clone(),
+            source_kind: "native-cron".to_string(),
+            source_id: "source-1".to_string(),
+            entry_id: "backup".to_string(),
+            agent_id: "agent-a".to_string(),
+            scheduled_for_ms: 42,
+            runtime_class: "cron".to_string(),
+            session_key: "cron:agent-a:backup:42".to_string(),
+            session_policy: "one-shot".to_string(),
+            max_attempts: 1,
+            now_ms: 1_000,
+        })
+        .unwrap();
+        let mut options = shell_options(&harness_home, "cancel-cron-worker", 1_001);
+        options.payload = json!({
+            "scriptPath": options.payload["scriptPath"].clone(),
+            "cwd": options.payload["cwd"].clone(),
+            "dryRun": true,
+            "cronRunId": cron_run.run_id,
+        });
+        bind_cron_worker_fixture(&mut options, &cron_run);
+        let worker = enqueue_worker_job(options).unwrap().job;
+        crate::mark_cron_run_worker_enqueued(
+            &harness_home,
+            &cron_run.run_id,
+            cron_run.attempt,
+            &worker.job_id,
+            1_002,
+        )
+        .unwrap();
+
+        let report = cancel_worker_job(WorkerCancelOptions {
+            harness_home: harness_home.clone(),
+            job_id: worker.job_id,
+            now_ms: 1_003,
+            reason: "operator canceled failed backup generation".to_string(),
+        })
+        .unwrap();
+        assert!(report.canceled);
+        let runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        let updated = runs
+            .runs
+            .iter()
+            .find(|run| run.run_id == cron_run.run_id)
+            .unwrap();
+        assert_eq!(updated.status, crate::CronRunStatus::Canceled);
+        assert_eq!(updated.finished_at_ms, Some(1_003));
+        assert!(
+            updated
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("failed backup generation"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_restart_reconciles_terminal_job_after_cron_sync_gap() {
+        let root = temp_root("worker_restart_reconciles_terminal_job_after_cron_sync_gap");
+        let harness_home = root.join(".agent-harness");
+        let cron_run = crate::admit_cron_run(crate::CronRunAdmitOptions {
+            harness_home: harness_home.clone(),
+            source_kind: "deterministic-cron".to_string(),
+            source_id: "source-reconcile".to_string(),
+            entry_id: "backup".to_string(),
+            agent_id: "agent-a".to_string(),
+            scheduled_for_ms: 42,
+            runtime_class: "cron".to_string(),
+            session_key: "cron:agent-a:backup:42".to_string(),
+            session_policy: "one-shot".to_string(),
+            max_attempts: 1,
+            now_ms: 1_000,
+        })
+        .unwrap();
+        let mut options = shell_options(&harness_home, "cron-sync-gap", 1_001);
+        options.payload = json!({
+            "scriptPath": options.payload["scriptPath"].clone(),
+            "cwd": options.payload["cwd"].clone(),
+            "dryRun": true,
+            "cronRunId": cron_run.run_id,
+        });
+        bind_cron_worker_fixture(&mut options, &cron_run);
+        let worker = enqueue_worker_job(options).unwrap().job;
+        crate::mark_cron_run_worker_enqueued(
+            &harness_home,
+            &cron_run.run_id,
+            cron_run.attempt,
+            &worker.job_id,
+            1_002,
+        )
+        .unwrap();
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        conn.execute(
+            "UPDATE jobs SET status='failed-terminal', result_json=?1, updated_at_ms=1003, finished_at_ms=1003 WHERE job_id=?2",
+            params![
+                json!({"reason":"simulated crash after worker commit"}).to_string(),
+                worker.job_id
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let before = crate::collect_cron_run_summary(&harness_home).unwrap();
+        assert_eq!(
+            before
+                .runs
+                .iter()
+                .find(|run| run.run_id == cron_run.run_id)
+                .unwrap()
+                .status,
+            crate::CronRunStatus::WorkerEnqueued
+        );
+
+        let report = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("shell".to_string()),
+            worker_id: "restart-reconciler".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 2_000,
+        })
+        .unwrap();
+        assert_eq!(report.status, WorkerRunOnceStatus::NoWork);
+        let after = crate::collect_cron_run_summary(&harness_home).unwrap();
+        let reconciled = after
+            .runs
+            .iter()
+            .find(|run| run.run_id == cron_run.run_id)
+            .unwrap();
+        assert_eq!(reconciled.status, crate::CronRunStatus::FailedTerminal);
+        assert!(
+            reconciled
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("simulated crash"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_restart_reconciles_all_stale_unlinked_cron_admission_outcomes() {
+        let root = temp_root("reconcile_stale_unlinked_cron_admissions");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let admit = |entry_id: &str, slot: i64| {
+            crate::admit_cron_run(crate::CronRunAdmitOptions {
+                harness_home: harness_home.clone(),
+                source_kind: "native-cron".to_string(),
+                source_id: "source-recovery".to_string(),
+                entry_id: entry_id.to_string(),
+                agent_id: "agent-a".to_string(),
+                scheduled_for_ms: slot,
+                runtime_class: "cron".to_string(),
+                session_key: format!("cron:agent-a:{entry_id}:{slot}"),
+                session_policy: "one-shot".to_string(),
+                max_attempts: 3,
+                now_ms: 1_000,
+            })
+            .unwrap()
+        };
+        let no_worker = admit("no-worker", 41);
+        let exact = admit("exact-worker", 42);
+        let mismatch = admit("mismatched-worker", 43);
+
+        let enqueue_for = |run: &crate::CronRun, payload_entry_id: &str| {
+            let mut options =
+                llm_options(&harness_home, &source, &workspace, payload_entry_id, 1_002);
+            options.lane = Some("cron-recovery".to_string());
+            options.source = Some("cron-scheduler".to_string());
+            options.idempotency_key = Some(crate::cron_runs::cron_run_worker_idempotency_key(run));
+            options.payload = json!({
+                "sourceHome": &source,
+                "sourceWorkspace": &workspace,
+                "sourceKind": &run.source_kind,
+                "sourceId": &run.source_id,
+                "entryId": payload_entry_id,
+                "agentId": &run.agent_id,
+                "sessionKey": &run.session_key,
+                "sessionPolicy": &run.session_policy,
+                "messageText": "reconcile fixture",
+                "runtimeClass": &run.runtime_class,
+                "origin": "cron-scheduler",
+                "cronRunId": &run.run_id,
+                "cronRunAttempt": run.attempt,
+                "scheduledForMs": run.scheduled_for_ms,
+                "platform": "native-cron"
+            });
+            enqueue_worker_job(options).unwrap().job
+        };
+        let exact_worker = enqueue_for(&exact, &exact.entry_id);
+        let _mismatched_worker = enqueue_for(&mismatch, "wrong-entry");
+
+        let report = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("__reconcile_only__".to_string()),
+            worker_id: "restart-reconciler".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 61_001,
+        })
+        .unwrap();
+        assert_eq!(report.status, WorkerRunOnceStatus::NoWork);
+        let runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        let find = |run_id: &str| runs.runs.iter().find(|run| run.run_id == run_id).unwrap();
+        assert_eq!(
+            find(&no_worker.run_id).status,
+            crate::CronRunStatus::Expired
+        );
+        assert_eq!(
+            find(&exact.run_id).status,
+            crate::CronRunStatus::WorkerEnqueued
+        );
+        assert_eq!(
+            find(&exact.run_id).worker_job_id.as_deref(),
+            Some(exact_worker.job_id.as_str())
+        );
+        let retry = crate::control_cron_run(crate::CronRunControlOptions {
+            harness_home: harness_home.clone(),
+            action: crate::CronRunControlAction::Retry,
+            run_id: Some(exact.run_id.clone()),
+            agent_id: None,
+            entry_id: None,
+            reason: "must not fork an active worker generation".to_string(),
+            now_ms: 61_002,
+        })
+        .unwrap();
+        assert_eq!(retry.affected, 0);
+        assert!(
+            retry
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("still active"))
+        );
+        assert_eq!(
+            find(&mismatch.run_id).status,
+            crate::CronRunStatus::AdmissionBlocked
+        );
+        assert!(find(&mismatch.run_id).quarantined);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancel_running_deterministic_shell_terminates_owned_process_tree() {
+        let root = temp_root("cancel_running_deterministic_shell_terminates_owned_process_tree");
+        let harness_home = root.join(".agent-harness");
+        let script_dir = harness_home.join("state").join("workers").join("scripts");
+        fs::create_dir_all(&script_dir).unwrap();
+        let pid_file = script_dir.join("cancel-descendant.pid");
+        let script = write_descendant_wait_script(&script_dir, &pid_file, "cancel-descendant");
+        let now_ms = epoch_ms().unwrap();
+        let mut options = shell_options(&harness_home, "cancel-running-shell", now_ms);
+        options.payload = json!({"scriptPath": script, "cwd": script_dir});
+        options.max_attempts = 1;
+        options.timeout_ms = Some(8_000);
+        let job = enqueue_worker_job(options).unwrap().job;
+        let run_home = harness_home.clone();
+        let runner = thread::spawn(move || {
+            run_worker_once(WorkerRunOnceOptions {
+                harness_home: run_home,
+                lane: Some("shell".to_string()),
+                worker_id: "cancel-running-worker".to_string(),
+                lease_ms: 300,
+                now_ms,
+            })
+        });
+
+        let descendant_pid = wait_for_descendant_pid(
+            &harness_home,
+            &job.job_id,
+            &pid_file,
+            Duration::from_secs(6),
+        );
+        cancel_worker_job(WorkerCancelOptions {
+            harness_home: harness_home.clone(),
+            job_id: job.job_id.clone(),
+            now_ms: epoch_ms().unwrap(),
+            reason: "test running cancellation".to_string(),
+        })
+        .unwrap();
+        let killed_while_active =
+            wait_for_test_process_absent(descendant_pid, Duration::from_millis(1_500));
+        let runner_result = runner.join().unwrap();
+        assert!(
+            runner_result.is_err(),
+            "canceled running generation unexpectedly retained result authority"
+        );
+        assert!(
+            killed_while_active,
+            "running cancellation did not promptly terminate the owned process tree"
+        );
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        let persisted = find_job_by_id(&conn, &job.job_id).unwrap().unwrap();
+        assert_eq!(persisted.status, WorkerJobStatus::Canceled);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn revoked_running_lease_terminates_old_process_before_successor_effects() {
+        let root =
+            temp_root("revoked_running_lease_terminates_old_process_before_successor_effects");
+        let harness_home = root.join(".agent-harness");
+        let script_dir = harness_home.join("state").join("workers").join("scripts");
+        fs::create_dir_all(&script_dir).unwrap();
+        let pid_file = script_dir.join("revoked-descendant.pid");
+        let script = write_descendant_wait_script(&script_dir, &pid_file, "revoked-descendant");
+        let now_ms = epoch_ms().unwrap();
+        let mut options = shell_options(&harness_home, "revoke-running-shell", now_ms);
+        options.payload = json!({"scriptPath": script, "cwd": script_dir});
+        options.max_attempts = 2;
+        options.timeout_ms = Some(8_000);
+        let job = enqueue_worker_job(options).unwrap().job;
+        let run_home = harness_home.clone();
+        let runner = thread::spawn(move || {
+            run_worker_once(WorkerRunOnceOptions {
+                harness_home: run_home,
+                lane: Some("shell".to_string()),
+                worker_id: "revoked-running-worker".to_string(),
+                lease_ms: 300,
+                now_ms,
+            })
+        });
+
+        let descendant_pid = wait_for_descendant_pid(
+            &harness_home,
+            &job.job_id,
+            &pid_file,
+            Duration::from_secs(6),
+        );
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        conn.execute(
+            "UPDATE jobs SET status='pending', lease_owner=NULL, lease_expires_at_ms=NULL, available_at_ms=?1, updated_at_ms=?1 WHERE job_id=?2 AND status='running' AND lease_owner='revoked-running-worker' AND attempt=1",
+            params![epoch_ms().unwrap(), job.job_id],
+        )
+        .unwrap();
+        drop(conn);
+        let killed_before_successor =
+            wait_for_test_process_absent(descendant_pid, Duration::from_millis(1_500));
+        let runner_result = runner.join().unwrap();
+        assert!(
+            runner_result.is_err(),
+            "revoked generation unexpectedly retained result authority"
+        );
+        assert!(
+            killed_before_successor,
+            "revoked generation remained active after exact lease authority changed"
+        );
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        let persisted = find_job_by_id(&conn, &job.job_id).unwrap().unwrap();
+        assert_eq!(persisted.status, WorkerJobStatus::Pending);
+        assert_eq!(persisted.attempt, 1);
+        assert!(persisted.lease_owner.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn deterministic_shell_final_timeout_is_terminal_and_next_job_runs() {
         let root = temp_root("deterministic_shell_final_timeout_is_terminal_and_next_job_runs");
@@ -6453,12 +7739,14 @@ mod tests {
             "cwd": script_dir,
             "cronRunId": &cron_run.run_id,
         });
+        bind_cron_worker_fixture(&mut timeout, &cron_run);
         timeout.max_attempts = 1;
         timeout.timeout_ms = Some(10);
         let timeout_job = enqueue_worker_job(timeout).unwrap();
         crate::mark_cron_run_worker_enqueued(
             &harness_home,
             &cron_run.run_id,
+            cron_run.attempt,
             &timeout_job.job.job_id,
             1001,
         )
@@ -6484,7 +7772,8 @@ mod tests {
         assert_eq!(persisted.attempt, persisted.max_attempts);
         assert!(persisted.lease_owner.is_none());
         assert!(persisted.lease_expires_at_ms.is_none());
-        assert_eq!(persisted.finished_at_ms, Some(1002));
+        assert!(persisted.finished_at_ms.is_some_and(|value| value >= 1002));
+        assert_eq!(persisted.updated_at_ms, persisted.finished_at_ms.unwrap());
 
         let runs = crate::collect_cron_run_summary(&harness_home).unwrap();
         let updated = runs
@@ -6613,11 +7902,13 @@ mod tests {
             "cwd": script_dir,
             "cronRunId": &cron_run.run_id,
         });
+        bind_cron_worker_fixture(&mut options, &cron_run);
         options.max_attempts = 3;
         let enqueued = enqueue_worker_job(options).unwrap();
         crate::mark_cron_run_worker_enqueued(
             &harness_home,
             &cron_run.run_id,
+            cron_run.attempt,
             &enqueued.job.job_id,
             1000,
         )
@@ -6732,6 +8023,63 @@ mod tests {
             "descendant process survived worker timeout"
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deterministic_timeout_terminates_unix_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("deterministic_timeout_terminates_unix_process_group");
+        let harness_home = root.join(".agent-harness");
+        let script_dir = harness_home.join("state").join("workers").join("scripts");
+        fs::create_dir_all(&script_dir).unwrap();
+        let pid_file = script_dir.join("descendant.pid");
+        let script = script_dir.join("spawn-descendant.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s' \"$child\" > '{}'\nwait \"$child\"\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let mut options = shell_options(&harness_home, "timeout-unix-process-group", 1_000);
+        options.payload = json!({"scriptPath": script, "cwd": script_dir});
+        options.max_attempts = 1;
+        options.timeout_ms = Some(1_000);
+        enqueue_worker_job(options).unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("shell".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1_001,
+        })
+        .unwrap();
+        assert_eq!(run.status, WorkerRunOnceStatus::Failed);
+        assert!(pid_file.is_file(), "descendant pid was never recorded");
+        let descendant_pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = SystemTime::now() + Duration::from_secs(5);
+        let mut absent = false;
+        while SystemTime::now() < deadline {
+            let result = unsafe { libc::kill(descendant_pid, 0) };
+            if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                absent = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(absent, "descendant process survived worker timeout");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7559,6 +8907,36 @@ mod tests {
         }
     }
 
+    fn bind_cron_worker_fixture(options: &mut WorkerEnqueueOptions, run: &crate::CronRun) {
+        let payload = options
+            .payload
+            .as_object_mut()
+            .expect("worker fixture payload must be an object");
+        for (name, value) in [
+            ("sourceKind", run.source_kind.as_str()),
+            ("sourceId", run.source_id.as_str()),
+            ("entryId", run.entry_id.as_str()),
+            ("agentId", run.agent_id.as_str()),
+            ("sessionKey", run.session_key.as_str()),
+            ("sessionPolicy", run.session_policy.as_str()),
+            ("runtimeClass", run.runtime_class.as_str()),
+            ("origin", "cron-scheduler"),
+            ("cronRunId", run.run_id.as_str()),
+        ] {
+            payload.insert(name.to_string(), Value::String(value.to_string()));
+        }
+        payload.insert(
+            "scheduledForMs".to_string(),
+            Value::Number(run.scheduled_for_ms.into()),
+        );
+        payload.insert(
+            "cronRunAttempt".to_string(),
+            Value::Number(run.attempt.into()),
+        );
+        options.idempotency_key = Some(crate::cron_runs::cron_run_worker_idempotency_key(run));
+        options.source = Some("cron-scheduler".to_string());
+    }
+
     fn llm_options(
         harness_home: &Path,
         source: &Path,
@@ -7787,6 +9165,119 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(&script, permissions).unwrap();
             script
+        }
+    }
+
+    fn write_long_running_script(script_dir: &Path, duration_ms: u64) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let script = script_dir.join("long-running.ps1");
+            fs::write(
+                &script,
+                format!("Start-Sleep -Milliseconds {duration_ms}\r\n"),
+            )
+            .unwrap();
+            script
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let script = script_dir.join("long-running.sh");
+            let duration_seconds = (duration_ms as f64) / 1_000.0;
+            fs::write(&script, format!("#!/bin/sh\nsleep {duration_seconds:.3}\n")).unwrap();
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+            script
+        }
+    }
+
+    fn write_descendant_wait_script(script_dir: &Path, pid_file: &Path, stem: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let script = script_dir.join(format!("{stem}.ps1"));
+            fs::write(
+                &script,
+                format!(
+                    "$child = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -WindowStyle Hidden -PassThru\r\nSet-Content -LiteralPath '{}' -Value $child.Id -NoNewline\r\nWait-Process -Id $child.Id\r\n",
+                    pid_file.display()
+                ),
+            )
+            .unwrap();
+            script
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let script = script_dir.join(format!("{stem}.sh"));
+            fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s' \"$child\" > '{}'\nwait \"$child\"\n",
+                    pid_file.display()
+                ),
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+            script
+        }
+    }
+
+    fn wait_for_descendant_pid(
+        harness_home: &Path,
+        job_id: &str,
+        pid_file: &Path,
+        timeout: Duration,
+    ) -> i64 {
+        let deadline = SystemTime::now() + timeout;
+        loop {
+            if let Ok(raw) = fs::read_to_string(pid_file)
+                && let Ok(pid) = raw.trim().parse::<i64>()
+            {
+                return pid;
+            }
+            let conn = Connection::open(worker_db_file(harness_home)).unwrap();
+            let job = find_job_by_id(&conn, job_id).unwrap().unwrap();
+            assert!(
+                matches!(
+                    job.status,
+                    WorkerJobStatus::Pending | WorkerJobStatus::Leased | WorkerJobStatus::Running
+                ),
+                "worker became {} before descendant PID was recorded",
+                job.status.as_str()
+            );
+            assert!(
+                SystemTime::now() < deadline,
+                "descendant PID was not recorded before timeout"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn wait_for_test_process_absent(process_id: i64, timeout: Duration) -> bool {
+        let deadline = SystemTime::now() + timeout;
+        loop {
+            #[cfg(windows)]
+            let alive = crate::loop_health::process_alive_for_pid(process_id) != Some(false);
+            #[cfg(unix)]
+            let alive = {
+                let Ok(pid) = i32::try_from(process_id) else {
+                    return true;
+                };
+                let result = unsafe { libc::kill(pid, 0) };
+                !(result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+            };
+            if !alive {
+                return true;
+            }
+            if SystemTime::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(25));
         }
     }
 

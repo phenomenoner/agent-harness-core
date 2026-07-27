@@ -31,7 +31,7 @@ Prompt assembly includes a stable skill catalog with id, description, category, 
 
 Skill mutation remains proposal-mediated for traceability, but the proposal is not a mandatory human approval queue. Create, patch, replace, and archive proposals are recorded under `state/learning/skill-proposals.jsonl`; guarded autonomous and operator-triggered apply both use checksum validation, a per-target lock, backup creation, approved-root checks, and receipts before writing.
 
-`skill-synthesize` and the runtime self-improvement hook default to guarded autonomous review/apply for agent-created skills. A complex successful turn that had no selected skill can enqueue a `skill_synthesis` worker job with explicit current-policy fields, persist the proposal and decision trace, and apply only when every lint, guard, checksum, target-lock, backup, and approved-root gate passes. Unsafe candidates are blocked or quarantined. `--propose-only` and `learning.skillSynthesis.mode = "propose-only"` remain explicit non-mutating modes; legacy worker payloads without policy fields also remain non-mutating for upgrade safety.
+`skill-synthesize` and the runtime self-improvement hook default to guarded autonomous review/apply for agent-created skills. A complex successful turn that had no selected skill can enqueue a `skill_synthesis` worker job with explicit current-policy fields, persist the proposal and decision trace, and apply only when every lint, guard, checksum, target-lock, backup, and approved-root gate passes. Unsafe candidates are blocked or quarantined. `--propose-only` and `learning.skillSynthesis.mode = "propose-only"` remain explicit non-mutating modes; legacy worker payloads without policy fields also remain non-mutating for backward-compatible safety.
 
 Quality gates are additive:
 
@@ -53,20 +53,31 @@ Skill packs use checksum manifests and an install lockfile. Import verifies mani
 
 The schema registry documents every public receipt and state file used by the skill ecosystem. Additive fields remain v1-compatible. Breaking changes require a new schema version, a reader for the prior version, and migration evidence.
 
-## Shortest Upgrade Path
+## Shortest Path to Outcome-Linked Routing and Governed Learning
 
-The next product slice is deliberately narrow:
+Before skill routing evidence is collected, the v0.13.1 hot patch must make
+generic third-party MCP availability truthful across generated-config updates
+and fresh backend startup. The complete product path remains deliberately
+narrow:
 
-1. freeze a versioned skill card and deterministic catalog digest;
-2. inventory and rebaseline the existing library without changing serving;
-3. run a role-first matcher in shadow mode against a reviewed replay corpus;
-4. join routing and delivery to exact virtual-session outcomes and cost;
-5. activate one reversible exact cohort only when the comparison shows value;
-6. close one selected-skill improvement loop through held-out replay, canary,
+1. preserve extension-owned MCP registrations transactionally and prove the
+   declared capabilities in a newly started, correctly isolated backend home;
+2. freeze a versioned skill card and deterministic catalog digest;
+3. inventory and rebaseline the existing library without changing serving;
+4. run a role-first matcher in shadow mode against a reviewed replay corpus;
+5. join routing and delivery to exact virtual-session outcomes and cost;
+6. activate one reversible exact cohort only when the comparison shows value;
+7. close one selected-skill improvement loop through held-out replay, canary,
    promotion, re-selection, and exact restore.
 
-This order establishes attribution before optimization and rollback before broader autonomy.
-Queue-store migration, warm process pools, native MCP, cross-platform packaging, broad knowledge
-graphs, and unattended structural consolidation are not prerequisites unless current measurements
-show that they block this slice. The [roadmap](agent-harness-core-roadmap-backlog.md) records the
-exit conditions and the continuous stability rails.
+This order establishes truthful capabilities before skill eligibility,
+attribution before optimization, and rollback before broader autonomy.
+Queue-store migration, warm process pools, a native MCP control surface,
+cross-platform packaging, broad knowledge graphs, and unattended structural
+consolidation are not prerequisites unless current measurements show that they
+block this slice. The [roadmap](agent-harness-core-roadmap-backlog.md) records
+the exit conditions and the continuous stability rails. The
+[phase-plan folder](roadmap/skill-routing-and-governed-learning/README.md)
+provides a
+self-contained implementation and acceptance plan for each independently useful
+product phase.

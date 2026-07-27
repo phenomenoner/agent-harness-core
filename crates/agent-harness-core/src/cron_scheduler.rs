@@ -6,6 +6,11 @@ use rusqlite::{Connection, Error as SqlError, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::cron_runs::{
+    block_unlinked_admitted_cron_run, cron_run_has_exact_worker_link,
+    cron_run_worker_idempotency_key, expire_unlinked_admitted_cron_run,
+};
+use crate::workers::{get_worker_job_by_idempotency_key, validate_cron_worker_identity};
 use crate::{
     AgentSource, CronRunAdmitOptions, CronRunStatus, DeterministicCronPlanAction,
     DeterministicCronPlanEntry, DeterministicCronPlanInput, DeterministicCronSchedule,
@@ -1048,13 +1053,14 @@ fn collect_native_cron_decisions(
                     "runtimeClass": "cron",
                     "origin": "cron-scheduler",
                     "cronRunId": &run_id,
+                    "cronRunAttempt": cron_run.attempt,
                     "platform": "native-cron",
                     "channelId": &entry.job_id,
                     "userId": "cron-scheduler",
                     "messageText": &message_text,
                     "inboundContext": serde_json::to_string(entry).unwrap_or_default()
                 });
-                let enqueue = enqueue_worker_job(WorkerEnqueueOptions {
+                let enqueue = match enqueue_worker_job(WorkerEnqueueOptions {
                     harness_home: options.harness_home.clone(),
                     kind: WorkerJobKind::LlmSubagent,
                     lane: Some("cron".to_string()),
@@ -1078,11 +1084,22 @@ fn collect_native_cron_decisions(
                         normalize_key_part(&master_session)
                     )),
                     now_ms: options.now_ms,
-                })?;
-                mark_cron_run_worker_enqueued(
+                }) {
+                    Ok(enqueue) => enqueue,
+                    Err(error) => {
+                        compensate_cron_worker_enqueue_error(
+                            &options.harness_home,
+                            &cron_run,
+                            options.now_ms,
+                            &error,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                validate_and_link_cron_worker(
                     &options.harness_home,
-                    &cron_run.run_id,
-                    &enqueue.job.job_id,
+                    &cron_run,
+                    &enqueue.job,
                     options.now_ms,
                 )?;
                 insert_watermark(
@@ -1458,6 +1475,7 @@ fn collect_deterministic_cron_decisions(
             "runtimeClass": "deterministic-shell",
             "origin": "cron-scheduler",
             "cronRunId": &run_id,
+            "cronRunAttempt": cron_run.attempt,
             "catchUpDecision": catch_up.as_ref().map(|value| value.decision.as_str()),
             "missedSlots": catch_up
                 .as_ref()
@@ -1467,7 +1485,7 @@ fn collect_deterministic_cron_decisions(
             "sourceWorkspace": &options.source.workspace,
             "runtimeWorkspace": &options.runtime_workspace,
         });
-        let enqueue = enqueue_worker_job(WorkerEnqueueOptions {
+        let enqueue = match enqueue_worker_job(WorkerEnqueueOptions {
             harness_home: options.harness_home.clone(),
             kind: WorkerJobKind::DeterministicShell,
             lane: Some("shell".to_string()),
@@ -1493,11 +1511,22 @@ fn collect_deterministic_cron_decisions(
                 normalize_key_part(&master_session)
             )),
             now_ms: options.now_ms,
-        })?;
-        mark_cron_run_worker_enqueued(
+        }) {
+            Ok(enqueue) => enqueue,
+            Err(error) => {
+                compensate_cron_worker_enqueue_error(
+                    &options.harness_home,
+                    &cron_run,
+                    options.now_ms,
+                    &error,
+                )?;
+                return Err(error);
+            }
+        };
+        validate_and_link_cron_worker(
             &options.harness_home,
-            &cron_run.run_id,
-            &enqueue.job.job_id,
+            &cron_run,
+            &enqueue.job,
             options.now_ms,
         )?;
         insert_watermark(
@@ -2601,6 +2630,90 @@ fn floor_to_minute(now_ms: i64) -> i64 {
     now_ms.div_euclid(60_000) * 60_000
 }
 
+fn validate_and_link_cron_worker(
+    harness_home: &Path,
+    cron_run: &crate::CronRun,
+    worker_job: &crate::WorkerJob,
+    now_ms: i64,
+) -> io::Result<()> {
+    if let Err(reason) = validate_cron_worker_identity(cron_run, worker_job) {
+        let _ = block_unlinked_admitted_cron_run(
+            harness_home,
+            &cron_run.run_id,
+            cron_run.attempt,
+            i64::MAX,
+            &reason,
+            now_ms,
+        )?;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
+    }
+    if mark_cron_run_worker_enqueued(
+        harness_home,
+        &cron_run.run_id,
+        cron_run.attempt,
+        &worker_job.job_id,
+        now_ms,
+    )? || cron_run_has_exact_worker_link(
+        harness_home,
+        &cron_run.run_id,
+        cron_run.attempt,
+        &worker_job.job_id,
+    )? {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "CronRun {} attempt {} rejected worker link {}",
+        cron_run.run_id, cron_run.attempt, worker_job.job_id
+    )))
+}
+
+fn compensate_cron_worker_enqueue_error(
+    harness_home: &Path,
+    cron_run: &crate::CronRun,
+    now_ms: i64,
+    enqueue_error: &io::Error,
+) -> io::Result<()> {
+    let idempotency_key = cron_run_worker_idempotency_key(cron_run);
+    match get_worker_job_by_idempotency_key(harness_home, &idempotency_key) {
+        Ok(Some(worker_job)) => {
+            validate_and_link_cron_worker(harness_home, cron_run, &worker_job, now_ms)
+        }
+        Ok(None) => {
+            if expire_unlinked_admitted_cron_run(
+                harness_home,
+                &cron_run.run_id,
+                cron_run.attempt,
+                i64::MAX,
+                &format!(
+                    "scheduler worker enqueue failed before a worker existed; zero worker and zero side effect: {enqueue_error}"
+                ),
+                now_ms,
+            )? {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "CronRun {} could not be compensated after worker enqueue failure",
+                    cron_run.run_id
+                )))
+            }
+        }
+        Err(lookup_error) => {
+            let reason = format!(
+                "worker enqueue outcome is ambiguous and exact idempotency lookup failed: {lookup_error}"
+            );
+            let _ = block_unlinked_admitted_cron_run(
+                harness_home,
+                &cron_run.run_id,
+                cron_run.attempt,
+                i64::MAX,
+                &reason,
+                now_ms,
+            )?;
+            Err(io::Error::other(reason))
+        }
+    }
+}
+
 fn scheduler_idempotency_key(
     source_kind: &str,
     source_id: &str,
@@ -2832,6 +2945,8 @@ mod tests {
         crate::mark_cron_run_worker_status(
             &harness_home,
             &cron_run.run_id,
+            cron_run.attempt,
+            cron_run.worker_job_id.as_deref().unwrap(),
             "failed-terminal",
             "test retry path",
             15_000,
@@ -2875,6 +2990,99 @@ mod tests {
         assert_eq!(job_count, 2);
         assert!(retry_idempotency_key.ends_with(":attempt:1"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enqueue_error_compensation_distinguishes_post_commit_worker_from_zero_worker() {
+        let root = temp_root("enqueue_error_compensation");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        let admit = |entry_id: &str, slot: i64| {
+            crate::admit_cron_run(crate::CronRunAdmitOptions {
+                harness_home: harness_home.clone(),
+                source_kind: "native-cron".to_string(),
+                source_id: "source-compensation".to_string(),
+                entry_id: entry_id.to_string(),
+                agent_id: "main".to_string(),
+                scheduled_for_ms: slot,
+                runtime_class: "cron".to_string(),
+                session_key: format!("cron:main:{entry_id}:{slot}"),
+                session_policy: "one-shot".to_string(),
+                max_attempts: 3,
+                now_ms: 1_000,
+            })
+            .unwrap()
+        };
+        let committed = admit("committed-worker", 42);
+        let missing = admit("missing-worker", 43);
+        let worker = crate::enqueue_worker_job(crate::WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: crate::WorkerJobKind::LlmSubagent,
+            lane: Some("cron".to_string()),
+            payload: json!({
+                "sourceKind": &committed.source_kind,
+                "sourceId": &committed.source_id,
+                "entryId": &committed.entry_id,
+                "agentId": &committed.agent_id,
+                "sessionKey": &committed.session_key,
+                "sessionPolicy": &committed.session_policy,
+                "runtimeClass": &committed.runtime_class,
+                "origin": "cron-scheduler",
+                "cronRunId": &committed.run_id,
+                "cronRunAttempt": committed.attempt,
+                "scheduledForMs": committed.scheduled_for_ms
+            }),
+            idempotency_key: Some(cron_run_worker_idempotency_key(&committed)),
+            parent_job_id: None,
+            job_group_id: Some("cron-scheduler:source-compensation".to_string()),
+            master_agent_id: Some("main".to_string()),
+            master_session_key: Some("master".to_string()),
+            wake_policy: None,
+            source: Some("cron-scheduler".to_string()),
+            priority: 0,
+            available_at_ms: Some(1_001),
+            max_attempts: 3,
+            timeout_ms: Some(DEFAULT_WORKER_TIMEOUT_MS),
+            cascade_timeout_ms: Some(DEFAULT_WATCHDOG_TIMEOUT_MS),
+            rate_key: None,
+            concurrency_group_key: None,
+            now_ms: 1_001,
+        })
+        .unwrap()
+        .job;
+
+        compensate_cron_worker_enqueue_error(
+            &harness_home,
+            &committed,
+            1_002,
+            &io::Error::other("simulated post-commit lifecycle failure"),
+        )
+        .unwrap();
+        assert!(
+            cron_run_has_exact_worker_link(
+                &harness_home,
+                &committed.run_id,
+                committed.attempt,
+                &worker.job_id,
+            )
+            .unwrap()
+        );
+
+        compensate_cron_worker_enqueue_error(
+            &harness_home,
+            &missing,
+            1_002,
+            &io::Error::other("simulated pre-commit enqueue failure"),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::cron_runs::get_cron_run_by_id(&harness_home, &missing.run_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::CronRunStatus::Expired
+        );
         let _ = fs::remove_dir_all(root);
     }
 

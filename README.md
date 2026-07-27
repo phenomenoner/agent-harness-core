@@ -7,8 +7,8 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](rust-toolchain.toml)
 [![Edition 2024](https://img.shields.io/badge/edition-2024-red.svg)](Cargo.toml)
-[![Version 0.13.0](https://img.shields.io/badge/version-0.13.0-blue.svg)](crates/agent-harness-core/Cargo.toml)
-[![Platform: Windows-first](https://img.shields.io/badge/platform-Windows--first-0078d4.svg)](#faq)
+[![Version 0.13.1](https://img.shields.io/badge/version-0.13.1-blue.svg)](crates/agent-harness-core/Cargo.toml)
+[![Core: Cross-platform](https://img.shields.io/badge/core-cross--platform-2ea44f.svg)](#faq)
 [![Status: Pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](CHANGELOG.md)
 
 [Quick Start](#quick-start) •
@@ -91,6 +91,25 @@ flowchart LR
 
 The harness owns ingress, permissions, queuing, prompt assembly, delivery, long-task continuity, and audit. **Codex owns the model**: system prompt, tool schemas, MCP, sandbox, approvals, and session continuity. That split keeps the harness small, deterministic, and testable — 1,200+ tests run without any model call, using a bundled fake Codex app-server.
 
+Agent Harness Core still materializes the backend home and generated config for
+the Codex process it launches. It owns the safety of that write and the
+truthfulness of any readiness claim, but not MCP protocol or tool semantics.
+Version 0.13.1 preserves operator-managed third-party MCP
+registrations through generated-config updates and requires fresh,
+same-connection readiness before turn admission. Required declarations fail
+closed when authentication, server identity/version, or tool-schema evidence
+does not match; optional declarations continue with a bounded warning. Initial
+server registration and login remain explicit operator actions. See the
+[third-party MCP reliability plan](docs/roadmap/skill-routing-and-governed-learning/phase-0-reliable-third-party-mcp-hosting.md)
+for the exercised boundaries and remaining release gaps.
+
+The same reliability release protects long deterministic operations.
+Running work retains renewable exact generation authority and wrapper
+heartbeats; cancellation, authority loss, timeout, or owner loss contains the
+complete child tree on Windows and Unix. Terminal worker state is
+restart-reconciled into linked cron state, and backup operations can publish
+atomic create/verify progress under an operation-specific absolute deadline.
+
 ### Current source contracts
 
 Channel task boundaries are two-phase and restart-safe. `/stop` and `/new` freeze the old exact
@@ -169,6 +188,15 @@ Live deployment receipts and operator runbooks remain outside the public reposit
 
 The v0.9.0 deployment contract exact-pins Codex CLI 0.144.5 and requires the supervisor to launch a deployment-owned canonical executable whose path, version, and SHA-256 are receipted. Harness-owned protocol compatibility still serializes resume/compact operations, preserves backend-reported `modelContextWindow`, and correlates completion events to the requesting operation; upgrading Codex alone is not treated as a race fix.
 
+The current source baseline pins Codex CLI 0.145.0. Its sanitized compatibility
+fixture is bound to the official tag and generated schemas, including
+`mcpServerStatus/list` and MCP startup-state notifications. Harness-managed
+Codex config now preserves extension-owned `mcp_servers` transactionally, and a
+required external capability must be observed with the declared tool-schema
+digest on the same fresh agent/provider app-server connection before a model
+turn. Source/staging compatibility does not by itself claim deployment or live
+provider readiness.
+
 Reasoning remains authorized against the exact effective provider/model route. Exact `max` is preserved only when advertised, exact `ultra` is filtered and rejected, and legacy `ultra-high` / `ultra_high` canonicalize to `xhigh` before duplicate handling. Other future effort names remain open-ended only when the exact route advertises them.
 
 Multi-agent dispatch is heterogeneous by design: siblings need not share a model or effort. Each child receives an immutable dispatch-time policy and an exact master owner. Terminal output is reduced to a bounded, redacted summary plus opaque artifact references in a durable mailbox; a missing or invalid expected result becomes an explicit failed-omission envelope instead of disappearing from the batch. Runtime class and origin are derived from the trusted worker job kind and checked against typed terminal receipts. Any active work in the exact master lane suppresses resumption; after confirmed lane release, duplicate and restarted watchdog passes coalesce into exactly one logical resume intent and typed continuation. Child progress, final text, and errors are internal evidence and never become parent user-facing output directly.
@@ -224,7 +252,7 @@ One binary, `agent-harness`, grouped into clear families:
 
 ## Project Status
 
-Version **0.13.0** is the current release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
+Version **0.13.1** is the current release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
 
 See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md) for what's done, gated, and next.
 
@@ -252,7 +280,16 @@ See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness
 Any model Codex app-server can drive: OpenAI models natively, and the whole OpenRouter catalog (Anthropic Claude, Google Gemini, Meta Llama, …) via `/model openrouter/<provider-model-id>`. Switching models is a chat command, not a redeploy; OpenRouter routes use an isolated Codex home so they do not contaminate the default OpenAI/Codex route.
 
 **Does it run on Linux or macOS?**
-The core library and CLI are portable Rust, but deployed supervision is currently **Windows-first**. Windows direct-owner mode holds one exclusive OS lease, directly retains service children, and uses kill-on-close Job containment; the older reconcile-managed shape remains available for compatibility and rollback. Linux has native `/proc` liveness/start-generation evidence plus shared/exclusive Unix ownership leases, and the workspace compiles there, but direct ownership fails before state mutation because process-group containment, signal drain/escalation, and host recovery are not implemented. macOS has not received equivalent native lifecycle evidence. Windows Service Control Manager, systemd, and launchd remain planned thin host adapters around the same master engine; Task Scheduler is the currently validated Windows adapter, not the cross-platform control plane.
+The core library, CLI, config materializer, and Codex/MCP child-containment
+contract are cross-platform Rust. Windows uses kill-on-close Job containment;
+Unix uses dedicated process groups, signal escalation, and durable cleanup
+fences. Current source checks compile the workspace natively on Linux and run
+focused Unix process, path, permission, and fresh-backend scenarios there.
+However, the complete Linux test suite still has known historical
+Windows-specific and writable-fixture failures, and native macOS execution has
+not been performed. Windows Task Scheduler is the currently validated deployed
+supervision adapter; systemd and launchd packaging, native macOS lifecycle
+evidence, and exact-platform live cutovers remain separate gates.
 
 **Do I need Telegram or Discord?**
 No. Every pipeline stage is a CLI command — you can enqueue, run, and inspect agent turns entirely from a terminal or your own scheduler.

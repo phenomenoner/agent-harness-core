@@ -2232,7 +2232,34 @@ fn generate_live_control_token() -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestEnvRestore {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl TestEnvRestore {
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for TestEnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn backup_copies_state_and_skips_secrets() {
@@ -2358,6 +2385,7 @@ mod tests {
 
     #[test]
     fn live_home_ops_control_requires_token_from_an_ordinary_shell() {
+        let _live_session = TestEnvRestore::remove("AGENT_HARNESS_LIVE_SESSION");
         let root = temp_root("live_home_ops_control_requires_token_from_an_ordinary_shell");
         let harness_home = root.join(".agent-harness");
         fs::create_dir_all(&harness_home).unwrap();

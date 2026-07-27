@@ -115,6 +115,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
         "liveControlGuard",
         "skills",
         "backendAuth",
+        "externalCapabilities",
     ];
     let has_known_section = object
         .keys()
@@ -153,6 +154,9 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             }
             "skills" => validate_skills_object("$.skills", child, errors),
             "backendAuth" => validate_backend_auth_object("$.backendAuth", child, errors),
+            "externalCapabilities" => {
+                validate_external_capabilities_object("$.externalCapabilities", child, errors)
+            }
             "goalAutonomy" => validate_goal_autonomy_object("$.goalAutonomy", child, errors),
             other => errors.push(format!("unknown harness-config key `{other}` at $")),
         }
@@ -163,6 +167,46 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             "codex/runtime security aliases are accepted for compatibility; prefer security.* keys"
                 .to_string(),
         );
+    }
+}
+
+fn validate_external_capabilities_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "mcpServers" => {
+                let Some(values) = child.as_array() else {
+                    errors.push(format!("{}.mcpServers must be an array", path));
+                    continue;
+                };
+                let declarations = values
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, value)| {
+                        serde_json::from_value::<
+                            crate::external_capability::ExternalMcpCapabilityDeclarationV1,
+                        >(value.clone())
+                        .map_err(|error| {
+                            errors.push(format!("{path}.mcpServers[{index}] is invalid: {error}"));
+                        })
+                        .ok()
+                    })
+                    .collect::<Vec<_>>();
+                if declarations.len() == values.len()
+                    && let Err(error) =
+                        crate::external_capability::validate_external_mcp_capability_declarations(
+                            &declarations,
+                        )
+                {
+                    errors.push(format!("{path}.mcpServers is invalid: {error}"));
+                }
+            }
+            other => errors.push(format!(
+                "unknown external capability config key `{other}` at {path}"
+            )),
+        }
     }
 }
 
@@ -1000,6 +1044,9 @@ fn validate_memory_object(path: &str, value: &Value, errors: &mut Vec<String>) {
             | "openclaw_mem_bridge_command"
             | "openclawMemBridgeBin"
             | "openclaw_mem_bridge_bin" => expect_string(path_key(path, key), child, errors),
+            "interactiveRecallBudgetMs" | "interactive_recall_budget_ms" => {
+                expect_positive_u64(path_key(path, key), child, errors)
+            }
             other => errors.push(format!("unknown memory config key `{other}` at {path}")),
         }
     }
@@ -1776,7 +1823,8 @@ mod tests {
               },
               "memory": {
                 "openclawMemBridgeCommand": "openclaw-mem-bridge-dispatch .agent-harness",
-                "openclawMemBridgeBin": "openclaw-mem"
+                "openclawMemBridgeBin": "openclaw-mem",
+                "interactiveRecallBudgetMs": 20000
               },
               "staging": {
                 "enabled": true,
@@ -2726,6 +2774,41 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| { error.contains("sliceDrainWindowMs must equal") })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn external_mcp_capabilities_require_exact_unique_agent_provider_bindings() {
+        let root = temp_root("external-mcp-capabilities");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            format!(
+                r#"{{"externalCapabilities":{{"mcpServers":[{{"serverId":"generic-mock","transport":"stdio","expectedToolSchemaDigest":"{digest}","requirement":"required","agentId":"main","provider":"openai"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_harness_config(&harness_home).unwrap().status,
+            HarnessConfigValidationStatus::Valid
+        );
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            format!(
+                r#"{{"externalCapabilities":{{"mcpServers":[{{"serverId":"generic-mock","transport":"stdio","expectedToolSchemaDigest":"{digest}","requirement":"required","agentId":"main","provider":"openai"}},{{"serverId":"generic-mock","transport":"stdio","expectedToolSchemaDigest":"{digest}","requirement":"optional","agentId":"main","provider":"openai"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        let invalid = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(invalid.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            invalid
+                .errors
+                .iter()
+                .any(|error| error.contains("duplicate agent/provider/server identity"))
         );
         let _ = fs::remove_dir_all(root);
     }

@@ -20,8 +20,8 @@ use serde_json::{Value, json};
 
 use crate::backend_auth::{
     BackendAuthLifecycleState, backend_auth_runtime_gate_enabled, load_backend_auth_state,
-    record_backend_auth_defer_intent, resolve_or_create_provider_codex_home,
-    resume_backend_auth_defer_intent,
+    provider_home_permissions_are_restrictive, record_backend_auth_defer_intent,
+    resolve_or_create_agent_provider_codex_home, resume_backend_auth_defer_intent,
 };
 use crate::backend_reasoning_execution::{
     BackendReasoningCapabilitySourceV1, BackendReasoningExecutionEvidenceFieldsV2,
@@ -33,12 +33,21 @@ use crate::codex_capability::{
     SameConnectionProofContext, bind_effective_provider, build_live_model_catalog_observation,
     build_same_connection_proof, decide_cache_live_drift,
 };
+use crate::codex_config_materialization::{
+    CODEX_CONFIG_MATERIALIZATION_SCHEMA, CodexConfigMaterializationOptions,
+    CodexConfigMaterializationReceiptV1, CodexConfigMaterializationResultV1,
+    CodexConfigMaterializationSourceV1, materialize_codex_config,
+};
 use crate::codex_web_search::{
     CodexWebSearchObserver, CodexWebSearchPlan, codex_web_search_resume_is_stable,
     codex_web_search_thread_bindings_file, decide_effective_codex_web_search,
     parse_codex_web_search_capability, persist_codex_web_search_decision,
     persist_codex_web_search_thread_binding, plan_codex_web_search,
     read_codex_web_search_thread_binding, unavailable_codex_web_search_capability,
+};
+use crate::external_capability::{
+    CodexExternalCapabilityReadinessInput, ExternalMcpCapabilityDeclarationV1,
+    evaluate_codex_external_capability_readiness, load_external_mcp_capability_declarations,
 };
 use crate::external_effect::{
     ExternalEffectAdmissionV1, ExternalEffectIntentV1, ExternalEffectRequestContextV1,
@@ -136,6 +145,10 @@ const CODEX_RESUME_SETTLE_QUIET_MS: u64 = 300;
 const CODEX_RESUME_SETTLE_MAX_MS: u64 = 1_000;
 const CODEX_CAPABILITY_CONFIG_READ_REQUEST_ID: i64 = 9_000;
 const CODEX_WEB_SEARCH_CAPABILITY_REQUEST_ID: i64 = 8_900;
+const CODEX_EXTERNAL_MCP_STATUS_FIRST_REQUEST_ID: i64 = 8_910;
+const CODEX_EXTERNAL_MCP_STATUS_PAGE_SIZE: usize = 100;
+const CODEX_EXTERNAL_MCP_STATUS_MAX_PAGES: usize = 16;
+const CODEX_EXTERNAL_MCP_STATUS_TIMEOUT_MS: u64 = 30_000;
 const CODEX_CAPABILITY_MODEL_LIST_FIRST_REQUEST_ID: i64 = 9_100;
 const CODEX_CAPABILITY_MODEL_LIST_PAGE_SIZE: usize = 256;
 const CODEX_CAPABILITY_MODEL_LIST_MAX_PAGES: usize = 16;
@@ -581,6 +594,9 @@ pub struct CodexRuntimePlan {
     pub provider_request_policy: crate::TurnProviderRequestPolicy,
     #[serde(default)]
     pub web_search: CodexWebSearchPlan,
+    pub config_materialization: CodexConfigMaterializationReceiptV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_mcp_capabilities: Vec<ExternalMcpCapabilityDeclarationV1>,
     /// Trusted, redacted prompt-boundary metadata. This is derived only from
     /// the prepared receipt and locally generated prompt bundle; it is never
     /// populated from inbound chat content.
@@ -3010,6 +3026,10 @@ struct CodexRuntimePlanFile {
     pub provider_request_policy: crate::TurnProviderRequestPolicy,
     #[serde(default)]
     pub web_search: CodexWebSearchPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_materialization: Option<CodexConfigMaterializationReceiptV1>,
+    #[serde(default)]
+    pub external_mcp_capabilities: Vec<ExternalMcpCapabilityDeclarationV1>,
     #[serde(default)]
     pub prompt_authority: CodexPromptAuthority,
     pub prompt_bundle_json: PathBuf,
@@ -3409,23 +3429,54 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     };
     let app_server_sandbox = resolve_codex_sandbox_policy(&options.harness_home, &mut warnings);
     let provider_config = codex_provider_config(provider.as_deref());
-    let codex_home = Some(harness_codex_home(
+    let effective_agent_id = agent_id.as_deref().unwrap_or("main");
+    let effective_provider = provider_config
+        .as_ref()
+        .map(|config| config.provider.as_str())
+        .unwrap_or("openai");
+    let codex_home = harness_codex_home(
         &options.harness_home,
+        effective_agent_id,
         provider_config.as_ref(),
-    )?);
-    ensure_harness_codex_config(
-        codex_home.as_deref(),
+    )?;
+    let config_materialization = ensure_harness_codex_config(
+        &codex_home,
         &working_directory,
         &options.harness_home,
+        effective_agent_id,
+        effective_provider,
         provider_config.as_ref(),
         &mut warnings,
     )?;
+    write_json_atomic(
+        &execution_dir.join("codex-config-materialization-receipt.json"),
+        &config_materialization,
+    )?;
+    let external_mcp_capabilities =
+        load_external_mcp_capability_declarations(&options.harness_home)?
+            .into_iter()
+            .filter(|declaration| {
+                declaration
+                    .agent_id
+                    .eq_ignore_ascii_case(effective_agent_id)
+                    && declaration
+                        .provider
+                        .eq_ignore_ascii_case(effective_provider)
+            })
+            .collect::<Vec<_>>();
+    if !external_mcp_capabilities.is_empty() && thread_id.is_some() {
+        warnings.push(
+            "declared external MCP capabilities require a fresh Codex app-server thread; cached thread resume was disabled"
+                .to_string(),
+        );
+        thread_id = None;
+    }
     let invocation = CodexInvocationPlan {
         executable,
         transport: CodexTransportPlan::StdioJsonRpcAppServer,
         arguments: vec!["app-server".to_string()],
         working_directory,
-        codex_home,
+        codex_home: Some(codex_home),
         prompt_input_file: prompt_markdown.clone(),
         env_requirements: env_requirements(provider.as_deref()),
         provider_config,
@@ -3455,6 +3506,8 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         backend_reasoning_policy,
         provider_request_policy,
         web_search,
+        config_materialization,
+        external_mcp_capabilities,
         prompt_authority,
         prompt_bundle_json,
         prompt_markdown,
@@ -7197,9 +7250,20 @@ struct CodexChildProcessGuard {
     harness_home: PathBuf,
     cleanup_fence: Option<crate::runtime_worker::RuntimeQueueChildCleanupFenceAuthority>,
     process_start_time_ms: Option<i64>,
+    readiness_process_generation: String,
     #[cfg(windows)]
     process_job: WindowsCodexProcessJob,
     resumed: bool,
+}
+
+fn fresh_codex_spawn_generation() -> io::Result<String> {
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    let mut nonce = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| io::Error::other("failed to generate a fresh Codex spawn-generation token"))?;
+    Ok(sha256_prefixed(&nonce))
 }
 
 #[derive(Clone)]
@@ -7374,6 +7438,7 @@ impl CodexChildProcessGuard {
         process_job: WindowsCodexProcessJob,
         harness_home: &Path,
         cleanup_fence: Option<crate::runtime_worker::RuntimeQueueChildCleanupFenceAuthority>,
+        readiness_process_generation: String,
     ) -> Self {
         let process_start_time_ms =
             crate::loop_health::process_start_time_ms_for_pid(i64::from(child.id()));
@@ -7382,6 +7447,7 @@ impl CodexChildProcessGuard {
             harness_home: harness_home.to_path_buf(),
             cleanup_fence,
             process_start_time_ms,
+            readiness_process_generation,
             process_job,
             resumed: false,
         }
@@ -7392,6 +7458,7 @@ impl CodexChildProcessGuard {
         child: std::process::Child,
         harness_home: &Path,
         cleanup_fence: Option<crate::runtime_worker::RuntimeQueueChildCleanupFenceAuthority>,
+        readiness_process_generation: String,
     ) -> Self {
         let process_start_time_ms =
             crate::loop_health::process_start_time_ms_for_pid(i64::from(child.id()));
@@ -7400,6 +7467,7 @@ impl CodexChildProcessGuard {
             harness_home: harness_home.to_path_buf(),
             cleanup_fence,
             process_start_time_ms,
+            readiness_process_generation,
             resumed: true,
         }
     }
@@ -7433,7 +7501,16 @@ impl CodexChildProcessGuard {
     }
 
     fn kill(&mut self) -> io::Result<()> {
-        self.child.kill()
+        #[cfg(unix)]
+        {
+            signal_unix_process_group(self.id(), libc::SIGKILL)?;
+            let _ = self.child.kill();
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            self.child.kill()
+        }
     }
 
     fn bind_cleanup_fence_before_execution(&mut self) -> io::Result<()> {
@@ -7452,7 +7529,7 @@ impl CodexChildProcessGuard {
                 }
                 #[cfg(not(windows))]
                 {
-                    false
+                    cfg!(unix)
                 }
             },
         )?;
@@ -7514,7 +7591,7 @@ impl Drop for CodexChildProcessGuard {
             // can then require exact dead-owner/dead-child evidence.
             fail_closed_child_cleanup_generation(
                 &self.harness_home,
-                "Windows child process-tree cleanup could not be proven",
+                "child process-tree containment cleanup could not be proven",
             );
             return;
         }
@@ -7937,6 +8014,92 @@ fn record_codex_test_child_pid(_harness_home: &Path, _pid: u32) -> io::Result<()
     Ok(())
 }
 
+fn revalidate_runtime_codex_config(
+    plan: &CodexRuntimePlanFile,
+    execution_dir: &Path,
+) -> io::Result<Option<CodexConfigMaterializationReceiptV1>> {
+    let Some(materialization) = plan.config_materialization.as_ref() else {
+        if plan.external_mcp_capabilities.is_empty() {
+            return Ok(None);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "declared external MCP capabilities require a config materialization receipt",
+        ));
+    };
+    if materialization.schema != CODEX_CONFIG_MATERIALIZATION_SCHEMA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex config materialization receipt schema is unsupported",
+        ));
+    }
+    let codex_home = plan.invocation.codex_home.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex config materialization receipt requires an explicit Codex home",
+        )
+    })?;
+    let config_file = codex_home.join("config.toml");
+    let config_bytes = fs::read(&config_file)?;
+    let config_digest = sha256_prefixed(&config_bytes);
+    if config_digest != materialization.config_hash_after {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex config changed after materialization; execution was denied before spawn",
+        ));
+    }
+    let effective_agent_id = plan.agent_id.as_deref().unwrap_or("main");
+    let effective_provider = plan
+        .invocation
+        .provider_config
+        .as_ref()
+        .map(|provider| provider.provider.as_str())
+        .unwrap_or("openai");
+    for (label, observed, expected) in [
+        (
+            "agent",
+            sha256_prefixed(effective_agent_id.as_bytes()),
+            materialization.agent_id_digest.as_str(),
+        ),
+        (
+            "provider",
+            sha256_prefixed(effective_provider.as_bytes()),
+            materialization.provider_digest.as_str(),
+        ),
+        (
+            "Codex home",
+            sha256_prefixed(codex_home.to_string_lossy().as_bytes()),
+            materialization.codex_home_digest.as_str(),
+        ),
+    ] {
+        if observed != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Codex config materialization {label} identity binding changed"),
+            ));
+        }
+    }
+    if !materialization.permissions_restrictive
+        || !provider_home_permissions_are_restrictive(codex_home)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Codex config home permissions were not restrictive at execution time",
+        ));
+    }
+
+    let mut reuse = materialization.clone();
+    reuse.source = CodexConfigMaterializationSourceV1::Reused;
+    reuse.result = CodexConfigMaterializationResultV1::Unchanged;
+    reuse.config_hash_before = Some(config_digest.clone());
+    reuse.config_hash_after = config_digest;
+    write_json_atomic(
+        &execution_dir.join("codex-config-reuse-receipt.json"),
+        &reuse,
+    )?;
+    Ok(Some(reuse))
+}
+
 fn drive_codex_app_server(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
@@ -7983,12 +8146,30 @@ fn drive_codex_app_server(
     fs::create_dir_all(&plan.invocation.working_directory)?;
     let stdout_log = execution_dir.join("codex-runtime-run.stdout.jsonl");
     let stderr_log = execution_dir.join("codex-runtime-run.stderr.log");
+    if let Err(error) = revalidate_runtime_codex_config(plan, &execution_dir) {
+        return Ok(codex_app_server_pre_execution_result(
+            CodexRuntimeRunStatus::ProtocolError,
+            format!("Codex config reuse validation failed: {error}"),
+            &stdout_log,
+            &stderr_log,
+        ));
+    }
     let stderr = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&stderr_log)?;
+    let resolved_backend_executable =
+        resolve_executable(&plan.invocation.executable).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "could not resolve Codex executable {}",
+                    plan.invocation.executable.display()
+                ),
+            )
+        })?;
     #[cfg(not(windows))]
-    let mut command = Command::new(&plan.invocation.executable);
+    let mut command = Command::new(&resolved_backend_executable);
     #[cfg(not(windows))]
     command
         .args(&plan.invocation.arguments)
@@ -7996,6 +8177,11 @@ fn drive_codex_app_server(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     #[cfg(not(windows))]
     apply_required_secret_env(
         &mut command,
@@ -8007,7 +8193,6 @@ fn drive_codex_app_server(
     #[cfg(not(windows))]
     apply_live_agent_session_env(&mut command, harness_home);
 
-    #[cfg(windows)]
     let cleanup_fence = match cancel_check.child_cleanup_lease_authority() {
         Ok(Some(authority)) => {
             match crate::runtime_worker::prearm_runtime_queue_child_cleanup_fence(
@@ -8038,10 +8223,25 @@ fn drive_codex_app_server(
             ));
         }
     };
-    #[cfg(not(windows))]
-    let cleanup_fence = None;
-    #[cfg(windows)]
     let child_cleanup_fence = cleanup_fence.clone();
+    let readiness_process_generation = match fresh_codex_spawn_generation() {
+        Ok(generation) => generation,
+        Err(error) => {
+            if let Some(fence) = cleanup_fence.as_ref() {
+                let cleanup_proven_at_ms =
+                    fence.monotonic_cleanup_proof_time(current_log_time_ms().unwrap_or(0));
+                finalize_or_retry_child_cleanup_proof(harness_home, fence, cleanup_proven_at_ms);
+            }
+            return Ok(codex_app_server_pre_execution_result(
+                CodexRuntimeRunStatus::ProtocolError,
+                format!(
+                    "Codex child execution was not started because its portable spawn generation could not be created: {error}"
+                ),
+                &stdout_log,
+                &stderr_log,
+            ));
+        }
+    };
     #[cfg(windows)]
     let mut child = match WindowsCodexProcessJob::create().and_then(|process_job| {
         spawn_atomic_windows_codex_child(
@@ -8052,7 +8252,13 @@ fn drive_codex_app_server(
             Duration::from_millis(idle_timeout_ms.max(1)),
         )
         .map(|child| {
-            CodexChildProcessGuard::new(child, process_job, harness_home, child_cleanup_fence)
+            CodexChildProcessGuard::new(
+                child,
+                process_job,
+                harness_home,
+                child_cleanup_fence,
+                readiness_process_generation,
+            )
         })
     }) {
         Ok(child) => child,
@@ -8104,8 +8310,18 @@ fn drive_codex_app_server(
     }
     #[cfg(not(windows))]
     let mut child = match command.spawn() {
-        Ok(child) => CodexChildProcessGuard::new(child, harness_home, cleanup_fence),
+        Ok(child) => CodexChildProcessGuard::new(
+            child,
+            harness_home,
+            child_cleanup_fence,
+            readiness_process_generation,
+        ),
         Err(error) => {
+            if let Some(fence) = cleanup_fence.as_ref() {
+                let cleanup_proven_at_ms =
+                    fence.monotonic_cleanup_proof_time(current_log_time_ms().unwrap_or(0));
+                finalize_or_retry_child_cleanup_proof(harness_home, fence, cleanup_proven_at_ms);
+            }
             return Ok(codex_app_server_pre_execution_result(
                 CodexRuntimeRunStatus::SpawnFailed,
                 format!("failed to spawn codex app-server process: {error}"),
@@ -8574,6 +8790,214 @@ fn drive_codex_app_server(
     }
     if let Some(observer) = state.goal_projection_observer.as_mut() {
         observer.set_current_thread(&thread_id);
+    }
+    if !plan.external_mcp_capabilities.is_empty() {
+        let Some(config_materialization) = plan.config_materialization.as_ref() else {
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                CodexRuntimeRunStatus::ProtocolError,
+                "external MCP readiness lacked a config materialization receipt".to_string(),
+                Some(thread_id),
+            ));
+        };
+        let Some(codex_home) = plan.invocation.codex_home.as_deref() else {
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                CodexRuntimeRunStatus::ProtocolError,
+                "external MCP readiness lacked an explicit Codex home".to_string(),
+                Some(thread_id),
+            ));
+        };
+        let backend_executable_digest = match sha256_file_prefixed(&resolved_backend_executable) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return Ok(codex_app_server_terminal_failure_result(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state,
+                    &stdout_log,
+                    &stderr_log,
+                    CodexRuntimeRunStatus::ProtocolError,
+                    format!(
+                        "external MCP readiness could not hash the backend executable: {error}"
+                    ),
+                    Some(thread_id),
+                ));
+            }
+        };
+        // This receipt is bound to the freshly spawned child handle and the
+        // same initialized app-server connection. OS start-time identity
+        // remains the cleanup/reconciliation authority where a platform
+        // exposes it; readiness uses a private random spawn token so macOS
+        // does not become functionally unavailable merely because it lacks
+        // the Linux `/proc` or Windows process-time adapter.
+        let process_generation = child.readiness_process_generation.clone();
+        let mut pages = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            if pages.len() >= CODEX_EXTERNAL_MCP_STATUS_MAX_PAGES {
+                return Ok(codex_app_server_terminal_failure_result(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state,
+                    &stdout_log,
+                    &stderr_log,
+                    CodexRuntimeRunStatus::ProtocolError,
+                    "external MCP readiness exceeded the bounded status page limit".to_string(),
+                    Some(thread_id),
+                ));
+            }
+            let request_id = CODEX_EXTERNAL_MCP_STATUS_FIRST_REQUEST_ID
+                + i64::try_from(pages.len()).unwrap_or(0);
+            let mut params = json!({
+                "threadId": thread_id,
+                "detail": "toolsAndAuthOnly",
+                "limit": CODEX_EXTERNAL_MCP_STATUS_PAGE_SIZE,
+            });
+            if let Some(cursor) = cursor.as_deref() {
+                params["cursor"] = json!(cursor);
+            }
+            if let Err(error) = write_json_rpc(
+                &mut stdin,
+                &json!({
+                    "id": request_id,
+                    "method": "mcpServerStatus/list",
+                    "params": params,
+                }),
+            ) {
+                return Ok(codex_app_server_write_failed_result(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state,
+                    &stdout_log,
+                    &stderr_log,
+                    "mcpServerStatus/list readiness request",
+                    error,
+                ));
+            }
+            let deadline = Instant::now()
+                .checked_add(Duration::from_millis(CODEX_EXTERNAL_MCP_STATUS_TIMEOUT_MS))
+                .unwrap_or_else(Instant::now)
+                .min(timeouts.absolute_deadline);
+            let page = match wait_for_codex_capability_rpc_response(
+                &line_rx,
+                &mut child,
+                &mut stdin,
+                &mut state,
+                &mut progress,
+                &mut timeouts,
+                plan.invocation.approval_policy,
+                Some(&cancel_check),
+                request_id,
+                "mcpServerStatus/list",
+                CODEX_EXTERNAL_MCP_STATUS_TIMEOUT_MS,
+                deadline,
+            )? {
+                Ok(page) => page,
+                Err(failure) => {
+                    return Ok(codex_app_server_terminal_failure_result(
+                        &mut child,
+                        &mut reader_handle,
+                        &mut state,
+                        &stdout_log,
+                        &stderr_log,
+                        failure.status(),
+                        failure.reason().to_string(),
+                        Some(thread_id),
+                    ));
+                }
+            };
+            cursor = match page.get("nextCursor") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(cursor)) if !cursor.is_empty() => Some(cursor.clone()),
+                _ => {
+                    return Ok(codex_app_server_terminal_failure_result(
+                        &mut child,
+                        &mut reader_handle,
+                        &mut state,
+                        &stdout_log,
+                        &stderr_log,
+                        CodexRuntimeRunStatus::ProtocolError,
+                        "external MCP readiness received an invalid pagination cursor".to_string(),
+                        Some(thread_id),
+                    ));
+                }
+            };
+            pages.push(page);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let effective_agent_id = plan.agent_id.as_deref().unwrap_or("main");
+        let effective_provider = plan
+            .invocation
+            .provider_config
+            .as_ref()
+            .map(|provider| provider.provider.as_str())
+            .unwrap_or("openai");
+        let readiness = match evaluate_codex_external_capability_readiness(
+            CodexExternalCapabilityReadinessInput {
+                declarations: &plan.external_mcp_capabilities,
+                agent_id: effective_agent_id,
+                provider: effective_provider,
+                codex_home,
+                config_digest: &config_materialization.config_hash_after,
+                backend_executable_digest: &backend_executable_digest,
+                process_generation: &process_generation,
+                thread_id: &thread_id,
+                pages: &pages,
+                observed_at_ms: current_log_time_ms()?,
+            },
+        ) {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                return Ok(codex_app_server_terminal_failure_result(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state,
+                    &stdout_log,
+                    &stderr_log,
+                    CodexRuntimeRunStatus::ProtocolError,
+                    format!("external MCP readiness response was invalid: {error}"),
+                    Some(thread_id),
+                ));
+            }
+        };
+        let readiness_file = execution_dir.join("codex-external-capability-readiness.json");
+        if let Err(error) = write_json_atomic(&readiness_file, &readiness) {
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                CodexRuntimeRunStatus::ProtocolError,
+                format!("failed to persist external MCP readiness receipt: {error}"),
+                Some(thread_id),
+            ));
+        }
+        state.warnings.extend(readiness.warnings.clone());
+        fail_codex_post_spawn_at(harness_home, "after-external-mcp-status")?;
+        if !readiness.admitted {
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                CodexRuntimeRunStatus::ProtocolError,
+                "required external MCP capability was not ready before turn/start".to_string(),
+                Some(thread_id),
+            ));
+        }
     }
     let mut context_recovery = None;
     let mut resume_settle_status = None;
@@ -14879,18 +15303,20 @@ fn goal_projection_from_event(
     if !matches!(json_method(value), Some("thread/goal/updated")) {
         return Ok(None);
     }
+    let explicit_goal_absence = value.pointer("/params/goal").is_some_and(Value::is_null);
+    let inherited_prior = (!explicit_goal_absence).then_some(prior).flatten();
     let objective = first_string_pointer(value, &["/params/goal/objective", "/params/objective"])
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .or_else(|| prior.map(|projection| projection.objective.clone()))
+        .or_else(|| inherited_prior.map(|projection| projection.objective.clone()))
         .unwrap_or_default();
     let status = first_string_pointer(value, &["/params/goal/status", "/params/status"])
-        .or_else(|| prior.map(|projection| projection.status.clone()))
+        .or_else(|| inherited_prior.map(|projection| projection.status.clone()))
         .unwrap_or_else(|| "unknown".to_string());
     let token_budget = ["/params/goal/tokenBudget", "/params/tokenBudget"]
         .iter()
         .find_map(|pointer| value.pointer(pointer).and_then(json_value_u64))
-        .or_else(|| prior.and_then(|projection| projection.token_budget));
+        .or_else(|| inherited_prior.and_then(|projection| projection.token_budget));
     let completion_criteria = value
         .pointer("/params/goal/completionCriteria")
         .and_then(Value::as_array)
@@ -14904,18 +15330,18 @@ fn goal_projection_from_event(
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
         })
-        .or_else(|| prior.map(|projection| projection.completion_criteria.clone()))
+        .or_else(|| inherited_prior.map(|projection| projection.completion_criteria.clone()))
         .unwrap_or_default();
     let goal_checksum = codex_goal_checksum(&objective, &status, token_budget, &[])?;
     let backend_goal_ref = first_string_pointer(
         value,
         &["/params/goal/id", "/params/goal/goalId", "/params/goalId"],
     )
-    .or_else(|| prior.and_then(|projection| projection.backend_goal_ref.clone()));
+    .or_else(|| inherited_prior.and_then(|projection| projection.backend_goal_ref.clone()));
     let goal_reference = backend_goal_ref
         .clone()
         .or_else(|| {
-            prior
+            inherited_prior
                 .map(|projection| projection.goal_reference.clone())
                 .filter(|value| !value.trim().is_empty())
         })
@@ -14927,7 +15353,10 @@ fn goal_projection_from_event(
     let projection_complete = !objective.is_empty()
         && !matches!(status.trim().to_ascii_lowercase().as_str(), "" | "unknown");
     let source_turn_id = extract_turn_id(value)
-        .or_else(|| prior.and_then(|projection| projection.source_turn_id.clone()));
+        .or_else(|| inherited_prior.and_then(|projection| projection.source_turn_id.clone()));
+    let concrete_backend_goal = backend_goal_ref
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
     let (turn_relation, source_final_eligible) = match observer.observation_phase {
         GoalProjectionObservationPhaseV1::ResumeSettle => {
             (GoalProjectionTurnRelationV1::HistoricalThreadState, false)
@@ -14939,7 +15368,8 @@ fn goal_projection_from_event(
         GoalProjectionObservationPhaseV1::OwnedTurn
         | GoalProjectionObservationPhaseV1::StdoutRecovery
             if observer.owned_turn_id.as_deref() == source_turn_id.as_deref()
-                && source_turn_id.is_some() =>
+                && source_turn_id.is_some()
+                && concrete_backend_goal =>
         {
             (GoalProjectionTurnRelationV1::CurrentOwnedTurn, true)
         }
@@ -15003,6 +15433,26 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     format!("sha256:{hex}")
+}
+
+fn sha256_file_prefixed(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut context = digest::Context::new(&digest::SHA256);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        context.update(&buffer[..read]);
+    }
+    let digest = context.finish();
+    let mut hex = String::with_capacity(64);
+    for byte in digest.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(format!("sha256:{hex}"))
 }
 
 fn json_value_u64(value: &Value) -> Option<u64> {
@@ -16205,20 +16655,75 @@ fn terminate_child_with_timeout(
     child: &mut CodexChildProcessGuard,
     timeout: Duration,
 ) -> io::Result<bool> {
-    if child.try_wait()?.is_some() {
+    let root_exited = child.try_wait()?.is_some();
+    if root_exited && codex_child_containment_empty(child)? {
         return Ok(true);
     }
 
     let started = Instant::now();
     terminate_child_process_tree(child, timeout);
     loop {
-        if child.try_wait()?.is_some() {
+        let root_exited = child.try_wait()?.is_some();
+        if root_exited && codex_child_containment_empty(child)? {
             return Ok(true);
         }
         if started.elapsed() >= timeout {
             return Ok(false);
         }
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn codex_child_containment_empty(_child: &CodexChildProcessGuard) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        Ok(!unix_process_group_alive(_child.id())?)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(true)
+    }
+}
+
+#[cfg(unix)]
+fn signal_unix_process_group(process_group_id: u32, signal: i32) -> io::Result<()> {
+    let process_group_id = i32::try_from(process_group_id).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unix process-group id exceeds the platform PID range",
+        )
+    })?;
+    // SAFETY: the child was spawned as leader of this process group; a
+    // negative PID targets only that group.
+    if unsafe { libc::kill(-process_group_id, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_group_alive(process_group_id: u32) -> io::Result<bool> {
+    let process_group_id = i32::try_from(process_group_id).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unix process-group id exceeds the platform PID range",
+        )
+    })?;
+    // SAFETY: signal zero does not deliver a signal; it probes the exact
+    // process group selected by the negative PID.
+    if unsafe { libc::kill(-process_group_id, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error),
     }
 }
 
@@ -19214,24 +19719,24 @@ fn completion_receipt_file(plan: &CodexRuntimePlanFile) -> PathBuf {
 
 fn harness_codex_home(
     harness_home: &Path,
+    agent_id: &str,
     provider_config: Option<&CodexProviderConfig>,
 ) -> io::Result<PathBuf> {
     let provider = provider_config
         .map(|config| config.provider.as_str())
         .unwrap_or("openai");
-    resolve_or_create_provider_codex_home(harness_home, provider)
+    resolve_or_create_agent_provider_codex_home(harness_home, agent_id, provider)
 }
 
 fn ensure_harness_codex_config(
-    codex_home: Option<&Path>,
+    codex_home: &Path,
     working_directory: &Path,
     harness_home: &Path,
+    agent_id: &str,
+    provider: &str,
     provider_config: Option<&CodexProviderConfig>,
     warnings: &mut Vec<String>,
-) -> io::Result<()> {
-    let Some(codex_home) = codex_home else {
-        return Ok(());
-    };
+) -> io::Result<CodexConfigMaterializationReceiptV1> {
     let sandbox = resolve_codex_sandbox(harness_home, warnings);
     let context_policy = match load_codex_context_policy(harness_home) {
         Ok(policy) => policy,
@@ -19242,64 +19747,35 @@ fn ensure_harness_codex_config(
             CodexContextPolicy::default()
         }
     };
-    let config_file = codex_home.join("config.toml");
-    if config_file.is_file() {
-        let existing = fs::read_to_string(&config_file)?;
-        if is_generated_harness_codex_config(&existing) {
-            let desired = harness_codex_config_toml(
-                working_directory,
-                harness_home,
-                sandbox,
-                provider_config,
-                &context_policy,
-            );
-            if existing != desired {
-                fs::write(&config_file, desired)?;
-                warnings.push(format!(
-                    "updated generated harness-local Codex config at {}",
-                    config_file.display()
-                ));
-            }
-            return Ok(());
-        }
-        if let Some(provider_config) = provider_config {
-            let updated = ensure_codex_context_config_in_toml(
-                &ensure_provider_config_in_toml(&existing, provider_config),
-                &context_policy,
-            );
-            if updated != existing {
-                fs::write(&config_file, updated)?;
-                warnings.push(format!(
-                    "updated harness-local Codex config provider/context stanza at {}",
-                    config_file.display()
-                ));
-            }
-            return Ok(());
-        }
-        return Ok(());
-    }
-
-    fs::create_dir_all(codex_home)?;
-    let config = harness_codex_config_toml(
+    let desired_config = harness_codex_config_toml(
         working_directory,
         harness_home,
         sandbox,
         provider_config,
         &context_policy,
     );
-    fs::write(&config_file, config)?;
-    warnings.push(format!(
-        "created harness-local Codex config at {} with Windows sandbox={sandbox} and trusted runtime workspace",
-        config_file.display(),
-    ));
-    Ok(())
+    let receipt = materialize_codex_config(CodexConfigMaterializationOptions {
+        codex_home,
+        desired_config: &desired_config,
+        agent_id,
+        provider,
+        preserve_unmanaged_roots: true,
+        failpoint: None,
+    })?;
+    match receipt.result {
+        CodexConfigMaterializationResultV1::Created => warnings.push(format!(
+            "created ownership-aware harness-local Codex config with Windows sandbox={sandbox} and trusted runtime workspace"
+        )),
+        CodexConfigMaterializationResultV1::Updated => warnings.push(
+            "updated ownership-aware harness-local Codex config while preserving extension-owned roots"
+                .to_string(),
+        ),
+        CodexConfigMaterializationResultV1::Unchanged => {}
+    }
+    Ok(receipt)
 }
 
-fn is_generated_harness_codex_config(existing: &str) -> bool {
-    existing.starts_with("# Generated by agent-harness.")
-        || existing.starts_with("# Generated by openclaw-harness.")
-}
-
+#[cfg(test)]
 fn ensure_provider_config_in_toml(existing: &str, provider_config: &CodexProviderConfig) -> String {
     let mut config = ensure_top_level_toml_key(
         existing,
@@ -19352,14 +19828,7 @@ fn ensure_provider_config_in_toml(existing: &str, provider_config: &CodexProvide
     config
 }
 
-fn ensure_codex_context_config_in_toml(existing: &str, policy: &CodexContextPolicy) -> String {
-    let mut config = existing.to_string();
-    for (key, value) in codex_context_toml_entries(policy) {
-        config = ensure_top_level_toml_key(&config, &key, &value);
-    }
-    config
-}
-
+#[cfg(test)]
 fn ensure_top_level_toml_key(existing: &str, key: &str, rendered_value: &str) -> String {
     let desired_line = format!("{key} = {rendered_value}");
     let mut lines: Vec<String> = existing.lines().map(ToString::to_string).collect();
@@ -19385,6 +19854,7 @@ fn ensure_top_level_toml_key(existing: &str, key: &str, rendered_value: &str) ->
     join_toml_lines(lines, true)
 }
 
+#[cfg(test)]
 fn ensure_table_toml_key(
     existing: &str,
     table_header: &str,
@@ -19413,6 +19883,7 @@ fn ensure_table_toml_key(
     join_toml_lines(lines, true)
 }
 
+#[cfg(test)]
 fn join_toml_lines(lines: Vec<String>, trailing_newline: bool) -> String {
     let mut text = lines.join("\n");
     if trailing_newline && !text.ends_with('\n') {
@@ -19436,7 +19907,8 @@ fn harness_codex_config_toml(
     project_roots.dedup();
 
     let mut config = String::from(
-        "# Generated by agent-harness. Contains no secrets.\n\
+        "# Generated by agent-harness. May preserve extension-owned secret-bearing values.\n\
+         # Keep this file and its original snapshot private; receipts contain hashes only.\n\
          # Codex OAuth state stays in auth.json/auth.toml.\n\
          \n",
     );
@@ -20560,6 +21032,7 @@ done
             .join("06")
             .join("24");
         fs::create_dir_all(&rollout_dir).unwrap();
+        make_private_test_provider_home(&harness_home.join("codex-home"));
         let image_payload = "B".repeat(
             usize::try_from(CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT).unwrap() + 128,
         );
@@ -20711,6 +21184,7 @@ done
             .join("06")
             .join("24");
         fs::create_dir_all(&rollout_dir).unwrap();
+        make_private_test_provider_home(&harness_home.join("codex-home"));
         let image_payload = "C".repeat(
             usize::try_from(CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT).unwrap() + 128,
         );
@@ -21129,7 +21603,7 @@ done
         let harness_home = root.join(".agent-harness");
         let openrouter_source = write_openrouter_codex_runtime_source(&root.join("openrouter"));
         let shared_codex_home = harness_home.join("codex-home");
-        fs::create_dir_all(&shared_codex_home).unwrap();
+        make_private_test_provider_home(&shared_codex_home);
         fs::write(shared_codex_home.join("auth.json"), "{}").unwrap();
         fs::write(
             shared_codex_home.join("config.toml"),
@@ -21355,7 +21829,7 @@ done
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
         let codex_home = harness_home.join("codex-home");
-        fs::create_dir_all(&codex_home).unwrap();
+        make_private_test_provider_home(&codex_home);
         fs::write(codex_home.join("auth.json"), "{}").unwrap();
         fs::write(
             harness_home.join(HARNESS_CONFIG_FILE_NAME),
@@ -21394,7 +21868,7 @@ done
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
         let codex_home = harness_home.join("codex-home");
-        fs::create_dir_all(&codex_home).unwrap();
+        make_private_test_provider_home(&codex_home);
         fs::write(codex_home.join("auth.json"), "{}").unwrap();
         fs::write(
             harness_home.join(HARNESS_CONFIG_FILE_NAME),
@@ -21511,7 +21985,7 @@ done
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
         let codex_home = harness_home.join("codex-home");
-        fs::create_dir_all(&codex_home).unwrap();
+        make_private_test_provider_home(&codex_home);
         fs::write(codex_home.join("auth.json"), "{}").unwrap();
         fs::write(
             codex_home.join("config.toml"),
@@ -21563,7 +22037,7 @@ done
         let source = write_openrouter_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
         let codex_home = harness_home.join("codex-home-providers").join("openrouter");
-        fs::create_dir_all(&codex_home).unwrap();
+        make_private_test_provider_home(&codex_home);
         fs::write(
             codex_home.join("config.toml"),
             "# Generated by agent-harness. Contains no secrets.\n\
@@ -21625,9 +22099,13 @@ done
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
         let codex_home = harness_home.join("codex-home");
-        fs::create_dir_all(&codex_home).unwrap();
+        make_private_test_provider_home(&codex_home);
         fs::write(codex_home.join("auth.json"), "{}").unwrap();
-        fs::write(codex_home.join("config.toml"), "# custom operator config\n").unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            "# custom operator config\n[operator_extension]\nenabled = true\n",
+        )
+        .unwrap();
         enqueue_and_prepare(&source, &harness_home);
 
         let report = plan_codex_runtime(CodexRuntimePlanOptions {
@@ -21637,11 +22115,15 @@ done
         })
         .unwrap();
 
-        assert_eq!(
-            fs::read_to_string(codex_home.join("config.toml")).unwrap(),
-            "# custom operator config\n"
-        );
-        assert!(report.warnings.is_empty());
+        let config = fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert!(config.contains("# custom operator config"));
+        assert!(config.contains("[operator_extension]"));
+        assert!(config.contains("enabled = true"));
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains(
+                "updated ownership-aware harness-local Codex config while preserving extension-owned roots",
+            )
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -21675,7 +22157,7 @@ done
         ));
         let harness_home = root.join(".agent-harness");
 
-        let resolved = harness_codex_home(&harness_home, None).unwrap();
+        let resolved = harness_codex_home(&harness_home, "main", None).unwrap();
 
         assert!(resolved.is_absolute());
         assert!(resolved.ends_with(harness_home.join("codex-home")));
@@ -23073,10 +23555,63 @@ file.Close();
         assert!(
             fs::read_to_string(fatal_markers[0].path())
                 .unwrap()
-                .contains("process-tree cleanup could not be proven")
+                .contains("process-tree containment cleanup could not be proven")
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_codex_child_guard_terminates_the_whole_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let root = temp_root("unix-process-group-cleanup");
+        fs::create_dir_all(&root).unwrap();
+        let descendant_file = root.join("descendant.pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "sleep 60 & echo $! > '{}' ; wait",
+                descendant_file.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = command.spawn().unwrap();
+        let process_group_id = child.id();
+        let guard = CodexChildProcessGuard::new(
+            child,
+            &root,
+            None,
+            fresh_codex_spawn_generation().unwrap(),
+        );
+        let started = Instant::now();
+        while !descendant_file.is_file() && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(descendant_file.is_file());
+        assert!(unix_process_group_alive(process_group_id).unwrap());
+
+        drop(guard);
+
+        assert!(
+            !unix_process_group_alive(process_group_id).unwrap(),
+            "dropping the guard must prove the Codex/MCP process group is empty"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_spawn_generation_is_portable_private_and_unique() {
+        let first = fresh_codex_spawn_generation().unwrap();
+        let second = fresh_codex_spawn_generation().unwrap();
+        assert!(first.starts_with("sha256:"));
+        assert_eq!(first.len(), "sha256:".len() + 64);
+        assert_ne!(first, second);
+        assert!(!first.contains(std::env::consts::OS));
     }
 
     #[test]
@@ -23171,6 +23706,241 @@ file.Close();
             2
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn generic_mock_status() -> Value {
+        json!({
+            "name": "generic-mock",
+            "authStatus": "unsupported",
+            "serverInfo": {
+                "name": "generic-mock",
+                "version": "1.0.0"
+            },
+            "resourceTemplates": [],
+            "resources": [],
+            "tools": {
+                "echo": {
+                    "name": "echo",
+                    "description": "Returns a sanitized fixture value.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"]
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"]
+                    }
+                }
+            }
+        })
+    }
+
+    fn run_external_mcp_readiness_fixture(
+        test_name: &str,
+        requirement: &str,
+        schema_mismatch: bool,
+        tamper_config_after_plan: bool,
+        auth_required: bool,
+    ) -> (PathBuf, PathBuf, CodexRuntimeRunReport) {
+        let root = temp_root(test_name);
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        crate::backend_auth::enforce_provider_home_permissions(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            "[mcp_servers.generic-mock]\ncommand = \"generic-mock-fixture\"\n",
+        )
+        .unwrap();
+        let expected_tool_schema_digest =
+            crate::canonical_mcp_tool_schema_digest(&generic_mock_status()).unwrap();
+        let expected_server_info_digest =
+            crate::canonical_mcp_server_info_digest(&generic_mock_status()).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            serde_json::to_vec_pretty(&json!({
+                "externalCapabilities": {
+                    "mcpServers": [{
+                        "serverId": "generic-mock",
+                        "transport": "stdio",
+                        "expectedToolSchemaDigest": expected_tool_schema_digest,
+                        "expectedServerInfoDigest": expected_server_info_digest,
+                        "requirement": requirement,
+                        "agentId": "main",
+                        "provider": "openai"
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, json!([]));
+        if schema_mismatch {
+            fs::write(root.join("fake-app-server-mcp-schema-mismatch"), "mismatch").unwrap();
+        }
+        if auth_required {
+            fs::write(root.join("fake-app-server-mcp-auth-required"), "auth").unwrap();
+        }
+        if tamper_config_after_plan {
+            fs::write(
+                codex_home.join("config.toml"),
+                "[mcp_servers.generic-mock]\ncommand = \"changed-after-plan\"\n",
+            )
+            .unwrap();
+        }
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+        (root, plan_report.execution_dir.unwrap(), report)
+    }
+
+    #[test]
+    fn required_external_mcp_ready_is_receipted_before_turn_start() {
+        let (root, execution_dir, report) = run_external_mcp_readiness_fixture(
+            "required_external_mcp_ready_is_receipted_before_turn_start",
+            "required",
+            false,
+            false,
+            false,
+        );
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let readiness: crate::CodexExternalCapabilityReadinessReceiptV1 =
+            read_json_file_as(&execution_dir.join("codex-external-capability-readiness.json"))
+                .unwrap();
+        assert!(readiness.admitted);
+        assert_eq!(readiness.page_count, 1);
+        assert!(
+            execution_dir
+                .join("codex-config-reuse-receipt.json")
+                .is_file()
+        );
+        let input = fs::read_to_string(root.join("fake-app-server-input.jsonl")).unwrap();
+        assert!(
+            input.find("\"mcpServerStatus/list\"").unwrap() < input.find("\"turn/start\"").unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn required_external_mcp_mismatch_blocks_before_turn_start() {
+        let (root, execution_dir, report) = run_external_mcp_readiness_fixture(
+            "required_external_mcp_mismatch_blocks_before_turn_start",
+            "required",
+            true,
+            false,
+            false,
+        );
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(
+            report
+                .receipt
+                .reason
+                .contains("required external MCP capability")
+        );
+        let readiness: crate::CodexExternalCapabilityReadinessReceiptV1 =
+            read_json_file_as(&execution_dir.join("codex-external-capability-readiness.json"))
+                .unwrap();
+        assert!(!readiness.admitted);
+        let input = fs::read_to_string(root.join("fake-app-server-input.jsonl")).unwrap();
+        assert!(input.contains("\"mcpServerStatus/list\""));
+        assert!(!input.contains("\"turn/start\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn optional_external_mcp_mismatch_warns_and_allows_turn_start() {
+        let (root, execution_dir, report) = run_external_mcp_readiness_fixture(
+            "optional_external_mcp_mismatch_warns_and_allows_turn_start",
+            "optional",
+            true,
+            false,
+            false,
+        );
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let readiness: crate::CodexExternalCapabilityReadinessReceiptV1 =
+            read_json_file_as(&execution_dir.join("codex-external-capability-readiness.json"))
+                .unwrap();
+        assert!(readiness.admitted);
+        assert_eq!(readiness.warnings.len(), 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("optional external MCP capability"))
+        );
+        let input = fs::read_to_string(root.join("fake-app-server-input.jsonl")).unwrap();
+        assert!(input.contains("\"turn/start\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_external_mcp_config_receipt_blocks_before_process_spawn() {
+        let (root, execution_dir, report) = run_external_mcp_readiness_fixture(
+            "stale_external_mcp_config_receipt_blocks_before_process_spawn",
+            "required",
+            false,
+            true,
+            false,
+        );
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(
+            report
+                .receipt
+                .reason
+                .contains("config changed after materialization")
+        );
+        assert!(!root.join("fake-app-server-input.jsonl").exists());
+        assert!(
+            !execution_dir
+                .join("codex-config-reuse-receipt.json")
+                .exists()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn required_external_mcp_auth_required_blocks_before_turn_start() {
+        let (root, execution_dir, report) = run_external_mcp_readiness_fixture(
+            "required_external_mcp_auth_required_blocks_before_turn_start",
+            "required",
+            false,
+            false,
+            true,
+        );
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        let readiness: crate::CodexExternalCapabilityReadinessReceiptV1 =
+            read_json_file_as(&execution_dir.join("codex-external-capability-readiness.json"))
+                .unwrap();
+        assert!(!readiness.admitted);
+        assert_eq!(
+            readiness.entries[0].status,
+            crate::CodexExternalCapabilityStatusV1::AuthenticationRequired
+        );
+        let input = fs::read_to_string(root.join("fake-app-server-input.jsonl")).unwrap();
+        assert!(input.contains("\"mcpServerStatus/list\""));
+        assert!(!input.contains("\"turn/start\""));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -26136,6 +26906,75 @@ file.Close();
     }
 
     #[test]
+    fn goal_projection_observer_treats_explicit_null_as_uncorrelated_absence() {
+        let root = temp_root("goal-projection-owned-turn-null-absence");
+        let receipts_file = root
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        let mut state = CodexProtocolState {
+            goal_projection_observer: Some(CodexGoalProjectionObserver {
+                receipts_file: receipts_file.clone(),
+                queue_id: Some("queue-note".to_string()),
+                session_key: "session-note".to_string(),
+                lane_digest: Some("lane-note".to_string()),
+                backend_context_generation: Some("generation-note".to_string()),
+                current_thread_id: Some("thread-note".to_string()),
+                observation_phase: GoalProjectionObservationPhaseV1::OwnedTurn,
+                owned_turn_id: Some("turn-note".to_string()),
+                latest_by_thread: BTreeMap::new(),
+            }),
+            ..CodexProtocolState::default()
+        };
+        state.event_count = 1;
+        record_protocol_usage_event(
+            &json!({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-note",
+                    "turnId": "turn-note",
+                    "goal": {
+                        "id": "goal-prior",
+                        "objective": "prior exact goal",
+                        "status": "active"
+                    }
+                }
+            }),
+            &mut state,
+        );
+        state.event_count = 2;
+        record_protocol_usage_event(
+            &json!({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-note",
+                    "turnId": "turn-note",
+                    "goal": null
+                }
+            }),
+            &mut state,
+        );
+
+        let projection: CodexGoalProjectionV1 = serde_json::from_str(
+            fs::read_to_string(&receipts_file)
+                .unwrap()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(projection.backend_goal_ref.is_none());
+        assert!(!projection.projection_complete);
+        assert_eq!(
+            projection.turn_relation,
+            GoalProjectionTurnRelationV1::Uncorrelated
+        );
+        assert!(!projection.source_final_eligible);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn latest_completed_goal_projection_cannot_rehydrate_an_older_active_goal() {
         let root = temp_root("goal-projection-no-active-resurrection");
         let harness_home = root.join(".agent-harness");
@@ -28433,7 +29272,7 @@ file.Close();
     }
 
     fn enable_managed_reasoning_fixture(harness_home: &Path, plan_file: &Path, effort: &str) {
-        fs::create_dir_all(harness_home.join("codex-home")).unwrap();
+        make_private_test_provider_home(&harness_home.join("codex-home"));
         fs::write(
             harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
             r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":"authoritative","enabledAgentIds":["main"]}}}}"#,
@@ -28531,6 +29370,8 @@ $holdAfterTurnStart = Join-Path $PSScriptRoot 'fake-app-server-hold-after-turn-s
 $denyMax = Join-Path $PSScriptRoot 'fake-app-server-live-deny-max'
 $webSearchAbsent = Join-Path $PSScriptRoot 'fake-app-server-web-search-absent'
 $webSearchEvent = Join-Path $PSScriptRoot 'fake-app-server-web-search-event'
+$mcpSchemaMismatch = Join-Path $PSScriptRoot 'fake-app-server-mcp-schema-mismatch'
+$mcpAuthRequired = Join-Path $PSScriptRoot 'fake-app-server-mcp-auth-required'
 Set-Content -LiteralPath $pidFile -Value $PID
 if (Test-Path -LiteralPath $spawnDescendant) {
     $powershell = Join-Path $PSHOME 'powershell.exe'
@@ -28568,6 +29409,53 @@ while ($true) {
     } elseif ($msg.method -eq 'thread/resume') {
         $threadMethod = 'thread/resume'
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'mcpServerStatus/list') {
+        if (Test-Path -LiteralPath $mcpSchemaMismatch) {
+            $result = @{
+                id = [Int64]$msg.id
+                result = @{
+                    data = @(@{
+                        name = 'generic-mock'
+                        authStatus = 'unsupported'
+                        serverInfo = @{ name = 'generic-mock'; version = '1.0.0' }
+                        resourceTemplates = @()
+                        resources = @()
+                        tools = @{
+                            echo = @{
+                                name = 'echo'
+                                description = 'Changed fixture schema.'
+                                inputSchema = @{ type = 'object'; properties = @{ changed = @{ type = 'boolean' } }; required = @('changed') }
+                            }
+                        }
+                    })
+                    nextCursor = $null
+                }
+            } | ConvertTo-Json -Compress -Depth 12
+        } else {
+            $result = @{
+                id = [Int64]$msg.id
+                result = @{
+                    data = @(@{
+                        name = 'generic-mock'
+                        authStatus = if (Test-Path -LiteralPath $mcpAuthRequired) { 'notLoggedIn' } else { 'unsupported' }
+                        serverInfo = @{ name = 'generic-mock'; version = '1.0.0' }
+                        resourceTemplates = @()
+                        resources = @()
+                        tools = @{
+                            echo = @{
+                                name = 'echo'
+                                description = 'Returns a sanitized fixture value.'
+                                inputSchema = @{ type = 'object'; additionalProperties = $false; properties = @{ value = @{ type = 'string' } }; required = @('value') }
+                                outputSchema = @{ type = 'object'; additionalProperties = $false; properties = @{ value = @{ type = 'string' } }; required = @('value') }
+                            }
+                        }
+                    })
+                    nextCursor = $null
+                }
+            } | ConvertTo-Json -Compress -Depth 12
+        }
+        [Console]::Out.WriteLine($result)
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'config/read') {
         [Console]::Out.WriteLine('{"id":9000,"result":{"config":{"model_provider":"openai"}}}')
@@ -29910,47 +30798,60 @@ hold_after_turn_start="$(dirname "$0")/fake-app-server-hold-after-turn-start"
 deny_max="$(dirname "$0")/fake-app-server-live-deny-max"
 web_search_absent="$(dirname "$0")/fake-app-server-web-search-absent"
 web_search_event="$(dirname "$0")/fake-app-server-web-search-event"
+mcp_schema_mismatch="$(dirname "$0")/fake-app-server-mcp-schema-mismatch"
+mcp_auth_required="$(dirname "$0")/fake-app-server-mcp-auth-required"
 printf '%s\n' "$$" > "$pid_file"
 while IFS= read -r line; do
     printf '%s\n' "$line" >> "$capture"
+    request_id="$(printf '%s' "$line" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
     case "$line" in
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
         *'"method":"modelProvider/capabilities/read"'*)
             if [ -f "$web_search_absent" ]; then
-                printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":false}}'
+                printf '{"id":%s,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":false}}\n' "$request_id"
             else
-                printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+                printf '{"id":%s,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}\n' "$request_id"
             fi
             ;;
         *'"method":"thread/start"'*)
             thread_method='thread/start'
-            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            printf '{"id":%s,"result":{"thread":{"id":"thread-test"}}}\n' "$request_id"
             ;;
         *'"method":"thread/resume"'*)
             thread_method='thread/resume'
-            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            printf '{"id":%s,"result":{"thread":{"id":"thread-test"}}}\n' "$request_id"
+            ;;
+        *'"method":"mcpServerStatus/list"'*)
+            if [ -f "$mcp_schema_mismatch" ]; then
+                printf '{"id":%s,"result":{"data":[{"name":"generic-mock","authStatus":"unsupported","serverInfo":{"name":"generic-mock","version":"1.0.0"},"resourceTemplates":[],"resources":[],"tools":{"echo":{"name":"echo","description":"Changed fixture schema.","inputSchema":{"type":"object","properties":{"changed":{"type":"boolean"}},"required":["changed"]}}}}],"nextCursor":null}}\n' "$request_id"
+            elif [ -f "$mcp_auth_required" ]; then
+                printf '{"id":%s,"result":{"data":[{"name":"generic-mock","authStatus":"notLoggedIn","serverInfo":{"name":"generic-mock","version":"1.0.0"},"resourceTemplates":[],"resources":[],"tools":{"echo":{"name":"echo","description":"Returns a sanitized fixture value.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"value":{"type":"string"}},"required":["value"]},"outputSchema":{"type":"object","additionalProperties":false,"properties":{"value":{"type":"string"}},"required":["value"]}}}}],"nextCursor":null}}\n' "$request_id"
+            else
+                printf '{"id":%s,"result":{"data":[{"name":"generic-mock","authStatus":"unsupported","serverInfo":{"name":"generic-mock","version":"1.0.0"},"resourceTemplates":[],"resources":[],"tools":{"echo":{"name":"echo","description":"Returns a sanitized fixture value.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"value":{"type":"string"}},"required":["value"]},"outputSchema":{"type":"object","additionalProperties":false,"properties":{"value":{"type":"string"}},"required":["value"]}}}}],"nextCursor":null}}\n' "$request_id"
+            fi
             ;;
         *'"method":"config/read"'*)
-            printf '%s\n' '{"id":9000,"result":{"config":{"model_provider":"openai"}}}'
+            printf '{"id":%s,"result":{"config":{"model_provider":"openai"}}}\n' "$request_id"
             ;;
         *'"method":"model/list"'*)
             if [ -f "$deny_max" ]; then
-                printf '%s\n' '{"id":9100,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"xhigh"}]}],"nextCursor":null}}'
+                printf '{"id":%s,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"xhigh"}]}],"nextCursor":null}}\n' "$request_id"
             else
-                printf '%s\n' '{"id":9100,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"xhigh"},{"reasoningEffort":"max"},{"reasoningEffort":"ultra"}]}],"nextCursor":null}}'
+                printf '{"id":%s,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"xhigh"},{"reasoningEffort":"max"},{"reasoningEffort":"ultra"}]}],"nextCursor":null}}\n' "$request_id"
             fi
             ;;
         *'"method":"turn/start"'*)
             if [ -f "$hold_after_turn_start" ]; then
                 while :; do sleep 1; done
             fi
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}'
             if [ -f "$web_search_event" ]; then
                 printf '%s\n' '{"method":"item/started","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"web-test","type":"webSearch","query":"private fixture query","action":{"type":"search","query":"private fixture query","queries":["private fixture query"]}}}}'
             fi
-            printf '%s\n' "{\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"Fake assistant reply. method=${thread_method:-unknown}\"}}"
-            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
+            printf '%s\n' "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-test\",\"turnId\":\"turn-test\",\"itemId\":\"msg-test\",\"delta\":\"Fake assistant reply. method=${thread_method:-unknown}\"}}"
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
             exit 0
             ;;
     esac
@@ -30868,6 +31769,11 @@ done
             "agent-harness-codex-runtime-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn make_private_test_provider_home(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        crate::backend_auth::enforce_provider_home_permissions(path).unwrap();
     }
 
     fn child_cleanup_fence_files(harness_home: &Path) -> Vec<PathBuf> {

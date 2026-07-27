@@ -16,6 +16,12 @@ $NodeExe = Join-Path $HarnessHome 'tools\node\node.exe'
 $KeeperRoot = Join-Path $HarnessHome 'state\supervisor\windows-reconcile-keeper'
 $KeeperPlan = Join-Path $KeeperRoot 'keeper-plan.json'
 $KeeperScripts = Join-Path $KeeperRoot 'scripts'
+$HarnessConfig = Join-Path $HarnessHome 'harness-config.json'
+$DirectOwnerHostRoot = Join-Path $HarnessHome 'state\supervisor\direct-owner-host'
+$DirectOwnerHostPlan = Join-Path $DirectOwnerHostRoot 'host-plan.json'
+$DirectOwnerHostScript = Join-Path $HarnessHome 'tools\supervisor-direct-owner\launch-direct-owner-hidden.ps1'
+$DirectOwnerMasterState = Join-Path $HarnessHome 'state\supervisor\master\master-state.json'
+$SupervisorStopRoot = Join-Path $HarnessHome 'state\supervisor\stop'
 $SupervisorLogs = Join-Path $HarnessHome 'state\logs\supervisor'
 $HarnessLog = Join-Path $HarnessHome 'state\logs\harness.jsonl'
 $ProgressLog = Join-Path $HarnessHome 'state\runtime-queue\progress-events.jsonl'
@@ -23,9 +29,9 @@ $ProgressLog = Join-Path $HarnessHome 'state\runtime-queue\progress-events.jsonl
 function Show-Help {
     @"
 Usage:
-  harness gateway start --live-control-token <token>
-  harness gateway stop --live-control-token <token>
-  harness gateway restart --live-control-token <token>
+  harness gateway start [--approve-live-control | --live-control-token <token>]
+  harness gateway stop [--approve-live-control | --live-control-token <token>]
+  harness gateway restart [--approve-live-control | --live-control-token <restart-token>]
   harness gateway status
   harness gateway ps
   harness gateway logs
@@ -39,7 +45,8 @@ Components for tail:
   runtime, telegram, discord, discord-gateway, discord-outbox, progress, worker, harness, progress-events
 
 Examples:
-  harness gateway restart --live-control-token <token>
+  harness gateway restart
+  harness gateway restart --approve-live-control
   harness gateway status
   harness gateway tail runtime 200
   harness gateway tail harness 300
@@ -136,12 +143,253 @@ function Invoke-LiveKeeperScript {
     }
 }
 
+function Get-LiveOwnershipMode {
+    Require-File $HarnessConfig 'Deploy the authoritative harness configuration first.'
+    $config = Get-Content -LiteralPath $HarnessConfig -Raw | ConvertFrom-Json -ErrorAction Stop
+    $mode = [string]$config.supervisor.ownershipMode
+    if ($mode -notin @('compatibility', 'direct-owner')) {
+        throw "Unsupported live supervisor ownership mode: $mode"
+    }
+    return $mode
+}
+
+function Get-ScheduledTaskActionField {
+    param(
+        [AllowNull()][object] $Action,
+        [Parameter(Mandatory = $true)][string] $Name
+    )
+    if ($null -eq $Action) {
+        return $null
+    }
+    $property = $Action.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return [string]$property.Value
+}
+
+function Get-ExactDirectOwnerHostTask {
+    Require-File $DirectOwnerHostPlan 'Deploy the direct-owner host plan first.'
+    Require-File $DirectOwnerHostScript 'Deploy the direct-owner hidden host adapter first.'
+    $planSha256 = (Get-FileHash -LiteralPath $DirectOwnerHostPlan -Algorithm SHA256).Hash.ToLowerInvariant()
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $expectedArguments = (
+        '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden ' +
+        "-File `"$DirectOwnerHostScript`" -PlanFile `"$DirectOwnerHostPlan`" " +
+        "-ExpectedPlanSha256 $planSha256"
+    )
+    $matches = @(
+        Get-ScheduledTask -ErrorAction Stop |
+            Where-Object {
+                $actions = @($_.Actions)
+                $actions.Count -eq 1 -and
+                [string]::Equals(
+                    (Get-ScheduledTaskActionField -Action $actions[0] -Name 'Execute'),
+                    $windowsPowerShell,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -and
+                [string]::Equals(
+                    (Get-ScheduledTaskActionField -Action $actions[0] -Name 'Arguments'),
+                    $expectedArguments,
+                    [StringComparison]::Ordinal
+                ) -and
+                [string]::Equals(
+                    (Get-ScheduledTaskActionField -Action $actions[0] -Name 'WorkingDirectory'),
+                    $RuntimeWorkspace,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            }
+    )
+    if ($matches.Count -ne 1) {
+        throw "Expected exactly one hash-bound direct-owner host task; observed $($matches.Count)"
+    }
+    return $matches[0]
+}
+
+function Write-DirectOwnerContainmentStop {
+    param(
+        [string] $Reason = 'direct-owner launcher start containment'
+    )
+    [IO.Directory]::CreateDirectory($SupervisorStopRoot) | Out-Null
+    $path = Join-Path $SupervisorStopRoot 'supervisor-master.stop'
+    Assert-DirectOwnerLauncherMasterStopOwnership
+    $temp = "$path.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $value = [ordered]@{
+            schema = 'agent-harness.supervisor-stop-file.v1'
+            serviceId = 'supervisor-master'
+            persistent = $true
+            reason = $Reason
+        }
+        [IO.File]::WriteAllText(
+            $temp,
+            (ConvertTo-Json -InputObject $value -Depth 8) + "`n",
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temp -Destination $path -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Assert-DirectOwnerLauncherMasterStopOwnership {
+    $path = Join-Path $SupervisorStopRoot 'supervisor-master.stop'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return
+    }
+    $stop = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -ErrorAction Stop
+    if (
+        [string]$stop.schema -ne 'agent-harness.supervisor-stop-file.v1' -or
+        [string]$stop.serviceId -ne 'supervisor-master' -or
+        -not ([string]$stop.reason).StartsWith(
+            'direct-owner launcher ',
+            [StringComparison]::Ordinal
+        )
+    ) {
+        throw 'refusing to alter an unrecognized supervisor-master hold'
+    }
+}
+
+function Remove-DirectOwnerLauncherMasterStop {
+    $path = Join-Path $SupervisorStopRoot 'supervisor-master.stop'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return
+    }
+    Assert-DirectOwnerLauncherMasterStopOwnership
+    Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+}
+
+function Assert-DirectOwnerReconcileFence {
+    $path = Join-Path $SupervisorStopRoot 'supervisor-reconcile.stop'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw 'direct-owner compatibility reconcile fence is missing'
+    }
+    $stop = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -ErrorAction Stop
+    if (
+        [string]$stop.schema -ne 'agent-harness.supervisor-stop-file.v1' -or
+        [string]$stop.serviceId -ne 'supervisor-reconcile' -or
+        $stop.persistent -ne $true
+    ) {
+        throw 'direct-owner compatibility reconcile fence is malformed'
+    }
+}
+
+function Write-DirectOwnerReconcileFence {
+    [IO.Directory]::CreateDirectory($SupervisorStopRoot) | Out-Null
+    $path = Join-Path $SupervisorStopRoot 'supervisor-reconcile.stop'
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        Assert-DirectOwnerReconcileFence
+        return
+    }
+    $temp = "$path.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $value = [ordered]@{
+            schema = 'agent-harness.supervisor-stop-file.v1'
+            serviceId = 'supervisor-reconcile'
+            persistent = $true
+            reason = 'direct-owner launcher compatibility fence'
+            createdBy = 'harness.ps1'
+            createdAtMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        }
+        [IO.File]::WriteAllText(
+            $temp,
+            (ConvertTo-Json -InputObject $value -Depth 8) + "`n",
+            [Text.UTF8Encoding]::new($false)
+        )
+        try {
+            Move-Item -LiteralPath $temp -Destination $path -ErrorAction Stop
+        }
+        catch {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw
+            }
+        }
+        Assert-DirectOwnerReconcileFence
+    }
+    finally {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Start-DirectOwnerHost {
+    param([string] $LiveControlToken)
+    $task = Get-ExactDirectOwnerHostTask
+    try {
+        Assert-DirectOwnerLauncherMasterStopOwnership
+        Invoke-LiveOpsControl 'start' $LiveControlToken
+        Write-DirectOwnerReconcileFence
+        Remove-DirectOwnerLauncherMasterStop
+        Enable-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName -ErrorAction Stop | Out-Null
+        Start-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName -ErrorAction Stop
+        $deadline = [DateTime]::UtcNow.AddSeconds(90)
+        do {
+            Start-Sleep -Milliseconds 250
+            $task = Get-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName -ErrorAction Stop
+            if (
+                [string]$task.State -eq 'Running' -and
+                (Test-Path -LiteralPath $DirectOwnerMasterState -PathType Leaf)
+            ) {
+                $state = Get-Content -LiteralPath $DirectOwnerMasterState -Raw |
+                    ConvertFrom-Json -ErrorAction Stop
+                $master = @(
+                    Get-CimInstance Win32_Process -Filter "name = 'agent-harness.exe'" |
+                        Where-Object {
+                            [int]$_.ProcessId -eq [int]$state.pid -and
+                            [string]::Equals(
+                                [string]$_.ExecutablePath,
+                                $HarnessExe,
+                                [StringComparison]::OrdinalIgnoreCase
+                            )
+                        }
+                )
+                if (
+                    [string]$state.schema -eq 'agent-harness.supervisor-master-state.v1' -and
+                    [string]$state.phase -eq 'running' -and
+                    [string]$state.mode -eq 'direct-owner' -and
+                    $master.Count -eq 1
+                ) {
+                    Assert-DirectOwnerReconcileFence
+                    return
+                }
+            }
+        } while ([DateTime]::UtcNow -lt $deadline)
+        throw 'Timed out waiting for the exact direct-owner master generation'
+    }
+    catch {
+        $startError = $_
+        Disable-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName -ErrorAction SilentlyContinue |
+            Out-Null
+        Stop-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName -ErrorAction SilentlyContinue
+        try {
+            Write-DirectOwnerContainmentStop
+        } catch {
+            # A foreign or malformed hold already provides fail-closed containment.
+        }
+        throw $startError
+    }
+}
+
+function Stop-DirectOwnerHost {
+    param([string] $LiveControlToken)
+    $task = Get-ExactDirectOwnerHostTask
+    Assert-DirectOwnerLauncherMasterStopOwnership
+    Invoke-LiveOpsControl 'stop' $LiveControlToken
+    Write-DirectOwnerContainmentStop 'direct-owner launcher stop'
+    Disable-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName -ErrorAction Stop | Out-Null
+    Stop-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName -ErrorAction SilentlyContinue
+}
+
 function Start-LiveSupervisors {
     param([string] $LiveControlToken)
     Require-File $HarnessExe "Deploy .agent-harness\bin\current\agent-harness.exe first."
     Require-File $CodexExe "Deploy the Codex CLI below .agent-harness\tools first."
     Require-File $NodeExe "Install or deploy the pinned Node executable first."
     Require-File $DiscordGateway "Deploy the Discord gateway below .agent-harness\tools first."
+    if ((Get-LiveOwnershipMode) -eq 'direct-owner') {
+        Start-DirectOwnerHost $LiveControlToken
+        return
+    }
     Require-File $KeeperPlan "Generate and install the reconcile keeper before starting live supervisors."
     Require-File (Join-Path $KeeperScripts 'start.ps1') "Regenerate the reconcile keeper plan before starting live supervisors."
     Invoke-LiveKeeperScript 'start' $LiveControlToken
@@ -149,6 +397,10 @@ function Start-LiveSupervisors {
 
 function Stop-LiveSupervisors {
     param([string] $LiveControlToken)
+    if ((Get-LiveOwnershipMode) -eq 'direct-owner') {
+        Stop-DirectOwnerHost $LiveControlToken
+        return
+    }
     $stopScript = Join-Path $KeeperScripts 'stop.ps1'
     if ((Test-Path -LiteralPath $KeeperPlan -PathType Leaf) -and
         (Test-Path -LiteralPath $stopScript -PathType Leaf)) {
@@ -185,6 +437,104 @@ function Get-LiveControlTokenArg {
         return $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN
     }
     return $null
+}
+
+function Test-LiveControlApprovalFlag {
+    return $CommandArgs -contains '--approve-live-control'
+}
+
+function Confirm-LiveGatewayControl {
+    param([ValidateSet('start', 'stop', 'restart')][string] $Action)
+    if (Test-LiveControlApprovalFlag) {
+        return
+    }
+    $inputRedirected = $false
+    try {
+        $inputRedirected = [Console]::IsInputRedirected
+    } catch {
+        $inputRedirected = $true
+    }
+    if ($inputRedirected) {
+        throw "live gateway $Action requires an explicit token or --approve-live-control in non-interactive mode"
+    }
+    $expected = $Action.ToUpperInvariant()
+    $confirmation = Read-Host "Type $expected to authorize live gateway $Action"
+    if (-not [string]::Equals($confirmation, $expected, [StringComparison]::Ordinal)) {
+        throw "live gateway $Action was not authorized"
+    }
+}
+
+function New-EphemeralLiveControlToken {
+    param([ValidateSet('start', 'stop')][string] $Action)
+    Require-File $HarnessExe "Deploy .agent-harness\bin\current\agent-harness.exe first. Cargo target\ is source/staging output only."
+    $requestOutput = & $HarnessExe ops-cutover-request --harness-home $HarnessHome `
+        --action $Action --summary "interactive harness gateway $Action" `
+        --test-note 'operator-confirmed launcher control' 2>&1
+    $requestExitCode = $LASTEXITCODE
+    if ($requestExitCode -ne 0) {
+        throw "live-control request failed for live gateway $Action with exit code $requestExitCode"
+    }
+    try {
+        $request = ($requestOutput -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "live-control request returned invalid JSON for live gateway $Action"
+    }
+    $requestExact = ([string]$request.schema -eq 'agent-harness.ops-cutover-request.v1') -and
+        ([string]$request.status -eq 'requested') -and
+        ([string]$request.action -eq $Action) -and
+        (-not [string]::IsNullOrWhiteSpace([string]$request.ticketId)) -and
+        [string]::Equals([string]$request.harnessHome, [string]$HarnessHome, [StringComparison]::OrdinalIgnoreCase)
+    if (-not $requestExact) {
+        throw "live-control request was not exact for live gateway $Action"
+    }
+
+    $operator = if (-not [string]::IsNullOrWhiteSpace($env:USERNAME)) {
+        if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) {
+            "$($env:USERDOMAIN)\$($env:USERNAME)"
+        } else {
+            $env:USERNAME
+        }
+    } else {
+        'interactive-operator'
+    }
+    $approvalOutput = & $HarnessExe ops-cutover-approve --harness-home $HarnessHome `
+        --ticket-id ([string]$request.ticketId) --action $Action --issued-to $operator `
+        --ttl-seconds 300 --reason "operator-confirmed harness gateway $Action" 2>&1
+    $approvalExitCode = $LASTEXITCODE
+    if ($approvalExitCode -ne 0) {
+        throw "live-control approval failed for live gateway $Action with exit code $approvalExitCode"
+    }
+    try {
+        $approval = ($approvalOutput -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        # Approval output can contain a bearer token, so never reflect it.
+        throw "live-control approval returned invalid JSON for live gateway $Action"
+    }
+    $approvalExact = ([string]$approval.schema -eq 'agent-harness.ops-cutover-approval.v1') -and
+        ([string]$approval.status -eq 'approved') -and
+        ([string]$approval.action -eq $Action) -and
+        ([string]$approval.ticketId -eq [string]$request.ticketId) -and
+        (-not [string]::IsNullOrWhiteSpace([string]$approval.token)) -and
+        [string]::Equals([string]$approval.harnessHome, [string]$HarnessHome, [StringComparison]::OrdinalIgnoreCase)
+    if (-not $approvalExact) {
+        throw "live-control approval was not exact for live gateway $Action"
+    }
+    return [string]$approval.token
+}
+
+function Resolve-LiveGatewayControlToken {
+    param(
+        [ValidateSet('start', 'stop')][string] $Action,
+        [string] $ExistingToken,
+        [switch] $AlreadyConfirmed
+    )
+    if (-not [string]::IsNullOrWhiteSpace($ExistingToken)) {
+        return $ExistingToken
+    }
+    if (-not $AlreadyConfirmed) {
+        Confirm-LiveGatewayControl $Action
+    }
+    return New-EphemeralLiveControlToken $Action
 }
 
 function Assert-LiveGatewayControlAllowed {
@@ -310,28 +660,36 @@ $liveControlToken = Get-LiveControlTokenArg
 
 switch ($action) {
     'start' {
+        $liveControlToken = Resolve-LiveGatewayControlToken 'start' $liveControlToken
         Assert-LiveGatewayControlAllowed 'start' $liveControlToken
         Start-LiveSupervisors $liveControlToken
     }
     'stop' {
+        $liveControlToken = Resolve-LiveGatewayControlToken 'stop' $liveControlToken
         Assert-LiveGatewayControlAllowed 'stop' $liveControlToken
         Stop-LiveSupervisors $liveControlToken
     }
     'restart' {
-        # Prove both action-specific grants and every start prerequisite before
-        # stopping anything, so a missing candidate cannot strand the live set.
-        Assert-LiveGatewayControlAllowed 'stop' $liveControlToken
-        Assert-LiveGatewayControlAllowed 'start' $liveControlToken
+        # A supplied restart grant authorizes deriving short-lived exact stop
+        # and start grants. Without one, obtain one operator confirmation and
+        # issue both exact grants; keeper scripts intentionally validate exact
+        # actions before mutating anything.
+        if (-not [string]::IsNullOrWhiteSpace($liveControlToken)) {
+            Assert-LiveGatewayControlAllowed 'restart' $liveControlToken
+        } else {
+            Confirm-LiveGatewayControl 'restart'
+        }
+        $stopLiveControlToken = New-EphemeralLiveControlToken 'stop'
+        $startLiveControlToken = New-EphemeralLiveControlToken 'start'
         Require-File $HarnessExe "Deploy .agent-harness\bin\current\agent-harness.exe first."
         Require-File $CodexExe "Deploy the Codex CLI below .agent-harness\tools first."
         Require-File $NodeExe "Install or deploy the pinned Node executable first."
         Require-File $DiscordGateway "Deploy the Discord gateway below .agent-harness\tools first."
-        Require-File $KeeperPlan "Generate and install the reconcile keeper before restarting live supervisors."
-        Require-File (Join-Path $KeeperScripts 'start.ps1') "Regenerate the reconcile keeper plan before restarting live supervisors."
-        Require-File (Join-Path $KeeperScripts 'stop.ps1') "Regenerate the reconcile keeper plan before restarting live supervisors."
-        Stop-LiveSupervisors $liveControlToken
+        Assert-LiveGatewayControlAllowed 'stop' $stopLiveControlToken
+        Assert-LiveGatewayControlAllowed 'start' $startLiveControlToken
+        Stop-LiveSupervisors $stopLiveControlToken
         Wait-LiveSupervisorsStopped
-        Start-LiveSupervisors $liveControlToken
+        Start-LiveSupervisors $startLiveControlToken
     }
     'keeper-plan' {
         Write-LiveKeeperPlan $liveControlToken

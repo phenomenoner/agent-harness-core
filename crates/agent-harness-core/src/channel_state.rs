@@ -3428,6 +3428,7 @@ mod tests {
         let mut step = command_step(ChannelCommandEffect::ShowStatus {
             scope: None,
             snapshot: ChannelStatusSnapshot {
+                snapshot_elapsed_ms: 0,
                 scope: None,
                 platform: "telegram".to_string(),
                 session_key: "telegram:dm:user:main".to_string(),

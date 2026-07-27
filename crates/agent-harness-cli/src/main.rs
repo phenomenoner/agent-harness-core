@@ -121,12 +121,12 @@ use agent_harness_core::{
     build_channel_step, build_dry_run_report, build_harness_skill_index, build_import_plan,
     build_runtime_skill_index, build_source_skill_index, build_turn_plan,
     build_turn_plan_for_account, cancel_worker_job, check_activation_readiness, check_config_drift,
-    check_tool_description_pin, collect_gateway_restart_status, collect_goal_campaign_status,
-    collect_harness_metrics, collect_harness_status, collect_healthz,
+    check_tool_description_pin, collect_cron_run_summary, collect_gateway_restart_status,
+    collect_goal_campaign_status, collect_harness_metrics, collect_harness_status, collect_healthz,
     collect_inbound_media_cache_report, collect_ops_cutover_status, collect_token_efficiency,
-    collect_worker_status, comment_on_operation_plan, compact_runtime_queue_receipts_if_needed,
-    compare_channel_turn_shadow, complete_operation_plan, control_cron_run,
-    control_runtime_queue_item, create_learning_proposal, create_operation_plan,
+    collect_worker_status, command_skill_index, comment_on_operation_plan,
+    compact_runtime_queue_receipts_if_needed, compare_channel_turn_shadow, complete_operation_plan,
+    control_cron_run, control_runtime_queue_item, create_learning_proposal, create_operation_plan,
     create_operation_plan_v2, create_ops_backup, create_skill_archive_proposal,
     create_skill_learning_proposal, current_log_time_ms, default_supervisor_child_specs,
     delegate_operation_plan_item, derive_supervisor_topology, doctor_backend_auth,
@@ -782,14 +782,25 @@ fn run_cron_runs(args: &[String]) -> Result<(), String> {
         &["--agent-id", "--entry-id", "--status", "--limit"],
         &[],
     )?;
-    let report = list_cron_runs(CronRunListOptions {
-        harness_home: options.target_home.clone(),
-        agent_id: options.optional("--agent-id").map(ToString::to_string),
-        entry_id: options.optional("--entry-id").map(ToString::to_string),
-        status: options.optional("--status").map(ToString::to_string),
-        limit: options.optional_usize("--limit")?.unwrap_or(50),
-    })
-    .map_err(|err| err.to_string())?;
+    let agent_id = options.optional("--agent-id").map(ToString::to_string);
+    let entry_id = options.optional("--entry-id").map(ToString::to_string);
+    let status = options.optional("--status").map(ToString::to_string);
+    let limit = options.optional_usize("--limit")?.unwrap_or(50);
+    let report = if agent_id.is_none() && entry_id.is_none() && status.is_none() {
+        let mut report =
+            collect_cron_run_summary(&options.target_home).map_err(|err| err.to_string())?;
+        report.runs.truncate(limit);
+        report
+    } else {
+        list_cron_runs(CronRunListOptions {
+            harness_home: options.target_home.clone(),
+            agent_id,
+            entry_id,
+            status,
+            limit,
+        })
+        .map_err(|err| err.to_string())?
+    };
     print_json(&report)
 }
 
@@ -3985,8 +3996,12 @@ fn run_channel_apply(args: &[String]) -> Result<(), String> {
 
 fn run_channel_receive(args: &[String]) -> Result<(), String> {
     let args = queue_enqueue_args_from_args(args)?;
-    let skill_index = build_runtime_skill_index(&args.turn.source, &args.target_home)
-        .map_err(|err| err.to_string())?;
+    let skill_index = if parse_channel_command(&args.turn.message).is_some() {
+        command_skill_index(&args.turn.source, &args.target_home)
+    } else {
+        build_runtime_skill_index(&args.turn.source, &args.target_home)
+            .map_err(|err| err.to_string())?
+    };
     let report = receive_channel_message(ChannelReceiveOptions {
         source: args.turn.source,
         runtime_workspace: None,
@@ -9929,6 +9944,21 @@ fn run_worker_run_once(args: &[String]) -> Result<(), String> {
 
 fn run_worker_loop(args: &[String]) -> Result<(), String> {
     let args = worker_loop_args_from_args(args)?;
+    #[cfg(windows)]
+    if env::var(agent_harness_core::supervisor_master::STANDALONE_MASTER_STATE_WRITER_ENV)
+        .ok()
+        .as_deref()
+        == Some("master")
+    {
+        let capability = arm_process_lifetime_tree_containment().map_err(|error| {
+            format!("failed to arm worker-loop descendant containment: {error}")
+        })?;
+        if capability != ProcessTreeContainmentCapability::TreeKillOnOwnerExit {
+            return Err(format!(
+                "worker-loop direct-owner wrapper requires tree-kill-on-owner-exit containment, observed {capability:?}"
+            ));
+        }
+    }
     let mut iterations = 0usize;
     let mut completed = 0usize;
     let mut idle = 0usize;
@@ -9958,13 +9988,19 @@ fn run_worker_loop(args: &[String]) -> Result<(), String> {
             iterations,
             "checking worker queue",
         )?;
-        match run_worker_once(WorkerRunOnceOptions {
-            harness_home: args.target_home.clone(),
-            lane: args.lane.clone(),
-            worker_id: args.worker_id.clone(),
-            lease_ms: args.lease_ms,
-            now_ms: current_time_ms()?,
-        }) {
+        let run = run_worker_once_with_heartbeat(
+            &args.target_home,
+            iterations,
+            args.idle_ms,
+            WorkerRunOnceOptions {
+                harness_home: args.target_home.clone(),
+                lane: args.lane.clone(),
+                worker_id: args.worker_id.clone(),
+                lease_ms: args.lease_ms,
+                now_ms: current_time_ms()?,
+            },
+        );
+        match run {
             Ok(report) => {
                 let label = worker_run_once_status_label(report.status);
                 write_loop_heartbeat(
@@ -10054,6 +10090,40 @@ fn run_worker_loop(args: &[String]) -> Result<(), String> {
         "stopReason": stop_reason
     });
     print_json(&summary)
+}
+
+fn run_worker_once_with_heartbeat(
+    harness_home: &Path,
+    iteration: usize,
+    idle_ms: u64,
+    options: WorkerRunOnceOptions,
+) -> Result<WorkerRunOnceReport, String> {
+    let target_home = harness_home.to_path_buf();
+    let interval_ms = idle_ms.clamp(25, 1_000);
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let pump = thread::spawn(move || -> Result<(), String> {
+        loop {
+            match stop_rx.recv_timeout(Duration::from_millis(interval_ms)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    write_loop_heartbeat(
+                        &target_home,
+                        "worker-loop",
+                        "running",
+                        iteration,
+                        "executing leased worker job",
+                    )?;
+                }
+            }
+        }
+    });
+    let run = run_worker_once(options).map_err(|error| error.to_string());
+    let _ = stop_tx.send(());
+    let pump_result = pump
+        .join()
+        .map_err(|_| "worker-loop heartbeat pump panicked".to_string())?;
+    pump_result?;
+    run
 }
 
 fn run_worker_status(args: &[String]) -> Result<(), String> {
@@ -15089,9 +15159,13 @@ fn launch_supervisor_reconcile_commands(
                 launch.service_id
             ));
         }
-        if let Some(conflict) =
-            supervisor_launch_owner_conflict(&args.target_home, &launch.service_id, None)?
-        {
+        let now_ms = current_time_ms()?;
+        if let Some(conflict) = supervisor_reconcile_launch_owner_conflict(
+            &args.target_home,
+            &launch.service_id,
+            now_ms,
+            args.default_heartbeat_timeout_ms,
+        )? {
             let record = serde_json::json!({
                 "schema": "agent-harness.supervisor-launch-receipt.v1",
                 "status": "launch-refused-owner-alive",
@@ -15099,14 +15173,13 @@ fn launch_supervisor_reconcile_commands(
                 "reason": "live owner from another generation or launch path is already running",
                 "conflict": conflict,
                 "command": launch.command,
-                "atMs": current_time_ms()?,
+                "atMs": now_ms,
             });
             append_supervisor_launch_receipt(&args.target_home, record.clone())?;
             launches.push(record);
             continue;
         }
         if args.auto_reconcile {
-            let now_ms = current_time_ms()?;
             if let Some(backoff) = supervisor_launch_backoff(
                 &args.target_home,
                 &launch.service_id,
@@ -15177,6 +15250,76 @@ fn launch_supervisor_reconcile_commands(
         launches.push(record);
     }
     Ok(launches)
+}
+
+fn supervisor_reconcile_launch_owner_conflict(
+    harness_home: &Path,
+    service_id: &str,
+    now_ms: i64,
+    heartbeat_timeout_ms: i64,
+) -> Result<Option<serde_json::Value>, String> {
+    if let Some(conflict) = supervisor_launch_owner_conflict(harness_home, service_id, None)? {
+        return Ok(Some(conflict));
+    }
+
+    let heartbeat_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("loop-heartbeats")
+        .join(format!("{service_id}.json"));
+    let text = match fs::read_to_string(&heartbeat_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read supervisor loop heartbeat {}: {error}",
+                heartbeat_file.display()
+            ));
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+        format!(
+            "invalid supervisor loop heartbeat {}: {err}",
+            heartbeat_file.display()
+        )
+    })?;
+    let Some(heartbeat_at_ms) = value.get("atMs").and_then(serde_json::Value::as_i64) else {
+        return Ok(None);
+    };
+    let heartbeat_age_ms = now_ms.saturating_sub(heartbeat_at_ms);
+    if heartbeat_age_ms < 0 || heartbeat_age_ms > heartbeat_timeout_ms {
+        return Ok(None);
+    }
+    let Some(process_id) = value.get("processId").and_then(serde_json::Value::as_i64) else {
+        return Ok(None);
+    };
+    if agent_harness_core::loop_health::process_alive_for_pid(process_id) != Some(true) {
+        return Ok(None);
+    }
+    let recorded_process_start_time_ms = value
+        .get("processStartTimeMs")
+        .and_then(serde_json::Value::as_i64);
+    let observed_process_start_time_ms =
+        agent_harness_core::loop_health::process_start_time_ms_for_pid(process_id);
+    let exact_process_identity = recorded_process_start_time_ms
+        .zip(observed_process_start_time_ms)
+        .is_some_and(|(recorded, observed)| recorded == observed);
+    if !exact_process_identity {
+        return Ok(None);
+    }
+
+    Ok(Some(serde_json::json!({
+        "heartbeatFile": heartbeat_file,
+        "ownerProcess": "heartbeat",
+        "pid": process_id,
+        "recordedProcessStartTimeMs": recorded_process_start_time_ms,
+        "observedProcessStartTimeMs": observed_process_start_time_ms,
+        "generationId": value.get("generationId").and_then(serde_json::Value::as_str),
+        "launchOwner": value.get("launchOwner").and_then(serde_json::Value::as_str),
+        "observedOnly": value.get("observedOnly").and_then(serde_json::Value::as_bool),
+        "heartbeatAtMs": heartbeat_at_ms,
+        "heartbeatAgeMs": heartbeat_age_ms,
+    })))
 }
 
 fn configure_supervisor_reconcile_child(command: &mut Command) -> serde_json::Value {
@@ -27077,6 +27220,7 @@ mod tests {
     fn live_keeper_plan_cli_requires_token_held_topology_and_zero_live_owners() {
         let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _token_env_restore = EnvVarRestore::remove("AGENT_HARNESS_LIVE_CONTROL_TOKEN");
+        let _live_session_env_restore = EnvVarRestore::remove("AGENT_HARNESS_LIVE_SESSION");
         let root = cli_temp_root("live_keeper_plan_mutation_gate");
         let harness_home = write_live_keeper_plan_fixture(&root);
         let base_args = vec![
@@ -29156,6 +29300,9 @@ mod tests {
     #[test]
     fn write_loop_heartbeat_replaces_json_atomically() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _state_writer = EnvVarRestore::remove(
+            agent_harness_core::supervisor_master::STANDALONE_MASTER_STATE_WRITER_ENV,
+        );
         let root = cli_temp_root("write_loop_heartbeat_replaces_json_atomically");
         let harness_home = root.join(".agent-harness");
         let watched_stop_file = harness_home
@@ -29261,6 +29408,92 @@ mod tests {
     }
 
     #[test]
+    fn worker_execution_pumps_wrapper_heartbeat_during_long_shell_job() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let root = cli_temp_root("worker_execution_pumps_wrapper_heartbeat");
+        let harness_home = root.join(".agent-harness");
+        let script_dir = harness_home.join("state").join("workers").join("scripts");
+        fs::create_dir_all(&script_dir).unwrap();
+        #[cfg(windows)]
+        let script = {
+            let path = script_dir.join("slow.ps1");
+            fs::write(&path, "Start-Sleep -Milliseconds 900\r\n").unwrap();
+            path
+        };
+        #[cfg(not(windows))]
+        let script = {
+            use std::os::unix::fs::PermissionsExt;
+            let path = script_dir.join("slow.sh");
+            fs::write(&path, "#!/bin/sh\nsleep 0.900\n").unwrap();
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).unwrap();
+            path
+        };
+        let started_at_ms = current_time_ms().unwrap();
+        enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::DeterministicShell,
+            lane: Some("shell".to_string()),
+            payload: serde_json::json!({
+                "scriptPath": script,
+                "cwd": script_dir,
+            }),
+            idempotency_key: Some("worker-heartbeat-long-shell".to_string()),
+            parent_job_id: None,
+            job_group_id: None,
+            master_agent_id: None,
+            master_session_key: None,
+            wake_policy: None,
+            source: Some("test".to_string()),
+            priority: 0,
+            available_at_ms: Some(started_at_ms),
+            max_attempts: 1,
+            timeout_ms: Some(5_000),
+            cascade_timeout_ms: None,
+            rate_key: None,
+            concurrency_group_key: None,
+            now_ms: started_at_ms,
+        })
+        .unwrap();
+
+        let report = run_worker_once_with_heartbeat(
+            &harness_home,
+            7,
+            250,
+            WorkerRunOnceOptions {
+                harness_home: harness_home.clone(),
+                lane: Some("shell".to_string()),
+                worker_id: "heartbeat-worker".to_string(),
+                lease_ms: 300,
+                now_ms: started_at_ms,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.status, WorkerRunOnceStatus::Completed);
+        let heartbeat: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                harness_home
+                    .join("state")
+                    .join("supervisor")
+                    .join("loop-heartbeats")
+                    .join("worker-loop.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(heartbeat["status"], "running");
+        assert_eq!(heartbeat["iteration"], 7);
+        assert_eq!(heartbeat["detail"], "executing leased worker job");
+        assert!(
+            heartbeat["atMs"]
+                .as_i64()
+                .is_some_and(|value| value >= started_at_ms.saturating_add(200))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn consume_gateway_restart_request_moves_file_and_receipts() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _parent_pid = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_PARENT_PID", "12345");
@@ -29337,15 +29570,31 @@ mod tests {
     #[test]
     fn gateway_restart_staging_replay_closes_loop_from_channel_run_once() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let root =
+            cli_temp_root("gateway_restart_staging_replay_closes_loop_from_channel_run_once");
+        let harness_home = root.join(".agent-harness");
+        let watched_stop_file = agent_harness_core::loop_health::supervisor_stop_file_path(
+            &harness_home,
+            "discord-gateway-loop",
+        );
+        let _state_writer = EnvVarRestore::remove(
+            agent_harness_core::supervisor_master::STANDALONE_MASTER_STATE_WRITER_ENV,
+        );
         let _parent_pid = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_PARENT_PID", "12345");
         let _generation = EnvVarRestore::set(
             "AGENT_HARNESS_SERVICE_GENERATION_ID",
             "gateway-generation-new",
         );
         let _started_at = EnvVarRestore::set("AGENT_HARNESS_SERVICE_STARTED_AT_MS", "67890");
-        let root =
-            cli_temp_root("gateway_restart_staging_replay_closes_loop_from_channel_run_once");
-        let harness_home = root.join(".agent-harness");
+        let _stop_file = EnvVarRestore::set(
+            "AGENT_HARNESS_SUPERVISOR_STOP_FILE",
+            &watched_stop_file.display().to_string(),
+        );
+        let _launch_owner = EnvVarRestore::set(
+            "AGENT_HARNESS_SUPERVISOR_LAUNCH_OWNER",
+            "rust-supervisor-run",
+        );
+        let _observed_only = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_OBSERVED_ONLY", "false");
         let source = write_cli_channel_source(&root);
 
         let request = run_channel_once(ChannelRunOnceOptions {

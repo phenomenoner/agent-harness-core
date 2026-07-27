@@ -170,6 +170,8 @@ pub fn build_turn_plan_for_account(
     account_id: Option<String>,
 ) -> io::Result<TurnPlan> {
     let mut warnings = Vec::new();
+    let command = parse_channel_command(&input.text);
+    let command_intent = command.clone().map(ChannelCommand::into_intent);
     // An explicit account turns this into a full-lane operation.  If the
     // selected agent/lane cannot be derived, do not fall through to the
     // account-less compatibility state file: that would let one account
@@ -177,7 +179,9 @@ pub fn build_turn_plan_for_account(
     let account_scope_requested = account_id.is_some();
     let selected_agent = select_agent(registry, input.requested_agent_id.as_deref(), &mut warnings);
     let skill_source = skill_source_for_agent(source, selected_agent);
-    let scoped_skill_index = if let Some(harness_home) = input.harness_home.as_ref() {
+    let scoped_skill_index = if command.is_some() {
+        None
+    } else if let Some(harness_home) = input.harness_home.as_ref() {
         Some(build_runtime_skill_index(&skill_source, harness_home)?)
     } else if skill_source != *source {
         Some(build_source_skill_index(&skill_source)?)
@@ -190,8 +194,6 @@ pub fn build_turn_plan_for_account(
     let mut thinking_policy = TurnThinkingPolicy::default();
     let mut reasoning_preference = None;
     let mut backend_reasoning_policy = None;
-    let command = parse_channel_command(&input.text);
-    let command_intent = command.clone().map(ChannelCommand::into_intent);
     let dispatch = if command.is_some() {
         TurnDispatch::ChannelCommand
     } else if agent.is_some() {
@@ -1312,6 +1314,50 @@ mod tests {
         );
         assert!(plan.selected_skills.is_empty());
         assert_eq!(plan.session_key, "discord:dm_42:user_7:main");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_command_bypasses_runtime_skill_index_construction() {
+        let root = temp_root("status_command_bypasses_runtime_skill_index_construction");
+        let source = write_turn_source(&root);
+        let harness_home = root.join("harness");
+        let failpoint = harness_home
+            .join("state")
+            .join("test-failpoints")
+            .join("runtime-skill-index");
+        fs::create_dir_all(failpoint.parent().unwrap()).unwrap();
+        fs::write(&failpoint, b"fail").unwrap();
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let plan = build_turn_plan_for_account(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home),
+                platform: "discord".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/status".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+            Some("default".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(plan.dispatch, TurnDispatch::ChannelCommand);
+        assert_eq!(
+            plan.command_intent,
+            Some(ChannelCommandIntent::ShowStatus { scope: None })
+        );
+        assert!(plan.selected_skills.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

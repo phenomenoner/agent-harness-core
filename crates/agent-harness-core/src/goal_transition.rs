@@ -49,6 +49,15 @@ pub enum GoalTransitionRelation {
     Unproven,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GoalTransitionCorrelationSourceV1 {
+    BackendGoal,
+    DurableContinuation,
+    #[default]
+    None,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GoalTransitionDecision {
@@ -90,6 +99,8 @@ pub struct GoalTransitionInput {
     pub backend_context_generation: Option<String>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
+    pub backend_goal_ref: Option<String>,
+    pub correlation_source: GoalTransitionCorrelationSourceV1,
     pub goal_checksum: Option<String>,
     pub source_slice_generation: u64,
     pub decision_generation: u64,
@@ -119,6 +130,10 @@ pub struct GoalTransitionReceiptV1 {
     pub backend_context_generation: Option<String>,
     pub source_thread_id: Option<String>,
     pub source_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_goal_ref: Option<String>,
+    #[serde(default)]
+    pub correlation_source: GoalTransitionCorrelationSourceV1,
     pub goal_checksum: Option<String>,
     pub source_slice_generation: u64,
     pub decision_generation: u64,
@@ -470,6 +485,8 @@ pub fn evaluate_goal_transition(input: GoalTransitionInput) -> GoalTransitionRec
         backend_context_generation: input.backend_context_generation,
         source_thread_id: input.source_thread_id,
         source_turn_id: input.source_turn_id,
+        backend_goal_ref: input.backend_goal_ref,
+        correlation_source: input.correlation_source,
         goal_checksum: input.goal_checksum,
         source_slice_generation: input.source_slice_generation,
         decision_generation: input.decision_generation,
@@ -721,12 +738,35 @@ mod tests {
             relation: GoalTransitionRelation::FreshUnrelatedTurn,
             lineage_id: None,
             campaign_family_id: None,
+            backend_goal_ref: None,
+            correlation_source: GoalTransitionCorrelationSourceV1::None,
             goal_checksum: None,
             ..input(GoalTransitionEventKind::NormalCompletion, None, false)
         });
         assert_eq!(ordinary.decision, GoalTransitionDecision::Complete);
         assert_eq!(ordinary.surface, GoalTransitionSurface::OrdinaryFinal);
         assert!(ordinary.terminal);
+        assert_eq!(
+            ordinary.correlation_source,
+            GoalTransitionCorrelationSourceV1::None
+        );
+        assert!(ordinary.backend_goal_ref.is_none());
+    }
+
+    #[test]
+    fn explicit_durable_goal_with_invalid_authority_still_parks_fail_closed() {
+        let receipt = evaluate_goal_transition(GoalTransitionInput {
+            authority: GoalTransitionAuthority::Invalid,
+            relation: GoalTransitionRelation::CurrentGoalSlice,
+            ..input(GoalTransitionEventKind::NormalCompletion, None, false)
+        });
+
+        assert_eq!(receipt.decision, GoalTransitionDecision::NeedsAuthority);
+        assert_eq!(receipt.surface, GoalTransitionSurface::ProgressOnly);
+        assert!(!receipt.schedule_continuation);
+        assert!(!receipt.allow_campaign_final);
+        assert!(!receipt.terminal);
+        assert!(receipt.reason.contains("goal-correlated work"));
     }
 
     fn input(
@@ -747,6 +787,8 @@ mod tests {
             backend_context_generation: Some("generation".to_string()),
             source_thread_id: Some("thread".to_string()),
             source_turn_id: Some("turn".to_string()),
+            backend_goal_ref: Some("backend-goal".to_string()),
+            correlation_source: GoalTransitionCorrelationSourceV1::BackendGoal,
             goal_checksum: Some("goal".to_string()),
             source_slice_generation: 1,
             decision_generation: 1,

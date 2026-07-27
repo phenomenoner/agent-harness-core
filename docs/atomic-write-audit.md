@@ -1,6 +1,6 @@
 # Atomic Write Audit
 
-Date: 2026-06-12
+Date: 2026-07-26
 
 Scope: mutable state writes in `crates/agent-harness-core` and new roadmap modules. Append-only JSONL receipts are intentionally excluded from atomic replacement; their integrity is covered by JSONL validation, receipt schemas, and trace reconstruction.
 
@@ -22,6 +22,7 @@ Mutable JSON documents must use `write_json_atomic` or an equivalent temp-file-a
 | Task entity | `task.json` via atomic JSON write; checkpoints are append-only JSONL. | `task_budget_learning_and_drift_paths_are_receipted`. |
 | Learning proposal | Proposal JSON via atomic JSON write; proposal receipts are append-only JSONL. | `task_budget_learning_and_drift_paths_are_receipted`. |
 | Vault | Encrypted vault JSON via atomic JSON write. | `vault_round_trips_without_plaintext_file_content`. |
+| Codex config materialization | Semantic TOML merge, same-directory private temp file, file sync, replace-existing rename, directory sync where supported, exact readback, stable original snapshot, and failpoint restoration. | `codex_config_materialization::tests::semantic_merge_preserves_mcp_and_unknown_roots_then_is_byte_idempotent`; `transaction_failpoints_restore_exact_prewrite_bytes`; `durable_original_snapshot_restores_pre_harness_config`. |
 
 ## Remaining Audit Work
 

@@ -729,6 +729,34 @@ pub(crate) fn query_channel_delivery_receipt_history_indexed(
     Ok(entries)
 }
 
+/// Returns the latest provider-delivered timestamp for one exact source queue.
+///
+/// This is an aggregate over the bounded SQLite sidecar, so callers do not
+/// need to choose a receipt-history window that could exclude later delivery
+/// evidence.
+pub(crate) fn latest_delivered_at_ms_for_source_queue(
+    channel_dir: &Path,
+    source_queue_id: &str,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<i64>> {
+    refresh_channel_delivery_index_nonblocking(channel_dir, warnings)?;
+    let connection = open_channel_delivery_state_index(channel_dir)?;
+    let delivered_at_ms = connection
+        .query_row(
+            "SELECT MAX(records.at_ms) \
+             FROM channel_delivery_receipt_records AS records \
+             INNER JOIN channel_delivery_outbox_lines AS outbox \
+                 ON outbox.delivery_id = records.delivery_id \
+             WHERE outbox.parse_error IS NULL \
+                 AND outbox.source_queue_id = ?1 \
+                 AND json_extract(records.receipt_json, '$.status') = 'delivered'",
+            params![source_queue_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(io::Error::other)?;
+    Ok(delivered_at_ms)
+}
+
 /// Source-authoritative exact lookup for one source queue.
 ///
 /// Final-outbox idempotency must use this variant before it decides whether a
@@ -2412,6 +2440,63 @@ mod tests {
     use super::*;
     use crate::{ChannelOutboundMessageKind, append_jsonl_value};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn phase0_1_aggregate_preserves_the_deployed_v3_index_contract() {
+        let root = temp_root("phase0_1_aggregate_preserves_the_deployed_v3_index_contract");
+        let channel_dir = root.join("state").join("channels");
+        let mut connection = open_channel_delivery_state_index(&channel_dir).unwrap();
+
+        let revision = read_meta(&connection, META_REVISION).unwrap();
+        assert_eq!(revision.as_deref(), Some("3"));
+        let receipt_columns = connection
+            .prepare("PRAGMA table_info(channel_delivery_receipt_records)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            !receipt_columns
+                .iter()
+                .any(|column| column == "receipt_status")
+        );
+
+        connection
+            .execute(
+                "INSERT INTO channel_delivery_receipt_records (
+                    source_kind,
+                    source_id,
+                    line_number,
+                    delivery_id,
+                    receipt_json,
+                    at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "hot",
+                    "receipts.jsonl",
+                    1_i64,
+                    "delivery-v3-sentinel",
+                    r#"{"status":"delivered"}"#,
+                    42_i64
+                ],
+            )
+            .unwrap();
+
+        initialize_channel_delivery_state_index(&mut connection).unwrap();
+        let sentinel_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM channel_delivery_receipt_records
+                 WHERE delivery_id = 'delivery-v3-sentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sentinel_count, 1);
+
+        drop(connection);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn blocking_source_queue_lookup_tails_a_new_source_row_before_querying_the_index() {
