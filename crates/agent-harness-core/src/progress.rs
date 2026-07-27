@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,6 +39,8 @@ const TERMINAL_PROGRESS_STATE_RETENTION_MS: i64 = 10 * 60 * 1000;
 /// surface, but it must never create a late message for retained history.
 const MAX_FRESH_PROGRESS_SURFACE_AGE_MS: i64 = TERMINAL_PROGRESS_STATE_RETENTION_MS;
 const PROGRESS_SURFACE_CLAIM_TTL_MS: i64 = 2 * 60 * 1000;
+const SESSION_SUPERSEDE_CLAIM_SCAN_LIMIT: usize = 256;
+const SESSION_SUPERSEDE_CLAIM_SCAN_BUDGET: Duration = Duration::from_millis(25);
 const SENSITIVE_PREVIEW: &str = "[redacted sensitive preview]";
 const MAX_LEGACY_COMPACTED_QUEUE_FALLBACK: usize = 1_024;
 const MAX_LEGACY_COMPACTED_EVENTS_PER_QUEUE: usize = 34;
@@ -1315,6 +1317,15 @@ pub fn append_agent_progress_event(
 pub fn supersede_agent_progress_session_surfaces(
     options: AgentProgressSessionSupersedeOptions,
 ) -> io::Result<AgentProgressSessionSupersedeReport> {
+    let transaction_file = agent_progress_delivery_transaction_file(&options.harness_home);
+    crate::logging::with_jsonl_append_lock(&transaction_file, || {
+        supersede_agent_progress_session_surfaces_locked(options)
+    })
+}
+
+fn supersede_agent_progress_session_surfaces_locked(
+    options: AgentProgressSessionSupersedeOptions,
+) -> io::Result<AgentProgressSessionSupersedeReport> {
     let state_file = agent_progress_delivery_state_file(&options.harness_home);
     let receipts_file = agent_progress_session_supersede_receipts_file(&options.harness_home);
     let mut warnings = Vec::new();
@@ -1359,11 +1370,46 @@ pub fn supersede_agent_progress_session_surfaces(
         !events.is_empty()
     });
 
+    // The superseded-session registry is authoritative. Commit it before
+    // touching surface claims so a transient Windows delete-share denial
+    // cannot hold `/new` in retry-pending or admit more old-session work.
+    write_delivery_state(&state_file, &state)?;
+
     let mut removed_claim_files = Vec::new();
     let claims_dir = progress_surface_claims_dir(&options.harness_home);
     if claims_dir.is_dir() {
-        for entry in fs::read_dir(&claims_dir)? {
-            let entry = entry?;
+        let cleanup_started = Instant::now();
+        let mut scanned = 0usize;
+        let entries = match fs::read_dir(&claims_dir) {
+            Ok(entries) => Some(entries),
+            Err(error) => {
+                warnings.push(format!(
+                    "deferred progress surface claim cleanup because {} could not be listed: {}",
+                    claims_dir.display(),
+                    error
+                ));
+                None
+            }
+        };
+        for entry in entries.into_iter().flatten() {
+            if scanned >= SESSION_SUPERSEDE_CLAIM_SCAN_LIMIT
+                || cleanup_started.elapsed() >= SESSION_SUPERSEDE_CLAIM_SCAN_BUDGET
+            {
+                warnings.push(format!(
+                    "deferred remaining progress surface claim cleanup after scanning {scanned} file(s)"
+                ));
+                break;
+            }
+            scanned += 1;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warnings.push(format!(
+                        "deferred one progress surface claim directory entry during supersede: {error}"
+                    ));
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
@@ -1375,7 +1421,11 @@ pub fn supersede_agent_progress_session_surfaces(
                     match fs::remove_file(&path) {
                         Ok(()) => removed_claim_files.push(path),
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error),
+                        Err(error) => warnings.push(format!(
+                            "deferred progress surface claim cleanup at {}: {}",
+                            path.display(),
+                            error
+                        )),
                     }
                 }
                 Ok(_) => {}
@@ -1388,7 +1438,6 @@ pub fn supersede_agent_progress_session_surfaces(
         }
     }
 
-    write_delivery_state(&state_file, &state)?;
     let report = AgentProgressSessionSupersedeReport {
         schema: AGENT_PROGRESS_SESSION_SUPERSEDE_SCHEMA,
         state_file,
@@ -1408,6 +1457,15 @@ pub fn supersede_agent_progress_session_surfaces(
 }
 
 pub fn plan_agent_progress_delivery(
+    options: AgentProgressDeliveryPlanOptions,
+) -> io::Result<AgentProgressDeliveryPlanReport> {
+    let transaction_file = agent_progress_delivery_transaction_file(&options.harness_home);
+    crate::logging::with_jsonl_append_lock(&transaction_file, || {
+        plan_agent_progress_delivery_locked(options)
+    })
+}
+
+fn plan_agent_progress_delivery_locked(
     options: AgentProgressDeliveryPlanOptions,
 ) -> io::Result<AgentProgressDeliveryPlanReport> {
     let events_file = agent_progress_events_file(&options.harness_home);
@@ -2102,6 +2160,16 @@ pub fn record_agent_progress_delivery(
 }
 
 pub fn record_agent_progress_delivery_with_context(
+    options: AgentProgressDeliveryRecordOptions,
+    context: AgentProgressDeliveryRecordContext,
+) -> io::Result<AgentProgressDeliveryReceipt> {
+    let transaction_file = agent_progress_delivery_transaction_file(&options.harness_home);
+    crate::logging::with_jsonl_append_lock(&transaction_file, || {
+        record_agent_progress_delivery_with_context_locked(options, context)
+    })
+}
+
+fn record_agent_progress_delivery_with_context_locked(
     options: AgentProgressDeliveryRecordOptions,
     context: AgentProgressDeliveryRecordContext,
 ) -> io::Result<AgentProgressDeliveryReceipt> {
@@ -3001,6 +3069,13 @@ fn final_source_delivery_is_still_pending(
 
 fn write_delivery_state(state_file: &Path, state: &AgentProgressDeliveryState) -> io::Result<()> {
     write_json_atomic(state_file, state)
+}
+
+fn agent_progress_delivery_transaction_file(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("progress")
+        .join("delivery-state-transaction.jsonl")
 }
 
 fn progress_surface_claims_dir(harness_home: &Path) -> PathBuf {
@@ -7927,7 +8002,13 @@ mod tests {
 
     #[test]
     fn new_session_supersedes_previous_progress_surfaces() {
-        let root = temp_root("new_session_supersedes_previous_progress_surfaces");
+        assert_new_session_supersedes_previous_progress_surfaces(
+            "new_session_supersedes_previous_progress_surfaces",
+        );
+    }
+
+    fn assert_new_session_supersedes_previous_progress_surfaces(test_name: &str) {
+        let root = temp_root(test_name);
         let harness_home = root.join(".agent-harness");
         fs::create_dir_all(&harness_home).unwrap();
         let context = context();
@@ -8018,9 +8099,194 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn new_session_commit_survives_a_transient_claim_delete_denial() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = temp_root("new_session_commit_survives_a_transient_claim_delete_denial");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "old session task",
+                AgentProgressStatus::Started,
+                1_000,
+            ),
+        )
+        .unwrap();
+        let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some(context.platform.clone()),
+            now_ms: 2_000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        let locked_claim = progress_surface_claim_file(
+            &harness_home,
+            &initial.pending.first().unwrap().status_surface_key,
+        );
+        let _deny_delete = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0x1 | 0x2)
+            .open(&locked_claim)
+            .unwrap();
+
+        let report =
+            supersede_agent_progress_session_surfaces(AgentProgressSessionSupersedeOptions {
+                harness_home: harness_home.clone(),
+                platform: context.platform.clone(),
+                account_id: context.account_id.clone(),
+                channel_id: context.channel_id.clone(),
+                user_id: context.user_id.clone(),
+                agent_id: context.agent_id.clone(),
+                session_key: context.session_key.clone(),
+                now_ms: 2_500,
+            })
+            .expect("claim cleanup cannot veto the authoritative session boundary");
+
+        assert!(
+            report.warnings.iter().any(|warning| {
+                warning.contains("deferred") && warning.contains("surface claim")
+            })
+        );
+        let old_session = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some(context.platform.clone()),
+            now_ms: 3_000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(old_session.pending.is_empty());
+        drop(_deny_delete);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_supersede_uses_the_progress_state_transaction_gate() {
+        let root = temp_root("session_supersede_uses_the_progress_state_transaction_gate");
+        let harness_home = root.join(".agent-harness");
+        let transaction_file = harness_home
+            .join("state")
+            .join("progress")
+            .join("delivery-state-transaction.jsonl");
+        let options = AgentProgressSessionSupersedeOptions {
+            harness_home: harness_home.clone(),
+            platform: "discord".to_string(),
+            account_id: Some("default".to_string()),
+            channel_id: "channel-1".to_string(),
+            user_id: "user-1".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: "discord:default:channel-1:user-1:main:old".to_string(),
+            now_ms: 1_000,
+        };
+        let (tx, rx) = mpsc::channel();
+
+        crate::logging::with_jsonl_append_lock(&transaction_file, || {
+            std::thread::spawn(move || {
+                tx.send(supersede_agent_progress_session_surfaces(options))
+                    .unwrap();
+            });
+            assert!(
+                matches!(
+                    rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "supersede bypassed the shared state transaction gate"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("supersede should resume after the gate is released")
+            .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_supersede_cleanup_is_bounded_with_a_large_claim_directory() {
+        let root = temp_root("session_supersede_cleanup_is_bounded_with_a_large_claim_directory");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "old session task",
+                AgentProgressStatus::Started,
+                1_000,
+            ),
+        )
+        .unwrap();
+        plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some(context.platform.clone()),
+            now_ms: 2_000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        let claims_dir = progress_surface_claims_dir(&harness_home);
+        for index in 0..2_000 {
+            fs::write(
+                claims_dir.join(format!("unrelated-{index:04}.json")),
+                b"{\"schema\":\"unrelated-claim\"}\n",
+            )
+            .unwrap();
+        }
+
+        let report =
+            supersede_agent_progress_session_surfaces(AgentProgressSessionSupersedeOptions {
+                harness_home: harness_home.clone(),
+                platform: context.platform.clone(),
+                account_id: context.account_id.clone(),
+                channel_id: context.channel_id.clone(),
+                user_id: context.user_id.clone(),
+                agent_id: context.agent_id.clone(),
+                session_key: context.session_key.clone(),
+                now_ms: 2_500,
+            })
+            .unwrap();
+
+        let deferred_warning = report
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("deferred remaining"))
+            .expect("large cleanup must stop at its deterministic scan or time budget");
+        let scanned = deferred_warning
+            .split("after scanning ")
+            .nth(1)
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("deferred warning must expose the bounded scan count");
+        assert!(scanned <= SESSION_SUPERSEDE_CLAIM_SCAN_LIMIT);
+        let old_session = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some(context.platform.clone()),
+            now_ms: 3_000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(old_session.pending.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn new_session_hides_old_lane_ghost_status() {
-        new_session_supersedes_previous_progress_surfaces();
+        assert_new_session_supersedes_previous_progress_surfaces(
+            "new_session_hides_old_lane_ghost_status",
+        );
     }
 
     #[test]

@@ -9,6 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_harness_core::loop_health::process_alive_for_pid;
 use agent_harness_core::process_launch::configure_noninteractive_command;
+use agent_harness_core::{
+    WorkerEnqueueOptions, WorkerJobKind, WorkerStatusOptions, collect_worker_status,
+    enqueue_worker_job, write_json_atomic,
+};
 use serde_json::Value;
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -374,6 +378,142 @@ fn abrupt_master_death_reaps_gateway_descendant_tree() {
 }
 
 #[test]
+fn long_worker_job_keeps_one_fresh_direct_owner_attempt() {
+    let fixture = MasterFixture::new("long-worker-heartbeat", "direct-owner");
+    fixture.write_worker_service(800, 600);
+    let script_dir = fixture
+        .harness_home
+        .join("state")
+        .join("workers")
+        .join("scripts");
+    fs::create_dir_all(&script_dir).expect("create worker scripts");
+    let script = script_dir.join("long-worker.ps1");
+    fs::write(&script, "Start-Sleep -Milliseconds 2600\r\n").expect("write long worker");
+
+    let mut master = fixture.spawn_master("direct-owner", "master.stderr.log");
+    let service_state_file = fixture.state_root.join("services").join("worker-loop.json");
+    let initial = wait_for_json_matching(
+        &service_state_file,
+        Duration::from_secs(15),
+        || master.assert_running("waiting for worker direct-owner admission"),
+        |value| value["actualState"] == "running",
+    );
+    let initial_pid = initial["processId"].as_u64().expect("worker pid");
+    let initial_attempt = initial["attemptOrdinal"].clone();
+    let initial_restart_count = initial["restartCount"].clone();
+    enqueue_shell_fixture(
+        &fixture.harness_home,
+        &script,
+        &script_dir,
+        "long-worker",
+        1,
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        master.assert_running("waiting for long worker completion");
+        let status = collect_worker_status(WorkerStatusOptions {
+            harness_home: fixture.harness_home.clone(),
+        })
+        .expect("collect worker status");
+        if status.totals.succeeded == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "long worker did not complete");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let final_state = wait_for_json_matching(
+        &service_state_file,
+        Duration::from_secs(5),
+        || master.assert_running("waiting for stable worker attempt"),
+        |value| value["actualState"] == "running",
+    );
+    assert_eq!(final_state["attemptOrdinal"], initial_attempt);
+    assert_eq!(final_state["restartCount"], initial_restart_count);
+    assert_eq!(final_state["processId"].as_u64(), Some(initial_pid));
+    fixture.stop_master_cleanly(&mut master);
+}
+
+#[test]
+fn abrupt_worker_death_reaps_descendant_and_expires_owned_job() {
+    let fixture = MasterFixture::new("abrupt-worker-descendant", "direct-owner");
+    fixture.write_worker_service(800, 600);
+    let script_dir = fixture
+        .harness_home
+        .join("state")
+        .join("workers")
+        .join("scripts");
+    fs::create_dir_all(&script_dir).expect("create worker scripts");
+    let descendant_pid_file = fixture.root.join("worker-descendant.pid");
+    let script = script_dir.join("spawn-worker-descendant.ps1");
+    fs::write(
+        &script,
+        format!(
+            "$child = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -WindowStyle Hidden -PassThru\r\nSet-Content -LiteralPath '{}' -Value $child.Id -NoNewline\r\nWait-Process -Id $child.Id\r\n",
+            descendant_pid_file.display()
+        ),
+    )
+    .expect("write descendant worker");
+    enqueue_shell_fixture(
+        &fixture.harness_home,
+        &script,
+        &script_dir,
+        "abrupt-worker",
+        1,
+    );
+
+    let mut master = fixture.spawn_master("direct-owner", "master.stderr.log");
+    let service_state_file = fixture.state_root.join("services").join("worker-loop.json");
+    let initial = wait_for_json_matching(
+        &service_state_file,
+        Duration::from_secs(15),
+        || master.assert_running("waiting for worker direct-owner admission"),
+        |value| value["actualState"] == "running",
+    );
+    let worker_pid = initial["processId"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .expect("worker pid");
+    let descendant_pid = wait_for_u32_file(&descendant_pid_file, Duration::from_secs(15));
+    assert_eq!(process_alive_for_pid(i64::from(descendant_pid)), Some(true));
+
+    terminate_process(worker_pid);
+    wait_for_process_absent(worker_pid, Duration::from_secs(5));
+    wait_for_process_absent(descendant_pid, Duration::from_secs(5));
+    let replacement = wait_for_json_matching(
+        &service_state_file,
+        Duration::from_secs(15),
+        || master.assert_running("waiting for replacement worker"),
+        |value| {
+            value["attemptOrdinal"].as_u64().unwrap_or_default() >= 2
+                && value["actualState"] == "running"
+        },
+    );
+    assert_ne!(
+        replacement["processId"].as_u64(),
+        Some(u64::from(worker_pid))
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        master.assert_running("waiting for expired old-generation worker job");
+        let status = collect_worker_status(WorkerStatusOptions {
+            harness_home: fixture.harness_home.clone(),
+        })
+        .expect("collect worker status");
+        if status.totals.expired == 1 && status.totals.running == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement did not expire old-generation worker job: {:?}",
+            status.totals
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    fixture.stop_master_cleanly(&mut master);
+}
+
+#[test]
 fn observe_mode_has_no_process_or_canonical_state_side_effects() {
     let fixture = MasterFixture::new("observe-no-side-effects", "observe");
     let output = fixture
@@ -626,13 +766,19 @@ impl MasterFixture {
     }
 
     fn write_ownership_mode(&self, ownership_mode: &str) {
-        fs::write(
-            self.harness_home.join("harness-config.json"),
-            format!(
-                r#"{{"schema":"agent-harness.config.v1","supervisor":{{"enabled":true,"manageAllLoops":false,"autoReconcile":false,"ownershipMode":"{ownership_mode}"}}}}"#
-            ),
+        write_json_atomic(
+            &self.harness_home.join("harness-config.json"),
+            &serde_json::json!({
+                "schema": "agent-harness.config.v1",
+                "supervisor": {
+                    "enabled": true,
+                    "manageAllLoops": false,
+                    "autoReconcile": false,
+                    "ownershipMode": ownership_mode,
+                },
+            }),
         )
-        .expect("write isolated ownership config");
+        .expect("atomically write isolated ownership config");
     }
 
     fn write_progress_service(
@@ -669,6 +815,32 @@ impl MasterFixture {
             serde_json::to_vec_pretty(&desired_services).expect("serialize desired services"),
         )
         .expect("write desired services");
+    }
+
+    fn write_worker_service(&self, heartbeat_timeout_ms: i64, lease_ms: i64) {
+        let worker_stop_file = self.state_root.join("stop").join("worker-loop.stop");
+        let desired_services = serde_json::json!([{
+            "enabled": true,
+            "serviceId": "worker-loop",
+            "serviceKind": "worker",
+            "args": [
+                "--harness-cli", self.harness_cli,
+                "--child-iterations", "0",
+                "--idle-ms", "50",
+                "--max-consecutive-errors", "5",
+                "--stop-file", worker_stop_file,
+                "--lease-ms", lease_ms.to_string(),
+                "--lane", "shell"
+            ],
+            "priority": "worker",
+            "restartDelayMs": 100,
+            "heartbeatTimeoutMs": heartbeat_timeout_ms
+        }]);
+        fs::write(
+            &self.desired_file,
+            serde_json::to_vec_pretty(&desired_services).expect("serialize worker service"),
+        )
+        .expect("write worker service");
     }
 
     fn write_partial_start_services(&self) -> PathBuf {
@@ -1083,6 +1255,58 @@ fn suspend_process(process_id: u32) {
             "suspend at least one thread for pid={process_id}"
         );
     }
+}
+
+fn wait_for_process_absent(process_id: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while process_alive_for_pid(i64::from(process_id)) != Some(false) {
+        assert!(
+            Instant::now() < deadline,
+            "process {process_id} remained alive after bounded termination wait"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn enqueue_shell_fixture(
+    harness_home: &Path,
+    script: &Path,
+    script_dir: &Path,
+    idempotency_key: &str,
+    max_attempts: i64,
+) {
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis(),
+    )
+    .expect("clock fits i64");
+    enqueue_worker_job(WorkerEnqueueOptions {
+        harness_home: harness_home.to_path_buf(),
+        kind: WorkerJobKind::DeterministicShell,
+        lane: Some("shell".to_string()),
+        payload: serde_json::json!({
+            "scriptPath": script,
+            "cwd": script_dir,
+        }),
+        idempotency_key: Some(idempotency_key.to_string()),
+        parent_job_id: None,
+        job_group_id: None,
+        master_agent_id: None,
+        master_session_key: None,
+        wake_policy: None,
+        source: Some("standalone-master-lifecycle-test".to_string()),
+        priority: 0,
+        available_at_ms: Some(now_ms),
+        max_attempts,
+        timeout_ms: Some(60_000),
+        cascade_timeout_ms: None,
+        rate_key: None,
+        concurrency_group_key: None,
+        now_ms,
+    })
+    .expect("enqueue shell fixture");
 }
 
 fn process_has_visible_top_level_window(process_id: u32) -> bool {

@@ -4,7 +4,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "16070f67c6965403064ce8505c9e88aee4a32b8d232af4f5f4d9fde12266f379"
+      "sha256": "4c99a0fdff36a7405727084d01e843ab28b168b5537f08cd96f77a2b71721c84"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -177,9 +177,9 @@
       "label": "codex_runtime / goal_closure",
       "group": "component",
       "state": "implemented",
-      "summary": "app-server protocol, Windows Job-at-create process-tree containment, exact-owned parent-event classification, preflight/start/run, governed original-thread goal closure, prepared work-authority classification, deadline/bounded-yield control, elicitation parking, recovery, and web-search mode",
+      "summary": "app-server protocol, platform-contained Codex/MCP process-tree lifecycle, exact-owned parent-event classification, preflight/start/run, governed original-thread goal closure, prepared work-authority classification, deadline/bounded-yield control, elicitation parking, recovery, and web-search mode",
       "reads": "prompt/config, exact queue lease and child-cleanup authority, task-family budget, closure intent, connector approval policy, provider capabilities, exact-lane policy",
-      "writes": "primary runtime outcome, atomic child binding and cleanup proof, quarantined foreign-event evidence, governed terminal projection, closure phase receipts, deadline/steer receipts, effect state, transcript/completion, and web-search evidence",
+      "writes": "primary runtime outcome, containment-specific child binding and cleanup proof, quarantined foreign-event evidence, governed terminal projection, closure phase receipts, deadline/steer receipts, effect state, transcript/completion, and web-search evidence",
       "invariants": "I2, I3, I5, I6, I7, I10, I13, I19, I31, I36, I37, I38",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -238,6 +238,19 @@
       ]
     },
     {
+      "id": "component-provider-gateway-adapters",
+      "label": "provider gateway adapters",
+      "group": "component",
+      "state": "implemented",
+      "summary": "provider connection, Identify/READY lifecycle, explicit provider-visible presence where supported, heartbeat, inbound event normalization, and no-console child launch behavior; never supervisor authority",
+      "reads": "provider token/config, gateway protocol events, watched stop file",
+      "writes": "bounded adapter event log, wrapper-owned loop heartbeat, normalized ingress event, explicit Discord online presence",
+      "invariants": "I14, I26, I41",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
       "id": "component-channel-delivery",
       "label": "channel_delivery",
       "group": "component",
@@ -255,9 +268,9 @@
       "label": "progress",
       "group": "component",
       "state": "implemented",
-      "summary": "source-authoritative progress narration delivery, separate from final replies, with terminal release bound to exact source-closure evidence and the derived source-final expectation",
-      "reads": "progress events/index, runtime receipt, exact-source outbox/delivery state, channel policy, watched stop file",
-      "writes": "progress outbox/delivery state, source cursor/cache, surface claims and fail-closed warnings; unexplained new-format non-delivery cannot release progress",
+      "summary": "source-authoritative progress narration delivery, separate from final replies, with terminal release bound to exact source-closure evidence and the derived source-final expectation; planning, delivery recording, and session supersession serialize through one state transaction gate",
+      "reads": "progress events/index, runtime receipt, exact-source outbox/delivery state, channel policy, superseded-session registry, watched stop file",
+      "writes": "progress outbox/delivery state, source cursor/cache, authoritative superseded-session commit, bounded best-effort surface-claim cleanup, and fail-closed warnings; unexplained new-format non-delivery cannot release progress",
       "invariants": "I2, I4, I9, I17, I25, I27, I37",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -539,9 +552,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Bounded receipt history and isolated maintenance owner",
-      "designTarget": "Interactive ingress, progress, runtime completion, and final delivery read source-authoritative bounded snapshots and only signal retention; expensive compaction runs under the independently supervised ledger-maintenance-loop.",
-      "currentEvidence": "Focused 100k history, busy-lock snapshot, wake-coalescing, failure-isolation, queue-index migration, and full-workspace staging tests are green. Candidate supervisor dry-run plans the owner; controlled live long-turn ordering/latency evidence remains pending.",
-      "promotionGate": "Promote only after candidate preflight includes the dedicated owner and controlled live evidence proves progress/final delivery does not wait for retention, with bounded maintenance receipts and no recurring rebuild warning.",
+      "designTarget": "Interactive ingress, progress, runtime completion, and final delivery read source-authoritative bounded snapshots and only signal retention; expensive compaction runs under the independently supervised ledger-maintenance-loop. Derived delivery indexes are single-version-owned while live: a candidate may inspect them only in an isolated snapshot or after the deployed topology is stopped and a stopped-state backup is captured.",
+      "currentEvidence": "Focused 100k history, busy-lock snapshot, wake-coalescing, failure-isolation, queue-index migration, deployed-v3 revision preservation, candidate-access fencing, and full-workspace staging tests are green. Candidate supervisor dry-run plans the owner; controlled live long-turn ordering/latency evidence remains pending.",
+      "promotionGate": "Promote only after candidate preflight includes the dedicated owner, proves the candidate did not touch live sidecars before stopped-state backup, and controlled live evidence proves progress/final delivery does not wait for retention, with bounded maintenance receipts and no recurring rebuild warning.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -1077,6 +1090,11 @@
     },
     {
       "source": "canon-topology-contract",
+      "target": "component-provider-gateway-adapters",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
       "target": "component-channel-delivery",
       "label": "owns boundary"
     },
@@ -1263,6 +1281,11 @@
     {
       "source": "axis-agentid",
       "target": "component-runtime-pipeline-task-transition-task-budget",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-provider-gateway-adapters",
       "label": "must survive through"
     },
     {
@@ -1601,6 +1624,11 @@
       "label": "changes trigger"
     },
     {
+      "source": "component-provider-gateway-adapters",
+      "target": "impact-provider-model-request-overrides",
+      "label": "changes trigger"
+    },
+    {
       "source": "impact-memory-or-session-history-search",
       "target": "canon-topology-contract",
       "label": "reviewed by"
@@ -1649,6 +1677,11 @@
       "source": "gap-bounded-ledger-maintenance-live-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
     },
     {
       "source": "component-channel-ingress-channel-runtime-channel-action",
@@ -1741,6 +1774,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-standalone-master-portability-soak-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-channel-delivery",
       "target": "gap-standalone-master-portability-soak-gap",
       "label": "has gap"
@@ -1806,6 +1844,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-memory-session-history-retrieval",
       "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
       "label": "has gap"
@@ -1837,6 +1880,11 @@
     },
     {
       "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
       "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
       "label": "has gap"
     },
@@ -2041,6 +2089,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-channel-delivery",
       "target": "gap-multi-agent-full-matrix-gap",
       "label": "has gap"
@@ -2211,6 +2264,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-channel-delivery",
       "target": "gap-progress-delivery-volume-gap",
       "label": "has gap"
@@ -2266,6 +2324,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-progress",
       "target": "gap-progress-final-surface-gap",
       "label": "has gap"
@@ -2317,6 +2380,11 @@
     },
     {
       "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
       "target": "gap-tool-use-timeout-recovery-gap",
       "label": "has gap"
     },
@@ -2427,6 +2495,11 @@
     },
     {
       "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
       "target": "gap-codex-startup-executable-stability-gap",
       "label": "has gap"
     },
@@ -2597,6 +2670,11 @@
     },
     {
       "source": "component-provider-request-policy",
+      "target": "gap-context-capacity-correlation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
       "target": "gap-context-capacity-correlation-gap",
       "label": "has gap"
     },
@@ -2806,6 +2884,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-channel-delivery",
       "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
@@ -2911,6 +2994,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
       "source": "component-channel-delivery",
       "target": "gap-fast",
       "label": "has gap"
@@ -2961,6 +3049,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-channel-delivery",
       "target": "gap-channel-media-delivery-gap",
       "label": "has gap"
@@ -2987,6 +3080,11 @@
     },
     {
       "source": "component-provider-request-policy",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
       "target": "gap-rich-message-presentation-gap",
       "label": "has gap"
     },
@@ -3031,6 +3129,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-progress",
       "target": "gap-generic-artifact-context-hygiene-gap",
       "label": "has gap"
@@ -3057,6 +3160,11 @@
     },
     {
       "source": "component-codex-web-search",
+      "target": "gap-image-route-vs-input-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
       "target": "gap-image-route-vs-input-classification-gap",
       "label": "has gap"
     },
@@ -3102,6 +3210,11 @@
     },
     {
       "source": "component-workers-child-execution-policy",
+      "target": "gap-supervisor-service-health-precedence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
       "target": "gap-supervisor-service-health-precedence-gap",
       "label": "has gap"
     },

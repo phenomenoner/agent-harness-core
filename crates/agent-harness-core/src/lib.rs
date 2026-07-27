@@ -24,6 +24,7 @@ pub mod channel_state;
 pub mod child_execution_policy;
 pub mod codex_backend_provenance;
 pub(crate) mod codex_capability;
+pub mod codex_config_materialization;
 pub mod codex_protocol_compat;
 pub mod codex_runtime;
 pub mod codex_web_search;
@@ -37,6 +38,7 @@ pub mod deploy;
 pub mod deterministic_cron;
 pub mod dream_director;
 pub mod execution_mode;
+pub mod external_capability;
 pub mod external_effect;
 pub mod goal_budget;
 pub mod goal_closure;
@@ -172,8 +174,9 @@ pub use backend_auth::{
     complete_backend_auth_operation, doctor_backend_auth, expire_backend_auth_operation,
     load_backend_auth_state, persist_backend_auth_state, probe_backend_account,
     record_backend_auth_defer_intent, request_backend_auth_cancel, require_backend_ready_for_turn,
-    resolve_or_create_provider_codex_home, resume_all_backend_auth_defer_intents,
-    resume_backend_auth_defer_intent, run_backend_auth_cli_operation,
+    resolve_or_create_agent_provider_codex_home, resolve_or_create_provider_codex_home,
+    resume_all_backend_auth_defer_intents, resume_backend_auth_defer_intent,
+    run_backend_auth_cli_operation,
 };
 pub use background::{
     BackgroundTaskListOptions, BackgroundTaskRecord, BackgroundTaskRegistryReport,
@@ -255,9 +258,15 @@ pub use codex_backend_provenance::{
     CodexBackendProvenanceReceiptV1, REQUIRED_CODEX_BACKEND_VERSION,
     probe_codex_backend_provenance, write_codex_backend_provenance_receipt,
 };
+pub use codex_config_materialization::{
+    CODEX_CONFIG_MATERIALIZATION_SCHEMA, CodexConfigMaterializationFailpoint,
+    CodexConfigMaterializationOptions, CodexConfigMaterializationReceiptV1,
+    CodexConfigMaterializationResultV1, CodexConfigMaterializationSourceV1,
+    HARNESS_MANAGED_CODEX_CONFIG_ROOTS, materialize_codex_config, restore_original_codex_config,
+};
 pub use codex_protocol_compat::{
     CODEX_PROTOCOL_COMPATIBILITY_SCHEMA, CodexProtocolCompatibilityReportV1,
-    model_context_window_from_protocol_event, validate_codex_0_144_5_protocol_fixture,
+    model_context_window_from_protocol_event, validate_codex_0_145_0_protocol_fixture,
 };
 pub use codex_runtime::{
     AssistantNarrationConfig, AssistantNarrationMode, CodexApprovalPolicy,
@@ -349,6 +358,16 @@ pub use dream_director::{
     DreamDirectorSendReport, dream_director_daily_state_dir, dream_director_send_receipt_file,
     run_dream_director_send,
 };
+pub use external_capability::{
+    CODEX_EXTERNAL_CAPABILITY_READINESS_SCHEMA, CodexExternalCapabilityReadinessEntryV1,
+    CodexExternalCapabilityReadinessInput, CodexExternalCapabilityReadinessReceiptV1,
+    CodexExternalCapabilityStatusV1, EXTERNAL_CAPABILITY_DECLARATION_SCHEMA,
+    ExternalCapabilityRequirementV1, ExternalCapabilityTransportV1,
+    ExternalMcpCapabilityDeclarationV1, canonical_mcp_server_info_digest,
+    canonical_mcp_tool_schema_digest, declaration_digest,
+    evaluate_codex_external_capability_readiness, load_external_mcp_capability_declarations,
+    validate_external_mcp_capability_declarations,
+};
 pub use external_effect::{
     CONNECTOR_APPROVAL_TOKEN_SCHEMA, ConnectorApprovalModeV1, ConnectorApprovalPolicyV1,
     ConnectorApprovalRuleV1, ConnectorApprovalTokenV1, EXTERNAL_EFFECT_INTENT_SCHEMA,
@@ -404,9 +423,10 @@ pub use goal_lineage::{
     goal_lineage_supersessions_file, latest_goal_projection_for_queue, run_goal_lineage_doctor,
 };
 pub use goal_transition::{
-    GOAL_SLICE_SCHEMA, GOAL_TRANSITION_SCHEMA, GoalTransitionAuthority, GoalTransitionDecision,
-    GoalTransitionEventKind, GoalTransitionInput, GoalTransitionReceiptV1, GoalTransitionSurface,
-    evaluate_goal_transition, goal_transition_receipts_file, record_goal_transition,
+    GOAL_SLICE_SCHEMA, GOAL_TRANSITION_SCHEMA, GoalTransitionAuthority,
+    GoalTransitionCorrelationSourceV1, GoalTransitionDecision, GoalTransitionEventKind,
+    GoalTransitionInput, GoalTransitionReceiptV1, GoalTransitionSurface, evaluate_goal_transition,
+    goal_transition_receipts_file, record_goal_transition,
 };
 pub use harness_registry::{
     CredentialStatus, HarnessAgent, HarnessPlugin, HarnessProvider, HarnessRegistry,
@@ -804,8 +824,8 @@ pub use skills::{
     SkillFrontmatter, SkillIndex, SkillIndexFile, SkillIndexOrigin, SkillIndexSummary, SkillRecord,
     SkillScoreComponent, SkillSelection, SkillSelectionQuery, SkillSelectionReceipt,
     SkillSourceKind, build_harness_skill_index, build_runtime_skill_index,
-    build_source_skill_index, select_skills, skill_selection_receipts_file, write_skill_index,
-    write_skill_selection_receipt,
+    build_source_skill_index, command_skill_index, select_skills, skill_selection_receipts_file,
+    write_skill_index, write_skill_selection_receipt,
 };
 pub use status::{
     GatewayRestartCompletionStatus, GatewayRestartHeartbeatStatus, GatewayRestartReceiptStatus,

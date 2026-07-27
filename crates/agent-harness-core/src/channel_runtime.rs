@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -221,6 +221,7 @@ pub struct FastRequestRoutePolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelStatusSnapshot {
+    pub snapshot_elapsed_ms: u64,
     pub scope: Option<String>,
     pub platform: String,
     pub session_key: String,
@@ -2504,6 +2505,7 @@ fn status_snapshot(
     turn: &TurnPlan,
     scope: Option<String>,
 ) -> ChannelStatusSnapshot {
+    let started = Instant::now();
     let codex_approval_policy = turn.harness_home.as_ref().map(|harness_home| {
         inspect_codex_approval_policy(harness_home)
             .policy
@@ -2518,7 +2520,8 @@ fn status_snapshot(
         .harness_home
         .as_ref()
         .map(|harness_home| inspect_codex_sandbox_policy(harness_home).sandbox);
-    ChannelStatusSnapshot {
+    let mut snapshot = ChannelStatusSnapshot {
+        snapshot_elapsed_ms: 0,
         scope,
         platform: turn.platform.clone(),
         session_key: turn.session_key.clone(),
@@ -2585,7 +2588,9 @@ fn status_snapshot(
             .as_ref()
             .map(|state| state.btw_notes.len())
             .unwrap_or(0),
-    }
+    };
+    snapshot.snapshot_elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    snapshot
 }
 
 fn outbound(

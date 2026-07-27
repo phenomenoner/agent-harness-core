@@ -167,6 +167,7 @@ pub struct GoalProjectionHint {
     pub source_thread_id: String,
     pub source_turn_id: Option<String>,
     pub goal_reference: String,
+    pub backend_goal_ref: Option<String>,
     pub lane_digest: Option<String>,
     pub backend_context_generation: Option<String>,
     pub status: String,
@@ -267,6 +268,7 @@ pub fn latest_goal_projection_for_queue(
             } else {
                 projection.goal_reference
             },
+            backend_goal_ref: projection.backend_goal_ref,
             lane_digest: projection.lane_digest,
             backend_context_generation: projection.backend_context_generation,
             status: projection.status,

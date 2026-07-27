@@ -326,6 +326,17 @@ fn build_summary(
         (Some(_), None) => true,
         _ => false,
     };
+    let observed_heartbeat_process_start_time_ms = heartbeat
+        .process_id
+        .and_then(crate::loop_health::process_start_time_ms_for_pid);
+    let heartbeat_process_identity_matches = heartbeat
+        .process_start_time_ms
+        .zip(observed_heartbeat_process_start_time_ms)
+        .is_some_and(|(recorded, observed)| recorded == observed);
+    let heartbeat_supersedes_dead_service = heartbeat_is_newer
+        && service_process_alive == Some(false)
+        && heartbeat.process_alive == Some(true)
+        && heartbeat_process_identity_matches;
     let process_id = if heartbeat_is_newer {
         heartbeat.process_id.or(service_process_id)
     } else {
@@ -382,11 +393,19 @@ fn build_summary(
             .and_then(|state| state.status.clone())
             .or_else(|| heartbeat.status.clone())
     };
-    let generation_id = service_state.and_then(|state| state.generation_id.clone());
+    let service_generation_id = service_state.and_then(|state| state.generation_id.clone());
     let heartbeat_generation_id = heartbeat.generation_id.clone();
-    let generation_mismatch = generation_id.is_some()
+    let generation_id = if heartbeat_supersedes_dead_service {
+        heartbeat_generation_id
+            .clone()
+            .or_else(|| service_generation_id.clone())
+    } else {
+        service_generation_id.clone()
+    };
+    let generation_mismatch = !heartbeat_supersedes_dead_service
+        && service_generation_id.is_some()
         && heartbeat_generation_id.is_some()
-        && generation_id != heartbeat_generation_id;
+        && service_generation_id != heartbeat_generation_id;
     let launch_owner = if heartbeat_is_newer {
         heartbeat
             .launch_owner
@@ -1238,6 +1257,82 @@ mod tests {
             report.running.first().map(|item| item.service_id.as_str()),
             Some("worker-loop")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inventory_adopts_newer_exact_live_heartbeat_generation_after_dead_service() {
+        let root =
+            temp_root("inventory_adopts_newer_exact_live_heartbeat_generation_after_dead_service");
+        let harness_home = root.join(".agent-harness");
+        let pid = i64::from(std::process::id());
+        let process_start_time_ms = crate::loop_health::process_start_time_ms_for_pid(pid)
+            .expect("current test process start identity");
+        let now_ms = 10_000;
+        write_service_state(
+            &harness_home,
+            "telegram-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "telegram-loop",
+                "serviceKind": "telegram-ingress",
+                "status": "stale",
+                "desiredState": "running",
+                "actualState": "stale",
+                "pid": -1,
+                "processId": -1,
+                "generationId": "generation-dead",
+                "launchOwner": "rust-supervisor-run",
+                "observedOnly": false,
+                "lastHeartbeatAtMs": now_ms - 1_000,
+            }),
+        );
+        write_heartbeat_state(
+            &harness_home,
+            "telegram-loop",
+            serde_json::json!({
+                "status": "running",
+                "processId": pid,
+                "processStartTimeMs": process_start_time_ms,
+                "generationId": "generation-replacement",
+                "launchOwner": "rust-supervisor-run",
+                "observedOnly": false,
+                "atMs": now_ms - 50,
+                "detail": "newer exact-live replacement heartbeat",
+            }),
+        );
+
+        let report = reconcile_supervisor_inventory(SupervisorInventoryOptions {
+            harness_home: harness_home.clone(),
+            desired_services: vec![SupervisorInventoryServiceConfig {
+                enabled: true,
+                service_id: "telegram-loop".to_string(),
+                service_kind: "telegram-ingress".to_string(),
+                args: Vec::new(),
+                priority: "critical".to_string(),
+                restart_delay_ms: 60_000,
+                heartbeat_timeout_ms: Some(1_000),
+            }],
+            now_ms: Some(now_ms),
+            default_heartbeat_timeout_ms: Some(120_000),
+        })
+        .unwrap();
+
+        assert!(report.stale.is_empty());
+        assert_eq!(report.running.len(), 1);
+        assert!(report.launch_commands.is_empty());
+        let running = report.running.first().unwrap();
+        assert_eq!(
+            running.generation_id.as_deref(),
+            Some("generation-replacement")
+        );
+        assert_eq!(
+            running.heartbeat_generation_id.as_deref(),
+            Some("generation-replacement")
+        );
+        assert!(!running.generation_mismatch);
+        assert!(!running.ownership_conflict);
 
         let _ = fs::remove_dir_all(root);
     }

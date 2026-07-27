@@ -37,6 +37,12 @@ This document supports P6.5 and the external review security dimension. It names
 
 ## Remaining Hardening Gates
 
+- Preserve extension-owned third-party MCP registrations when generated backend
+  config is refreshed, materialize changes transactionally, distinguish
+  regenerated state from reused plan state, and verify required capabilities in
+  a fresh isolated backend process. Config-file or registration-CLI evidence is
+  not sufficient. See
+  [Reliable Third-Party MCP Hosting](roadmap/skill-routing-and-governed-learning/phase-0-reliable-third-party-mcp-hosting.md).
 - Add environment scrubbing and command hash pinning to the actual shell job runner.
 - Wire MCP/tool description pins into `enable-check` before enabling real invocation.
 - Run a network-backed dependency advisory audit before public release.

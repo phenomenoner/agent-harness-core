@@ -1980,6 +1980,31 @@ pub fn prepare_runtime_queue_item(
             pending.queue_id
         ));
     }
+    #[cfg(test)]
+    if options
+        .harness_home
+        .join("state")
+        .join("test-failpoints")
+        .join("prepare-after-lease")
+        .is_file()
+    {
+        return Err(io::Error::other(
+            "injected preparation pause immediately after durable lease",
+        ));
+    }
+    if let Err(error) = crate::latency::record_latency_stage(
+        crate::latency::latency_receipts_file(&options.harness_home),
+        &pending.queue_id,
+        &pending.runtime_class,
+        crate::latency::LatencyStage::PromptBundleStart,
+        None,
+    ) {
+        warnings.push(format!(
+            "failed to record prompt-bundle-start latency stage for `{}`: {error}",
+            pending.queue_id
+        ));
+    }
+    let prompt_bundle_started = Instant::now();
 
     let prompt_workspace = prompt_source_workspace(&pending.source_home, &pending.source_workspace);
     if !paths_equivalent(&prompt_workspace, &pending.source_workspace) {
@@ -2115,6 +2140,30 @@ pub fn prepare_runtime_queue_item(
     let execution_dir = queue_execution_dir(&options.harness_home, &pending.queue_id);
     fs::create_dir_all(&execution_dir)?;
     let prompt_files = write_prompt_bundle(&bundle, &execution_dir)?;
+    if let Err(error) = crate::latency::record_latency_stage(
+        crate::latency::latency_receipts_file(&options.harness_home),
+        &pending.queue_id,
+        &pending.runtime_class,
+        crate::latency::LatencyStage::PromptBundleDone,
+        None,
+    ) {
+        warnings.push(format!(
+            "failed to record prompt-bundle-done latency stage for `{}`: {error}",
+            pending.queue_id
+        ));
+    }
+    if let Err(error) = crate::latency::record_monotonic_latency_span(
+        crate::latency::latency_receipts_file(&options.harness_home),
+        &pending.queue_id,
+        &pending.runtime_class,
+        crate::latency::MonotonicLatencySpan::PromptBundlePreparation,
+        prompt_bundle_started.elapsed(),
+    ) {
+        warnings.push(format!(
+            "failed to record monotonic prompt-bundle latency span for `{}`: {error}",
+            pending.queue_id
+        ));
+    }
     let receipt_file = execution_dir.join("execution-receipt.json");
     let receipt_runtime_class = pending.runtime_class.clone();
     let receipt_origin = pending.origin.clone();
@@ -2853,10 +2902,60 @@ struct RuntimeQueueChildCleanupFenceV1 {
     child_process_id: Option<u32>,
     child_process_start_time_ms: Option<i64>,
     job_containment_assigned: bool,
+    #[serde(default = "default_child_containment_kind")]
+    containment_kind: String,
     reason: String,
     fenced_at_ms: i64,
     #[serde(default)]
     cleanup_proven_at_ms: Option<i64>,
+}
+
+fn default_child_containment_kind() -> String {
+    "windows-job".to_string()
+}
+
+fn current_child_containment_kind() -> &'static str {
+    #[cfg(windows)]
+    {
+        "windows-job"
+    }
+    #[cfg(unix)]
+    {
+        "unix-process-group"
+    }
+    #[cfg(all(not(windows), not(unix)))]
+    {
+        "root-process"
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_group_alive(process_group_id: u32) -> io::Result<bool> {
+    let process_group_id = i32::try_from(process_group_id).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unix process-group id exceeds the platform PID range",
+        )
+    })?;
+    // SAFETY: signal zero performs a liveness/permission probe and a negative
+    // PID addresses the exact process group without delivering a signal.
+    if unsafe { libc::kill(-process_group_id, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn unix_process_group_alive(_process_group_id: u32) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix process-group liveness is unavailable on this platform",
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3006,6 +3105,7 @@ pub(crate) fn prearm_runtime_queue_child_cleanup_fence(
         child_process_id: None,
         child_process_start_time_ms: None,
         job_containment_assigned: false,
+        containment_kind: current_child_containment_kind().to_string(),
         reason: "Codex app-server spawn is fenced before process creation".to_string(),
         fenced_at_ms,
         cleanup_proven_at_ms: None,
@@ -3067,16 +3167,20 @@ pub(crate) fn bind_runtime_queue_child_cleanup_fence(
     child_process_start_time_ms: Option<i64>,
     job_containment_assigned: bool,
 ) -> io::Result<RuntimeQueueChildCleanupFenceAuthority> {
-    let child_start_is_exact = child_process_start_time_ms.is_some_and(|value| value >= 0);
+    let child_identity_is_exact = match authority.record.containment_kind.as_str() {
+        "windows-job" => child_process_start_time_ms.is_some_and(|value| value >= 0),
+        "unix-process-group" => child_process_start_time_ms.is_none_or(|value| value >= 0),
+        _ => false,
+    };
     if authority.record.phase != "spawn-in-progress"
         || authority.record.child_process_id.is_some()
         || child_process_id == 0
-        || !child_start_is_exact
+        || !child_identity_is_exact
         || !job_containment_assigned
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "child-cleanup fence binding requires exact unbound spawn authority, PID/start generation, and assigned Job containment",
+            "child-cleanup fence binding requires exact unbound spawn authority, PID/generation evidence appropriate to the platform, and assigned process-tree containment",
         ));
     }
     let mut bound = authority.record.clone();
@@ -3154,9 +3258,14 @@ pub(crate) fn mark_runtime_queue_child_cleanup_proven(
         && authority.record.child_process_id.is_none()
         && authority.record.child_process_start_time_ms.is_none()
         && !authority.record.job_containment_assigned;
+    let valid_bound_identity = match authority.record.containment_kind.as_str() {
+        "windows-job" => authority.record.child_process_start_time_ms.is_some(),
+        "unix-process-group" => true,
+        _ => false,
+    };
     let valid_bound = authority.record.phase == "child-bound"
         && authority.record.child_process_id.is_some()
-        && authority.record.child_process_start_time_ms.is_some()
+        && valid_bound_identity
         && authority.record.job_containment_assigned;
     if (!valid_prearm && !valid_bound) || cleanup_proven_at_ms < authority.record.fenced_at_ms {
         return Err(io::Error::new(
@@ -3235,6 +3344,7 @@ fn runtime_queue_child_cleanup_proof_derives_from(
         && current.child_process_id == authority.child_process_id
         && current.child_process_start_time_ms == authority.child_process_start_time_ms
         && current.job_containment_assigned == authority.job_containment_assigned
+        && current.containment_kind == authority.containment_kind
         && current.fenced_at_ms == authority.fenced_at_ms
         && current
             .cleanup_proven_at_ms
@@ -3245,8 +3355,15 @@ fn runtime_queue_child_cleanup_proof_derives_from(
             current.job_containment_assigned,
         ) {
             (None, None, false) => true,
-            (Some(process_id), Some(process_start_time_ms), true) => {
-                process_id > 0 && process_start_time_ms >= 0
+            (Some(process_id), process_start_time_ms, true)
+                if current.containment_kind == "windows-job" =>
+            {
+                process_id > 0 && process_start_time_ms.is_some_and(|value| value >= 0)
+            }
+            (Some(process_id), process_start_time_ms, true)
+                if current.containment_kind == "unix-process-group" =>
+            {
+                process_id > 0 && process_start_time_ms.is_none_or(|value| value >= 0)
             }
             _ => false,
         }
@@ -3422,8 +3539,15 @@ fn reconcile_orphaned_runtime_queue_child_cleanup_fences_locked(
                     fence.job_containment_assigned,
                 ) {
                     (None, None, false) => true,
-                    (Some(process_id), Some(process_start_time_ms), true) => {
-                        process_id > 0 && process_start_time_ms >= 0
+                    (Some(process_id), process_start_time_ms, true)
+                        if fence.containment_kind == "windows-job" =>
+                    {
+                        process_id > 0 && process_start_time_ms.is_some_and(|value| value >= 0)
+                    }
+                    (Some(process_id), process_start_time_ms, true)
+                        if fence.containment_kind == "unix-process-group" =>
+                    {
+                        process_id > 0 && process_start_time_ms.is_none_or(|value| value >= 0)
                     }
                     _ => false,
                 };
@@ -3466,7 +3590,40 @@ fn reconcile_orphaned_runtime_queue_child_cleanup_fences_locked(
                 // generation proves an unbound child could never execute.
                 cfg!(windows)
             }
-            "child-bound" if fence.job_containment_assigned => {
+            "child-bound"
+                if fence.job_containment_assigned
+                    && fence.containment_kind == "unix-process-group" =>
+            {
+                match fence.child_process_id {
+                    Some(process_group_id) => match unix_process_group_alive(process_group_id) {
+                        Ok(false) => true,
+                        Ok(true) => {
+                            warnings.push(format!(
+                                "child-cleanup fence {} remains fail-closed because Unix process group {process_group_id} is still alive",
+                                path.display()
+                            ));
+                            false
+                        }
+                        Err(error) => {
+                            warnings.push(format!(
+                                "child-cleanup fence {} remains fail-closed because Unix process-group liveness is ambiguous: {error}",
+                                path.display()
+                            ));
+                            false
+                        }
+                    },
+                    None => {
+                        warnings.push(format!(
+                            "child-cleanup fence {} remains fail-closed because process-group identity is incomplete",
+                            path.display()
+                        ));
+                        false
+                    }
+                }
+            }
+            "child-bound"
+                if fence.job_containment_assigned && fence.containment_kind == "windows-job" =>
+            {
                 match (fence.child_process_id, fence.child_process_start_time_ms) {
                     (Some(process_id), Some(process_start_time_ms)) => {
                         match exact_process_generation_state(
@@ -8886,9 +9043,36 @@ mod tests {
         enqueue_channel_step, inbound_media_attachment_root, read_channel_session_state,
         record_context_compact_attempt, record_scoped_stop,
     };
+    use std::ffi::OsString;
     use std::io::Write;
     use std::sync::mpsc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    struct TestEnvRestore {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl TestEnvRestore {
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for TestEnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn refresh_runtime_queue_state_index_reuses_persisted_cursor_across_restart_and_observes_appends()
@@ -11339,6 +11523,7 @@ mod tests {
 
     #[test]
     fn prepare_runtime_queue_item_writes_prompt_bundle_and_receipts() {
+        let _service_generation = TestEnvRestore::remove("AGENT_HARNESS_SERVICE_GENERATION_ID");
         let root = temp_root("prepare_runtime_queue_item_writes_prompt_bundle_and_receipts");
         let source = write_worker_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -11665,6 +11850,55 @@ mod tests {
                 .filter(|status| *status == "prepared")
                 .count(),
             1
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preparing_progress_is_durable_before_slow_prompt_preparation() {
+        let root = temp_root("preparing_progress_is_durable_before_slow_prompt_preparation");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn(&source, &harness_home);
+        let failpoint = harness_home
+            .join("state")
+            .join("test-failpoints")
+            .join("prepare-after-lease");
+        fs::create_dir_all(failpoint.parent().unwrap()).unwrap();
+        fs::write(&failpoint, b"pause").unwrap();
+
+        let error = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("immediately after durable lease")
+        );
+
+        let events = fs::read_to_string(crate::agent_progress_events_file(&harness_home)).unwrap();
+        let lifecycle = events
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter_map(|value| {
+                value
+                    .get("lifecycle")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lifecycle.last().map(String::as_str),
+            Some("preparing"),
+            "a leased turn must surface Preparing before any prompt or memory work"
+        );
+        assert!(
+            !queue_dir(&harness_home).join("executions").exists(),
+            "failpoint must run before prompt artifacts are written"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -13113,8 +13347,23 @@ mod tests {
             now_ms: 1001,
         })
         .unwrap();
-        crate::mark_cron_run_runtime_enqueued(&harness_home, &cron_run.run_id, cron_queue_id, 1002)
-            .unwrap();
+        crate::mark_cron_run_worker_enqueued(
+            &harness_home,
+            &cron_run.run_id,
+            cron_run.attempt,
+            "test-worker",
+            1001,
+        )
+        .unwrap();
+        crate::mark_cron_run_runtime_enqueued(
+            &harness_home,
+            &cron_run.run_id,
+            cron_run.attempt,
+            "test-worker",
+            cron_queue_id,
+            1002,
+        )
+        .unwrap();
         append_cron_pending_runtime_item(
             &source,
             &harness_home,
@@ -13825,8 +14074,23 @@ mod tests {
             now_ms: 1001,
         })
         .unwrap();
-        crate::mark_cron_run_runtime_enqueued(&harness_home, &cron_run.run_id, cron_queue_id, 1002)
-            .unwrap();
+        crate::mark_cron_run_worker_enqueued(
+            &harness_home,
+            &cron_run.run_id,
+            cron_run.attempt,
+            "test-worker",
+            1001,
+        )
+        .unwrap();
+        crate::mark_cron_run_runtime_enqueued(
+            &harness_home,
+            &cron_run.run_id,
+            cron_run.attempt,
+            "test-worker",
+            cron_queue_id,
+            1002,
+        )
+        .unwrap();
         append_cron_pending_runtime_item(
             &source,
             &harness_home,

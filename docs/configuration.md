@@ -223,16 +223,25 @@ primary path requires `openclaw-mem >= 1.9.31`.
 {
   "memory": {
     "openclawMemBridgeCommand": "openclaw-mem-bridge-dispatch .agent-harness",
-    "openclawMemBridgeBin": "openclaw-mem-bridge-dispatch"
+    "openclawMemBridgeBin": "openclaw-mem-bridge-dispatch",
+    "interactiveRecallBudgetMs": 20000
   }
 }
 ```
 
 `openclawMemBridgeCommand` takes precedence when both fields are present because
 it can include required arguments such as the harness home. `openclawMemBridgeBin`
-is the portable fallback when no extra arguments are needed. Read-only
-`status`/`recall` calls use a bounded deadline and one retry; approved `store`
-calls fail closed and are not retried, avoiding duplicate canonical writes.
+is the portable fallback when no extra arguments are needed.
+`interactiveRecallBudgetMs` sets one monotonic budget for memory preparation
+inside an interactive prompt. It defaults to 20,000 ms and is clamped to
+100–120,000 ms. Interactive recall clamps the bridge to the remaining budget,
+does not repeat a full timeout, bounds local text fallback, and continues
+without memory context with a `degraded` prompt-memory receipt when the total
+budget expires. This fail-open behavior never authorizes a memory write.
+
+Standalone read-only `status`/`recall` operations retain their bounded bridge
+deadline and one retry. Approved `store` calls fail closed and are not retried,
+avoiding duplicate canonical writes.
 
 ## Service Executables
 
@@ -610,7 +619,7 @@ mismatched readback stays `ambiguous`; it never authorizes blind resubmission.
 
 ## Backend Authentication
 
-Each backend provider uses a canonical harness-owned Codex home. The default OpenAI provider uses `<harness-home>/codex-home`; named providers use `<harness-home>/codex-home-providers/<provider>`. The runtime never falls back to `~/.codex`, `%USERPROFILE%/.codex`, a global `CODEX_HOME`, or global npm authentication.
+Each backend agent/provider pair uses a canonical harness-owned Codex home. The main agent retains `<harness-home>/codex-home` for OpenAI and `<harness-home>/codex-home-providers/<provider>` for named providers. Non-main agents use `<harness-home>/codex-home-agents/<agent>/codex-home` or `<harness-home>/codex-home-agents/<agent>/codex-home-providers/<provider>`. The runtime never falls back to `~/.codex`, `%USERPROFILE%/.codex`, a global `CODEX_HOME`, another agent/provider home, or global npm authentication.
 
 New provider homes are created with current-operator-only permissions: Unix mode `0700`, or a protected Windows DACL containing one current-process-token SID allow ACE with full control and object/container inheritance. `backend-auth --action doctor` verifies this shape and cannot report ready when it drifts. Existing provider homes are not silently rewritten during ordinary source/runtime resolution; permission migration belongs to the explicitly approved stopped-state cutover.
 
@@ -627,7 +636,64 @@ Use the operator-only CLI surface with the deployment-owned canonical Codex exec
 - `backend-auth --action logout` removes credentials through the canonical Codex executable and reconciles with `account/read`.
 - `backend-auth --action doctor` checks cold/pending/ready state, provider lease/cancel consistency, and same-generation account/capability receipt evidence without starting a login.
 
-Pass `--provenance-receipt <candidate-receipt.json>` for candidate/auth operations. The receipt must match the canonical executable, exact 0.144.5 version, and ready provenance result; backend-auth receipts store only its SHA-256 reference, never a machine-local receipt path.
+Pass `--provenance-receipt <candidate-receipt.json>` for candidate/auth operations. The receipt must match the canonical executable, exact 0.145.0 version, and ready provenance result; backend-auth receipts store only its SHA-256 reference, never a machine-local receipt path.
+
+## External MCP Capabilities
+
+Third-party MCP process configuration remains in Codex `config.toml` under
+`mcp_servers`. Harness config declares only the capability that must be visible
+to an exact agent/provider pair:
+
+```json
+{
+  "externalCapabilities": {
+    "mcpServers": [
+      {
+        "serverId": "generic-mock",
+        "transport": "stdio",
+        "expectedToolSchemaDigest": "sha256:<64-lowercase-hex>",
+        "expectedServerInfoDigest": "sha256:<optional-name-and-version-digest>",
+        "requirement": "required",
+        "agentId": "main",
+        "provider": "openai"
+      }
+    ]
+  }
+}
+```
+
+Phase 0 admits `stdio` declarations only. Duplicate agent/provider/server
+identities, unsupported transports, malformed digests, ambiguous TOML, or an
+HTTP registration fail before mutation. Harness-managed config roots are
+regenerated semantically; `mcp_servers` and unknown top-level roots are
+preserved, transactionally replaced, permission-checked, and hash-receipted
+without copying command arguments, environment variables, headers, or other
+secret-bearing config into public evidence.
+
+Config materialization does not silently migrate an existing permissive backend
+home during ordinary runtime resolution. It fails closed until a separately
+authorized stopped-state permission migration has made the home restrictive.
+After that gate, the exact config, original snapshot, and transaction files are
+enforced and independently read back as Unix `0600` files or protected
+current-operator-only Windows file DACLs; a restrictive parent directory alone
+is not accepted as file-level proof.
+
+A required declaration must match the exact server and canonical tool-schema
+digest returned by bounded `mcpServerStatus/list` pages on the fresh
+`0.145.0` app-server connection before `turn/start`. A declaration may also
+pin a canonical `serverInfo` name/version digest. Missing authentication
+(`authStatus=notLoggedIn`), missing servers, stale server information, or
+mismatched tool schemas block required capabilities. Optional failures emit a
+bounded warning and never produce a false-ready claim. `authStatus=unsupported`
+means the server declares no Codex-managed authentication; a product launcher
+must still fail closed on any private-profile or authenticated-subject contract
+it owns.
+
+Materialization preserves a registration after an operator or plugin has
+placed it in the exact agent/provider Codex home. It deliberately does not
+create an initial MCP command, private profile, credential, or consumer
+identity from `externalCapabilities`; first mount remains a stopped-state
+operator action with its own preimage and rollback evidence.
 
 Login challenges and credentials are transient operator-process data. They must not be copied into harness configuration, logs, receipts, public diffs, Discord/Telegram messages, or runtime queue payloads. Source/staging implementation does not activate authentication in the live deployment.
 

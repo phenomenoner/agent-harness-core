@@ -1,5 +1,99 @@
 # Changelog
 
+## v0.13.1 - 2026-07-27
+
+### Added
+
+- Added ownership-aware Codex config materialization. Harness-managed roots are
+  regenerated semantically while extension-owned `mcp_servers` and unknown
+  top-level roots survive; malformed or unsupported TOML fails before mutation,
+  commits are transactional, and receipts contain only hashes, counts, and
+  redacted identity bindings.
+- Added exact agent-and-provider Codex homes for non-main agents plus generic
+  required/optional external MCP declarations and fresh app-server tool-schema
+  readiness evidence.
+- Added fail-closed external MCP authentication and optional server
+  identity/version digest checks. A tool catalog reported by a server that
+  still requires login is not turn-admission evidence.
+
+### Changed
+
+- Raised the deployment-owned Codex CLI baseline to `0.145.0` and refreshed the
+  sanitized protocol fixture from the exact official tag and generated schemas,
+  including bounded `mcpServerStatus/list` and MCP startup-state coverage.
+- Ordinary completed turns with an owned-turn `goal:null` observation remain
+  ordinary finals. Explicit durable Goal work with unresolved authority still
+  parks fail closed.
+- Channel commands are classified before runtime skill discovery, keeping the
+  default exact-lane `/status` path independent from the runtime skill index.
+  Active queue workers publish `preparing` immediately after durable lease
+  acquisition and record prompt-bundle latency boundaries. Expensive runtime
+  stages now also record `Instant`-derived prompt preparation, Codex
+  planning/execution, and terminalization durations; wall-clock timestamps
+  remain correlation evidence rather than elapsed-time authority.
+- Interactive prompt-memory recall now uses one configurable monotonic total
+  budget. The interactive bridge path does not repeat a full timeout, local
+  fallback is bounded, redundant post-service scans are removed, and budget
+  exhaustion produces a typed degraded-memory receipt while prompt assembly
+  continues without recalled context.
+- Codex/MCP child cleanup now retains the Windows Job adapter and adds a Unix
+  process-group adapter so cancel, timeout, and scope exit target the contained
+  descendant tree instead of only the Codex root. The shared cleanup fence
+  records its containment kind and remains fail closed when cleanup is
+  ambiguous.
+- Fresh-process MCP receipts bind a private random spawn generation to the
+  exact child guard and same app-server connection. OS process start metadata
+  remains cleanup authority but is no longer required for portable readiness,
+  avoiding a false macOS dependency without claiming native macOS execution.
+- Long-running deterministic workers now retain and renew an exact
+  worker/attempt lease while keeping the wrapper heartbeat fresh. Cancellation,
+  lease revocation, timeout, or owner loss contains the complete Windows Job or
+  Unix process group; superseded results are rejected, transient SQLite
+  contention retries only inside a safe lease margin, and terminal worker state
+  is restart-reconciled into linked cron state. Completion timestamps are
+  captured after execution rather than reusing iteration-start time.
+- The scheduled backup operator contract now supports an operation-specific
+  absolute deadline and atomic create/verify progress receipts with typed
+  failure evidence. The release transaction promotes and rolls back this
+  contract with the reviewed harness and backend artifacts.
+- Backend-home resolution rejects canonical link/reparse escapes, creates new
+  homes with platform-restrictive permissions, and does not silently migrate an
+  existing home during ordinary resolution. Materialized config and rollback
+  files receive exact file-level Unix mode or Windows DACL verification.
+- Codex npm provenance maps Rust `macos` targets to the official `darwin`
+  native-package key; platform/architecture mapping has host-independent
+  contract tests.
+- Discord Gateway Identify now publishes an explicit online, non-AFK
+  presence. Provider-visible presence remains a separate health claim from
+  READY, heartbeat, and successful message delivery.
+- Progress planning, delivery recording, and session supersession now share
+  one delivery-state transaction gate. A new-session boundary commits the
+  authoritative superseded-session registry before bounded best-effort claim
+  cleanup, so transient Windows delete-share failures and large stale claim
+  directories cannot hold the lane retry-pending.
+- Latency projection tolerates only short bounded SQLite writer contention,
+  derives a missing final-delivery stage from the durable source-queue delivery
+  index, and reports non-causal wall-clock pairs separately instead of
+  presenting negative elapsed durations.
+- Release preparation keeps derived delivery indexes under one deployed
+  version at a time: candidate compatibility reads are deferred until a
+  stopped-state backup. Apply preflight also replays every frozen source
+  manifest entry against the current worktree before accepting an independent
+  review, so post-freeze source drift fails before live mutation.
+- Compatibility supervisor recovery now treats a newer, process-start-verified
+  live heartbeat as the effective generation after the recorded service owner
+  is positively dead. The same exact-live evidence fences duplicate reconcile
+  launches before restart backoff, while active-owner or ambiguous generation
+  mismatches remain fail closed. Gateway-restart replay tests now isolate
+  supervisor ownership environment inherited from a running harness, and
+  keeper-plan fixtures isolate the live-session marker without weakening the
+  production token-issuance guard.
+  Atomic heartbeat/service-state tests likewise opt into their intended
+  compatibility writer instead of inheriting a live direct-owner process.
+  Core ops and runtime-worker fixtures also isolate live-session and service
+  generation markers, while large claim-cleanup coverage asserts the
+  deterministic scan limit instead of a scheduler-sensitive wall-clock proxy.
+
 ## v0.13.0 - 2026-07-26
 
 ### Added

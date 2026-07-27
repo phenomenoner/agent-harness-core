@@ -174,7 +174,7 @@ function writeProbeReceipt(args, probe) {
   return { probeFile, receiptsFile, receipt };
 }
 
-async function runGateway(args) {
+export async function runGateway(args) {
   const token = process.env.DISCORD_BOT_TOKEN;
   if (!token) {
     throw new Error("DISCORD_BOT_TOKEN is required for Discord gateway loop");
@@ -295,10 +295,16 @@ async function runGateway(args) {
   });
 }
 
-function identifyPayload(token, intents) {
+export function identifyPayload(token, intents) {
   return {
     token,
     intents,
+    presence: {
+      since: null,
+      activities: [],
+      status: "online",
+      afk: false,
+    },
     properties: {
       os: process.platform,
       browser: "agent-harness",

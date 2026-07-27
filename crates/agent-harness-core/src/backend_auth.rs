@@ -224,35 +224,100 @@ pub fn resolve_or_create_provider_codex_home(
     harness_home: &Path,
     provider: &str,
 ) -> io::Result<PathBuf> {
+    resolve_or_create_agent_provider_codex_home(harness_home, "main", provider)
+}
+
+pub fn resolve_or_create_agent_provider_codex_home(
+    harness_home: &Path,
+    agent_id: &str,
+    provider: &str,
+) -> io::Result<PathBuf> {
     let provider = normalized_provider(provider)?;
+    let agent_id = normalized_agent_id(agent_id)?;
     let absolute_harness_home = if harness_home.is_absolute() {
         harness_home.to_path_buf()
     } else {
         std::env::current_dir()?.join(harness_home)
     };
-    let candidate = if provider == "openai" {
-        absolute_harness_home.join("codex-home")
+    fs::create_dir_all(&absolute_harness_home)?;
+    let canonical_harness_home = absolute_harness_home.canonicalize()?;
+    let candidate = if agent_id == "main" && provider == "openai" {
+        canonical_harness_home.join("codex-home")
+    } else if agent_id == "main" {
+        canonical_harness_home
+            .join("codex-home-providers")
+            .join(provider)
+    } else if provider == "openai" {
+        canonical_harness_home
+            .join("codex-home-agents")
+            .join(agent_id)
+            .join("codex-home")
     } else {
-        absolute_harness_home
+        canonical_harness_home
+            .join("codex-home-agents")
+            .join(agent_id)
             .join("codex-home-providers")
             .join(provider)
     };
+    let existing_ancestor = nearest_existing_ancestor(&candidate).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "backend home candidate has no existing ancestor",
+        )
+    })?;
+    let canonical_existing_ancestor = existing_ancestor.canonicalize()?;
+    if !canonical_existing_ancestor.starts_with(&canonical_harness_home) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "backend home path escapes the canonical harness home through an existing link or reparse point",
+        ));
+    }
     let created = !candidate.exists();
     fs::create_dir_all(&candidate)?;
     if created {
         enforce_provider_home_permissions(&candidate)?;
     }
-    candidate.canonicalize()
+    let canonical_candidate = candidate.canonicalize()?;
+    if !canonical_candidate.starts_with(&canonical_harness_home) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "backend home canonical path is outside the canonical harness home",
+        ));
+    }
+    Ok(canonical_candidate)
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
 }
 
 #[cfg(not(windows))]
-fn enforce_provider_home_permissions(path: &Path) -> io::Result<()> {
+pub(crate) fn enforce_provider_home_permissions(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(windows))]
-fn provider_home_permissions_are_restrictive(path: &Path) -> io::Result<bool> {
+pub(crate) fn provider_home_permissions_are_restrictive(path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(fs::metadata(path)?.permissions().mode() & 0o077 == 0)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn enforce_private_file_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn private_file_permissions_are_restrictive(path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::PermissionsExt;
     Ok(fs::metadata(path)?.permissions().mode() & 0o077 == 0)
 }
@@ -303,7 +368,17 @@ fn with_current_user_sid<T>(
 }
 
 #[cfg(windows)]
-fn enforce_provider_home_permissions(path: &Path) -> io::Result<()> {
+pub(crate) fn enforce_provider_home_permissions(path: &Path) -> io::Result<()> {
+    enforce_restrictive_windows_acl(path, true)
+}
+
+#[cfg(windows)]
+pub(crate) fn enforce_private_file_permissions(path: &Path) -> io::Result<()> {
+    enforce_restrictive_windows_acl(path, false)
+}
+
+#[cfg(windows)]
+fn enforce_restrictive_windows_acl(path: &Path, inherit_children: bool) -> io::Result<()> {
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
@@ -329,16 +404,15 @@ fn enforce_provider_home_permissions(path: &Path) -> io::Result<()> {
         if unsafe { InitializeAcl(acl, acl_bytes as u32, ACL_REVISION) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: acl is initialized and sid is valid; inheritance is confined to this tree.
-        if unsafe {
-            AddAccessAllowedAceEx(
-                acl,
-                ACL_REVISION,
-                CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
-                FILE_ALL_ACCESS,
-                sid,
-            )
-        } == 0
+        let inheritance = if inherit_children {
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+        } else {
+            0
+        };
+        // SAFETY: acl is initialized and sid is valid; directory inheritance
+        // is enabled only for a provider-home directory.
+        if unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, inheritance, FILE_ALL_ACCESS, sid) }
+            == 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -367,7 +441,17 @@ fn enforce_provider_home_permissions(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn provider_home_permissions_are_restrictive(path: &Path) -> io::Result<bool> {
+pub(crate) fn provider_home_permissions_are_restrictive(path: &Path) -> io::Result<bool> {
+    restrictive_windows_acl(path, true)
+}
+
+#[cfg(windows)]
+pub(crate) fn private_file_permissions_are_restrictive(path: &Path) -> io::Result<bool> {
+    restrictive_windows_acl(path, false)
+}
+
+#[cfg(windows)]
+fn restrictive_windows_acl(path: &Path, require_inheritance: bool) -> io::Result<bool> {
     use std::mem::{size_of, zeroed};
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::LocalFree;
@@ -440,9 +524,14 @@ fn provider_home_permissions_are_restrictive(path: &Path) -> io::Result<bool> {
                 .cast_mut()
                 .cast::<core::ffi::c_void>();
             let inheritance = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u8;
+            let inheritance_matches = if require_inheritance {
+                ace.Header.AceFlags & inheritance == inheritance
+            } else {
+                ace.Header.AceFlags & inheritance == 0
+            };
             // AceType 0 is ACCESS_ALLOWED_ACE_TYPE.
             Ok(ace.Header.AceType == 0
-                && ace.Header.AceFlags & inheritance == inheritance
+                && inheritance_matches
                 && ace.Mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS
                 // SAFETY: ace_sid points to the SID tail of a valid access-allowed ACE.
                 && unsafe { EqualSid(ace_sid, sid) } != 0)
@@ -1630,6 +1719,21 @@ fn normalized_provider(provider: &str) -> io::Result<String> {
     Ok(provider)
 }
 
+fn normalized_agent_id(agent_id: &str) -> io::Result<String> {
+    let agent_id = agent_id.trim().to_ascii_lowercase();
+    if agent_id.is_empty()
+        || !agent_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent id must be a non-empty safe path component",
+        ));
+    }
+    Ok(agent_id)
+}
+
 fn nonempty_operation_id(operation_id: &str) -> io::Result<String> {
     let operation_id = operation_id.trim();
     if operation_id.is_empty() {
@@ -1880,6 +1984,81 @@ mod tests {
         assert!(home.ends_with("codex-home"));
         assert!(!home.join("auth.json").exists());
         assert!(provider_home_permissions_are_restrictive(&home).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_main_agents_receive_distinct_provider_scoped_homes() {
+        let root = temp_root("agent-provider-homes");
+        let main_openai =
+            resolve_or_create_agent_provider_codex_home(&root, "main", "openai").unwrap();
+        let main_named =
+            resolve_or_create_agent_provider_codex_home(&root, "main", "openrouter").unwrap();
+        let worker_openai =
+            resolve_or_create_agent_provider_codex_home(&root, "reviewer", "openai").unwrap();
+        let worker_named =
+            resolve_or_create_agent_provider_codex_home(&root, "reviewer", "openrouter").unwrap();
+
+        assert!(main_openai.ends_with("codex-home"));
+        assert!(main_named.ends_with("codex-home-providers/openrouter"));
+        assert!(worker_openai.ends_with("codex-home-agents/reviewer/codex-home"));
+        assert!(
+            worker_named.ends_with("codex-home-agents/reviewer/codex-home-providers/openrouter")
+        );
+        assert_eq!(
+            [main_openai, main_named, worker_openai, worker_named]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
+        );
+        assert!(resolve_or_create_agent_provider_codex_home(&root, "../escape", "openai").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ordinary_resolution_does_not_migrate_existing_home_permissions() {
+        let root = temp_root("existing-home-permissions");
+        let home = root.join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(
+            !provider_home_permissions_are_restrictive(&home).unwrap(),
+            "fixture must begin with a non-restrictive existing home"
+        );
+
+        let resolved =
+            resolve_or_create_agent_provider_codex_home(&root, "main", "openai").unwrap();
+
+        assert_eq!(resolved, home.canonicalize().unwrap());
+        assert!(
+            !provider_home_permissions_are_restrictive(&home).unwrap(),
+            "ordinary resolution must not perform an implicit permission migration"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backend_home_resolution_rejects_symlink_escape_before_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("home-symlink-escape");
+        let harness_home = root.join("harness");
+        let external = root.join("external");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        symlink(&external, harness_home.join("codex-home")).unwrap();
+
+        let error = resolve_or_create_agent_provider_codex_home(&harness_home, "main", "openai")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -99,8 +99,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I9",
-            statement: "final channel replies exclude progress/narration stream content and review-only evidence when the parent workflow has not completed",
-            owner: "runtime_pipeline/progress/channel_delivery",
+            statement: "final channel replies exclude progress/narration stream content and review-only evidence when the parent workflow has not completed; progress is terminal-monotonic and an exact-lane worker publishes preparing immediately after durable lease acquisition and before prompt or memory work",
+            owner: "runtime_worker/runtime_pipeline/progress/channel_delivery",
         },
         InvariantEntry {
             id: "I10",
@@ -114,8 +114,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I12",
-            statement: "active mem-engine ownership uses the openclaw-mem bridge as the primary write/recall path when configured; recall fallback remains read-only and store fails closed unless the memory layer accepts the write",
-            owner: "memory/memory_owner/openclaw-mem",
+            statement: "active mem-engine ownership uses the openclaw-mem bridge as the primary write/recall path when configured; interactive prompt recall shares one monotonic total budget across bridge and read-only fallback, fails open with typed degraded evidence and no context after exhaustion, and store fails closed unless the memory layer accepts the write",
+            owner: "memory/memory_owner/prompt/openclaw-mem",
         },
         InvariantEntry {
             id: "I13",
@@ -184,8 +184,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I26",
-            statement: "supervisor availability has one config-derived topology authority and one explicit ownership mode. Compatibility mode retains the deployment-owned same-user OS task, hidden adapter, singleton reconcile keeper, and one intermediate supervisor-run per service. Direct-owner mode uses the mutually exclusive form of the same OS ownership lease, one exact master generation, direct retained child handles, master-only canonical service-state writes, freshness-bounded heartbeat restart, generation-scoped drain holds, and tree-kill-on-owner-exit containment. Observe mode is non-owning and never activation-ready. Compatibility and direct owners cannot coexist; mode/config drift is revalidated before every external-effect spawn and drains the direct master. Stopped-state import is provenance-bound and never adopts a PID. PID-only, mismatched, stale, unknown, or observe-only evidence cannot fence recovery. Every non-interactive Windows child remains no-console or hidden-window by default. Direct-owner activation is Windows-only until an equivalent native process-tree adapter passes the same lifecycle scenarios; unsupported hosts reject it before state mutation.",
-            owner: "activation/health/supervisor_topology/supervisor_keeper/supervisor_inventory/supervisor_master/process_launch/ops/agent-harness-cli",
+            statement: "supervisor availability has one config-derived topology authority and one explicit ownership mode. Compatibility mode retains the deployment-owned same-user OS task, hidden adapter, singleton reconcile keeper, and one intermediate supervisor-run per service. Direct-owner mode uses the mutually exclusive form of the same OS ownership lease, one exact master generation, direct retained child handles, master-only canonical service-state writes, freshness-bounded heartbeat restart, generation-scoped drain holds, and tree-kill-on-owner-exit containment. Worker and CronRun ownership is fenced by exact attempt and worker identity across the two stores; an interrupted admission is reconciled as exactly one linked worker, a terminal blocked outcome, or expiry, and cutover requires a complete-store active count rather than a bounded display page. Observe mode is non-owning and never activation-ready. Compatibility and direct owners cannot coexist; mode/config drift is revalidated before every external-effect spawn and drains the direct master. Stopped-state import is provenance-bound and never adopts a PID. PID-only, mismatched, stale, unknown, or observe-only evidence cannot fence recovery. Every non-interactive Windows child remains no-console or hidden-window by default. Direct-owner activation is Windows-only until an equivalent native process-tree adapter passes the same lifecycle scenarios; unsupported hosts reject it before state mutation.",
+            owner: "activation/health/supervisor_topology/supervisor_keeper/supervisor_inventory/supervisor_master/process_launch/workers/cron_runs/ops/agent-harness-cli",
         },
         InvariantEntry {
             id: "I27",
@@ -209,7 +209,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I31",
-            statement: "the exact Codex 0.144.5 JSON-RPC surface is fixture-locked for initialization, thread start/resume, turn lifecycle, token/context accounting, goal state/update, compact, account, capability, web-search, MCP, and error/null behavior; completion affects a parent, compact, or closure only after exact operation and thread/turn/item ownership",
+            statement: "the exact Codex 0.145.0 JSON-RPC surface is fixture-locked for initialization, thread start/resume, turn lifecycle, token/context accounting, goal state/update, compact, account, capability, web-search, MCP status/startup, and error/null behavior; completion affects a parent, compact, or closure only after exact operation and thread/turn/item ownership",
             owner: "codex_protocol_compat/codex_runtime/context_rollover/coordinator_resume/goal_closure/task_transition/external_effect",
         },
         InvariantEntry {
@@ -252,6 +252,16 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             statement: "OperationPlan mutations are serialized per plan and enforce stored open-item limits plus dependency-graph acyclicity before any durable write; concurrent contenders cannot both pass one stale limit snapshot and rejected mutations leave all plan state unchanged",
             owner: "operation_plan",
         },
+        InvariantEntry {
+            id: "I40",
+            statement: "harness-managed Codex config roots are merged semantically while extension-owned MCP and unknown roots survive; materialization is private, transactional, hash-bound, exactly recoverable, and agent/provider isolated, and declared external MCP capabilities are admitted only by bounded same-connection fresh-thread status evidence before turn/start, with required failures blocking and optional failures warning",
+            owner: "codex_config_materialization/external_capability/codex_runtime/backend_auth/config",
+        },
+        InvariantEntry {
+            id: "I41",
+            statement: "provider transport health, delivery capability, and provider-visible presence are separate claims; Discord publishes an explicit non-idle online presence in the real Identify path, and READY or a fresh local heartbeat alone cannot authorize an online claim",
+            owner: "agent-discord-gateway/supervisor/health",
+        },
     ]
 }
 
@@ -280,7 +290,22 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.codex-protocol-compatibility.v1",
             owner_module: "codex_protocol_compat",
-            compatibility: "version-locked sanitized fixture; additive cases require refreshed 0.144.5 schema hashes, while existing method/field and harness-correlation expectations cannot be removed",
+            compatibility: "version-locked sanitized fixture; additive cases require refreshed 0.145.0 schema hashes, while existing method/field and harness-correlation expectations cannot be removed",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-config-materialization.v1",
+            owner_module: "codex_config_materialization/codex_runtime",
+            compatibility: "per-plan generated/reused receipt; exact agent/provider/home, before/after config digests, managed/preserved root summary, restrictive permissions, and rollback availability are stable and secret-bearing config values are forbidden",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.external-capability-declaration.v1",
+            owner_module: "external_capability/config",
+            compatibility: "operator declaration; exact agent/provider/server identity, stdio transport, required/optional policy, and expected canonical tool-schema digest are stable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-external-capability-readiness.v1",
+            owner_module: "external_capability/codex_runtime",
+            compatibility: "per-fresh-thread admission receipt; agent/provider/home/config/backend/declaration/process/thread bindings, bounded page count, per-server status and digests, admission, and redacted warnings are stable in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.codex-web-search-decision.v1",
@@ -385,7 +410,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.runtime-queue-latency.v1",
             owner_module: "latency",
-            compatibility: "append-only per-stage queue latency receipts; additive stages and timestamps only in v1",
+            compatibility: "bounded SQLite per-stage queue latency projection; stages, monotonic spans, and derivedStageSources are additive in v1, a missing delivery-done projection may be joined from the durable source-queue delivery index, and non-causal timestamp pairs remain diagnostics rather than negative elapsed authority",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.latency-status.v1",
@@ -465,7 +490,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.goal-transition.v1",
             owner_module: "goal_transition/runtime_pipeline",
-            compatibility: "append-only unified decision receipt; exact goal/lane/session/generation/source-slice identity and decision generation are immutable in v1",
+            compatibility: "append-only unified decision receipt; exact goal/lane/session/generation/source-slice identity, optional concrete backend goal reference, correlation source, and decision generation are immutable in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.goal-slice.v1",
@@ -1098,6 +1123,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "accepted producer schema translated to agent-harness.context-pack.v1; unknown versions fail open",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.memory-prompt-context-receipt.v1",
+            owner_module: "memory/prompt",
+            compatibility: "status values are additive in v1; degraded means the one interactive recall budget was exhausted and prompt assembly continued without memory context or write authority",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.openclaw-mem-local-owner-prepare.v1",
             owner_module: "memory",
             compatibility: "append-only receipts; local prepare may add diagnostics but must not promote without operator approval",
@@ -1568,7 +1598,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "continuity_interactions_actions::expiry_reconciler_and_native_callback_race_consumes_decision_once_after_restart",
                 "continuity_interactions_goal::legacy_state_is_readable_without_fabricating_completion_or_native_authority",
             ],
-            promotion_gate: "Run the exact 0.144.5 fixture plus the fake MCP server park/approve/submit/confirm replay, channel token isolation matrix, readback ambiguity matrix, and provider progress renderers; live connector mutation requires an explicitly authorized bounded smoke and readback receipt.",
+            promotion_gate: "Run the exact 0.145.0 fixture plus the fake MCP server park/approve/submit/confirm replay, channel token isolation matrix, readback ambiguity matrix, and provider progress renderers; live connector mutation requires an explicitly authorized bounded smoke and readback receipt.",
         },
         ScenarioMatrixEntry {
             id: "skill-ecosystem-autonomous-learning",
@@ -1706,6 +1736,39 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "continuity_interactions_goal::legacy_state_is_readable_without_fabricating_completion_or_native_authority",
             ],
             promotion_gate: "Replay Telegram and Discord long-running turns through progress caps, recovery, final outbox, terminal convergence, source-index contention, historical-cache recovery, and a watched progress-owner stop.",
+        },
+        ScenarioMatrixEntry {
+            id: "channel-presence-session-latency",
+            title: "Provider presence, session boundary, and latency completeness",
+            changed_areas: vec![
+                "Discord gateway adapter",
+                "channel session transition",
+                "progress delivery state",
+                "latency projection",
+                "channel delivery index",
+            ],
+            required_invariants: vec!["I17", "I25", "I27", "I41"],
+            required_evidence: vec![
+                "the real Discord Hello-to-Identify path publishes explicit online non-AFK presence",
+                "progress plan, record, and session supersede serialize their delivery-state RMW",
+                "the superseded-session registry commits before bounded best-effort claim cleanup",
+                "Windows claim delete denial cannot hold a committed /new boundary retry-pending",
+                "large unrelated claim directories have count and elapsed cleanup bounds",
+                "short latency SQLite contention is retried without an unbounded provider-path wait",
+                "a missing delivery projection stage is derived from the durable source-queue delivery index",
+                "non-causal timestamps are reported as anomalies rather than negative elapsed deltas",
+            ],
+            runnable_tests: vec![
+                "tools/agent-discord-gateway/interaction.test.mjs",
+                "progress::tests::session_supersede_uses_the_progress_state_transaction_gate",
+                "progress::tests::new_session_commit_survives_a_transient_claim_delete_denial",
+                "progress::tests::session_supersede_cleanup_is_bounded_with_a_large_claim_directory",
+                "latency::tests::latency_stage_write_waits_for_a_short_sqlite_writer",
+                "latency::tests::latency_read_joins_durable_delivery_when_projection_stage_is_missing",
+                "latency::tests::latency_summary_never_reports_negative_elapsed_time",
+                "phase0_1_channel_contract::t3_session_supersede_and_delivery_latency_converge_under_contention",
+            ],
+            promotion_gate: "Promote only after the focused replays and a contained concurrent Discord/Telegram scenario pass, then require post-cutover provider delivery, complete latency readback, no recurring session-supersede denial, and an independent provider-visible Discord online indicator.",
         },
         ScenarioMatrixEntry {
             id: "cron-freshness-canon",
@@ -1856,7 +1919,72 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "codex_runtime::tests::run_codex_runtime_resumes_existing_thread_binding",
                 "codex_runtime::tests::run_codex_runtime_rolls_over_legacy_thread_without_web_search_binding",
             ],
-            promotion_gate: "Promote only after a 0.144.5 same-connection modelProvider/capabilities/read probe and cached/live/disabled/capability-absent/restart replay pass, receipt scans contain no raw prompt/query/private URL leakage, and built-in live search remains disabled for lanes that require hard pre-query allowlists or exact query caps.",
+            promotion_gate: "Promote only after a 0.145.0 same-connection modelProvider/capabilities/read probe and cached/live/disabled/capability-absent/restart replay pass, receipt scans contain no raw prompt/query/private URL leakage, and built-in live search remains disabled for lanes that require hard pre-query allowlists or exact query caps.",
+        },
+        ScenarioMatrixEntry {
+            id: "codex-external-mcp-readiness",
+            title: "Semantic external MCP hosting and pre-turn readiness",
+            changed_areas: vec![
+                "Codex config materialization",
+                "agent/provider backend homes",
+                "external capability declarations",
+                "Codex app-server admission",
+            ],
+            required_invariants: vec!["I3", "I7", "I30", "I31", "I32", "I40"],
+            required_evidence: vec![
+                "semantic merge preserves extension-owned MCP and unknown roots",
+                "malformed or unsupported config leaves original bytes unchanged",
+                "transaction failpoints exactly restore the prior config",
+                "cached config receipts are revalidated before process spawn",
+                "same-connection MCP status is queried after fresh thread creation and before turn admission",
+                "required missing or mismatched capability blocks before turn/start",
+                "optional mismatch warns without a false ready entry",
+                "readiness binds agent, provider, home, config, backend executable, declaration, process generation, and thread",
+            ],
+            runnable_tests: vec![
+                "codex_config_materialization::tests::semantic_merge_preserves_mcp_and_unknown_roots_then_is_byte_idempotent",
+                "codex_config_materialization::tests::malformed_or_unsupported_config_fails_without_touching_original_bytes",
+                "codex_config_materialization::tests::transaction_failpoints_restore_exact_prewrite_bytes",
+                "backend_auth::tests::non_main_agents_receive_distinct_provider_scoped_homes",
+                "external_capability::tests::required_mismatch_blocks_while_optional_mismatch_only_warns",
+                "external_capability::tests::pagination_and_cross_agent_evidence_fail_closed",
+                "codex_runtime::tests::stale_external_mcp_config_receipt_blocks_before_process_spawn",
+                "codex_runtime::tests::required_external_mcp_ready_is_receipted_before_turn_start",
+                "codex_runtime::tests::required_external_mcp_mismatch_blocks_before_turn_start",
+                "codex_runtime::tests::optional_external_mcp_mismatch_warns_and_allows_turn_start",
+                "codex_protocol_compat::tests::exact_0_145_0_protocol_fixture_covers_cross_cutting_contracts",
+            ],
+            promotion_gate: "Promote only after the exact Codex 0.145.0 generic MCP real-process regeneration/restart/home-isolation replay, secret and ACL scan, rollback readback, frozen-candidate full regression, and independent review pass. Live deployment remains a separate authorized cutover.",
+        },
+        ScenarioMatrixEntry {
+            id: "interactive-preparation-latency",
+            title: "Bounded interactive preparation and truthful progress",
+            changed_areas: vec![
+                "channel command planning",
+                "runtime queue preparation",
+                "progress lifecycle",
+                "memory bridge and fallback",
+                "latency receipts",
+            ],
+            required_invariants: vec!["I3", "I7", "I9", "I12", "I15", "I22"],
+            required_evidence: vec![
+                "default status bypasses runtime skill discovery and remains an exact-lane snapshot",
+                "durable lease acquisition is followed by preparing before prompt or memory work",
+                "bridge and local fallback share one monotonic interactive recall budget",
+                "budget exhaustion produces degraded memory evidence and no recalled prompt context",
+                "prompt-bundle start and completion delimit the formerly opaque preparation interval",
+                "an unrelated exact lane remains runnable while one lane prepares slowly",
+            ],
+            runnable_tests: vec![
+                "channel_pipeline::tests::status_run_once_bypasses_runtime_skill_index_before_ingress",
+                "turns::tests::status_command_bypasses_runtime_skill_index_construction",
+                "runtime_worker::tests::preparing_progress_is_durable_before_slow_prompt_preparation",
+                "memory::tests::interactive_prompt_memory_recall_respects_one_total_budget_and_fails_open",
+                "memory::tests::build_memory_prompt_context_prepares_receipt_without_raw_context",
+                "memory::tests::non_main_memory_prompt_context_excludes_global_imported_snapshot_by_default",
+                "runtime_worker::tests::prepare_runtime_queue_item_allows_different_sessions_when_channel_capacity_allows",
+            ],
+            promotion_gate: "Promote only after the bridge-timeout/slow-fallback replay, exact-lane status fast path, immediate Preparing visibility, monotonic preparation timing, healthy-memory control, and parallel unrelated-lane control pass together. Provider-visible smoke remains a separately authorized live gate.",
         },
         ScenarioMatrixEntry {
             id: "per-agent-prompt-manifest",
@@ -2205,6 +2333,8 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "desired arguments and environment cannot redirect authoritative home, service, executable, ownership, or generation identity",
                 "observe mode writes a separate receipt only, and unsupported non-Windows direct ownership fails before lease, receipt, process, or canonical state mutation",
                 "native Linux and macOS process-group containment plus host recovery must pass this lifecycle matrix before cross-platform direct-owner activation is claimed",
+                "CronRun admission, worker linkage, settlement, retry, and recovery compare-and-set the exact attempt and worker identity; stale unlinked admissions converge to one exact linked worker, a blocked identity mismatch, or expiry",
+                "the cutover idle gate summarizes the complete CronRun store and cannot hide an active row beyond the bounded display page",
             ],
             runnable_tests: vec![
                 "supervisor_master::tests::compatibility_import_is_idempotent_and_never_adopts_process_identity",
@@ -2224,6 +2354,9 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "standalone_master_lifecycle::abrupt_master_death_reaps_direct_child",
                 "standalone_master_lifecycle::abrupt_master_death_reaps_gateway_descendant_tree",
                 "standalone_master_lifecycle::observe_mode_has_no_process_or_canonical_state_side_effects",
+                "cron_runs::tests::complete_summary_counts_active_rows_beyond_bounded_page",
+                "cron_runs::tests::worker_link_and_settlement_are_fenced_by_attempt_and_worker",
+                "workers::tests::worker_restart_reconciles_all_stale_unlinked_cron_admission_outcomes",
             ],
             promotion_gate: "The normal Windows direct-owner cutover gate is passed after focused lifecycle replay, full serial workspace and public-contract checks, rollback rehearsal, independent review, stopped-state migration, post-cutover process and health readback, and exact-lane Telegram and Discord delivery. Promotion of an exact release tag still requires artifact-bound readback. A long-duration endurance claim and non-Windows activation remain blocked until their own soak, native containment, signal, host-recovery, and packaging evidence reaches the same scenario altitude.",
         },
@@ -2644,7 +2777,7 @@ mod tests {
             .map(|entry| entry.id)
             .collect::<std::collections::HashSet<_>>();
         for invariant in [
-            "I21", "I22", "I23", "I24", "I25", "I26", "I27", "I37", "I38", "I39",
+            "I21", "I22", "I23", "I24", "I25", "I26", "I27", "I37", "I38", "I39", "I40", "I41",
         ] {
             assert!(
                 invariant_ids.contains(invariant),
@@ -2680,6 +2813,9 @@ mod tests {
             "agent-harness.codex-web-search-decision.v1",
             "agent-harness.codex-web-search-thread-binding.v1",
             "agent-harness.codex-web-search-action.v1",
+            "agent-harness.codex-config-materialization.v1",
+            "agent-harness.external-capability-declaration.v1",
+            "agent-harness.codex-external-capability-readiness.v1",
             "agent-harness.supervisor-process-boundary.v1",
             "agent-harness.windows-reconcile-keeper-plan.v1",
             "agent-harness.windows-reconcile-keeper-observation.v1",

@@ -367,6 +367,17 @@ pub fn build_runtime_skill_index(
     harness_home: impl AsRef<Path>,
 ) -> io::Result<SkillIndex> {
     let harness_home = harness_home.as_ref();
+    #[cfg(test)]
+    if harness_home
+        .join("state")
+        .join("test-failpoints")
+        .join("runtime-skill-index")
+        .is_file()
+    {
+        return Err(io::Error::other(
+            "injected runtime skill index construction failure",
+        ));
+    }
     let mut source_index = build_source_skill_index(source)?;
     let harness_index = build_harness_skill_index(harness_home)?;
     source_index.skills.extend(harness_index.skills);
@@ -383,6 +394,18 @@ pub fn build_runtime_skill_index(
         summary: summarize_skills(&skills),
         skills,
     })
+}
+
+pub fn command_skill_index(source: &AgentSource, harness_home: impl AsRef<Path>) -> SkillIndex {
+    SkillIndex {
+        schema: SKILL_INDEX_SCHEMA,
+        origin: SkillIndexOrigin::RuntimeMerged,
+        source_home: Some(source.home.clone()),
+        source_workspace: Some(source.workspace.clone()),
+        harness_home: Some(harness_home.as_ref().to_path_buf()),
+        summary: SkillIndexSummary::default(),
+        skills: Vec::new(),
+    }
 }
 
 pub fn select_skills(index: &SkillIndex, query: &SkillSelectionQuery) -> Vec<SkillSelection> {

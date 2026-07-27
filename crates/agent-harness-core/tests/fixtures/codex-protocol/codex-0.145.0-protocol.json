@@ -1,14 +1,14 @@
 {
   "schema": "agent-harness.codex-protocol-compatibility.v1",
-  "codexVersion": "0.144.5",
-  "sourceTag": "rust-v0.144.5",
-  "sourceCommit": "87db9bc18ba5bc82c1cb4e4381b44f693ee35623",
+  "codexVersion": "0.145.0",
+  "sourceTag": "rust-v0.145.0",
+  "sourceCommit": "25af12f7e61572b0bc18ddb1008be543b91519b0",
   "schemaBundleSha256": {
-    "ClientRequest.json": "d8474445e109c242a2cc1169ed6d8644f86df3a097230c8c52bdc107a9014efa",
-    "ServerNotification.json": "fb0d6bf6b9f192257f452340de3fdca6b4b2c8e1a216aafaf48837a006e14bea",
-    "ServerRequest.json": "886f30bd882a73600566695e0f08f8a10fcd9897742c4745ecf91710ec256f6a",
-    "codex_app_server_protocol.schemas.json": "85ea836927d6cfdd3c68a9bda17dba48d2573bbc282ab2d5775a5005e40bc9c3",
-    "codex_app_server_protocol.v2.schemas.json": "82968303c0e1555c78cdf8bc5bf8f28946665c11c4f68bae128e678652479d23"
+    "ClientRequest.json": "03e30c97136d6618273e3e9197d8621bad9ac6cfd733c0cfe09dc8754ee6ac5c",
+    "ServerNotification.json": "5c428385a06f41d4de4d26e320efc15bc8c5fcee2e54b5045b87e46aa066e8ab",
+    "ServerRequest.json": "5abe765ff9bd94b88f2f2fb417025ec011eac172925ffdfc74d7ccf2542bc114",
+    "codex_app_server_protocol.schemas.json": "1f66700d1cc3de4a5004e5614a6098878b405c7e7c5f8c9be97fc900d0ad6c68",
+    "codex_app_server_protocol.v2.schemas.json": "e7ae2b3834bd0bce3b18b54c57e46d419aec83beaa8676072695fd9a3a6be110"
   },
   "requests": [
     {"id": 0, "method": "initialize", "params": {"clientInfo": {"name": "agent_harness", "title": "Agent Harness", "version": "0.8.1"}, "capabilities": {"experimentalApi": true}}},
@@ -27,10 +27,11 @@
     {"id": 12, "method": "account/logout", "params": {}},
     {"id": 13, "method": "model/list", "params": {}},
     {"id": 14, "method": "config/read", "params": {}},
-    {"id": 15, "method": "modelProvider/capabilities/read", "params": {}}
+    {"id": 15, "method": "modelProvider/capabilities/read", "params": {}},
+    {"id": 16, "method": "mcpServerStatus/list", "params": {"threadId": "thread-fixture", "detail": "toolsAndAuthOnly", "limit": 100}}
   ],
   "responses": [
-    {"id": 0, "result": {"userAgent": "Codex Desktop/0.144.5 (<PLATFORM>)", "codexHome": "<CODEX_HOME>", "platformFamily": "windows", "platformOs": "windows"}},
+    {"id": 0, "result": {"userAgent": "Codex Desktop/0.145.0 (<PLATFORM>)", "codexHome": "<CODEX_HOME>", "platformFamily": "windows", "platformOs": "windows"}},
     {"id": 1, "result": {"thread": {"id": "thread-fixture"}, "model": "gpt-fixture", "modelProvider": "openai", "cwd": "<WORKSPACE>", "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandbox": {"type": "workspaceWrite"}}},
     {"id": 2, "result": {"thread": {"id": "thread-fixture"}, "model": "gpt-fixture", "modelProvider": "openai", "cwd": "<WORKSPACE>", "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandbox": {"type": "workspaceWrite"}}},
     {"id": 3, "result": {"turn": {"id": "turn-fixture", "status": "inProgress", "items": [], "error": null}}},
@@ -40,6 +41,7 @@
     {"id": 13, "result": {"data": [{"id": "gpt-fixture", "model": "gpt-fixture", "displayName": "Fixture", "description": "sanitized", "hidden": false, "supportedReasoningEfforts": [{"reasoningEffort": "medium", "description": "fixture"}], "defaultReasoningEffort": "medium", "inputModalities": ["text"], "supportsPersonality": false, "additionalSpeedTiers": [], "serviceTiers": [], "defaultServiceTier": null, "isDefault": true}], "nextCursor": null}},
     {"id": 14, "result": {"config": {"web_search": null, "model_context_window": null}, "origins": {}}},
     {"id": 15, "result": {"namespaceTools": true, "imageGeneration": true, "webSearch": true}},
+    {"id": 16, "result": {"data": [{"name": "generic-mock", "authStatus": "unsupported", "resourceTemplates": [], "resources": [], "serverInfo": {"name": "generic-mock", "version": "1.0.0"}, "tools": {"echo": {"name": "echo", "description": "Returns a sanitized fixture value.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"value": {"type": "string"}}, "required": ["value"]}, "outputSchema": {"type": "object", "additionalProperties": false, "properties": {"value": {"type": "string"}}, "required": ["value"]}}}}], "nextCursor": null}},
     {"id": 99, "result": null},
     {"id": 100, "error": {"code": -32600, "message": "fixture error"}}
   ],
@@ -56,7 +58,10 @@
     {"method": "thread/compacted", "params": {"threadId": "thread-fixture", "turnId": "compact-turn"}},
     {"method": "turn/completed", "params": {"threadId": "thread-fixture", "turn": {"id": "resume-turn", "status": "interrupted", "items": [], "error": null}, "interrupted": null}},
     {"method": "item/started", "params": {"threadId": "thread-fixture", "turnId": "turn-fixture", "startedAtMs": 1, "item": {"id": "web-fixture", "type": "webSearch", "query": "sanitized fixture query", "action": {"type": "search", "query": "sanitized fixture query", "queries": ["sanitized fixture query"]}}}},
-    {"method": "thread/status/changed", "params": {"threadId": "thread-fixture", "status": {"activeFlags": ["waitingOnApproval"]}}}
+    {"method": "thread/status/changed", "params": {"threadId": "thread-fixture", "status": {"activeFlags": ["waitingOnApproval"]}}},
+    {"method": "mcpServer/startupStatus/updated", "params": {"threadId": "thread-fixture", "name": "generic-mock", "status": "ready"}},
+    {"method": "mcpServer/startupStatus/updated", "params": {"threadId": "thread-fixture", "name": "optional-failed", "status": "failed", "error": "sanitized startup failure", "failureReason": "startup"}},
+    {"method": "mcpServer/startupStatus/updated", "params": {"threadId": "thread-fixture", "name": "optional-cancelled", "status": "cancelled"}}
   ],
   "raceExpectation": {
     "resumeTurnId": "resume-turn",

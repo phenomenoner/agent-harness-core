@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{process_launch::configure_noninteractive_command, write_json_atomic};
 
 pub const CODEX_BACKEND_PROVENANCE_SCHEMA: &str = "agent-harness.codex-backend-provenance.v1";
-pub const REQUIRED_CODEX_BACKEND_VERSION: &str = "0.144.5";
+pub const REQUIRED_CODEX_BACKEND_VERSION: &str = "0.145.0";
 
 #[derive(Debug, Clone)]
 pub struct CodexBackendProvenanceProbeOptions {
@@ -297,11 +297,16 @@ fn read_npm_package_provenance(executable: &Path) -> io::Result<NpmPackageProven
 }
 
 fn npm_platform_key() -> (&'static str, &'static str) {
-    let os = match std::env::consts::OS {
+    npm_platform_key_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn npm_platform_key_for<'a>(os: &'a str, arch: &'a str) -> (&'a str, &'a str) {
+    let os = match os {
         "windows" => "win32",
+        "macos" => "darwin",
         other => other,
     };
-    let arch = match std::env::consts::ARCH {
+    let arch = match arch {
         "x86_64" => "x64",
         "aarch64" => "arm64",
         other => other,
@@ -372,9 +377,20 @@ mod tests {
 
     #[test]
     fn exact_version_parser_rejects_drift_and_suffixes() {
-        assert_eq!(parse_codex_version("codex-cli 0.144.5").unwrap(), "0.144.5");
-        assert!(parse_codex_version("codex-cli 0.144.5-beta").is_err());
-        assert!(parse_codex_version("0.144.5").is_err());
+        assert_eq!(parse_codex_version("codex-cli 0.145.0").unwrap(), "0.145.0");
+        assert!(parse_codex_version("codex-cli 0.145.0-beta").is_err());
+        assert!(parse_codex_version("0.145.0").is_err());
+    }
+
+    #[test]
+    fn npm_native_package_keys_cover_windows_linux_and_macos_architectures() {
+        assert_eq!(npm_platform_key_for("windows", "x86_64"), ("win32", "x64"));
+        assert_eq!(npm_platform_key_for("linux", "aarch64"), ("linux", "arm64"));
+        assert_eq!(npm_platform_key_for("macos", "x86_64"), ("darwin", "x64"));
+        assert_eq!(
+            npm_platform_key_for("macos", "aarch64"),
+            ("darwin", "arm64")
+        );
     }
 
     #[test]
