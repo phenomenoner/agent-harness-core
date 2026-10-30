@@ -31,3 +31,13 @@ tools/.private/
 
 # Imported legacy source state should be staged intentionally.
 imports/
+
+# Python environments, generated indexes and local verification caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.codegraph/
+.coverage
+htmlcov/

@@ -1,317 +1,86 @@
-<div align="center">
-
 # Agent Harness Core
 
-**Self-hosted AI agent runtime in Rust. Run autonomous LLM agents over Telegram and Discord — with durable queues, fail-closed permissions, and an auditable receipt for every single step.**
+Agent Harness Core (AHC) is a self-hosted Python agent runtime for Linux that connects Telegram, Discord and a local CLI to an AHC-managed Codex app-server backend. It owns conversation identity, tasks, Python workspaces, tools, memory and delivery independently of the model's threads.
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](rust-toolchain.toml)
-[![Edition 2024](https://img.shields.io/badge/edition-2024-red.svg)](Cargo.toml)
-[![Version 0.13.1](https://img.shields.io/badge/version-0.13.1-blue.svg)](crates/agent-harness-core/Cargo.toml)
-[![Core: Cross-platform](https://img.shields.io/badge/core-cross--platform-2ea44f.svg)](#faq)
-[![Status: Pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](CHANGELOG.md)
+**Status: pre-release.** The active product lives in [python/](python/). Linux is the runtime platform; WSL is a supported deployment shape. The Rust crates remain a distinct historical implementation. Source tests, installed packages and live deployments are separate claims.
 
-[Quick Start](#quick-start) •
-[Features](#why-agent-harness-core) •
-[Adaptive Skills](docs/adaptive-skill-intelligence.md) •
-[Architecture](#how-it-works) •
-[CLI](#cli-at-a-glance) •
-[Docs](#documentation) •
-[Website](https://phenomenoner.github.io/agent-harness-core/) •
-[FAQ](#faq)
+[Product Guide](docs/python-standalone/PRODUCT-GUIDE.md) · [Technical Overview](docs/python-standalone/TECHNICAL-OVERVIEW.md) · [Channel Notifications](docs/python-standalone/CHANNEL-NOTIFICATIONS.md) · [Backend Upgrades](docs/python-standalone/BACKEND-UPGRADES.md) · [Changelog](CHANGELOG.md)
 
-</div>
+## What AHC Provides
 
----
+| Capability | Behavior |
+| --- | --- |
+| Conversations | Telegram, Discord and CLI entry points with exact agent, account, channel, user and virtual-session boundaries. |
+| Continuity | Durable tasks, results and workspace checkpoints. A fresh backend thread does not create a new AHC conversation. |
+| Interactive work | Optional typing and bounded public progress; final replies headed “💬 回覆” and progress headed “⏳ 互動進度”. |
+| Scheduled work | Interval/daily schedules publish final “⏰ 定時任務” results without typing, Working timers or intermediate chat messages. |
+| Tools | Persistent Python/IPython workspaces, artifacts, admitted child work and optional MCP integrations under the current policy. |
+| Memory | Durable source records with scoped recall and a MemPalace/Qdrant semantic integration. Full-corpus acceptance remains explicit. |
+| Skills | Versioned selection, qualification and protected reversible learning trials. Trial success does not imply useful adoption. |
+| Delivery | Route-bound durable results with sent/unknown receipts. Uncertain effects and sends are not blindly repeated. |
 
-## What is Agent Harness Core?
+## Latest Source Update
 
-Agent Harness Core is a **self-hosted AI agent harness written in Rust**: a runtime that connects chat channels (Telegram, Discord) to LLM coding agents (OpenAI Codex app-server, plus any model reachable through OpenRouter — Claude, GPT, Gemini, and more) through a durable job queue, bounded concurrency, and append-only JSONL receipts for every turn.
-
-It is **not** another prompt-orchestration library. It is the **operations layer** for personal and small-team AI agents — the part that answers questions frameworks usually leave to you:
-
-- What happens when the process dies mid-turn? *(durable queue + completed-turn recovery — the turn is not lost)*
-- Who is allowed to talk to my agent? *(fail-closed allow-lists plus platform/account/channel identity bindings)*
-- What exactly did the agent do at 03:12? *(append-only JSONL logs, receipts, transcripts, and trajectories for everything)*
-- How do I stop a runaway turn? *(`/stop` cancel markers honored by the runtime poll loop)*
-
-Born as a ground-up Rust rebuild of a Docker-based legacy agent gateway ("OpenClaw"), it keeps full import compatibility with that ecosystem — agents, sessions, skills, cron jobs, subagents, and memory snapshots migrate in with dry-run reports and receipts.
-
-Prefer the long-form story? The [project website](https://phenomenoner.github.io/agent-harness-core/) hosts three essays: [Adaptive Skill Intelligence](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/) (skills as evidence-governed rules of thumb), [The Long-Task Engine](https://phenomenoner.github.io/agent-harness-core/essay/long-task-engine/) (virtual sessions and bounded reasoning), and [the experiment essay](https://phenomenoner.github.io/agent-harness-core/essay/) (how this project was built and reviewed).
-
-## Why Agent Harness Core?
-
-| | What you get |
-|---|---|
-| 🧾 **A receipt for everything** | Every ingress, queue write, model turn, delivery, and retry appends to JSONL ledgers. Reconstruct any incident after the fact — no black boxes. |
-| 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, policy-gated media attachments, referenced-media artifacts, message splitting, edit-in-place progress panels, guarded connector-approval buttons, default-off opt-in final-reply tone, and `/new` `/model` `/think` `/reasoning` `/steer` `/stop` `/status` commands. |
-| 🔐 **Fail-closed by default** | DMs require explicit admin allow-lists, and ingress must resolve a platform/account/channel identity binding before dispatch. Unknown senders or ambiguous channel bindings never reach the model. |
-| ⚙️ **Durable, bounded work** | SQLite-backed worker dispatch with leases, retry/backoff, stale reaping, watchdogs, and concurrency limits per global / agent / channel / lane. Runtime dispatch classes isolate interactive, cron, worker, and maintenance turns so noisy cron work does not block channel agents. |
-| 🧵 **Long-task continuity** | A turn's session lives inside a stable **virtual session**. Backend-reported context windows are persisted, compact/resume events are correlated to the requesting operation, and safe rollover carries a bounded **working set** (goal, plan refs, decisions, open files, validation, blockers) under the same exact lane. `/stop` and `/new` durably bind any active backend goal before cancellation; `/new` holds ordinary ingress until the old boundary is proven closed and one frozen replacement session commits. |
-| 🤖 **Model-agnostic routing** | Codex app-server executes turns; OpenRouter routing switches any conversation to e.g. `anthropic/claude-sonnet-4` with one `/model` command. Provider-specific Codex homes keep OpenRouter config out of the default Codex/OAuth path; secrets are checked at preflight, never written to disk. |
-| 🧭 **Capability-aware reasoning** | The v0.8.0 model catalog resolves the exact provider/model capability surface instead of assuming one global effort list. `/think` and `/reasoning` are aliases for one last-write-wins setting. Exact `max` is the highest currently known legal GPT-5.6 effort; unknown future names are accepted only when that exact route advertises them. Exact `ultra` is filtered and rejected, never advertised or configured as an effort. |
-| 🧩 **Per-agent runtime context** | Every configured agent can use its own OpenClaw-style model and eight-file static prompt inventory, with fallback aliases and deletion tombstones. Canonical prompt manifests are keyed by the exact virtual-session lane and Codex backend generation, while dynamic memory recall remains a separate per-turn context source. |
-| 🕸️ **Master-owned delegation** | A master agent can assign a different provider/model/effort policy to every child. Ordinary child terminals enter a bounded, actually redacted, exact-owner mailbox with opaque artifact pointers; terminal-controlled quarantine closes the waiting coordinator without creating a resumable mailbox. Child progress, final text, and errors stay internal, and only a lease-owning master continuation can acknowledge valid results and create user-facing output. |
-| 🧠 **Memory-aware** | OpenClaw-compatible memory hooks (recall, lifecycle capture, store proposals) with vector recall over imported SQLite embeddings — integrated via adapters, not forks. |
-| 📦 **Skills as runtime state** | Versioned, indexed `SKILL.md` runbooks are matched per turn and injected once per session via an injection ledger. Shadow runtime receipts observe matching and outcomes with zero serving-side effects. Generated agent-created skills always leave a proposal/decision trace and default to guarded autonomous apply; unsafe changes are blocked or quarantined, while `--propose-only` remains an explicit non-mutating mode. |
-| 🌐 **Policy-owned web search** | Codex built-in web search defaults to cached mode. Explicit freshness intent may request live search; sensitive, offline, and replay contexts force it disabled. Sandbox selection never changes the web-search policy implicitly. |
-| 🔑 **Operator-owned backend auth** | Provider-scoped Codex homes isolate credentials. Account inspection, browser/device-code/API-key login, cancel/logout/refresh/restart reconciliation, and `needs-operator-auth` defer/resume stay on operator-only CLI surfaces; ordinary agent turns never receive credential material. |
-| 🪶 **Minimal dependencies** | Six crates: `serde`, `serde_json`, `ureq`, `rusqlite`, `ring`, `base64`. No tokio, no async runtime, no clap. Synchronous Rust you can read in an afternoon and audit forever. |
-| 🔑 **Encrypted secret vault** | Repo-local vault using PBKDF2-HMAC-SHA256 + ChaCha20-Poly1305; `vault-get` reports presence and length, never plaintext. |
-| 🔁 **Legacy migration built in** | Read-only dry-run import plans, conflict policies (skip/overwrite/rename), safe-copy execution that skips raw secrets by default, and cutover readiness gates. |
-
-### Adaptive skill intelligence — design direction
-
-Agent Harness Core is extending skills from matched runbooks into an **evidence-governed procedural learning system**. The target is an agent that combines external guidance with verified task experience, reflects on what worked under which conditions, and accumulates reusable individual capability without turning every transcript or popular workflow into permanent prompt text.
-
-The design uses competence-role retrieval, minimal sufficient disclosure, virtual-session revision manifests, contextual and uncertainty-aware skill beliefs, cost-aware evaluation, and reversible promotion. Existing selection receipts, proposal-mediated trace, guarded autonomous mutation, and lifecycle controls are the foundation; outcome-linked learning, consolidation, and full-lifecycle autonomous promotion remain a product direction, not a claim that the complete loop is active. Human intervention is an escalation for concrete technical or safety blockers, not the default learning path. Read [Adaptive Skill Intelligence](docs/adaptive-skill-intelligence.md) or the [web essay](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/) for the rationale, architecture, measurement model, and delivery boundary.
+The Codex transport accepts incoming frames up to 16 MiB, with a 32 MiB queue ceiling and reader backpressure. Outgoing frames remain capped at 1 MiB; MCP incoming frames retain their separate 512 KiB bound. Rejected frames preserve payload-free failure details, unknown-effect custody and existing delivery receipts. Controlled real-pipe tests cover a large tool event, parent completion, notification and the next turn.
 
 ## How It Works
 
 ```mermaid
 flowchart LR
-    TG[Telegram Bot API] --> IN
-    DC[Discord Gateway / REST] --> IN
-    IN[Ingress + fail-closed\nallow-list + identity gate] --> CMD{Command or\nagent turn?}
-    CMD -- "/model /status /stop ..." --> ST[Channel state\n+ command reply]
-    TG -.approval callback.-> ACT[Typed channel action\n+ exact authority gate]
-    DC -.component interaction.-> ACT
-    ACT --> ST
-    CMD -- ordinary message --> Q[(Durable runtime queue\npending.jsonl + leases)]
-    Q --> PB[Prompt bundle\nprompts + skills + memory]
-    PB --> CX[Codex app-server\nOpenAI / OpenRouter models]
-    CX --> OUT[(Channel outbox\n+ delivery receipts)]
-    OUT --> TG2[Telegram reply + media]
-    OUT --> DC2[Discord reply + attachments]
-    CX -.progress events.-> PR[Progress panel\nedit-in-place status]
-    W[(SQLite worker dispatch\ncron / subagents / watchdogs)] --> CR[(CronRunStore\nretry / quarantine)]
-    CR --> Q
-    ALL[every stage] -.appends.-> LOG[(JSONL logs, receipts,\ntranscripts, trajectories)]
+    C[Telegram / Discord / CLI] --> I[Identity and ingress]
+    I --> T[Durable task state]
+    S[Schedules] --> T
+    T --> F[Python execution owners]
+    F --> B[Pinned Codex app-server]
+    B <--> W[AHC tools and workspace]
+    W <--> M[Memory and artifacts]
+    B --> R[Result acceptance]
+    R --> O[Durable channel outbox]
+    O --> N[Typed reply or notification]
+    F -. interactive only .-> P[Typing and progress]
 ```
 
-The harness owns ingress, permissions, queuing, prompt assembly, delivery, long-task continuity, and audit. **Codex owns the model**: system prompt, tool schemas, MCP, sandbox, approvals, and session continuity. That split keeps the harness small, deterministic, and testable — 1,200+ tests run without any model call, using a bundled fake Codex app-server.
+AHC owns task and effect boundaries; Codex supplies the admitted agent loop behind AgentBackend. A response can explain an unresolved task without accepting it as successful. The [technical overview](docs/python-standalone/TECHNICAL-OVERVIEW.md) describes ownership and recovery.
 
-Agent Harness Core still materializes the backend home and generated config for
-the Codex process it launches. It owns the safety of that write and the
-truthfulness of any readiness claim, but not MCP protocol or tool semantics.
-Version 0.13.1 preserves operator-managed third-party MCP
-registrations through generated-config updates and requires fresh,
-same-connection readiness before turn admission. Required declarations fail
-closed when authentication, server identity/version, or tool-schema evidence
-does not match; optional declarations continue with a bounded warning. Initial
-server registration and login remain explicit operator actions. See the
-[third-party MCP reliability plan](docs/roadmap/skill-routing-and-governed-learning/phase-0-reliable-third-party-mcp-hosting.md)
-for the exercised boundaries and remaining release gaps.
+## Getting Started
 
-The same reliability release protects long deterministic operations.
-Running work retains renewable exact generation authority and wrapper
-heartbeats; cancellation, authority loss, timeout, or owner loss contains the
-complete child tree on Windows and Unix. Terminal worker state is
-restart-reconciled into linked cron state, and backup operations can publish
-atomic create/verify progress under an operation-specific absolute deadline.
+Use Linux with Python 3.14 or later and [uv](https://docs.astral.sh/uv/):
 
-### Current source contracts
-
-Channel task boundaries are two-phase and restart-safe. `/stop` and `/new` freeze the old exact
-session, backend generation, source thread, and active goal before writing the run-cancel fence.
-Duplicate commands reuse the same durable effect identity. `/new` freezes one replacement session
-and holds later ordinary messages before model admission until goal closure is proven or exact
-`NotApplicable` evidence exists; close or reconciliation ambiguity leaves the old session
-authoritative. Held messages are replayed in arrival order after the committed boundary.
-
-Connector approval waits use an explicit `ApprovalRequest` message instead of a generic failure.
-Telegram inline keyboards and Discord components contain public, non-bearer action IDs; re-entry
-still passes channel identity, administrator permission, effect generation, exact lane/session,
-authority-digest, expiry, and consume-once checks before the protected capability is resolved.
-Legacy text approval remains readable for capabilities created before the additional authority
-digests, while native callbacks require the complete binding. Waiting parents are parked without a
-lease so later same-lane work can run, and bounded expiry reconciliation settles abandoned waits.
-
-Final delivery and terminal progress are correlated explicitly. Runtime receipts state whether a
-source final is required, explicitly not delivered, or not applicable, and record whether the
-canonical final was appended, already present, or safely reused. Terminal progress does not release
-on another queue or lane's delivery evidence.
-
-### v0.13.0 durable goals and direct service ownership
-
-Version 0.13.0 makes unfinished Goals restart-safe under their original exact-lane authority. A
-successful but unfinished turn can continue in bounded slices; explicit pause, block, input,
-authentication, supersession, stop, and terminal states remain authoritative. New same-lane user
-input takes priority before an unleased autonomous slice, while a leased slice still obeys the
-explicit `/steer`, `/stop`, and `/new` boundaries.
-
-On Windows, the supported standalone process shape is intentionally thin:
-
-```text
-Task Scheduler or another thin OS host adapter
-└─ one Rust supervisor-master
-   └─ N directly owned service children
+```bash
+cd python
+uv sync --extra linux
+uv run ahc --help
+uv run pytest tests/test_channel_background_presentation.py tests/test_codex_app_server_contract.py
 ```
 
-The OS adapter verifies and launches; it does not own topology, restarts, routing, or service
-state. The Rust master holds the exclusive deployment lease, directly retains every configured
-service child, contains the process tree with Windows Jobs, owns restart/backoff/drain decisions,
-and writes generation-bound state. The previous reconcile keeper plus per-service
-`supervisor-run` shape remains a compatibility and rollback path rather than the recommended
-Windows topology. Provider gateways are data-plane children; they never become the control-plane
-master.
-
-The same release also changes agent-created skill synthesis from a mandatory approval queue to a
-traceable guarded path: proposals, lint, guard, exact target/checksum checks, backups, receipts,
-quarantine, and rollback remain mandatory, while `--propose-only` is the explicit non-mutating
-mode. Outcome-linked routing, attribution, consolidation, and broader autonomous promotion are the
-next measured product slice, not a shipped completeness claim.
-
-### v0.10.0 continuity and external-effect boundary
-
-The v0.10.0 checkpoint makes channel continuity and external mutations explicit state-machine
-contracts. Exact channel-session identity is canonicalized before dispatch, queued work remains
-distinct from leased work, continuation parents cannot impersonate logical success, and structured
-provider overload recovery is gated by durable mutation evidence and retry eligibility.
-
-Eligible ordinary interactive turns can use a default-off productive-deadline policy: exact-owned,
-deduplicated progress may extend a bounded deadline only after the runtime proves queue-lease coverage,
-while pending same-lane work, hard caps, task budgets, and control boundaries reclaim the lane. Once
-bounded yield begins it is irreversible. The harness owns the primary outcome and selects exactly one
-logical final, deterministic continuation child, parked notice, or one bounded observation-only recovery
-child; any generation-bound model disposition is advisory evidence rather than outcome authority.
-OperationPlan continuation still requires a current exact-lane, versioned checkpoint. Recognized MCP connector
-elicitations park as `WaitingForApproval`; exact-lane expiring approve/deny capabilities and
-connector-specific readback prevent ambiguous writes from being blindly resubmitted. Provider error
-diagnostics are retained without absolute request URLs or credentials.
-
-These contracts are covered by sanitized Telegram/Discord scenario replays, restart and crash-window
-matrices, terminal-index reconciliation tests, and the public invariant/schema/scenario catalogs.
-Live deployment receipts and operator runbooks remain outside the public repository surface.
-
-### v0.9.0 runtime boundary
-
-The v0.9.0 deployment contract exact-pins Codex CLI 0.144.5 and requires the supervisor to launch a deployment-owned canonical executable whose path, version, and SHA-256 are receipted. Harness-owned protocol compatibility still serializes resume/compact operations, preserves backend-reported `modelContextWindow`, and correlates completion events to the requesting operation; upgrading Codex alone is not treated as a race fix.
-
-The current source baseline pins Codex CLI 0.145.0. Its sanitized compatibility
-fixture is bound to the official tag and generated schemas, including
-`mcpServerStatus/list` and MCP startup-state notifications. Harness-managed
-Codex config now preserves extension-owned `mcp_servers` transactionally, and a
-required external capability must be observed with the declared tool-schema
-digest on the same fresh agent/provider app-server connection before a model
-turn. Source/staging compatibility does not by itself claim deployment or live
-provider readiness.
-
-Reasoning remains authorized against the exact effective provider/model route. Exact `max` is preserved only when advertised, exact `ultra` is filtered and rejected, and legacy `ultra-high` / `ultra_high` canonicalize to `xhigh` before duplicate handling. Other future effort names remain open-ended only when the exact route advertises them.
-
-Multi-agent dispatch is heterogeneous by design: siblings need not share a model or effort. Each child receives an immutable dispatch-time policy and an exact master owner. Terminal output is reduced to a bounded, redacted summary plus opaque artifact references in a durable mailbox; a missing or invalid expected result becomes an explicit failed-omission envelope instead of disappearing from the batch. Runtime class and origin are derived from the trusted worker job kind and checked against typed terminal receipts. Any active work in the exact master lane suppresses resumption; after confirmed lane release, duplicate and restarted watchdog passes coalesce into exactly one logical resume intent and typed continuation. Child progress, final text, and errors are internal evidence and never become parent user-facing output directly.
-
-These are source and compatibility contracts; release evidence and owner-machine receipts are tracked separately from the public interface description. See [Configuration](docs/configuration.md), [0.7 to 0.8.0 Migration](docs/migration-0.8.md), [Invariants](docs/invariants.md), and [Schema Registry](docs/schema-registry.md) for the public operator and compatibility details.
-
-## Quick Start
-
-```powershell
-# Build and verify (no model account needed)
-cargo test
-cargo run -p agent-harness-cli -- doctor
-
-# Import an existing OpenClaw-style deployment (read-only dry run first)
-cargo run -p agent-harness-cli -- import-dry-run --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --conflict skip --output imports\dry-run
-cargo run -p agent-harness-cli -- import-execute --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --conflict skip
-
-# Check channel + runtime readiness, then go live
-cargo run -p agent-harness-cli -- telegram-probe --target-home C:\path\to\.agent-harness
-cargo run -p agent-harness-cli -- channel-identity-check --target-home C:\path\to\.agent-harness --platform telegram --account-id default --chat-id <chat-id> --agent main
-cargo run -p agent-harness-cli -- cron-scheduler-lint --target-home C:\path\to\.agent-harness --dry-run --enable
-cargo run -p agent-harness-cli -- cron-scheduler-run-once --target-home C:\path\to\.agent-harness --dry-run --enable
-cargo run -p agent-harness-cli -- enable-check --target-home C:\path\to\.agent-harness
-cargo run -p agent-harness-cli -- status --target-home C:\path\to\.agent-harness --json
-```
-
-Want to smoke-test the full pipeline offline? Pass `--codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd` to `channel-run-once` and exercise prompt assembly, receipts, transcripts, and outbox delivery without a single model request.
-
-The public command families are summarized below. Owner-machine deployment runbooks and live cutover receipts are intentionally kept out of the public repository surface.
-
-## CLI at a Glance
-
-One binary, `agent-harness`, grouped into clear families:
-
-| Family | Commands | What they do |
-|---|---|---|
-| **Import & registry** | `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `channel-credentials-export` | Migrate a legacy agent deployment with dry-run reports, conflict policies, and redacted credential receipts. |
-| **Channels** | `channel-identity-check`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `telegram-probe`, `telegram-loop`, `discord-gateway-loop`, `discord-outbox-send-once`, … | Telegram/Discord ingress, identity binding, permission gating, slash commands, outbox delivery with retry ledgers. |
-| **Runtime & queue** | `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `progress-delivery-loop` | Durable agent-turn queue, bounded-concurrency runtime loop, live progress panels, final-reply tone policy. |
-| **Codex pipeline** | `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `backend-auth` | Plan → preflight → launch → run → record, each stage inspectable and receipt-backed; operator-only provider authentication stays in harness-owned Codex homes. |
-| **Workers & scheduling** | `worker-enqueue`, `worker-loop`, `worker-status`, `cron-runs`, `cron-run-control`, `cron-plan`, `cron-scheduler-lint`, `cron-scheduler-run-once`, `cron-scheduler-loop`, `ledger-maintenance-once`, `ledger-maintenance-loop`, `native-cron-enqueue`, `deterministic-cron-plan`, `subagent-plan`, … | SQLite-durable jobs: LLM subagents, native/deterministic cron scheduler ticks, no-LLM deterministic shell jobs, watchdogs, master wakeups, dedicated cron worker/runtime lanes, isolated bounded receipt/history maintenance, and cron skip/retry/quarantine controls. |
-| **Memory** | `memory-hook`, `memory-search`, `memory-vector-search`, `memory-service-status/recall/propose/store`, `memory-read-path-smoke` | OpenClaw-compatible memory hooks, vector recall over imported snapshots, redacted credential/coverage reporting, and read-only memory smoke checks. |
-| **Ops & security** | `status`, `enable-check`, `healthz`, `ops-backup`, `ops-cutover-request/approve/apply/status`, `ops-control`, `supervisor-plan`, `supervisor-run`, `vault-put`/`vault-get`, `public-hygiene`, `invariants`, `schema-registry` | Health, supervisor service registry, telemetry and final-delivery child supervision, live-control cutover tokens, backups, Windows Task Scheduler supervision plans that preserve enabled configured channel loops, encrypted vault, release hygiene. |
-
-## Design Principles
-
-1. **Receipts over trust.** Two-phase persistence: intent is written before side effects, results are written after. If it isn't in a ledger, it didn't happen.
-2. **Deterministic before generative.** Slash commands, permission checks, cron planning, and queue mechanics never call a model. Only ordinary agent turns do.
-3. **Fail closed.** No allow-list match, no channel identity binding, no model access. Missing credentials fail at preflight, not mid-turn.
-4. **Small surface, sync Rust.** No async runtime, no macro-heavy frameworks. Boring code that one person can fully audit.
-5. **The model backend is a contractor, not a roommate.** The harness assembles payloads and records outcomes; Codex keeps its own session, tools, and sandbox. App-server protocol errors and failed turns are terminal runtime failures, not empty successful replies.
-6. **Learning is a behavioral deployment.** Skill evidence, proposals, evaluation, promotion, and rollback are distinct. Activity and model self-assessment do not prove that a procedure improved a task.
-
-## Project Status
-
-Version **0.13.1** is the current release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
-
-See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md) for what's done, gated, and next.
+Launch requires an explicit configuration, a verified AHC-owned backend bundle, configured channel credentials and a workspace policy. Package installation does not create a bot, import another agent's credentials or start a service. Follow [native Linux configuration](docs/python-standalone/LINUX-NATIVE-CONFIGURATION.md) and [backend upgrades](docs/python-standalone/BACKEND-UPGRADES.md).
 
 ## Documentation
 
-| Document | What's inside |
-|---|---|
-| [Project Website](https://phenomenoner.github.io/agent-harness-core/) | GitHub Pages home for the project, with long-form essays on [adaptive skill intelligence](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/), [the long-task engine](https://phenomenoner.github.io/agent-harness-core/essay/long-task-engine/), and [the experiment behind the project](https://phenomenoner.github.io/agent-harness-core/essay/). |
-| [Adaptive Skill Intelligence](docs/adaptive-skill-intelligence.md) ([web essay](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/)) | Product direction for turning external knowledge and task experience into measurable, cost-aware, reversible procedural capability. |
-| [Capability Map](docs/agent-harness-feature-parity.html) ([Markdown](docs/agent-harness-feature-parity.md)) | Public source overview separating implemented foundations, evidence boundaries, and design directions across the harness. |
-| [Skill Ecosystem](docs/skill-ecosystem.md) | Current discovery, selection, learning-gate, lifecycle, and compatibility behavior, separated from the adaptive design direction. |
-| [Topology Contract](docs/agent-harness-topology-contract.md) | Identity axes, component ownership, impact matrix, and scenario packs for behavior-changing code reviews. |
-| [Topology Explorer](docs/topology-explorer.html) | Generated interactive browser view of the topology contract, ownership graph, release gates, and open implementation gaps. |
-| [Configuration](docs/configuration.md) | `harness-config.json` reference. |
-| [0.7 to 0.8.0 Migration](docs/migration-0.8.md) | Rust source incompatibilities, supported legacy artifact reads, upgrade sequence, and rollback boundary. |
-| [Worker Dispatch Strategy](docs/agent-worker-dispatch-strategy.md) | Durable workers, cron lanes, subagents, watchdog design. |
-| [Trust Boundaries](docs/trust-boundaries.md) | Where untrusted input enters and how it's bounded. |
-| [Invariants](docs/invariants.md) & [Schema Registry](docs/schema-registry.md) | The contracts the test suite enforces. |
-| [SECURITY.md](SECURITY.md) | Security policy and reporting process. |
-| [Doc Writing Guidelines](DOC-GUIDELINES.md) | How documentation in this repo is written and kept honest. |
+| Document | Purpose |
+| --- | --- |
+| [Product Guide](docs/python-standalone/PRODUCT-GUIDE.md) | User workflows, completion scopes and current limitations. |
+| [Technical Overview](docs/python-standalone/TECHNICAL-OVERVIEW.md) | Runtime components, state, tools, backend and evidence boundaries. |
+| [Channel Notifications](docs/python-standalone/CHANNEL-NOTIFICATIONS.md) | Interactive progress and background summaries. |
+| [Backend Upgrades](docs/python-standalone/BACKEND-UPGRADES.md) | Linux pin, upstream provenance and qualification. |
+| [Task Lifecycles](docs/python-standalone/TASK-LIFECYCLES.md) | Conversation, workspace, schedule, delivery and recovery behavior. |
+| [Message Context](docs/python-standalone/CHANNEL-MESSAGE-CONTEXT.md) | Quotes, forwards, attachments and operation-bound context. |
+| [Architecture](docs/python-standalone/PRODUCT-ARCHITECTURE.md) | Runtime ownership and supported platform boundaries. |
+| [Transport and Rust Topology Contracts](docs/agent-harness-topology-contract.md) | Current Python transport bounds and the retained Rust topology. |
+| [Security Policy](SECURITY.md) | Reporting and operational boundaries. |
 
-## FAQ
+Dated acceptance documents in the retained Rust documentation describe their named candidate and scope. They do not establish Python deployment acceptance.
 
-**Which LLMs can I use?**
-Any model Codex app-server can drive: OpenAI models natively, and the whole OpenRouter catalog (Anthropic Claude, Google Gemini, Meta Llama, …) via `/model openrouter/<provider-model-id>`. Switching models is a chat command, not a redeploy; OpenRouter routes use an isolated Codex home so they do not contaminate the default OpenAI/Codex route.
+## Source Verification
 
-**Does it run on Linux or macOS?**
-The core library, CLI, config materializer, and Codex/MCP child-containment
-contract are cross-platform Rust. Windows uses kill-on-close Job containment;
-Unix uses dedicated process groups, signal escalation, and durable cleanup
-fences. Current source checks compile the workspace natively on Linux and run
-focused Unix process, path, permission, and fresh-backend scenarios there.
-However, the complete Linux test suite still has known historical
-Windows-specific and writable-fixture failures, and native macOS execution has
-not been performed. Windows Task Scheduler is the currently validated deployed
-supervision adapter; systemd and launchd packaging, native macOS lifecycle
-evidence, and exact-platform live cutovers remain separate gates.
+The last full Linux suite run (2026-10-30, before the latest transport repair) reported 4,127 passed, 155 failed and 150 skipped. Fresh checks of the updated transport, failure custody, notifications and backend contracts pass 168 tests. This update remains a source preview. See [source verification](docs/python-standalone/SOURCE-VERIFICATION.md) for environment, scope and remaining gaps.
 
-**Do I need Telegram or Discord?**
-No. Every pipeline stage is a CLI command — you can enqueue, run, and inspect agent turns entirely from a terminal or your own scheduler.
+## Current Limits
 
-**Is my data sent anywhere besides the model provider?**
-No. The harness is fully self-hosted: state is local JSONL/SQLite under your harness home, secrets stay in env files or the encrypted vault, and the only network calls are to your chat platforms and your chosen model endpoint.
+Channel-controlled trusted runtimes run scheduled work through a separate background owner, with dedicated schedule sessions and workspaces in the same store. Foreground conversation work can continue while a schedule runs. Configurations without that composition retain foreground idle admission. Ordinary user messages remain separate conversation requests.
 
-**How is this different from LangChain-style agent frameworks?**
-Those help you *compose prompts and tools inside* an agent. Agent Harness Core sits *around* agents: ingress, permissions, durable queuing, concurrency, delivery, audit, and recovery. Use both if you like — the harness doesn't care how the model thinks, only that every step is gated and recorded.
-
-**Is it production-ready?**
-It's pre-release. It runs a real daily-driver deployment with hundreds of completed turns, but interfaces may change and some release gates (e.g. long-horizon parity evidence, advisory audits) are still being collected. Read [SECURITY.md](SECURITY.md) before exposing it to anyone you don't trust.
-
-## Security
-
-Secrets never enter receipts or logs; exports redact by default and `--include-sensitive` must be explicit. Inbound platform text is wrapped as bounded, untrusted context — never trusted instructions. See [SECURITY.md](SECURITY.md) for the reporting process and current posture.
+Authenticated model execution, live selection, platform rendering, cold boot, endurance and full-product acceptance require evidence for the exact selected instance. Native child discovery does not prove all upstream delegation paths are admitted.
 
 ## License
 
-Dual-licensed under either of:
-
-- **MIT License** ([LICENSE-MIT](LICENSE-MIT) or https://opensource.org/licenses/MIT)
-- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or https://www.apache.org/licenses/LICENSE-2.0)
-
-at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work by you, as defined in the Apache-2.0 license, shall be dual-licensed as above, without any additional terms or conditions.
+Dual licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).

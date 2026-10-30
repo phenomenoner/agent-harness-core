@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ahc"
+version = "0.3.0"
+description = "Standalone Agent Harness with native Linux foreground execution"
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "MIT" }
+authors = [{ name = "Agent Harness contributors" }]
+classifiers = [
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+  "portalocker>=3.0",
+  "portalocker[win32]>=3.0; sys_platform == 'win32'",
+  "psutil>=6.0",
+]
+
+[project.optional-dependencies]
+discord = ["websockets>=17.0.1,<18"]
+mcp = ["jsonschema>=4.23,<5", "referencing>=0.35,<1"]
+memory = [
+  "mempalace @ git+https://github.com/MemPalace/mempalace.git@8c4865f70c49b6346c53474a9e5684c5f17d3fa9",
+  "onnxruntime==1.30.0",
+  "numpy==2.5.3",
+  "tokenizers==0.23.2",
+]
+linux = ["ipython>=9.17.1,<10", "websockets>=17.0.1,<18", "jsonschema>=4.23,<5", "referencing>=0.35,<1"]
+
+[project.scripts]
+ahc = "ahc.cli:main"
+
+[dependency-groups]
+dev = [
+  "packaging>=24",
+  "pytest>=8.3",
+  "pytest-timeout>=2.3",
+  "ruff>=0.8",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = ["-ra"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

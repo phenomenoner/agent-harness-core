@@ -1,0 +1,398 @@
+{
+  "schemaVersion": "ahc.m2.3-lite-acceptance.v1",
+  "status": "OWNER_FROZEN_SPECIFICATION_DEVELOPMENT_PAUSED",
+  "acceptedCount": 0,
+  "implementationAuthorized": false,
+  "runtimeWriters": "CLOSED",
+  "historicalVerdictTransfer": false,
+  "riskPolicy": {
+    "consequenceDomain": [
+      "HIGH",
+      "MEDIUM",
+      "LOW"
+    ],
+    "frequencyDomain": [
+      "HIGH",
+      "MEDIUM",
+      "LOW",
+      "UNKNOWN"
+    ],
+    "unknownFrequencyTreatment": "Use the MEDIUM-frequency row for the same consequence until evidence improves.",
+    "boundedFailOpen": "Continue only unaffected or safely reversible work; never mint authority, approval, success, receipt, secret access, or external-effect certainty; preserve a sanitized residual and repair trigger.",
+    "matrix": [
+      {
+        "consequence": "HIGH",
+        "frequency": "HIGH",
+        "runtimeDisposition": "FAIL_CLOSED_BEFORE_EFFECT",
+        "mvpDisposition": "BLOCK_MVP_OR_CORE_CLAIM",
+        "minimumTier": "T2"
+      },
+      {
+        "consequence": "HIGH",
+        "frequency": "MEDIUM",
+        "runtimeDisposition": "FAIL_CLOSED_BEFORE_EFFECT",
+        "mvpDisposition": "BLOCK_AFFECTED_REQUIRED_CAPABILITY",
+        "minimumTier": "T2"
+      },
+      {
+        "consequence": "HIGH",
+        "frequency": "LOW",
+        "runtimeDisposition": "FAIL_CLOSED_BEFORE_EFFECT",
+        "mvpDisposition": "DISABLE_AFFECTED_CAPABILITY; BLOCK_ONLY_IF_REQUIRED",
+        "minimumTier": "T2"
+      },
+      {
+        "consequence": "MEDIUM",
+        "frequency": "HIGH",
+        "runtimeDisposition": "FAIL_CLOSED_FOR_AFFECTED_OPERATION_WITH_SAFE_FALLBACK",
+        "mvpDisposition": "FOCUSED_REPAIR_BEFORE_COMMON_PATH_ACCEPTANCE",
+        "minimumTier": "T2"
+      },
+      {
+        "consequence": "MEDIUM",
+        "frequency": "MEDIUM",
+        "runtimeDisposition": "CONTAIN_OR_DENY_AFFECTED_CAPABILITY",
+        "mvpDisposition": "OPTIONAL_PATH_MAY_DEFER_WITH_DEGRADED_STATUS",
+        "minimumTier": "T1_OR_T2"
+      },
+      {
+        "consequence": "MEDIUM",
+        "frequency": "LOW",
+        "runtimeDisposition": "BOUNDED_FALLBACK_OR_CAPABILITY_LOCAL_DENY",
+        "mvpDisposition": "NO_WHOLE_MVP_BLOCK_IF_REVERSIBLE_AND_OPTIONAL",
+        "minimumTier": "T1"
+      },
+      {
+        "consequence": "LOW",
+        "frequency": "HIGH",
+        "runtimeDisposition": "BOUNDED_FAIL_OPEN_WITH_SAFE_WARNING",
+        "mvpDisposition": "FOCUSED_OPERABILITY_REPAIR; NO_RELEASE_WIDE_GATE",
+        "minimumTier": "T1"
+      },
+      {
+        "consequence": "LOW",
+        "frequency": "MEDIUM",
+        "runtimeDisposition": "BOUNDED_FAIL_OPEN_WITH_RESIDUAL_RECORD",
+        "mvpDisposition": "BACKLOG; NO_MVP_BLOCK",
+        "minimumTier": "T0_OR_T1"
+      },
+      {
+        "consequence": "LOW",
+        "frequency": "LOW",
+        "runtimeDisposition": "BOUNDED_FAIL_OPEN_WITH_LIGHTWEIGHT_CONTAINMENT",
+        "mvpDisposition": "NO_MVP_BLOCK; NO_FORMAL_MATRIX_OR_REVIEW_WAVE",
+        "minimumTier": "T0"
+      }
+    ]
+  },
+  "rows": [
+    {
+      "id": "L-T0-01",
+      "area": "contract",
+      "tier": "T0",
+      "consequence": "MEDIUM",
+      "frequency": "LOW",
+      "blocksMvp": false,
+      "claim": "Architecture, specification, and acceptance projection agree on the Lite cutline, domains, and zero accepted count.",
+      "expected": "No missing link, duplicate acceptance ID, stale R3 wording, or accepted runtime claim.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T0-02",
+      "area": "architecture",
+      "tier": "T0",
+      "consequence": "MEDIUM",
+      "frequency": "MEDIUM",
+      "blocksMvp": true,
+      "claim": "Future Lite source follows the proposed module allowlist, every source module is below 300 physical lines, and no dependency is added.",
+      "expected": "Static architecture and package-metadata checks pass on final implementation bytes.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T0-03",
+      "area": "scope-guard",
+      "tier": "T0",
+      "consequence": "HIGH",
+      "frequency": "MEDIUM",
+      "blocksMvp": true,
+      "claim": "Lite introduces no generic adapter lifecycle, callback/reentry guard, invocation reservation, wire request/result, generic receipt, persistence, daemon, queue, scheduler, MCP route, dynamic loader, provider, credential, or OpenClaw-Mem import.",
+      "expected": "Forbidden-symbol/import and changed-path checks find none.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-01",
+      "area": "composition",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "HIGH",
+      "blocksMvp": true,
+      "claim": "A complete valid policy joins exact configured agents, owned resources, package definitions, and grants, then issues one opaque bound view per configured agent.",
+      "expected": "Composition succeeds and views disclose no mutable policy or caller-settable agent identity.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-02",
+      "area": "composition",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "MEDIUM",
+      "blocksMvp": true,
+      "claim": "Unknown agent or unknown resource rejects the complete policy before any view is published.",
+      "expected": "Typed bounded rejection; zero views.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-03",
+      "area": "authority",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "MEDIUM",
+      "blocksMvp": true,
+      "claim": "Cross-agent resource ownership and resource-kind mismatch reject before view issuance.",
+      "expected": "Typed bounded rejection; zero views; no repair or fallback grant.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-04",
+      "area": "policy",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "LOW",
+      "blocksMvp": true,
+      "claim": "Duplicate capability IDs or duplicate agent-capability grants reject all-or-nothing.",
+      "expected": "Typed bounded rejection; no last-write-wins behavior.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-05",
+      "area": "policy",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "LOW",
+      "blocksMvp": true,
+      "claim": "Every EXTERNAL_OR_IRREVERSIBLE capability definition requires approval mode REQUIRED.",
+      "expected": "A NONE definition rejects before view issuance.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-06",
+      "area": "custody",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "MEDIUM",
+      "blocksMvp": true,
+      "claim": "Mutation of every caller-owned definition/grant/container after composition cannot change any issued view or decision.",
+      "expected": "Decisions before and after isolated mutations are equal; no newly granted capability appears.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-07",
+      "area": "decision",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "HIGH",
+      "blocksMvp": true,
+      "claim": "Unknown package capability returns DENY/capability-unknown.",
+      "expected": "Exact decision pair; no exception text or effect.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-08",
+      "area": "decision",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "HIGH",
+      "blocksMvp": true,
+      "claim": "Known but ungranted capability returns DENY/capability-not-granted.",
+      "expected": "Exact decision pair and known definition effect; no effect.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-09",
+      "area": "decision",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "MEDIUM",
+      "blocksMvp": true,
+      "claim": "A requested effect differing from the package definition returns DENY/effect-mismatch.",
+      "expected": "Exact decision pair; caller cannot downgrade or upgrade effect authority.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-10",
+      "area": "decision",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "HIGH",
+      "blocksMvp": true,
+      "claim": "A granted approval-required capability returns REQUIRES_APPROVAL/approval-required and never ALLOW.",
+      "expected": "Exact decision pair; no caller-approved input exists.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-11",
+      "area": "decision",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "HIGH",
+      "blocksMvp": true,
+      "claim": "A granted exact-effect capability with approval mode NONE returns ALLOW/allowed.",
+      "expected": "Exact decision pair only; no success or receipt claim.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-12",
+      "area": "absence",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "MEDIUM",
+      "blocksMvp": true,
+      "claim": "Absent or invalid optional capability policy permits basic foreground startup/doctor but issues no affected views or grants.",
+      "expected": "Availability continues in denied/degraded mode; authority remains fail closed.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-13",
+      "area": "doctor",
+      "tier": "T1",
+      "consequence": "MEDIUM",
+      "frequency": "MEDIUM",
+      "blocksMvp": false,
+      "claim": "Doctor consumes only immutable snapshot or None and performs no filesystem, environment, database, network, process, provider, adapter, approval, or repair effect.",
+      "expected": "Every controlled forbidden-effect counter remains zero.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T1-14",
+      "area": "doctor",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "MEDIUM",
+      "blocksMvp": true,
+      "claim": "Doctor never overstates a grant and emits no raw path, exception, payload, result, credential, or provider text.",
+      "expected": "Projection matches immutable policy truth and sanitized finite fields only.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T2-01",
+      "area": "effect-seam",
+      "tier": "T2",
+      "consequence": "HIGH",
+      "frequency": "HIGH",
+      "blocksMvp": true,
+      "claim": "A controlled domain entrypoint receiving DENY performs zero fake effects.",
+      "expected": "Effect counter remains zero and a bounded domain denial is returned.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T2-02",
+      "area": "effect-seam",
+      "tier": "T2",
+      "consequence": "HIGH",
+      "frequency": "HIGH",
+      "blocksMvp": true,
+      "claim": "A controlled domain entrypoint receiving unresolved REQUIRES_APPROVAL performs zero fake effects.",
+      "expected": "Effect counter remains zero; the decision is not treated as approval.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T2-03",
+      "area": "effect-seam",
+      "tier": "T2",
+      "consequence": "HIGH",
+      "frequency": "HIGH",
+      "blocksMvp": true,
+      "claim": "A controlled domain entrypoint receiving ALLOW reaches exactly one fake effect through the bound agent path.",
+      "expected": "Effect counter becomes one; Lite itself emits no generic receipt or success claim.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T2-04",
+      "area": "effect-seam",
+      "tier": "T2",
+      "consequence": "HIGH",
+      "frequency": "MEDIUM",
+      "blocksMvp": true,
+      "claim": "Using agent A's view cannot authorize agent B's resource or capability path.",
+      "expected": "Denied before the fake effect; both wrong-agent and target counters remain zero.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-T2-05",
+      "area": "ownership",
+      "tier": "T2",
+      "consequence": "MEDIUM",
+      "frequency": "LOW",
+      "blocksMvp": false,
+      "claim": "The controlled domain, not Lite, owns result, receipt, lifecycle, idempotency, timeout, and recovery behavior after the decision.",
+      "expected": "No generic plugin receipt/lifecycle type is imported or emitted by the Lite core.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-RISK-01",
+      "area": "risk-policy",
+      "tier": "T0",
+      "consequence": "MEDIUM",
+      "frequency": "MEDIUM",
+      "blocksMvp": true,
+      "claim": "The machine risk matrix contains each of the nine consequence-frequency pairs exactly once.",
+      "expected": "3x3 set equality and no duplicate pair.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-RISK-02",
+      "area": "risk-policy",
+      "tier": "T1",
+      "consequence": "HIGH",
+      "frequency": "LOW",
+      "blocksMvp": true,
+      "claim": "A high-consequence low-frequency authority/effect concern remains fail closed and cannot be reclassified fail open because it is rare.",
+      "expected": "Disposition is FAIL_CLOSED_BEFORE_EFFECT; affected capability disabled until closed or explicitly descoped.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-RISK-03",
+      "area": "risk-policy",
+      "tier": "T0",
+      "consequence": "LOW",
+      "frequency": "LOW",
+      "blocksMvp": false,
+      "claim": "A reversible non-authoritative low-consequence low-frequency concern uses bounded fail-open and does not create an MVP blocker or formal review wave.",
+      "expected": "Lightweight containment, sanitized residual, owner, and recurrence/escalation trigger only.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-RISK-04",
+      "area": "risk-policy",
+      "tier": "T0",
+      "consequence": "MEDIUM",
+      "frequency": "UNKNOWN",
+      "blocksMvp": false,
+      "claim": "Unknown frequency maps to the same consequence's medium-frequency disposition without inflating consequence.",
+      "expected": "Risk-local treatment and no unrelated evidence invalidation.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-RISK-05",
+      "area": "risk-policy",
+      "tier": "T0",
+      "consequence": "MEDIUM",
+      "frequency": "MEDIUM",
+      "blocksMvp": true,
+      "claim": "Every material finding records scope class, first effect boundary, consequence, frequency, confidence, reversibility, disposition, affected IDs, residual owner, and repair trigger.",
+      "expected": "No severity-only or whole-candidate-default finding disposition.",
+      "evidenceStatus": "OPEN"
+    },
+    {
+      "id": "L-RISK-06",
+      "area": "scope-guard",
+      "tier": "T0",
+      "consequence": "HIGH",
+      "frequency": "LOW",
+      "blocksMvp": true,
+      "claim": "A finding that requires generic lifecycle, persistence, transport, global grants, a fourth decision, or sealed M2.1/M2.2 changes stops at CK scope amendment.",
+      "expected": "No silent regrowth of full M2.3 and no finding-created implementation authority.",
+      "evidenceStatus": "OPEN"
+    }
+  ]
+}

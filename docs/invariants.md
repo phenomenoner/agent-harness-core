@@ -1,5 +1,23 @@
 # Agent Harness Core Invariants
 
+## Current Python Transport Contract
+
+Updated: 2026-10-31. The active runtime is `python/`; see the [technical overview](python-standalone/TECHNICAL-OVERVIEW.md).
+
+Python Codex framing is finite without treating legitimate multi-megabyte tool
+events as task failure: incoming frames are capped at 16 MiB and queued raw bytes
+at 32 MiB, with backpressure. Outgoing and MCP-specific limits remain separate.
+Framing availability cannot bypass parent/turn validation, answer seals or tool
+authority. A rejected frame retains fixed, payload-free failure metadata and
+UNKNOWN/no-replay custody through result commit, notification and reopen. Existing
+notifications retain their exact payload, claim and delivery state. The real-pipe
+scenario checks a large event followed by parent final delivery and a subsequent
+turn, plus bounded oversize refusal. See `test_large_tool_transport` and
+`test_large_tool_lifecycle`.
+
+
+## Retained Rust Contract
+
 Date: 2026-07-24
 
 This catalog is the release-gate source for deterministic simulation, scenario replay, and review evidence. The same invariant IDs are exposed by `agent-harness invariants` through `agent_harness_core::quality::invariant_catalog`.

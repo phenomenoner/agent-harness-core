@@ -1,1 +1,7 @@
 crates/agent-harness-cli/tests/fixtures/skill-replay-private/*.json text eol=lf
+
+# Keep the Python source distribution portable across Windows and Linux.
+python/** text eol=lf
+docs/python-standalone/** text eol=lf
+tools/ahc-linux.ps1 text eol=lf
+tools/ahc-health.ps1 text eol=lf

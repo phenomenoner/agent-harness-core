@@ -1,0 +1,97 @@
+{
+  "provenance": {
+    "version": "0.163.0",
+    "generator": "codex app-server generate-json-schema --experimental",
+    "target": "x86_64-unknown-linux-musl",
+    "executable_sha256": "399ff69c431c066e40de318fba45c2b07f45a76b19939d247ee4828fc70c4215",
+    "source_release": "https://github.com/openai/codex/releases/tag/rust-v0.163.0",
+    "combined_schema_sha256": "43e8c1495557ca91e33a63bbfae36c311c206253afae2974c979dbdf5d940c71",
+    "scope": "Generated upstream method catalog and consumed parameter fields; no inference"
+  },
+  "server_request_methods": [
+    "account/chatgptAuthTokens/refresh",
+    "applyPatchApproval",
+    "attestation/generate",
+    "currentTime/read",
+    "execCommandApproval",
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "item/tool/call",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request"
+  ],
+  "thread_start_properties": [
+    "allowProviderModelFallback",
+    "approvalPolicy",
+    "approvalsReviewer",
+    "baseInstructions",
+    "config",
+    "cwd",
+    "daybreakEnabled",
+    "developerInstructions",
+    "dynamicTools",
+    "environments",
+    "ephemeral",
+    "experimentalRawEvents",
+    "historyMode",
+    "mockExperimentalField",
+    "model",
+    "modelProvider",
+    "multiAgentMode",
+    "permissions",
+    "personality",
+    "projectId",
+    "runtimeWorkspaceRoots",
+    "sandbox",
+    "selectedCapabilityRoots",
+    "serviceName",
+    "serviceTier",
+    "sessionStartSource",
+    "threadSource"
+  ],
+  "turn_start_properties": [
+    "additionalContext",
+    "approvalPolicy",
+    "approvalsReviewer",
+    "clientUserMessageId",
+    "collaborationMode",
+    "cwd",
+    "cyberAccessProgram",
+    "disabledPluginIds",
+    "effort",
+    "environments",
+    "input",
+    "model",
+    "multiAgentMode",
+    "outputSchema",
+    "parentTurnId",
+    "permissions",
+    "personality",
+    "responsesapiClientMetadata",
+    "rootTurnId",
+    "runtimeWorkspaceRoots",
+    "sandboxPolicy",
+    "serviceTier",
+    "serviceTierForTurn",
+    "summary",
+    "threadId",
+    "toolOutput",
+    "turnTrigger"
+  ],
+  "current_time_response_schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "properties": {
+      "currentTimeAt": {
+        "description": "Current time as whole Unix seconds.",
+        "format": "int64",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "currentTimeAt"
+    ],
+    "title": "CurrentTimeReadResponse",
+    "type": "object"
+  }
+}

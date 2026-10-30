@@ -1,0 +1,19 @@
+"""Stateful isolated workspace capability; unsupported hosts have no execution fallback."""
+
+from typing import Protocol
+
+from ahc.domain.workspace import WorkspaceCheckpoint, WorkspaceIdentity
+
+
+class WorkspacePort(Protocol):
+    @property
+    def identity(self) -> WorkspaceIdentity: ...
+    def execute(self, expected: WorkspaceIdentity, code: str) -> dict[str, object]: ...
+    def inspect(self, expected: WorkspaceIdentity, names: tuple[str, ...]) -> dict[str, object]: ...
+    def checkpoint(
+        self, expected: WorkspaceIdentity, names: tuple[str, ...]
+    ) -> WorkspaceCheckpoint: ...
+    def restore(
+        self, expected: WorkspaceIdentity, checkpoint: WorkspaceCheckpoint
+    ) -> WorkspaceIdentity: ...
+    def close(self) -> None: ...

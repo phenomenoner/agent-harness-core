@@ -1,5 +1,23 @@
 # Changelog
 
+## Python Transport Source Update - 2026-10-31
+
+- Raised the Codex incoming frame limit from 4 MiB to 16 MiB and bounded queued raw frames at 32 MiB with reader backpressure. The 1 MiB outgoing and 512 KiB MCP incoming limits remain separate.
+- Preserved fixed, payload-free framing failure reasons and observed byte counts through diagnostics, durable results and notifications, including unverified cleanup.
+- Retained UNKNOWN/no-replay behavior and predecessor notification payloads and delivery state.
+- Added large-event, oversize-rejection, real-child-pipe, delivery and next-turn regressions. Fresh focused Linux checks pass 168 tests.
+- Refreshed transport and source-verification documentation. This is a source preview; the last full-suite run still records known failures.
+
+## Python Runtime Preview 0.3.0 - 2026-10-30
+
+- Added the standalone Python/Linux runtime, Telegram and Discord adapters, local CLI, persistent Python/IPython workspaces, durable schedules, artifacts, memory integration and governed skills/learning.
+- Added the pinned Codex app-server integration with bounded frames, reader backpressure, correlated tools and recovery that preserves unknown effects. Both transport lifetime modes retain valid long exchanges without cumulative frame or byte cutoffs.
+- Added route-bound conversation continuity, result acceptance, background notification categories and durable delivery receipts. Channel-controlled trusted runtimes use independent background schedule execution with dedicated session/workspace ownership; other compositions retain foreground idle admission.
+- Updated the public overview, installation and wheel verification instructions, architecture, service ownership, execution-access and failure references. The existing Rust release history and source remain retained separately.
+- Updated the persistent stdio regression to cross the retired cumulative limits while retaining per-frame rejection coverage.
+
+This is a source preview. Installed-package identity, authenticated provider execution and live deployment acceptance remain separately qualified.
+
 ## v0.13.1 - 2026-07-27
 
 ### Added

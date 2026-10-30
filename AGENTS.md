@@ -1,5 +1,9 @@
 # Project Agent Instructions
 
+## Active Runtime
+
+The active product is `python/`, targeting native Linux with Python 3.14 or later. Use its `pyproject.toml` and `uv.lock`, run Python checks from that directory, and follow `docs/python-standalone/` for current contracts. The existing Rust crates and Rust/Windows deployment instructions below describe the retained historical implementation. Source publication does not authorize live deployment or service changes.
+
 ## Scope And Authority
 
 - These instructions govern the source/development repository. `.agent-harness/` is excluded from ordinary source work.

@@ -1,0 +1,14 @@
+# Disposable M0 smoke-test configuration.
+# The state directory is ignored by python/.gitignore and is safe to remove.
+config_version = "ahc.standalone.config.v1"
+state_dir = "../.example-state"
+
+[[services]]
+name = "sleep-demo"
+command = ["{python}", "-c", "import time; time.sleep(60)"]
+cwd = ".."
+enabled = true
+restart_policy = "never"
+max_restarts = 0
+restart_delay_seconds = 0.0
+stop_timeout_seconds = 5.0

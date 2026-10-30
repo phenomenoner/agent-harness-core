@@ -1,0 +1,327 @@
+{
+  "schemaVersion": "ahc.m2.3-lite.acceptance-evidence.v1",
+  "epochId": "m2.3-lite-rb1-20260829",
+  "status": "RB1_REMEDIATION_REVIEW_PASSED_MILESTONE_HOLD",
+  "baseFreeze": {
+    "aggregateSha256": "eb35a2e0769302503e79e53a371db1e8d3f2acf2bf6c3017a8e2eb381b6cdc0e",
+    "manifestSha256": "21af8500ec289269b296f8d2c342d324fa4dc07830e3cefd93af44093608d6d6",
+    "predecessorImplementationAuthorized": false,
+    "predecessorRuntimeWriters": "CLOSED",
+    "verdictTransfer": false
+  },
+  "ownerDecision": {
+    "authorizedAt": "2026-08-29T00:38:53+08:00",
+    "decision": "OPEN_BOUNDED_RB1_EPOCH",
+    "directModuleOnly": true,
+    "resourceDecisionSignature": "decide(capability_id, resource_id, requested_effect, /)",
+    "lT112": "OPEN"
+  },
+  "repository": {
+    "branch": "codex/python-standalone-rewrite",
+    "head": "37e8f041b93356f599a0de15beb5975bf95bf103",
+    "worktree": "DIRTY_WITH_PREEXISTING_HISTORICAL_M2_3_WORK"
+  },
+  "writerAllowlist": [
+    "python/src/ahc/domain/capability_values.py",
+    "python/src/ahc/domain/capability_policy.py",
+    "python/src/ahc/application/capability_view.py",
+    "python/src/ahc/application/capability_doctor.py",
+    "python/src/ahc/application/capability_composition.py",
+    "python/tests/test_capability_policy.py",
+    "python/tests/test_capability_integration.py",
+    "docs/python-standalone/M2.3-LITE-RESOURCE-BINDING-AMENDMENT.md",
+    "docs/python-standalone/M2.3-LITE-ACCEPTANCE-EVIDENCE.json",
+    "docs/python-standalone/CURRENT-M2.3-LITE-HANDOFF.md",
+    "docs/python-standalone/PRODUCT-ROADMAP.md",
+    "docs/python-standalone/PM-DASHBOARD.html"
+  ],
+  "closedPathsAndEffects": [
+    "python/src/ahc/__init__.py",
+    "python/src/ahc/domain/__init__.py",
+    "python/src/ahc/application/__init__.py",
+    "python/tests/test_package.py",
+    "python/src/ahc/cli/**",
+    "python/src/ahc/infrastructure/**",
+    "python/src/ahc/application/supervisor.py",
+    "python/src/ahc/application/lifecycle.py",
+    "python/tests/profile_test_support.py",
+    "python/**/plugin_*",
+    "commit/push/deploy/import/provider/MCP/OpenClaw-Mem/credential/live-routing/cutover"
+  ],
+  "amendment": {
+    "path": "docs/python-standalone/M2.3-LITE-RESOURCE-BINDING-AMENDMENT.md",
+    "sha256": "06fca0f800673c68927ee01b136572ff5ef1b087bc2c04e92e5452d0d28c153a",
+    "status": "AUTHORIZED_ACTIVE",
+    "fixtureNormalizedSha256": "06fca0f800673c68927ee01b136572ff5ef1b087bc2c04e92e5452d0d28c153a"
+  },
+  "candidateHashes": {
+    "python/src/ahc/domain/capability_values.py": "adf552ecce1f362f511591e15b77e29a5c541a42d00abfc00c232c5cf62ea7f7",
+    "python/src/ahc/domain/capability_policy.py": "a15e7f134b6bb62d33c5db708df05697976925d4c1cbee0885d549165e505321",
+    "python/src/ahc/application/capability_view.py": "f5bbd4a33dbc2706369dda54d8f1f402d09f8bce0394ba734cd53c7966fee31d",
+    "python/src/ahc/application/capability_composition.py": "169d83e199a4db0abe426c2725b370b7c2f5f3c4dc38a927f3bdc4f7c192836f",
+    "python/src/ahc/application/capability_doctor.py": "1d5c7217229d477ae00eaf95eace74c01784e8c1010f76bd295edfee697f42eb",
+    "python/tests/test_capability_policy.py": "a192cd70bbb21e91e6cff57f68a00f94dcbdec0585903bb7b00099c53614add1",
+    "python/tests/test_capability_integration.py": "d605c3566f215fc78e62f21b34bdd67e5cfb648d3ea272f0b7cba5ef0602a09e"
+  },
+  "readOnlyDependencyHashes": {
+    "python/pyproject.toml": "ebf018728df7e7de13477ce08e5e5c406b9089ef518bb28dfb7bc0cc4c7d2b07",
+    "python/src/ahc/domain/profile_registry.py": "15f65a3d340c6f3e1c9a4a3fe74a1d12a7d4d91a95982ef4cfe5aea7a73de00e",
+    "python/src/ahc/domain/profile_values.py": "9a670ffe60822ac56fbc8fbc285a0e65354ce66a75d06881f539cc5081cbd596",
+    "python/src/ahc/domain/profiles.py": "66fc21e4b23a2b04307c8eceb71284b866facabe4bfe1e0ecb7f10ff7ce71215",
+    "python/src/ahc/domain/sessions.py": "cb2f5008b17dcadbb1d31491918117b25258766abd3c18b349e93debcd65a06d"
+  },
+  "materialFindings": [
+    {
+      "id": "R1",
+      "scopeClass": "SCOPE_GUARD",
+      "consequence": "HIGH",
+      "estimatedFrequency": "MEDIUM",
+      "confidence": "HIGH",
+      "firstEffectBoundary": "runtime source/test writer admission",
+      "reversibilityContainment": "prior candidate retained as diagnostic only; no acceptance transfer",
+      "disposition": "OWNER_GATE_CLOSED_FOR_NEW_EPOCH",
+      "affectedAcceptanceIds": [
+        "L-T0-01",
+        "L-T0-02",
+        "L-T0-03",
+        "L-RISK-06"
+      ],
+      "residualOwner": "CK",
+      "repairTrigger": "any write outside the exact allowlist"
+    },
+    {
+      "id": "R2",
+      "scopeClass": "IN_SCOPE",
+      "consequence": "HIGH",
+      "estimatedFrequency": "MEDIUM",
+      "confidence": "HIGH",
+      "firstEffectBoundary": "domain sink after ALLOW on a non-grant resource",
+      "reversibilityContainment": "deny resource mismatch before effect",
+      "disposition": "CLOSED_PASS_RB1_REMEDIATION",
+      "affectedAcceptanceIds": [
+        "L-T1-01",
+        "L-T1-03",
+        "L-T2-03",
+        "L-T2-04"
+      ],
+      "residualOwner": "M2.3-Lite RB1",
+      "repairTrigger": "same-capability cross-resource negative does not remain discriminating"
+    },
+    {
+      "id": "R3",
+      "scopeClass": "IN_SCOPE",
+      "consequence": "HIGH",
+      "estimatedFrequency": "MEDIUM",
+      "confidence": "HIGH",
+      "firstEffectBoundary": "controlled T2 agent/resource path",
+      "reversibilityContainment": "same-capability two-resource fake sink with zero authorization and target counters",
+      "disposition": "CLOSED_PASS_RB1_REMEDIATION",
+      "affectedAcceptanceIds": [
+        "L-T2-03",
+        "L-T2-04"
+      ],
+      "residualOwner": "M2.3-Lite RB1 tests",
+      "repairTrigger": "negative can pass without the target resource sink"
+    },
+    {
+      "id": "R4",
+      "scopeClass": "IN_SCOPE",
+      "consequence": "MEDIUM",
+      "estimatedFrequency": "MEDIUM",
+      "confidence": "HIGH",
+      "firstEffectBoundary": "acceptance evidence closure",
+      "reversibilityContainment": "keep unsupported rows OPEN; add focused direct evidence only",
+      "disposition": "PASS_LIMITED_CLAIM_L_T1_12_OPEN",
+      "affectedAcceptanceIds": [
+        "L-T0-01",
+        "L-T0-02",
+        "L-T0-03",
+        "L-T1-12",
+        "L-T2-05",
+        "L-RISK-04",
+        "L-RISK-05",
+        "L-RISK-06"
+      ],
+      "residualOwner": "PMO main session",
+      "repairTrigger": "a row is projected accepted without a discriminating check"
+    }
+  ],
+  "localVerification": {
+    "resourceBindingFailFirst": "5 failed, 9 passed against predecessor source; all five failures were decide signature mismatches",
+    "focusedCurrent": "14 passed on WSL Python 3.14.4 after RB1 source and evidence-oracle changes",
+    "affectedRegressionCurrent": "49 passed: RB1 focused plus M2.1 profiles/config/package and architecture gate",
+    "currentEvidenceScope": "resource-binding remediation, direct-module scope/risk evidence, M2.1 regressions, architecture, and isolated neutral-wheel package pickup",
+    "neutralWheel": {
+      "sha256": "21550a36f99a16690f49f84cf0d07d15637229e4744f10608e70ea9d134b2028",
+      "capabilityModuleCount": 5,
+      "historicalPluginEntryCount": 0
+    },
+    "windowsCurrentEpoch": "14 passed on Windows Python 3.14.7 x64 from isolated installed neutral wheel",
+    "independentReviewCurrentEpoch": {
+      "delegationId": "deleg_eacd04c5",
+      "reviewSubjectEvidenceSha256": "5e59b7e3aa767d1ed618a51c0101c9b19a15f2159c410eba12847e1d57812514",
+      "reviewSummarySha256": "2aaba0fe802c23e52ce087738509dbe78be570433073b7b067fa5a7f50239035",
+      "hashGate": "PASS",
+      "r2": "PASS",
+      "r3": "PASS",
+      "r4EvidenceHonesty": "PASS_LIMITED_CLAIM",
+      "finalDriftCheck": "PASS",
+      "final": "PASS_RB1_REMEDIATION",
+      "materialFinding": "RG-01_SCOPE_GUARD_L_T1_12_OPEN_FORMAL_0_OF_28"
+    }
+  },
+  "acceptanceRows": [
+    {
+      "id": "L-T0-01",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T0-02",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T0-03",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-01",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-02",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-03",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-04",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-05",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-06",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-07",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-08",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-09",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-10",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-11",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-12",
+      "status": "OPEN_OWNER_DEFERRED",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-13",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T1-14",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T2-01",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T2-02",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T2-03",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T2-04",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-T2-05",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-RISK-01",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-RISK-02",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-RISK-03",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-RISK-04",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-RISK-05",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    },
+    {
+      "id": "L-RISK-06",
+      "status": "OPEN_REMEDIATION_IN_PROGRESS",
+      "evidence": []
+    }
+  ],
+  "summary": {
+    "normativeRows": 28,
+    "acceptedCount": 0,
+    "openCount": 28,
+    "localPassReviewPendingCount": 0
+  },
+  "nonClaims": [
+    "No package export integration",
+    "No foreground startup/doctor integration",
+    "No commit or live/external effect"
+  ],
+  "fixtureNote": "Historical test input; private coordination locator omitted. This is not current release evidence or active policy."
+}

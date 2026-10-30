@@ -1,5 +1,25 @@
 # Agent Harness Topology Contract
 
+## Current Python Transport Contract
+
+Updated: 2026-10-31. The active runtime is `python/`; see the [technical overview](python-standalone/TECHNICAL-OVERVIEW.md).
+
+The Python Codex transport accepts incoming JSONL events up to 16 MiB, including
+large tool-call telemetry, and applies backpressure with at most 32 MiB of queued
+raw frames. One reader frame and the consumer's decoded object are additional
+bounded working memory; the queue bound is not a total process-memory guarantee.
+The outgoing request limit remains 1 MiB; MCP transports retain their own smaller
+frame limit. A larger accepted event does not grant tool authority or count as a
+completed turn. Oversized or malformed events stop the owned transport and retain
+UNKNOWN effects without replay. Payload-free transport diagnostics preserve the
+fixed reader reason and observed prefix/limit byte counts, including a first
+reader fault when cleanup is unverified. Failure notices explain the transport
+interruption while predecessor notice bytes and delivery custody remain readable.
+See `test_large_tool_transport` and `test_large_tool_lifecycle`.
+
+
+## Retained Rust Contract
+
 Date: 2026-07-26
 
 This contract turns the architecture handoff into release-gate input. Use it before changing channel ingress, channel state, prompt assembly, runtime queueing, Codex execution, final outbox, delivery, progress, workers, cron, or memory. The operations handbook remains the live operational source of truth; this file is the compact dependency map and scenario matrix that reviewers and external coding agents should apply to code changes.
