@@ -21,7 +21,8 @@ def initialize_message():
         "method": "initialize",
         "params": {
             "clientInfo": {"name": "ahc", "version": "0.3.0"},
-            "capabilities": {"experimentalApi": False},
+            "capabilities": {"experimentalApi": False,
+                             "optOutNotificationMethods": ["turn/diff/updated"]},
         },
     }
 

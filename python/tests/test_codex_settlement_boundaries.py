@@ -39,7 +39,7 @@ def test_successful_terminal_never_dispatches_a_new_approval(mode, method, after
     if effective.codex_approvals_reviewer is not None:
         peer.messages[1]['result']['approvalsReviewer'] = effective.codex_approvals_reviewer
     full = summary(peer)
-    peer.messages.extend([approval_frame(method=method), {'id': 5, 'result': {'data': [full]}}])
+    peer.messages.extend([approval_frame(method=method), {'id': 5, 'result': {'data': [{'turnId': full['id'], 'item': full['items'][0]}]}}])
     client = CodexProtocolClient(peer, cwd='workspace', model='fixture', clock=clock,
         effective_policy=effective, approval_port=port,
         startup_timeout=180, request_timeout=60, settlement_timeout=120)
@@ -73,7 +73,7 @@ def test_readback_idle_keeps_real_pending_channel_steering_unsent(tmp_path, afte
 
     peer = IdlePeer(original.effective_policy)
     full = summary(peer)
-    peer.messages.append({'id': 5, 'result': {'data': [full]}})
+    peer.messages.append({'id': 5, 'result': {'data': [{'turnId': full['id'], 'item': full['items'][0]}]}})
     client = CodexProtocolClient(peer, cwd='workspace', model='fixture', clock=clock,
         effective_policy=original.effective_policy,
         startup_timeout=180, request_timeout=60, settlement_timeout=120)
@@ -131,7 +131,7 @@ def test_child_full_readback_uses_actual_short_transport_and_original_deadline(
     peer.messages[0]['result'].update(platformFamily='unix', platformOs='linux')
     peer.messages[1]['result'].update(cwd=config.workspace['cwd'], model=config.backend['model'])
     full = summary(peer)
-    peer.messages.append({'id': 5, 'result': {'data': [full]}})
+    peer.messages.append({'id': 5, 'result': {'data': [{'turnId': full['id'], 'item': full['items'][0]}]}})
     client = owner._client(peer, None, lambda: False, child=True)
     client.clock = clock
     client.turn_context = client.turn_media = None
@@ -154,7 +154,7 @@ def test_no_configured_grace_still_closes_effect_admission_on_success():
     clock = Clock()
     peer = TimedPeer(clock, [0, 0, 0, 0, 0])
     full = summary(peer)
-    peer.messages.extend([approval_frame(), {'id': 5, 'result': {'data': [full]}}])
+    peer.messages.extend([approval_frame(), {'id': 5, 'result': {'data': [{'turnId': full['id'], 'item': full['items'][0]}]}}])
     client, admitted = bounded(peer, clock, original, settlement_timeout=None)
     result = client.run_admitted(admitted)
     assert result.disposition == 'unknown'
@@ -189,7 +189,7 @@ def test_completion_buffered_before_start_ack_closes_steering_before_poll(
             'params': {'threadId': 'thread', 'turn': {'id': 'turn', 'status': 'inProgress'}}})
     peer.messages.append(acknowledgement)
     if summary_view:
-        peer.messages.append({'id': 5, 'result': {'data': [full]}})
+        peer.messages.append({'id': 5, 'result': {'data': [{'turnId': full['id'], 'item': full['items'][0]}]}})
     client = CodexProtocolClient(peer, cwd='workspace', model='fixture', clock=lambda: 0,
         effective_policy=original.effective_policy,
         startup_timeout=180, request_timeout=60, settlement_timeout=120)

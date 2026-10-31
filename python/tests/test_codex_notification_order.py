@@ -134,15 +134,16 @@ def test_advisory_rpc_request_is_not_silently_consumed():
 
 
 @pytest.mark.parametrize("drift", [False, True])
-def test_summary_completion_requires_exact_full_turn_readback(drift):
+def test_summary_completion_requires_exact_turn_item_readback(drift):
     peer, client, request=setup()
     original=peer.messages[-1]["params"]["turn"]
     full=dict(original,itemsView="full")
     if drift:full["id"]="other"
     peer.messages[-1]["params"]["turn"]=dict(original,itemsView="summary",items=[])
-    peer.messages.append({"id":5,"result":{"data":[full],"nextCursor":None}})
+    peer.messages.append({"id":5,"result":{"data":[{"turnId":full["id"],"item":full["items"][0]}],"nextCursor":None}})
     result=client.run_admitted(request)
     assert result.disposition == ("unknown" if drift else "completed")
     assert sum(m.get("method")=="turn/start" for m in peer.sent)==1
-    assert peer.sent[-1]["method"]=="thread/turns/list"
-    assert peer.sent[-1]["params"]["itemsView"]=="full"
+    assert peer.sent[-1]["method"]=="thread/items/list"
+    assert peer.sent[-1]["params"]["turnId"]=="turn"
+    assert peer.sent[-1]["params"]["limit"]==1

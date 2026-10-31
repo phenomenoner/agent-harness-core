@@ -46,6 +46,7 @@ _REQUEST_METHODS = SERVER_REQUEST_METHODS | frozenset(
         "turn/steer",
         "turn/interrupt",
         "thread/turns/list",
+        "thread/items/list",
         "item/tool/call",
         "item/commandExecution/requestApproval",
         "item/fileChange/requestApproval",

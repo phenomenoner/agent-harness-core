@@ -1,5 +1,21 @@
 # Agent Harness Topology Contract
 
+Codex successful terminal settlement uses completed final-answer items from the
+exact streamed thread and turn, followed by the matching successful terminal
+receipt and descendant settlement. Deltas, tool output, commentary and asynchronous
+questions cannot supply the answer. At most 128 final messages and 4 MiB of UTF-8
+answer text are retained. Missing streamed answers use exact-turn item pagination
+(one item per page, at most 128 pages and 8 MiB of conservatively re-encoded JSON).
+The adapter never requests a full-turn history response. Invalid/repeated cursors,
+wrong-turn entries, unavailable pagination or exhausted budgets remain UNKNOWN
+without automatic model or external-effect replay. The existing 16 MiB individual
+frame limit still applies, including a single oversized stored item. Unused
+`turn/diff/updated` notifications are suppressed at initialization.
+Large repository/file bytes travel through verified execution, Git or an existing
+upload/artifact path; conversation results carry bounded locators and hashes.
+See `test_codex_terminal_projection` and the cumulative-summary cases in
+`test_large_tool_lifecycle`.
+
 ## Current Python Transport Contract
 
 Updated: 2026-10-31. The active runtime is `python/`; see the [technical overview](python-standalone/TECHNICAL-OVERVIEW.md).

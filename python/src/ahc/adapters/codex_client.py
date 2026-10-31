@@ -398,7 +398,7 @@ class CodexProtocolClient:
         from .codex_diagnostics import method
 
         if (self._native_terminal_received and message.get('method') is not None
-                and message['method'] not in {'thread/turns/list', 'turn/interrupt'}):
+                and message['method'] not in {'thread/items/list', 'turn/interrupt'}):
             raise ContractError('Codex new request after native completion')
         if message.get('method') in {'turn/start', 'turn/steer'} and not self.effects_open:
             raise ContractError('Codex execution authority expired or closed')

@@ -5,7 +5,13 @@ import platform
 
 ENVIRONMENT_INSTRUCTIONS = (
     "AHC runtime environment contract v1. Read the current runtime_environment snapshot before "
-    "choosing execution tools or interpreting paths. AHC's host loop, the Codex backend shell "
+    "choosing execution tools or interpreting paths. Large file/repository bytes stay on the "
+    "execution/data path: use git in the environment with verified repository access and "
+    "credentials, or an existing artifact/upload reference. A path string grants no remote "
+    "connector access. Keep tool replies to bounded summaries, hashes and locators; do not "
+    "echo/base64 bulk file bodies into conversation or GitHub content arguments. After uncertain "
+    "push/publication, inspect the remote commit before retrying; existing write authorization "
+    "still applies. AHC's host loop, the Codex backend shell "
     "and the persistent Python workbench are distinct execution contexts. Native shell/Python "
     "commands run in the backend environment, not automatically on the host or in the persistent "
     "workbench. Use workspace.execute/inspect for persistent Python state only when declared. "

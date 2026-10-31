@@ -34,10 +34,17 @@ for raw in sys.stdin.buffer:
         index={'initialize':0,'thread/start':1,'turn/start':2}[method]
         sys.stdout.write(json.dumps(messages[index])+'\\n');sys.stdout.flush()
     if method=='turn/start':
-        event={'method':'item/started','params':{'threadId':'thread','turnId':'turn','item':{
-            'id':'large','type':'mcpToolCall','server':'fixture','tool':'create_tree',
-            'status':'inProgress','arguments':{'content':'x'*settings['content_bytes']}}}}
-        sys.stdout.write(json.dumps(event)+'\\n');sys.stdout.flush()
+        for index in range(settings.get('chunks',1)):
+            event={'method':'item/started','params':{'threadId':'thread','turnId':'turn','item':{
+                'id':'large-'+str(index),'type':'mcpToolCall','server':'fixture','tool':'create_tree',
+                'status':'inProgress','arguments':{'content':'x'*settings['content_bytes']}}}}
+            sys.stdout.write(json.dumps(event)+'\\n');sys.stdout.flush()
+        if settings.get('streamed_summary'):
+            turn=messages[-1]['params']['turn']
+            final={'method':'item/completed','params':{'threadId':'thread','turnId':'turn',
+                                                      'item':turn['items'][0]}}
+            sys.stdout.write(json.dumps(final)+'\\n');sys.stdout.flush()
+            turn.update(items=[],itemsView='summary')
         sys.stdout.write(json.dumps(messages[-1])+'\\n');sys.stdout.flush()
 """
 
@@ -55,12 +62,14 @@ class OwnedPeer:
         return SimpleNamespace(complete=True, remaining_count=0)
 
 
+@pytest.mark.parametrize("streamed_summary", [False, True], ids=["full", "streamed-summary"])
 @pytest.mark.parametrize("oversized", [False, True], ids=["large-success", "bounded-refusal"])
-def test_real_pipe_turn_delivery_reopen_and_continuation(tmp_path, oversized):
+def test_real_pipe_turn_delivery_reopen_and_continuation(tmp_path, oversized, streamed_summary):
     repo, snapshot, template, route = state(tmp_path)
     fixture = tmp_path / "peer.json"
     fixture.write_text(json.dumps({"messages": Peer().messages,
-        "content_bytes": CodexStdioTransport.MAX_FRAME + 1 if oversized else 6_541_197}))
+        "content_bytes": CodexStdioTransport.MAX_FRAME + 1 if oversized else 6_541_197,
+        "streamed_summary": streamed_summary, "chunks": 3 if streamed_summary else 1}))
     process = subprocess.Popen([sys.executable, "-I", "-B", "-c", _PEER, str(fixture)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         cwd=tmp_path)

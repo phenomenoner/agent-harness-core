@@ -294,7 +294,7 @@ def test_late_warning_ack_is_consumed_during_exact_terminal_readback():
             "turn": {**full, "items": [], "itemsView": "summary"},
         },
     }
-    peer.messages.append({"id": 5, "result": {"data": [full]}})
+    peer.messages.append({"id": 5, "result": {"data": [{"turnId": full["id"], "item": full["items"][0]}]}})
     client, request = wrap_client(peer, clock, settlement_timeout=60)
 
     result = client.run_admitted(request)

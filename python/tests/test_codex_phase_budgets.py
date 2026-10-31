@@ -112,7 +112,7 @@ def test_exact_terminal_receipt_has_a_separate_bounded_full_readback():
     full = peer.messages[-1]['params']['turn']
     peer.messages[-1] = {'method': 'turn/completed', 'params': {'threadId': 'thread',
         'turn': {**full, 'items': [], 'itemsView': 'summary'}}}
-    peer.messages.append({'id': 5, 'result': {'data': [full]}})
+    peer.messages.append({'id': 5, 'result': {'data': [{'turnId': full['id'], 'item': full['items'][0]}]}})
     client, request = bounded(peer, clock, request)
     result = client.run_admitted(request)
     assert clock() > request.deadline
@@ -130,7 +130,7 @@ def test_foreign_terminal_cannot_obtain_post_execution_time():
     client, request = bounded(peer, clock, request)
     result = client.run_admitted(request)
     assert result.disposition == 'unknown' and result.output_text == ''
-    assert not any(m.get('method') == 'thread/turns/list' for m in peer.sent)
+    assert not any(m.get('method') == 'thread/items/list' for m in peer.sent)
 
 
 def test_native_long_profile_aligns_lifetime_with_settlement_reserve():
