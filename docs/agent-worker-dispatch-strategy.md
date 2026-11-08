@@ -1,5 +1,7 @@
 # Agent Worker Dispatch Strategy
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 Date: 2026-06-15
 
 Status: Round5 cron/runtime isolation implemented in staging; remaining items are live smoke coverage and external-provider hardening.

@@ -308,11 +308,12 @@ class ForegroundRuntime:
             except Exception:
                 return None  # Retain exact custody and fence fresh backend admission.
             return None  # Cleanup succeeded without a model turn; admit only on a later step.
-        if self.workspace is not None and self.workspace.closed:
+        if self.workspace is not None and (self.workspace.closed or self.workspace.unavailable):
             # A terminal unknown cell is never replayed. Once its exact workspace
             # and backend cleanup have completed, a fresh generation can serve
             # the next distinct submission. Failed creation is not retried here.
             try:
+                self.workspace.close()  # Unavailable ports retain exact cleanup custody.
                 self.workspace = self.open_workspace(current)
                 if (self.workspace.store is not self.store
                         or self.workspace.identity.session != self.session):

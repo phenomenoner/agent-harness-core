@@ -1,5 +1,6 @@
 """Review-derived failures at blocking send and borrowed read budgets."""
 import io
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -67,7 +68,7 @@ def test_new_mcp_after_renewal_keeps_transport_operation_cap(monkeypatch,tmp_pat
     request=SimpleNamespace(session=session,effective_deadline=time.monotonic()+extension,
                             deadline=time.monotonic()-10)
     if stdio:
-        profile=McpStdioProfile("server","agent",("/usr/bin/python3",),str(tmp_path),(),("echo",),"a"*64,True)
+        profile=McpStdioProfile("server","agent",(sys.executable,),str(tmp_path),(),("echo",),"a"*64,True)
     else:
         profile=McpHttpProfile("server","agent","https://example.com/mcp",None,("echo",),"a"*64,True)
     deadlines=[]

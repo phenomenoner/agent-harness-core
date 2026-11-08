@@ -1,5 +1,7 @@
 # Migrating from 0.7 to 0.8.0
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 This guide describes the public v0.8.0 compatibility boundary. It does not describe any particular deployment.
 
 ## Two Different Compatibility Questions

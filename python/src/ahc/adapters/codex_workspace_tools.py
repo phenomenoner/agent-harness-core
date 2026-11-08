@@ -11,6 +11,7 @@ import time
 from ahc.adapters.codex_memory_tool_schema import exact_value_schema, native_memory_payload_schema
 from ahc.domain.result_artifacts import ResultArtifact
 from ahc.domain.sessions import ContractError, _identifier
+from ahc.domain.workspace import WorkspaceIdentity
 
 
 def _json(value):
@@ -487,7 +488,12 @@ class CodexWorkspaceTools:
             value = result.get("result")
             if (type(value) is dict and type(value.get("job_id")) is str
                     and type(value.get("job_identity")) is dict):
-                self._job_observations.add((value["job_id"], _json(value["job_identity"])))
+                try:
+                    identity = WorkspaceIdentity.from_dict(value["job_identity"])
+                    if identity.session == self.request.session:
+                        self._job_observations.add((value["job_id"], identity))
+                except (ContractError, TypeError, ValueError):
+                    pass  # Invalid feedback cannot grant observation authority.
         self.unresolved = self.unresolved or result.get("unresolved_effects") is True
         optional_read = (
             capability in {'workspace.environment', 'workspace.memory_pack',
@@ -553,8 +559,9 @@ class CodexWorkspaceTools:
         if type(arguments["job_id"]) is not str or type(arguments["expected"]) is not dict:
             return False
         try:
-            return (arguments["job_id"], _json(arguments["expected"])) in self._job_observations
-        except (TypeError, ValueError, UnicodeError):
+            identity = WorkspaceIdentity.from_dict(arguments["expected"])
+            return (arguments["job_id"], identity) in self._job_observations
+        except (ContractError, TypeError, ValueError, UnicodeError):
             return False
 
     def _reporting_context(self):

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-08 — Python/Linux Source Synchronization
+
+- Updated the Linux Codex source pin to 0.167.0 with a version-bound protocol fixture. Official asset metadata and the complete existing native bundle were checked separately from live backend selection.
+- Bound job observations to typed workspace/session identities. Busy observations reject before interpreter admission; unavailable workspaces must close before replacement, and long-job waits yield to budget finalization.
+- Added durable silence for scheduled results containing exactly `NO_REPLY`, covering text and selected attachments. Ordinary interactive delivery and existing UNKNOWN custody remain intact.
+- Replaced the historical documentation-site redirect with a Python/Linux landing page, added a documentation index and aligned security/agent guidance. Retained Rust/design references now state their implementation scope.
+- Fresh checks and known platform, dependency and architecture gaps are recorded in [source verification](docs/python-standalone/SOURCE-VERIFICATION.md). This is a source update, not a release tag, package installation or deployment acceptance.
+
 ## Python Transport Source Update - 2026-10-31
 
 - Raised the Codex incoming frame limit from 4 MiB to 16 MiB and bounded queued raw frames at 32 MiB with reader backpressure. The 1 MiB outgoing and 512 KiB MCP incoming limits remain separate.

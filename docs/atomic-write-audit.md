@@ -1,5 +1,7 @@
 # Atomic Write Audit
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 Date: 2026-07-26
 
 Scope: mutable state writes in `crates/agent-harness-core` and new roadmap modules. Append-only JSONL receipts are intentionally excluded from atomic replacement; their integrity is covered by JSONL validation, receipt schemas, and trace reconstruction.

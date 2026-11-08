@@ -31,8 +31,8 @@ The README is optimized for human skimming and for generative/search engines (GE
 - Use question-style headings where natural, and keep an FAQ whose answers are self-contained — each Q&A pair must make sense quoted in isolation.
 - Lead with benefits, then mechanics. Tables for enumerable facts, mermaid for architecture, prose for everything else.
 - Every claim must be verifiable in this repository (test counts, dependency lists, feature behavior). No aspirational claims; pre-release status stays stated until releases exist.
-- Weave keywords naturally (self-hosted, Rust, agent runtime, Telegram, Discord, LLM orchestration). Never keyword-stuff.
-- Keep command examples minimal and link the operations handbook for the full walkthrough.
+- Weave keywords naturally (self-hosted, Python, Linux, agent runtime, Telegram, Discord). Never keyword-stuff.
+- Keep command examples minimal and link the current public Python configuration and service guides.
 
 ## Internal Documents — Style Rules
 
@@ -46,11 +46,11 @@ The README is optimized for human skimming and for generative/search engines (GE
 
 - Never include secrets, bot tokens, API keys, real user/chat/channel/guild IDs, or any content from `.agent-harness/secrets`.
 - Nothing from `.agent-harness`, `.review`, `.debug`, or `.tmp` may be quoted into tracked documents.
-- All tracked documents are public: they must pass `agent-harness public-hygiene`. Write everything as if it is already on GitHub — because it is.
+- All tracked documents are public: inspect the exact tracked export for secrets, private identifiers, local paths and accidental artifacts. The Rust `agent-harness public-hygiene` command is a historical helper, not a Python CLI gate. Write everything as if it is already on GitHub — because it is.
 - `docs/.private/`, `tools/.private/`, `.debug/`, and `.external/` are local-only and ignored. Do not force-add from those paths unless the file has been deliberately promoted and sanitized into a public path.
 - Redact by default. Receipts-style summaries (names, lengths, statuses) are fine; raw values are not.
 - Release and hotfix tags must be cut from a public-safe commit. Summarize live validation in `CHANGELOG.md` with sanitized command names, status counts, and release-level outcomes; keep raw receipts, channel/user ids, machine-specific handoffs, and cutover scratch evidence in ignored private paths.
-- Before pushing or tagging a release/hotfix, run `git diff --check` and `agent-harness public-hygiene` against a tracked-file public export. Do not use a raw workspace root containing ignored private directories as proof of public hygiene.
+- Before pushing or tagging a release/hotfix, run `git diff --check` and inspect a tracked-file public export for private material. Do not use a raw workspace root containing ignored private directories as proof of public hygiene.
 
 ## Formatting Conventions
 

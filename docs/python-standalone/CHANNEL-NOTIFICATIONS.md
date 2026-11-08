@@ -1,6 +1,6 @@
 # Channel Notifications
 
-Updated: 2026-10-24. Status: source implementation with controlled verification. Deployment and real-client rendering remain separate.
+Updated: 2026-11-08. Status: source implementation with controlled verification. Deployment and real-client rendering remain separate.
 
 ## Presentation Policy
 
@@ -37,7 +37,7 @@ The scheduled check needs an authorization unavailable in the background.
 No additional permission was granted; user action is required.
 ```
 
-The model supplies task scope and conclusions; the runtime supplies the category. A category does not declare the project complete. One final text may have its existing result attachments. This change does not add semantic deduplication or automatic suppression of a no-change conclusion; an alert-only monitor needs an explicit notification policy.
+The model supplies task scope and conclusions; the runtime supplies the category. A category does not declare the project complete. One final text may have its existing result attachments. A scheduled result whose complete output is exactly `NO_REPLY` is acknowledged durably with `suppressed:scheduled:no-reply` and produces no text or attachment send. Its pending selected-attachment intents receive the same suppression receipt, including through direct attachment delivery. The stored result, artifact selection and artifact bytes remain intact; historical sent/unknown receipts are not rewritten or retried. Whitespace variants, interactive results and other text remain ordinary output. This is an explicit sentinel policy, not semantic deduplication; the schedule instruction must decide when silence is appropriate.
 
 ## Compatibility And Failure Handling
 

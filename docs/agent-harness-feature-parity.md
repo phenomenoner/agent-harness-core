@@ -1,5 +1,7 @@
 # Agent Harness Core Capability Map
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 Date: 2026-07-21
 
 Status: pre-release source overview. This page describes public repository contracts and separates implemented foundations from design directions and evidence still required for broader claims.

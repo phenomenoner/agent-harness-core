@@ -15,6 +15,10 @@ class CheckpointNotSaved(ContractError):
     """Capture failed before the checkpoint writer; resource health is separate."""
 
 
+class WorkspaceOperationNotStarted(ContractError):
+    """The runtime rejected admission before invoking the interpreter port."""
+
+
 def workspace_failure_projection(value):
     """Fixed diagnostic categories only; no exception text or user payload."""
     if type(value) is not dict:

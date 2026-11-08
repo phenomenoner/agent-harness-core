@@ -1,5 +1,7 @@
 # Agent Harness Topology Contract
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 Codex successful terminal settlement uses completed final-answer items from the
 exact streamed thread and turn, followed by the matching successful terminal
 receipt and descendant settlement. Deltas, tool output, commentary and asynchronous
@@ -15,6 +17,13 @@ Large repository/file bytes travel through verified execution, Git or an existin
 upload/artifact path; conversation results carry bounded locators and hashes.
 See `test_codex_terminal_projection` and the cumulative-summary cases in
 `test_large_tool_lifecycle`.
+
+## Current Python Workspace Observation And Recovery
+
+Updated: 2026-11-08. A running job owns its interpreter namespace. An `inspect` or `checkpoint` rejected before interpreter admission returns `workspace-operation-not-started` without creating unknown-effect custody; use status/wait for the admitted job. Observation authority compares typed workspace identities and remains bound to the same virtual session. A failure after interpreter admission can still be unknown and must not be replayed.
+
+Unavailable interpreter resources retain exact cleanup custody. A distinct next foreground turn may open a replacement workspace only after the previous workspace closes successfully. Long-job waits yield when the adaptive budget enters finalization so the model can use its wrap-up allowance. Controlled native-workspace and lifecycle regressions are listed in [source verification](python-standalone/SOURCE-VERIFICATION.md).
+
 
 ## Current Python Transport Contract
 

@@ -1,5 +1,7 @@
 # Configuration
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 Agent Harness Core reads most operator state from a harness home directory supplied with `--harness-home` or `--target-home`. Keep that directory outside git or under an ignored `.agent-harness/` path.
 
 ## Common Paths

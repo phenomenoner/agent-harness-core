@@ -14,6 +14,9 @@ class ChannelAttachmentDelivery:
         with scoped(self.route) if callable(scoped) else self.outbox.delivery_scope():
             record = self.outbox.claim(self.route, operation_id, ordinal, token)
             try:
+                if record.get("suppression_receipt") is not None:
+                    return self.outbox.acknowledge(
+                        self.route, operation_id, ordinal, token, record["suppression_receipt"])
                 selected = record["selection"]
                 upload = prepare_artifact_upload(
                     self.outbox.store, self.route, selected["artifact_id"], selected["filename"],

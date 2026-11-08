@@ -154,6 +154,8 @@ class WorkspaceJobs:
                 if now >= until:
                     break
                 active = budget.current_deadline() if budget is not None else until
+                if budget is not None and budget.status()["state"] == "finalizing":
+                    break  # Return control so the model can use its wrap-up allowance.
                 remaining = min(until - now, active - time.monotonic())
                 if remaining <= 0 or slot["done"].wait(remaining):
                     break

@@ -1,5 +1,7 @@
 # Agent Harness Assistant Narration Tech Note
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 ## Purpose
 
 Before 2026-06-11, Agent Harness delivered some Codex app-server intermediate

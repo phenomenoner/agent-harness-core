@@ -215,7 +215,7 @@ def test_current_linux_pin_matches_generated_upstream_request_surface():
     from ahc.adapters.codex_linux_bundle import LINUX_CODEX_PIN
     from ahc.adapters.codex_server_requests import SERVER_REQUEST_METHODS
 
-    fixture = json.loads((Path(__file__).parent / "fixtures/codex_0_163_0_surface.json")
+    fixture = json.loads((Path(__file__).parent / ("fixtures/codex_" + LINUX_CODEX_PIN["version"].replace(".", "_") + "_surface.json"))
                          .read_text(encoding="utf-8"))
     assert fixture["provenance"]["version"] == LINUX_CODEX_PIN["version"]
     executable = next(m for m in LINUX_CODEX_PIN["members"]

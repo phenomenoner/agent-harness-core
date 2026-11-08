@@ -1,29 +1,35 @@
 {
   "schema_version": "ahc.codex-linux-archive-pin.v1",
-  "version": "0.163.0",
+  "version": "0.167.0",
   "target": "x86_64-unknown-linux-musl",
-  "release_tag": "rust-v0.163.0",
-  "release_url": "https://github.com/openai/codex/releases/tag/rust-v0.163.0",
-  "package_sha256": "582646c6bf0561eb0de540f7fc85b9121b0091a826bc6e96830b7f1722122182",
-  "package_size": 159424486,
+  "release_tag": "rust-v0.167.0",
+  "release_url": "https://github.com/openai/codex/releases/tag/rust-v0.167.0",
+  "package_sha256": "3bbf75e83de6b58aed28f2cf6e33ad423ec31fd4700a1457b94be557ea5a7c6e",
+  "package_size": 200178910,
   "entrypoint": "bin/codex",
   "members": [
     {
       "path": "bin/codex",
-      "size": 296865480,
-      "sha256": "399ff69c431c066e40de318fba45c2b07f45a76b19939d247ee4828fc70c4215",
+      "size": 320575976,
+      "sha256": "cdcb45aaa01d0f14e298985e09465aebccd47f64ecd298aea44814af7b62bbda",
       "mode": 493
     },
     {
       "path": "bin/codex-code-mode-host",
-      "size": 74277776,
-      "sha256": "8724d73ec190536233ab4628d24a071bfbcf27e5124f08fe35129f26fe48b916",
+      "size": 79209744,
+      "sha256": "83f3e174c2da2f1ca8655cce686e302509640d34c0f4407c1155056f64536e0f",
+      "mode": 493
+    },
+    {
+      "path": "bin/codex-exec-server",
+      "size": 81940392,
+      "sha256": "43376b1af843ffc71726a35d53b6e2241cbe1e8c9e8ec758402460295eec2107",
       "mode": 493
     },
     {
       "path": "codex-package.json",
-      "size": 205,
-      "sha256": "5fa8533bde21972564cbb2c665c99c6d6d0e92b625fa6f4fdf1354ac5fb71a78",
+      "size": 246,
+      "sha256": "3a463ad54e841d45ebc9266b6c98b0b928235db6648a8575500adc6bf271f1e5",
       "mode": 420
     },
     {
@@ -46,50 +52,50 @@
     },
     {
       "path": "codex-resources/voice/bin/codex-voice-host",
-      "size": 40474688,
-      "sha256": "63c71195198947c347d32e5a22496a77a6bd0f9f20ea221c8ff23afcd2ef615f",
+      "size": 40487744,
+      "sha256": "c05b83394702244501525bb980f5a6d0256adc65be0c32a63c1ca789c9d7b672",
       "mode": 493
     },
     {
       "path": "codex-resources/voice/lib/gstreamer-1.0/libgstapp.so",
       "size": 6488,
-      "sha256": "0d3f1beec96331bc43385e80ef75ef53e4c159b019e18b3e9f075db1331a0d45",
+      "sha256": "38a2e99404f8a3968cca8ff1bc29917d5ee163a2c4efdc0a853f122399c6d1ca",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/gstreamer-1.0/libgstaudioconvert.so",
       "size": 41040,
-      "sha256": "3e09dacb2e23a55c329cac82a8edc45902a7e4c5c1e04fa1d0210a56cc3e0515",
+      "sha256": "3a15981c9fe11df025ff0c65ab8f07ac5cc8e7852f843c0bc3b04464d7ae835b",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/gstreamer-1.0/libgstaudioresample.so",
       "size": 35264,
-      "sha256": "365192116e1e5f49dd40abd5f367edd2ddd55b697bec7864ef4b8c3cce8b4c28",
+      "sha256": "10b028cd687681426ebcc0d17b809cdc40265ffb4d1ff78445c0811efb4c0b6f",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/gstreamer-1.0/libgstcoreelements.so",
       "size": 479848,
-      "sha256": "6da8c18d850a4446f6c82b3fc83d818ce4d5c93a2a05543540bb924b088d11af",
+      "sha256": "058b01346bbe924aad4b138c6f2d61fc8b87b1c244505ec50e3b06e9925551ee",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/gstreamer-1.0/libgstopus.so",
       "size": 73464,
-      "sha256": "43bafaa50bf566c3b9441a1c70ff149902e4bb81419d2fc768b612b42eed39f4",
+      "sha256": "d1593d4b7a82363b1495bbdf563b5851faf627f32486521d8c0425ff3f8eed0d",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/gstreamer-1.0/libgstrtp.so",
       "size": 757800,
-      "sha256": "e92445b9fd8a88da735f3b4292ad8fde06e5956875063acf651e6fbf23d14ab6",
+      "sha256": "67386a01238de72e659d86291f5df38f2d9724ef112c08ff5fc0f77e6c168a21",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/gstreamer-1.0/libgstrtpmanager.so",
       "size": 564072,
-      "sha256": "f7a8ec1e2d3db9bbe5dcc95ea3fe85d29dcc0412cbab1e6d80a97bf262a8cfb5",
+      "sha256": "203a3f71f223fb7155d53aae1250f8582f0b38cbc3833f21bb751168a43d5a95",
       "mode": 365
     },
     {
@@ -101,85 +107,85 @@
     {
       "path": "codex-resources/voice/lib/libgio-2.0.so.0",
       "size": 2338512,
-      "sha256": "0b979fdd4ee61863124192680dfb5986b910882c972e6a02269610b03fb5434a",
+      "sha256": "ad894fd22d64560e6832f38de46b4950e8e6a8b6a557ef25c982c382024a11a2",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libglib-2.0.so.0",
       "size": 1521616,
-      "sha256": "bfb005d53cbd1b9ae60ba3226c83d5034a16595c35a44682733e521550cce11c",
+      "sha256": "1e8ad575d9670af003ac695386ee7fdd367b0d673ec846ba9021f33ec9f7c7d8",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgmodule-2.0.so.0",
       "size": 15720,
-      "sha256": "8b3abc4191301533e222f115597987fb9e3534406d7bfc11c2ad50f6ef46a973",
+      "sha256": "365b6c8cc6a7db396a3e11d08e31b6c1be5590705daa778d8a2d7c676dd32bad",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgobject-2.0.so.0",
       "size": 454720,
-      "sha256": "a367f69850d4ba782ef10bdbf1f36706ac757b2c0f33f8b31fe534ce4c28134c",
+      "sha256": "f65c12f03af15b5cf598de5405d0b1ef3c6f227558c9e00e27633ed4c5864ffa",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgstallocators-1.0.so.0",
       "size": 30416,
-      "sha256": "1c8aa524e1dec2d665388c030b3ec7a8500c20347ea6f0b89a38403cfc8e08cf",
+      "sha256": "8b0629555410e1fab350575e092d27f607509aecfe0aa1aab92a7099b3e5fe14",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgstapp-1.0.so.0",
       "size": 106144,
-      "sha256": "b925905fda01b2c1ca9493ae9ae2333a150f1434817e844f6d0be0130954dc37",
+      "sha256": "72c4cd61e7e6b7d24848cbb9f3ebaf114019af6cb82b6b2763f5512094ca4d14",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgstaudio-1.0.so.0",
       "size": 636544,
-      "sha256": "37f41aefafda9c7b9a849db7b6805eacaf443230ee7c8cbb6dae20a1977b6e5c",
+      "sha256": "c8c5686348f7b8d19f5836fd5bb4d5277b9ec456472ff986b52145352a6dd4f1",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgstbase-1.0.so.0",
       "size": 573072,
-      "sha256": "f29102c4d8107529a1f8f84cbb405df30944e3945de65b22946ee3b91a61cfcf",
+      "sha256": "21f9b42f628663747cc4e12c3a661b7217a73aae25e173acd45a106a1041ab2a",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgstnet-1.0.so.0",
       "size": 74192,
-      "sha256": "b54b294a2aae2a65ed7064dc451bafd054a6bafb60ef4adcdb7502da91bac9d9",
+      "sha256": "d8c161a7f270fe29d33b91788025e36496066c270b48ffbfa4554ec3ecc3db42",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgstpbutils-1.0.so.0",
       "size": 321880,
-      "sha256": "51f4b5a590d1e1b7d8b16fc87f8e0482ed1b456d39f06002bfe511946396e109",
+      "sha256": "6aa0fd15cd76b027f9b233618297d8f73621802356c2a18cac2ab33d35c38a4f",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgstreamer-1.0.so.0",
       "size": 1582088,
-      "sha256": "ed2d53764156bdedcac239a7402ed0b4e974d5f8261b71a76e2acd07d844038e",
+      "sha256": "811598785a423c47f2cbdd3e42fdafb3f71e2b6906fd90da2adb543f0059e721",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgstrtp-1.0.so.0",
       "size": 211744,
-      "sha256": "3718a3bc886e499d2c97c1c1f0b2d3d25e9efac9ab70b77decc9c3f22a77dd76",
+      "sha256": "47ac745d3f622d08a4ceee9fc596ec4157e7adf56fa5757d26e55312eb12f037",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgsttag-1.0.so.0",
       "size": 273976,
-      "sha256": "0ace6f9258b42033979b997f52c6b7394493ac35e61a2ae51d5a5806a99d722e",
+      "sha256": "df5d4beb59b8b5b7644043c4933384d2d299f7266677c06eefaf1dfb05ef1c81",
       "mode": 365
     },
     {
       "path": "codex-resources/voice/lib/libgstvideo-1.0.so.0",
       "size": 1004720,
-      "sha256": "1b1169be1951dd106318b102427509130d5f2a5d396bc6a9f450b840f5ee17d1",
+      "sha256": "5afdf56a8fd3aac7d152022628fa6d64bf1d7477f59181bae773c4b86c510085",
       "mode": 365
     },
     {
@@ -191,7 +197,7 @@
     {
       "path": "codex-resources/voice/lib/libopus.so.0",
       "size": 565744,
-      "sha256": "95d8a0d04ce2a6d9ef8184987b88933f235986ab10520999068b8df0e1a9bfe2",
+      "sha256": "68f96a5dc71a01f3d564d0ef948c869c75f0d37fc273cf4ee8e927fda178b20f",
       "mode": 365
     },
     {
@@ -251,13 +257,13 @@
     {
       "path": "codex-resources/voice/manifest.json",
       "size": 4768,
-      "sha256": "41c63db714036c52a7a72892e34e072044c9199ed43b9b4b1e0a6428e7fa1b35",
+      "sha256": "eaf6c23b031f6137f30d02ebecbcf6eb74954b92be26f00b30df04a5fdf42d91",
       "mode": 420
     },
     {
       "path": "codex-resources/voice/runtime.json",
       "size": 13941,
-      "sha256": "0525052f851810c7403eec0b4b1534d8161a70f581dcb607a64b7287b093ec72",
+      "sha256": "e87d5e773bf17af6ae89e88d9a14538ec56f59225e9482cd356cff5624e39ec9",
       "mode": 493
     },
     {

@@ -1,5 +1,7 @@
 # Adaptive Skill Intelligence
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 > **Status: product design direction.** Agent Harness Core already provides auditable skill discovery and selection, revision-bound receipts, proposal-mediated mutation, guarded autonomous apply for mature paths, lifecycle tooling, and virtual-session foundations. The outcome-linked learning, contextual belief, and broad autonomous promotion system described here is not yet fully implemented or enabled.
 
 [Read the web essay](https://phenomenoner.github.io/agent-harness-core/essay/adaptive-skill-intelligence/) or continue with the source-oriented design below.

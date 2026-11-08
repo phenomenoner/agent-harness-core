@@ -70,7 +70,8 @@ def test_callback_inherits_job_deadline_and_suppresses_reply_after_stop(stop):
     assert sends == []
 
 
-def test_native_cancel_keeps_only_exact_job_observation_available():
+@pytest.mark.parametrize('reorder', [False, True])
+def test_native_cancel_keeps_only_exact_job_observation_available(reorder):
     adapter,tools=bridge()
     adapter.request=replace(adapter.request,capabilities=('workspace.job','workspace.execute'))
     identity=tools.workspace.identity.to_dict()
@@ -82,10 +83,14 @@ def test_native_cancel_keeps_only_exact_job_observation_available():
             'status':'cancelled','cancellation':{'cancel_requested':True,
             'execution_stopped':False,'effects_unknown':True}}}
     tools.invoke=invoke
+    def wire_order(value):
+        if type(value) is dict:
+            return {key:wire_order(item) for key,item in reversed(list(value.items()))}
+        return value
     def request(index,action,job_id='admitted'):
         value=message(); value['id']=index; value['params']['callId']=f'call{index}'
         value['params']['tool']='job'; value['params']['arguments']={
-            'expected':identity,'action':action,'job_id':job_id}
+            'expected':wire_order(identity) if reorder else identity,'action':action,'job_id':job_id}
         response=adapter.respond(value)
         return json.loads(response['result']['contentItems'][0]['text'])
     cancelled=request(11,'cancel')
@@ -95,7 +100,39 @@ def test_native_cancel_keeps_only_exact_job_observation_available():
     assert request(13,'wait')['disposition'] == 'observed'
     assert request(14,'start')['reason'] == 'problem-report-only'
     assert request(15,'status','other')['reason'] == 'problem-report-only'
+    for field in ('generation','revision','workspace_id'):
+        forged=json.loads(json.dumps(identity))
+        forged[field] = forged[field]+1 if type(forged[field]) is int else 'foreign'
+        frame=message();frame['id']='foreign-'+field;frame['params']['callId']='foreign-'+field
+        frame['params']['tool']='job';frame['params']['arguments']={
+            'expected':forged,'action':'status','job_id':'admitted'}
+        rejected=adapter.respond(frame)
+        assert json.loads(rejected['result']['contentItems'][0]['text'])['reason']=='problem-report-only'
     assert len(invoked)==3
+
+
+def test_busy_inspect_then_same_job_observation_keeps_turn_usable(owned):
+    _,workspace,tools=owned
+    template,_=bridge()
+    from ahc.adapters.codex_workspace_tools import CodexWorkspaceTools
+    request=replace(template.request,session=workspace.identity.session,
+                    capabilities=('workspace.job','workspace.inspect','workspace.execute'))
+    native=CodexWorkspaceTools(request,tools,'thread','turn',clock=lambda:0)
+    def invoke(index,tool,arguments):
+        frame=message();frame['id']=index;frame['params']['callId']=f'busy{index}'
+        frame['params']['tool']=tool;frame['params']['arguments']=arguments
+        response=native.respond(frame)
+        return json.loads(response['result']['contentItems'][0]['text'])
+    started=invoke(41,'job',{'expected':workspace.identity.to_dict(),'action':'start',
+        'job_id':'work1','code':'count-once','expected_seconds':10})
+    assert started['result']['status']=='running' and workspace.port.entered.wait(1)
+    rejected=invoke(42,'inspect',{'expected':workspace.identity.to_dict(),'names':['progress_line']})
+    assert rejected['disposition']=='rejected' and not native.reporting and not native.unresolved
+    workspace.port.release.set()
+    completed=invoke(43,'job',{'expected':workspace.identity.to_dict(),'action':'wait',
+                             'job_id':'work1','wait_seconds':1})
+    assert completed['result']['status']=='complete'
+    assert not native.reporting and not native.unresolved and workspace.port.calls==1
 
 
 def test_cancel_commit_then_receipt_loss_still_signals_exact_worker(owned,monkeypatch):

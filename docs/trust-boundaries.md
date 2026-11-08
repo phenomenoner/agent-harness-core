@@ -1,5 +1,7 @@
 # Agent Harness Trust Boundaries
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 Date: 2026-07-21
 
 This document supports P6.5 and the external review security dimension. It names the boundaries that must fail closed or fail open safely before live enablement.

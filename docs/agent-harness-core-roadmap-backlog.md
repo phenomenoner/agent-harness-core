@@ -1,5 +1,7 @@
 # Agent Harness Core Roadmap
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 Updated: 2026-07-26
 
 This roadmap is organized into one prerequisite third-party-tool hot patch and

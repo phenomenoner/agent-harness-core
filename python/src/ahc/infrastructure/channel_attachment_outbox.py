@@ -3,11 +3,13 @@
 import json
 
 from ahc.domain.channel_ingress import ChannelRoute
+from ahc.domain.channel_presentation import scheduled_silence_receipt
 from ahc.domain.result_artifacts import ResultArtifact
 from ahc.domain.sessions import ContractError, _identifier
 from ahc.domain.skill_values import canonical_json
 
 from .channel_outbox import ChannelOutbox, _receipt
+from .channel_presentation import operation_kind
 from .runtime_channel_store import _exists, _route_json
 from .runtime_result_artifacts import validate_selected
 from .working_repository import WorkingSetConflict, WorkingSetCorrupt
@@ -49,7 +51,7 @@ class ChannelAttachmentOutbox:
         ).fetchone()
         if parent is None:
             raise WorkingSetCorrupt("attachment parent outbox unavailable")
-        ChannelOutbox(self.store)._record(connection, parent, route)
+        parent_record = ChannelOutbox(self.store)._record(connection, parent, route)
         terminal = connection.execute(
             "SELECT result_json FROM runtime_turns WHERE operation_id=?", (row["operation_id"],)
         ).fetchone()
@@ -71,9 +73,14 @@ class ChannelAttachmentOutbox:
                 raise ValueError()
         except (KeyError, IndexError, TypeError, ValueError, ContractError):
             raise WorkingSetCorrupt("attachment intent corrupted") from None
+        # Text claims derive categories from durable occurrence provenance too.
+        # Do not infer a category from _record(), whose historical shape is untyped.
+        kind = operation_kind(connection, row["operation_id"]) if result.get("accepted") is True else None
+        suppressed = scheduled_silence_receipt({**parent_record, "message_type": kind})
         return {"operation_id": row["operation_id"], "ordinal": row["ordinal"],
                 "route": route.to_dict(), "selection": selected.to_dict(),
                 "state": state, "receipt": decoded,
+                **({"suppression_receipt": suppressed} if suppressed is not None else {}),
                 **({"reply_to_message_id": result["reply_to_message_id"]}
                    if "reply_to_message_id" in result else {})}
 

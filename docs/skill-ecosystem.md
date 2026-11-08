@@ -1,5 +1,7 @@
 # Skill Ecosystem
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 Agent Harness Core treats skills as runtime state, not static notes. A skill is a directory with `SKILL.md` plus optional `references/`, `templates/`, `scripts/`, and `assets/` support folders.
 
 ## Current Foundation And Adaptive Direction

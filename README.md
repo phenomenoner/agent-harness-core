@@ -19,7 +19,10 @@ Agent Harness Core (AHC) is a self-hosted Python agent runtime for Linux that co
 | Skills | Versioned selection, qualification and protected reversible learning trials. Trial success does not imply useful adoption. |
 | Delivery | Route-bound durable results with sent/unknown receipts. Uncertain effects and sends are not blindly repeated. |
 
-## Latest Source Update
+## Source Updates (2026-11-08)
+
+The Linux backend source pin is now Codex CLI 0.167.0. Workspace observations reject before interpreter admission when a job owns the namespace, unavailable workspaces are retired before the next distinct turn, and long-job waits return control for finalization. Scheduled results containing exactly `NO_REPLY` are durably acknowledged without a platform send; interactive replies are unaffected. See [backend upgrades](docs/python-standalone/BACKEND-UPGRADES.md) and [source verification](docs/python-standalone/SOURCE-VERIFICATION.md) for evidence and limits.
+
 
 The Codex transport accepts incoming frames up to 16 MiB, with a 32 MiB queue ceiling and reader backpressure. Outgoing frames remain capped at 1 MiB; MCP incoming frames retain their separate 512 KiB bound. Rejected frames preserve payload-free failure details, unknown-effect custody and existing delivery receipts. Controlled real-pipe tests cover a large tool event, parent completion, notification and the next turn.
 
@@ -59,6 +62,7 @@ Launch requires an explicit configuration, a verified AHC-owned backend bundle, 
 
 | Document | Purpose |
 | --- | --- |
+| [Documentation Index](docs/python-standalone/README.md) | Current Python/Linux guides and scope boundaries. |
 | [Product Guide](docs/python-standalone/PRODUCT-GUIDE.md) | User workflows, completion scopes and current limitations. |
 | [Technical Overview](docs/python-standalone/TECHNICAL-OVERVIEW.md) | Runtime components, state, tools, backend and evidence boundaries. |
 | [Channel Notifications](docs/python-standalone/CHANNEL-NOTIFICATIONS.md) | Interactive progress and background summaries. |
@@ -73,7 +77,7 @@ Dated acceptance documents in the retained Rust documentation describe their nam
 
 ## Source Verification
 
-The last full Linux suite run (2026-10-30, before the latest transport repair) reported 4,127 passed, 155 failed and 150 skipped. Fresh checks of the updated transport, failure custody, notifications and backend contracts pass 168 tests. This update remains a source preview. See [source verification](docs/python-standalone/SOURCE-VERIFICATION.md) for environment, scope and remaining gaps.
+Fresh focused checks cover workspace/job recovery, scheduled silence, attachment delivery and backend contracts. The full suite and architecture gate retain known failures; this remains a source preview. See [source verification](docs/python-standalone/SOURCE-VERIFICATION.md) for exact results, evidence origins and remaining gaps.
 
 ## Current Limits
 

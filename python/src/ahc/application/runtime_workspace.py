@@ -4,7 +4,9 @@ from contextlib import contextmanager, nullcontext
 from threading import local
 
 from ahc.domain.sessions import ContractError
-from ahc.domain.workspace import WorkspaceCodeRejected, workspace_failure_projection
+from ahc.domain.workspace import (
+    WorkspaceCodeRejected, WorkspaceOperationNotStarted, workspace_failure_projection,
+)
 from ahc.infrastructure.working_repository import WorkingSetConflict, WorkingWriterBusy
 
 
@@ -79,6 +81,22 @@ class RuntimeWorkspace:
             raise ContractError("workspace reference is stale or closed")
         return self.store.require_workspace(expected)
 
+    @contextmanager
+    def _observation_admission(self, expected, runtime_expected=None):
+        admitted = False
+        try:
+            with self.store.workspace_execution_lock(expected):
+                snapshot = self._require(expected)
+                if runtime_expected is not None and snapshot != runtime_expected:
+                    raise ContractError("checkpoint runtime snapshot is stale")
+                admitted = True
+                yield snapshot
+        except Exception as error:
+            if not admitted:
+                raise WorkspaceOperationNotStarted(
+                    "workspace operation rejected before interpreter admission") from error
+            raise  # A lost reply or save receipt may follow an actual effect.
+
     def execute(self, expected, code):
         observation = {"started": False, "failure": None, "recovery": None, "phase": "admission"}
         self._execution_observation.current = observation
@@ -144,21 +162,24 @@ class RuntimeWorkspace:
     def inspect(self, expected, names):
         from ahc.domain.workspace_inspection import inspection_result
 
-        with self.store.workspace_execution_lock(expected):
-            self._require(expected)
-            result = self.port.inspect(expected, names)
-            if self.port.identity != expected or result.get("identity") != expected.to_dict():
-                self.close()
-                raise ContractError("workspace inspection changed identity")
-            return inspection_result(expected, names, result.get("variables"))
+        with self._observation_admission(expected):
+            try:
+                result = self.port.inspect(expected, names)
+                if self.port.identity != expected or result.get("identity") != expected.to_dict():
+                    raise ContractError("workspace inspection changed identity")
+                return inspection_result(expected, names, result.get("variables"))
+            except Exception:
+                self.unavailable = True
+                try:
+                    self.close()
+                except Exception:
+                    pass  # Keep exact cleanup custody; no replacement without proof.
+                raise
 
     def checkpoint(self, expected, names, *, runtime_expected=None):
         from ahc.domain.workspace import CheckpointNotSaved, CheckpointValueRejected
 
-        with self.store.workspace_execution_lock(expected):
-            snapshot = self._require(expected)
-            if runtime_expected is not None and snapshot != runtime_expected:
-                raise ContractError("checkpoint runtime snapshot is stale")
+        with self._observation_admission(expected, runtime_expected) as snapshot:
             try:
                 checkpoint = self.port.checkpoint(expected, names)
                 if checkpoint.origin != expected or self.port.identity != expected:

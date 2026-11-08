@@ -2,6 +2,9 @@
 
 import os
 import sys
+import json
+import time
+from dataclasses import replace
 
 import pytest
 from skill_test_support import goal
@@ -11,6 +14,7 @@ from test_linux_workspace_boundary import boundary
 from ahc.adapters.native_process_runner import NativeProcessRunner
 from ahc.adapters.native_python_workspace import NativePythonWorkspace
 from ahc.application.runtime_workspace import RuntimeWorkspace
+from ahc.application.workspace_tools import WorkspaceTools
 from ahc.domain.native_resource_limits import NativeResourceLimits
 from ahc.domain.native_scratch_limits import NativeScratchLimits
 from ahc.domain.runtime_policy import EffectivePolicy
@@ -21,6 +25,60 @@ from ahc.infrastructure.runtime_repository import RuntimeRepository
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux native workbench")
 __all__ = ["native_owner", "boundary"]
+
+
+@pytest.mark.parametrize("platform", ["telegram", "discord"])
+def test_busy_read_job_observation_and_next_cell_share_core(native_owner, tmp_path, platform):
+    """Recorded incident shape with a real kernel, then useful next-cell output."""
+    from test_codex_workspace_tools import bridge, message
+    from ahc.adapters.codex_workspace_tools import CodexWorkspaceTools
+
+    store = RuntimeRepository.initialize(tmp_path / "runtime")
+    current = store.create(WorkingSetSnapshot.initial(
+        VirtualSessionIdentity.initial("session-" + platform, "agent", "route-" + platform), goal()))
+    owner = NativeProcessRunner(cwd=str(tmp_path), environment={}, persistent=True,
+                                owner_lifetime=True)
+    policy = EffectivePolicy(1, "manual", "workspace-write", True, "a" * 64, 30)
+    def create(identity, checkpoint):
+        return NativePythonWorkspace(store, owner, identity, effective_policy=policy,
+            environment_digest="a" * 64, cwd=str(tmp_path), interpreter=sys.executable,
+            user=None, timeout=10, lifetime_seconds=30, checkpoint=checkpoint)
+    workspace = RuntimeWorkspace.open(store, current, "work-" + platform, create)
+    tools = WorkspaceTools(workspace)
+    template, _ = bridge()
+    request = replace(template.request, session=current.session,
+                      capabilities=("workspace.job", "workspace.inspect", "workspace.execute"))
+    native = CodexWorkspaceTools(request, tools, "thread", "turn", clock=lambda: 0)
+    def invoke(index, tool, **args):
+        frame=message();frame['id']=index;frame['params']['callId']=f'native{index}'
+        frame['params']['tool']=tool
+        frame['params']['arguments']={'expected':workspace.identity.to_dict(),**args}
+        response=native.respond(frame)
+        return json.loads(response['result']['contentItems'][0]['text'])
+    release = tmp_path / 'release-job'
+    try:
+        with workspace.turn_scope(time.monotonic()+30):
+            started=invoke(61,'job',action='start',job_id='one',expected_seconds=20,
+                code="import time\nfrom pathlib import Path\nwhile not Path("+repr(str(release))+").exists():\n    time.sleep(.01)\nanswer=42")
+            assert started['result']['status']=='running'
+            rejected=invoke(62,'inspect',names=['answer'])
+            assert rejected['disposition']=='rejected' and not native.reporting
+            release.write_text('release')
+            done=invoke(63,'job',action='wait',job_id='one',wait_seconds=10)
+            assert done['result']['status']=='complete'
+            result=invoke(64,'execute',code='print(answer+1)')
+            assert result['disposition']=='observed' and result['result']['output'].strip()=='43'
+            assert not native.reporting and not native.unresolved
+    finally:
+        release.touch()
+        workspace.jobs.finish_turn()
+        workspace.close()
+    custody=BackendCustody(store,resource_role='python-workspace')
+    lease=custody.acquire(current.session,'work-'+platform)
+    try:
+        assert custody.recover(lease,owner)==() and not custody._held(lease)
+    finally:
+        lease.close()
 
 
 @pytest.mark.parametrize("engine", ["python", "ipython"])

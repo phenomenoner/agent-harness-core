@@ -1,5 +1,7 @@
 # Agent Harness Schema Registry
 
+> **Implementation scope:** Rust/Windows commands and dated acceptance statements below apply to their retained implementation and candidate. Use the [Python/Linux documentation](python-standalone/README.md) and [current source verification](python-standalone/SOURCE-VERIFICATION.md) for the active product.
+
 Date: 2026-07-26
 
 The authoritative in-code registry is `agent_harness_core::quality::schema_registry_entries`, exposed by `agent-harness schema-registry`. This document records the current public compatibility contract for review and release checks.

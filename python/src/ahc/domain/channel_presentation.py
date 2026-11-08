@@ -32,3 +32,11 @@ def text_document_caption(text):
         if heading in {f"{icon} **{label}**", f"[{label}]"}:
             return heading.replace("**", "") + "\n完整回覆"
     return "完整回覆"
+
+
+def scheduled_silence_receipt(record):
+    """One exact accepted-result policy for text and selected attachments."""
+    if (record.get("message_type") == "scheduled"
+            and record["payload"]["output_text"] == "NO_REPLY"):
+        return "suppressed:scheduled:no-reply"
+    return None

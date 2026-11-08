@@ -1,7 +1,7 @@
 """One-shot delivery of an already durable, route-bound local outbox entry."""
 
 from ahc.domain.channel_ingress import ChannelRoute
-from ahc.domain.channel_presentation import typed_payload
+from ahc.domain.channel_presentation import scheduled_silence_receipt, typed_payload
 from ahc.domain.sessions import ContractError
 
 
@@ -23,6 +23,10 @@ class ChannelDelivery:
             record = self.outbox.claim(self.trusted_route, operation_id, token)
             try:
                 payload = record["payload"]
+                suppressed = scheduled_silence_receipt(record)
+                if suppressed is not None:
+                    return self.outbox.acknowledge(
+                        self.trusted_route, operation_id, token, suppressed)
                 if "message_type" in record:
                     payload = typed_payload(payload, record["message_type"])
                 receipt = self.transport.send(self.trusted_route, payload, operation_id)

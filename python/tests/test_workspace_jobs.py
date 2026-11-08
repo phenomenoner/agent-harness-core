@@ -119,6 +119,35 @@ def test_busy_namespace_and_conflicting_job_id_reject_before_execution(owned):
     assert workspace.port.calls == 1
 
 
+@pytest.mark.parametrize("operation", ["inspect", "checkpoint"])
+def test_busy_namespace_read_rejects_without_inventing_unknown_effect(owned, operation):
+    store, workspace, tools = owned
+    start(tools)
+    assert workspace.port.entered.wait(1)
+    result = tools.invoke("workspace." + operation, {
+        "expected": workspace.identity.to_dict(), "names": ["progress_line"]})
+    assert result["disposition"] == "rejected"
+    assert result["unresolved_effects"] is False
+    assert not workspace.unavailable and not workspace.closed
+    assert call(tools, "status")["result"]["status"] == "running"
+    workspace.port.release.set()
+    assert call(tools, "wait", wait_seconds=1)["result"]["status"] == "complete"
+    assert store.observe_workspace_step(workspace.identity) == "ready"
+    assert workspace.port.calls == 1
+
+
+def test_inspection_failure_after_port_admission_stays_unknown(owned, monkeypatch):
+    _, workspace, tools = owned
+    def lost_reply(*args):
+        raise OSError("inspection reply lost")
+    monkeypatch.setattr(workspace.port, "inspect", lost_reply, raising=False)
+    result = tools.invoke("workspace.inspect", {
+        "expected": workspace.identity.to_dict(), "names": ["progress_line"]})
+    assert result["disposition"] == "unknown"
+    assert result["unresolved_effects"] is True
+    assert workspace.unavailable and workspace.closed
+
+
 def test_cancel_reports_stop_and_unknown_effects_and_keeps_status(owned):
     _, workspace, tools = owned
     start(tools)

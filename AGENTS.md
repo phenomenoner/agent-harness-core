@@ -7,13 +7,22 @@ The active product is `python/`, targeting native Linux with Python 3.14 or late
 ## Scope And Authority
 
 - These instructions govern the source/development repository. `.agent-harness/` is excluded from ordinary source work.
-- `.agent-harness/` is the deployed live `agent-harness-core` instance and runtime home. It is operationally related to this source repository, but it is not the source-editing tree or default working directory.
+- `.agent-harness/` is reserved for the retained Rust deployment/runtime home. Python runtime homes are explicitly configured. Every deployed runtime home is separate from the source-editing tree and default development directory.
 - Do not read, search, modify, execute, validate, or control anything under `.agent-harness/` unless the user explicitly scopes a deployment, live-operations, cutover, repair, or post-cutover verification task to it.
 - Use the user request, this file, current code/tests, and the relevant public contracts as active authority. `README.md` is a public overview, not an operations runbook.
 - Read private documents only when a specific task needs them. A document marked `RETIRED` is historical context only and must not be invoked as a workflow or rule source.
 - Write technical documents in English unless the user asks for another language.
 
-## Deployment Boundary
+## Python/Linux Deployment Boundary
+
+- Source publication does not authorize installation, service changes, backend selection or live operation.
+- Keep Python runtime state, credentials and operator configuration outside the source checkout. Follow `docs/python-standalone/LINUX-NATIVE-CONFIGURATION.md` and `LINUX-SERVICE.md` for current interfaces.
+- Run source checks from `python/`. Inspect `ahc --help` and the selected command's help before operating a configured instance; the retained Rust CLI is not the Python command surface.
+- Before an explicitly authorized deployment, bind the exact package, interpreter, backend bundle, configuration and service identity. Preserve recovery evidence and distinguish installed bytes from a process that has actually loaded them.
+
+## Retained Rust/Windows Deployment Boundary
+
+The following executable paths and supervisor arguments apply only to the historical Rust/Windows implementation. They do not identify the active Python/Linux deployment.
 
 - Develop and verify changes in the source repository and staging locations. Mutate the live `.agent-harness/` deployment only during an explicitly authorized cutover or live-operations task, using the applicable current runbook and rollback evidence.
 - Treat the deployed path as a compatibility boundary. Moving `.agent-harness/` is a separate migration project, not routine cleanup; it requires a path-consumer inventory, compatibility or redirect plan, staged validation, intentional cutover, and rollback plan.

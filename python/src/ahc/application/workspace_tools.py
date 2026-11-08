@@ -7,7 +7,7 @@ runner, filesystem root, container ID, session replacement or execution backend.
 from ahc.domain.sessions import ContractError
 from ahc.domain.workspace import (
     CheckpointNotSaved, CheckpointValueRejected, WorkspaceCodeRejected, WorkspaceIdentity,
-    workspace_failure_projection,
+    WorkspaceOperationNotStarted, workspace_failure_projection,
 )
 from ahc.domain.workspace_display import display_fields
 from ahc.domain.workspace_inspection import inspection_names
@@ -246,6 +246,13 @@ class WorkspaceTools:
                         getattr(workspace, "last_recovery", None) == "receipt-reconciled" else {})
             return {"disposition": "observed", "result": result, "unresolved_effects": False,
                     **recovery}
+        except WorkspaceOperationNotStarted:
+            return {"disposition": "rejected", "reason": "workspace-operation-not-started",
+                    "unresolved_effects": False,
+                    "recovery": "The interpreter was not invoked. A running job owns its "
+                                "namespace; use status/wait for that exact admitted job. "
+                                "Otherwise inspect current identity before another call. "
+                                "Do not repeat earlier writes to obtain a read result."}
         except WorkspaceCodeRejected as error:
             return {"disposition": "rejected", "reason": "workspace-code-frame-invalid",
                     "unresolved_effects": False, "invalid_fields": ["code"],

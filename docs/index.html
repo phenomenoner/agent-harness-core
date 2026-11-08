@@ -3,11 +3,44 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="0; url=agent-harness-feature-parity.html">
-  <link rel="canonical" href="agent-harness-feature-parity.html">
-  <title>Agent Harness Core</title>
+  <meta name="description" content="Agent Harness Core: a pre-release, self-hosted Python agent runtime for Linux, Telegram, Discord and CLI.">
+  <title>Agent Harness Core — Python/Linux</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.6; }
+    body { max-width: 56rem; margin: 3rem auto; padding: 0 1.5rem; }
+    h1, h2 { line-height: 1.2; } a { color: #397cce; }
+    .status { border-left: .25rem solid #397cce; padding: .75rem 1rem; background: #397cce12; }
+    li { margin-bottom: .5rem; } footer { margin-top: 3rem; border-top: 1px solid #8885; padding-top: 1rem; }
+    code { font-size: .95em; }
+  </style>
 </head>
 <body>
-  <p>Open the <a href="agent-harness-feature-parity.html">Agent Harness Core capability map</a>.</p>
+  <header>
+    <p>Self-hosted agent runtime</p>
+    <h1>Agent Harness Core</h1>
+    <p>AHC connects Telegram, Discord and a local CLI to an AHC-managed Codex app-server backend. It owns conversation identity, durable tasks, Python workspaces, memory, tools and delivery independently of model threads.</p>
+    <p class="status"><strong>Pre-release · Python 3.14+ · Linux, including WSL.</strong> Source checks, installed packages and live deployment acceptance remain separate claims. Updated 2026-11-08.</p>
+  </header>
+  <main>
+    <h2>Start With The Current Product</h2>
+    <ul>
+      <li><a href="https://github.com/phenomenoner/agent-harness-core">Repository and quick start</a></li>
+      <li><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/python-standalone/README.md">Python/Linux documentation index</a></li>
+      <li><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/python-standalone/PRODUCT-GUIDE.md">Product guide</a> and <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/python-standalone/TECHNICAL-OVERVIEW.md">technical overview</a></li>
+      <li><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/python-standalone/SOURCE-VERIFICATION.md">Verification results and known limits</a></li>
+      <li><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/SECURITY.md">Security and reporting</a></li>
+    </ul>
+    <h2>Current Source Update</h2>
+    <p>The Linux backend source pin is Codex CLI 0.167.0. Workspace job observations retain exact session identity; unavailable interpreters must close before replacement. Scheduled results containing exactly <code>NO_REPLY</code> are durably acknowledged without a platform send.</p>
+    <p>Existing Codex transport bounds, unknown-effect custody and no-replay delivery guarantees remain in place. Source publication does not start or upgrade a running service.</p>
+    <h2>Retained Rust And Design References</h2>
+    <p>The earlier Rust/Windows implementation remains available for history and comparison. Its dated capability maps and release tags do not establish current Python acceptance.</p>
+    <ul>
+      <li><a href="agent-harness-feature-parity.html">Historical Rust capability map</a></li>
+      <li><a href="adaptive-skill-intelligence.html">Skill-intelligence design reference</a></li>
+      <li><a href="topology-explorer.html">Retained topology explorer</a></li>
+    </ul>
+  </main>
+  <footer><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/CHANGELOG.md">Changelog</a> · MIT or Apache-2.0</footer>
 </body>
 </html>
