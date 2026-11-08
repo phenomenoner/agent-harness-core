@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Public capability map for Agent Harness Core, including durable channel operations, virtual sessions, evidence boundaries, and the Adaptive Skill Intelligence design direction.">
+  <title>Agent Harness Core · Capability Map</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #5a687d;
+      --navy: #132238;
+      --navy-2: #1c3553;
+      --blue: #2c6eaa;
+      --blue-soft: #eaf3fb;
+      --green: #147a4f;
+      --green-soft: #e9f7f0;
+      --amber: #9a6011;
+      --amber-soft: #fff4df;
+      --paper: #f5f7fa;
+      --panel: #ffffff;
+      --line: #d9e1eb;
+      --shadow: 0 18px 50px rgba(18, 34, 56, 0.10);
+      --radius: 16px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: "Segoe UI", "Noto Sans", Arial, sans-serif;
+      line-height: 1.62;
+    }
+
+    a { color: var(--blue); }
+    a:hover { color: var(--navy-2); }
+
+    .wrap {
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 22px 0;
+      color: #d9e7f4;
+      font-size: 14px;
+    }
+
+    .brand {
+      color: #fff;
+      font-weight: 800;
+      text-decoration: none;
+    }
+
+    .topnav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+    }
+
+    .topnav a { color: #c2d3e4; text-decoration: none; }
+
+    .hero-shell {
+      overflow: hidden;
+      color: #fff;
+      background:
+        radial-gradient(circle at 84% 22%, rgba(72, 151, 210, 0.28), transparent 26rem),
+        radial-gradient(circle at 16% 100%, rgba(46, 163, 107, 0.18), transparent 30rem),
+        var(--navy);
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 50px;
+      align-items: center;
+      padding: 66px 0 92px;
+    }
+
+    .eyebrow {
+      margin: 0 0 14px;
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 850;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+    }
+
+    .hero .eyebrow { color: #8fc8f1; }
+
+    h1, h2, h3 {
+      line-height: 1.14;
+      letter-spacing: -0.025em;
+    }
+
+    h1 {
+      max-width: 760px;
+      margin: 0;
+      font-size: clamp(42px, 6vw, 72px);
+    }
+
+    .hero .lead {
+      max-width: 760px;
+      margin: 24px 0 0;
+      color: #d7e3ef;
+      font-size: clamp(18px, 2vw, 23px);
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 28px;
+    }
+
+    .badge {
+      padding: 7px 11px;
+      border: 1px solid rgba(255, 255, 255, 0.19);
+      border-radius: 999px;
+      color: #e8f2fa;
+      background: rgba(255, 255, 255, 0.07);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .boundary-card {
+      padding: 30px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.08);
+      box-shadow: 0 24px 70px rgba(4, 17, 32, 0.30);
+      backdrop-filter: blur(8px);
+    }
+
+    .boundary-row {
+      display: grid;
+      grid-template-columns: 112px 1fr;
+      gap: 14px;
+      padding: 14px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+    }
+
+    .boundary-row:last-child { border-bottom: 0; }
+    .boundary-row strong { color: #9ed1f4; }
+    .boundary-row span { color: #e2ebf3; }
+
+    main { padding-bottom: 72px; }
+    section { padding: 72px 0; }
+
+    .status-strip {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      overflow: hidden;
+      margin-top: -42px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .status-item { padding: 24px; }
+    .status-item + .status-item { border-left: 1px solid var(--line); }
+    .status-item strong { display: block; margin-bottom: 6px; }
+    .status-item p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: 0.72fr 1.28fr;
+      gap: 52px;
+      align-items: start;
+      margin-bottom: 36px;
+    }
+
+    h2 { margin: 0; font-size: clamp(31px, 4vw, 50px); }
+    .section-intro { margin: 5px 0 0; color: var(--muted); font-size: 18px; }
+
+    .spotlight {
+      display: grid;
+      grid-template-columns: 1.22fr 0.78fr;
+      gap: 34px;
+      padding: 38px;
+      border: 1px solid rgba(20, 122, 79, 0.25);
+      border-radius: 22px;
+      background: linear-gradient(135deg, var(--green-soft), #f8fcfa);
+      box-shadow: var(--shadow);
+    }
+
+    .spotlight h2 { font-size: clamp(31px, 4vw, 46px); }
+    .spotlight p { color: #435b52; }
+
+    .article-link {
+      display: inline-block;
+      margin-top: 12px;
+      padding: 11px 15px;
+      border-radius: 9px;
+      color: #fff;
+      background: var(--green);
+      font-weight: 750;
+      text-decoration: none;
+    }
+
+    .direction-list {
+      margin: 0;
+      padding: 24px;
+      border-radius: 15px;
+      background: #fff;
+    }
+
+    .direction-list strong { display: block; margin-bottom: 11px; color: var(--green); }
+    .direction-list ul { margin: 0; padding-left: 20px; color: var(--muted); }
+
+    .capability-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .capability-card {
+      min-height: 250px;
+      padding: 25px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      transition: transform 160ms ease, box-shadow 160ms ease;
+    }
+
+    .capability-card:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
+    .capability-card .tag { color: var(--blue); font-size: 12px; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
+    .capability-card h3 { margin: 16px 0 10px; font-size: 21px; }
+    .capability-card p { margin: 0 0 12px; color: var(--muted); font-size: 15px; }
+    .capability-card .evidence { padding-top: 12px; border-top: 1px solid var(--line); color: var(--amber); font-size: 13px; font-weight: 700; }
+
+    .architecture {
+      color: #fff;
+      background: var(--navy);
+    }
+
+    .architecture .eyebrow { color: #8fc8f1; }
+    .architecture .section-intro { color: #c9d8e6; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+      margin-top: 36px;
+    }
+
+    .flow-step {
+      position: relative;
+      min-height: 160px;
+      padding: 20px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 13px;
+      background: rgba(255, 255, 255, 0.07);
+    }
+
+    .flow-step:not(:last-child)::after {
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      right: -18px;
+      color: #8fc8f1;
+      content: "→";
+      font-size: 24px;
+      transform: translateY(-50%);
+    }
+
+    .flow-step span { display: block; margin-bottom: 22px; color: #8fc8f1; font-size: 13px; font-weight: 850; }
+    .flow-step strong { display: block; margin-bottom: 7px; }
+    .flow-step p { margin: 0; color: #c9d8e6; font-size: 14px; }
+
+    .ownership {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      margin-top: 30px;
+    }
+
+    .owner-card {
+      padding: 26px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .owner-card h3 { margin: 0 0 12px; color: #fff; }
+    .owner-card ul { margin: 0; padding-left: 20px; color: #c9d8e6; }
+
+    .evidence-ladder {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 10px;
+      margin-top: 34px;
+    }
+
+    .evidence-level {
+      min-height: 205px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel);
+    }
+
+    .evidence-level b { display: block; margin-bottom: 12px; color: var(--blue); }
+    .evidence-level p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    .score-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-top: 34px;
+    }
+
+    .score-card {
+      padding: 22px;
+      border-left: 4px solid var(--green);
+      border-radius: 0 12px 12px 0;
+      background: var(--panel);
+    }
+
+    .score-card strong { display: block; margin-bottom: 7px; }
+    .score-card span { color: var(--muted); font-size: 14px; }
+
+    .delivery {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      counter-reset: stage;
+      margin-top: 34px;
+    }
+
+    .delivery-card {
+      min-height: 190px;
+      padding: 26px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .delivery-card::before {
+      counter-increment: stage;
+      display: block;
+      margin-bottom: 22px;
+      color: var(--amber);
+      content: "0" counter(stage);
+      font-size: 13px;
+      font-weight: 900;
+      letter-spacing: 0.12em;
+    }
+
+    .delivery-card h3 { margin: 0 0 9px; }
+    .delivery-card p { margin: 0; color: var(--muted); }
+
+    .docs-panel {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px 28px;
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .doc-link {
+      padding: 14px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .doc-link a { font-weight: 750; text-decoration: none; }
+    .doc-link span { display: block; margin-top: 3px; color: var(--muted); font-size: 13px; }
+
+    footer {
+      padding: 34px 0 48px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 980px) {
+      .hero, .spotlight { grid-template-columns: 1fr; }
+      .capability-grid, .score-grid, .delivery { grid-template-columns: repeat(2, 1fr); }
+      .flow, .evidence-ladder { grid-template-columns: repeat(2, 1fr); }
+      .flow-step:not(:last-child)::after { display: none; }
+    }
+
+    @media (max-width: 720px) {
+      .wrap { width: min(100% - 28px, 1180px); }
+      .topbar, .section-head { display: block; }
+      .topnav { margin-top: 12px; }
+      .hero { grid-template-columns: 1fr; padding: 46px 0 82px; }
+      .status-strip, .capability-grid, .ownership, .score-grid, .delivery, .docs-panel { grid-template-columns: 1fr; }
+      .status-item + .status-item { border-top: 1px solid var(--line); border-left: 0; }
+      .flow, .evidence-ladder { grid-template-columns: 1fr; }
+      .section-head { margin-bottom: 24px; }
+      .section-intro { margin-top: 16px; }
+      .spotlight { padding: 28px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .capability-card { transition: none; }
+    }
+  </style>
+</head>
+<body>
+<aside aria-label="Implementation scope" style="padding:1rem;margin:1rem;border:1px solid #888;border-radius:.5rem">Historical Rust/Windows capability snapshot. Dated claims describe their named scope. <a href="index.html">Current Python/Linux overview</a>.</aside>
+  <div class="hero-shell">
+    <div class="wrap">
+      <nav class="topbar" aria-label="Capability map navigation">
+        <a class="brand" href="https://github.com/phenomenoner/agent-harness-core/blob/main/README.md">Agent Harness Core</a>
+        <div class="topnav">
+          <a href="#capabilities">Capabilities</a>
+          <a href="#architecture">Architecture</a>
+          <a href="#evidence">Evidence</a>
+          <a href="adaptive-skill-intelligence.html">Adaptive skills</a>
+          <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-feature-parity.md">Markdown source</a>
+        </div>
+      </nav>
+
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Public source overview</p>
+          <h1>Durable operations for self-hosted AI agents</h1>
+          <p class="lead">Exact channel identity, bounded work, virtual-session continuity, auditable receipts, and recoverable delivery around Codex-backed agents.</p>
+          <div class="badges">
+            <span class="badge">Pre-release</span>
+            <span class="badge">Rust</span>
+            <span class="badge">Windows-first</span>
+            <span class="badge">Telegram + Discord</span>
+            <span class="badge">Codex backend</span>
+          </div>
+        </div>
+        <div class="boundary-card">
+          <div class="boundary-row"><strong>Harness</strong><span>Identity, authority, durable state, queues, schedules, effects, evidence, and delivery.</span></div>
+          <div class="boundary-row"><strong>Backend</strong><span>Model reasoning, native tools, sandbox behavior, and concrete model sessions.</span></div>
+          <div class="boundary-row"><strong>Rule</strong><span>One semantic owner per decision—no double selection, learning, continuation, or delivery.</span></div>
+        </div>
+      </header>
+    </div>
+  </div>
+
+  <main>
+    <div class="wrap">
+      <div class="status-strip">
+        <div class="status-item"><strong>Implemented foundation</strong><p>The source contains the mechanism and public contract; release evidence must still match its blast radius.</p></div>
+        <div class="status-item"><strong>Evidence boundary</strong><p>Source behavior may still need joined replay, provider-visible checks, operating-system proof, or controlled soak.</p></div>
+        <div class="status-item"><strong>Design direction</strong><p>Documented architecture is presented as future work until the complete behavior is implemented and activated.</p></div>
+      </div>
+    </div>
+
+    <section>
+      <div class="wrap">
+        <div class="spotlight">
+          <div>
+            <p class="eyebrow">Major product direction</p>
+            <h2>Adaptive Skill Intelligence</h2>
+            <p>Skills can become more than matched runbooks. The target system combines external knowledge with verified task experience, reflects on what worked under which conditions, and accumulates a reusable individual capability asset for future comparable tasks.</p>
+            <p>It resolves task-local competence roles, discloses the smallest useful procedure, joins use with real outcomes, maintains contextual beliefs with uncertainty, and promotes only independently evaluated, reversible changes.</p>
+            <a class="article-link" href="adaptive-skill-intelligence.html">Read the feature article</a>
+          </div>
+          <div class="direction-list">
+            <strong>Honest status boundary</strong>
+            <ul>
+              <li>Scoped discovery, receipts, proposal-mediated mutation, guards, lifecycle tooling, and virtual-session foundations exist.</li>
+              <li>Outcome attribution, contextual beliefs, relationship-first consolidation, evaluator routing, and progressive promotion remain design and implementation work.</li>
+              <li>Broad autonomous self-improvement is not claimed implemented or active.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="capabilities">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Capability map</p>
+            <h2>What the harness owns</h2>
+          </div>
+          <p class="section-intro">Each card separates the public source contract from the evidence that still matters. A mechanism can be implemented without being proven under every provider, restart window, operating-system boundary, or long-horizon workload.</p>
+        </div>
+
+        <div class="capability-grid">
+          <article class="capability-card"><span class="tag">Ingress</span><h3>Exact channel identity</h3><p>Telegram and Discord inputs pass allow-list and exact platform, account, channel, and user resolution before durable admission.</p><div class="evidence">Needs per-account and per-channel provider-visible smoke evidence.</div></article>
+          <article class="capability-card"><span class="tag">Runtime</span><h3>Durable bounded work</h3><p>Queue leases, retries, stale recovery, admission controls, and global, agent, channel, and lane bounds isolate interactive and background work.</p><div class="evidence">Needs joined crash, overload, fairness, and soak evidence.</div></article>
+          <article class="capability-card"><span class="tag">Backend</span><h3>Codex execution boundary</h3><p>Plans, preflight, app-server execution, terminal state, concrete session continuity, and provider-scoped homes are explicit and receipted.</p><div class="evidence">Backend upgrades require protocol and provenance proof.</div></article>
+          <article class="capability-card"><span class="tag">Continuity</span><h3>Virtual sessions</h3><p>A stable task identity can span compact, resume, and concrete-session rollover while carrying a bounded working set.</p><div class="evidence">Needs end-to-end rollover and restart through final delivery.</div></article>
+          <article class="capability-card"><span class="tag">Channels</span><h3>Replies, progress, and actions</h3><p>Commands, normal replies, bounded progress, media delivery, and guarded connector-approval actions share identity and delivery contracts.</p><div class="evidence">Rendering and interaction behavior remains channel-specific.</div></article>
+          <article class="capability-card"><span class="tag">Background work</span><h3>Workers, cron, and delegation</h3><p>Durable jobs, cron evaluation, watchdogs, exact subagent ownership, bounded mailboxes, and master-only final synthesis are explicit surfaces.</p><div class="evidence">Needs reboot, real-effect, and heterogeneous-provider evidence.</div></article>
+          <article class="capability-card"><span class="tag">Memory</span><h3>Adapter-owned recall</h3><p>Recall, lifecycle capture, proposals, approved writeback, imported snapshots, and per-agent compartments are receipt-backed adapters.</p><div class="evidence">Fallback behavior is not full graph-memory parity.</div></article>
+          <article class="capability-card"><span class="tag">Procedural memory</span><h3>Skill runtime foundations</h3><p>Skills are scoped, indexed, revisioned, selected with receipts, guarded before controlled mutation, and managed reversibly.</p><div class="evidence">Adaptive outcome-linked learning remains a design direction.</div></article>
+          <article class="capability-card"><span class="tag">Planning</span><h3>Layered task authority</h3><p>Codex owns in-turn decomposition; optional durable plans own milestones and evidence; the runtime owns budgets, effects, continuation, fairness, and finals.</p><div class="evidence">Needs joined scope, replan, budget, and terminal scenarios.</div></article>
+          <article class="capability-card"><span class="tag">Operations</span><h3>Audit and recovery</h3><p>Receipts, trace reconstruction, health, repair, backup, canary, rollback, and migration controls make decisions inspectable.</p><div class="evidence">Receipts do not substitute for restore or provider recovery drills.</div></article>
+          <article class="capability-card"><span class="tag">Security</span><h3>Fail-closed trust boundaries</h3><p>Bounded untrusted context, secret isolation, external-effect gates, encrypted-vault primitives, and public-hygiene checks constrain exposure.</p><div class="evidence">Live credential and network review stays operator-controlled.</div></article>
+          <article class="capability-card"><span class="tag">Compatibility</span><h3>Dry-run migration</h3><p>Legacy agents, prompts, skills, sessions, memory snapshots, and compatible state can be planned and imported with conflict policies and receipts.</p><div class="evidence">Every real source still needs its own dry run and rollback boundary.</div></article>
+        </div>
+      </div>
+    </section>
+
+    <section id="architecture" class="architecture">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Architecture boundary</p>
+            <h2>One durable path from message to evidence</h2>
+          </div>
+          <p class="section-intro">The harness does not replace the model. It gives model work an exact identity, bounded authority, recoverable lifecycle, and traceable terminal result.</p>
+        </div>
+        <div class="flow">
+          <div class="flow-step"><span>01</span><strong>Ingress</strong><p>Allow-list and exact identity before admission.</p></div>
+          <div class="flow-step"><span>02</span><strong>Durable queue</strong><p>Lease, retry, fairness, and bounded concurrency.</p></div>
+          <div class="flow-step"><span>03</span><strong>Virtual session</strong><p>Task continuity, plans, memory, and skill manifest.</p></div>
+          <div class="flow-step"><span>04</span><strong>Codex backend</strong><p>Reasoning, tools, sandbox, and concrete session.</p></div>
+          <div class="flow-step"><span>05</span><strong>Delivery</strong><p>Outbox, progress, provider result, and receipts.</p></div>
+        </div>
+        <div class="ownership">
+          <div class="owner-card"><h3>Harness authority</h3><ul><li>identity and eligibility</li><li>durable state, budgets, and scheduling</li><li>external-effect admission</li><li>evidence, promotion, rollback, and delivery</li></ul></div>
+          <div class="owner-card"><h3>Backend authority</h3><ul><li>in-turn reasoning and decomposition</li><li>native tool sequencing</li><li>model-session and sandbox semantics</li><li>semantic drafts and advisory proposals</li></ul></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="evidence">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Verification</p>
+            <h2>Claims stop where evidence stops</h2>
+          </div>
+          <p class="section-intro">The right verification level follows the blast radius. Cross-cutting changes to identity, routing, skills, memory, planning, continuation, effects, or final delivery need whole-task evidence before promotion.</p>
+        </div>
+        <div class="evidence-ladder">
+          <div class="evidence-level"><b>Contracts</b><p>Schemas, configuration, identity derivation, compatibility, and deterministic decision tables.</p></div>
+          <div class="evidence-level"><b>Focused tests</b><p>Local state transitions, validation, matching, serialization, and error handling.</p></div>
+          <div class="evidence-level"><b>Integration</b><p>Immediate producer/consumer boundaries such as queue-to-runtime or effect-to-receipt.</p></div>
+          <div class="evidence-level"><b>Scenario / replay</b><p>Exact identity, virtual session, backend, effects, restart, outbox, and terminal behavior in one joined task.</p></div>
+          <div class="evidence-level"><b>Controlled live</b><p>Provider presentation, real routing, service persistence, resource use, and bounded cohort soak.</p></div>
+        </div>
+
+        <div class="score-grid">
+          <div class="score-card"><strong>Outcome</strong><span>Acceptance, verifier pass, corrections, failures, and time to terminal.</span></div>
+          <div class="score-card"><strong>Coverage</strong><span>Required roles, calibrated abstention, and critical-case non-inferiority.</span></div>
+          <div class="score-card"><strong>Disclosure</strong><span>Relevant procedure per token, repeat loads, latency, tools, and interference.</span></div>
+          <div class="score-card"><strong>Learning quality</strong><span>Attribution, calibration, drift, held-out regression, and false promotion.</span></div>
+          <div class="score-card"><strong>Total cost</strong><span>Backend, evaluator, maintenance, operator attention, and opportunity cost.</span></div>
+          <div class="score-card"><strong>Hard gates</strong><span>Zero cross-scope exposure, unauthorized effect, policy bypass, secret leak, or failed rollback.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Delivery path</p>
+            <h2>From source foundations to earned autonomy</h2>
+          </div>
+          <p class="section-intro">Every expansion of behavior or authority is a versioned deployment. Observation and proposals may become increasingly automatic; broad, privileged, or cross-agent change requires stronger independent evidence.</p>
+        </div>
+        <div class="delivery">
+          <div class="delivery-card"><h3>Correct and observe</h3><p>Remove unsafe attribution, compile exact contracts, and compare new policies without changing prompts, effects, learning, or delivery.</p></div>
+          <div class="delivery-card"><h3>Join and evaluate</h3><p>Connect effects and outcomes, calibrate contextual beliefs and evaluator cost, and test held-out behavior plus downgrade.</p></div>
+          <div class="delivery-card"><h3>Promote narrowly</h3><p>Activate one reversible low-risk cohort with explicit authority and provider-visible evidence before any widening.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Explore</p>
+            <h2>Public documentation</h2>
+          </div>
+          <p class="section-intro">Private deployment receipts, operator-only runbooks, real identifiers, and machine-specific evidence are intentionally excluded from these public surfaces.</p>
+        </div>
+        <div class="docs-panel">
+          <div class="doc-link"><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/README.md">README</a><span>Project definition, quick start, architecture, and documentation index.</span></div>
+          <div class="doc-link"><a href="adaptive-skill-intelligence.html">Adaptive Skill Intelligence</a><span>Product rationale, learning loop, decision science, and status boundary.</span></div>
+          <div class="doc-link"><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/skill-ecosystem.md">Skill Ecosystem</a><span>Current implemented discovery, selection, learning gates, lifecycle, and compatibility.</span></div>
+          <div class="doc-link"><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-topology-contract.md">Topology Contract</a><span>Identity axes, component ownership, invariants, and scenario impact.</span></div>
+          <div class="doc-link"><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/configuration.md">Configuration</a><span>Public configuration reference.</span></div>
+          <div class="doc-link"><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/trust-boundaries.md">Trust Boundaries</a><span>Untrusted input, secret, effect, and publication boundaries.</span></div>
+          <div class="doc-link"><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/schema-registry.md">Schema Registry</a><span>Receipt and durable-state compatibility contracts.</span></div>
+          <div class="doc-link"><a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/invariants.md">Invariants</a><span>Behavioral truths and their required verification surfaces.</span></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">Agent Harness Core capability map · Public source overview · Updated 2026-07-21</div>
+  </footer>
+</body>
+</html>

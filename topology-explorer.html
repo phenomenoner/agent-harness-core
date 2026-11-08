@@ -1,0 +1,4015 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Harness Topology Explorer</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --ink: #172033;
+      --muted: #5b6474;
+      --line: #d6dce8;
+      --panel: #ffffff;
+      --soft: #eef3f7;
+      --accent: #2563a8;
+      --green: #15845c;
+      --amber: #9a6700;
+      --red: #b13f3f;
+      --shadow: 0 18px 44px rgba(19,33,56,.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Segoe UI", "Inter", Arial, sans-serif;
+    }
+    header {
+      padding: 24px 30px 18px;
+      background: #182235;
+      color: #fff;
+      border-bottom: 1px solid rgba(255,255,255,.12);
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: 0; }
+    .lead { max-width: 1180px; margin: 0; color: #d8e0ec; line-height: 1.55; }
+    .sources { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; font-size: 12px; color: #d8e0ec; }
+    .sources code { color: #fff; background: rgba(255,255,255,.12); }
+    .toolbar {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) repeat(5, auto);
+      gap: 10px;
+      padding: 14px 18px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      align-items: center;
+    }
+    input, button {
+      font: inherit;
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fff;
+      color: var(--ink);
+    }
+    input { min-width: 0; padding: 8px 10px; }
+    button { padding: 8px 12px; cursor: pointer; }
+    button.active { background: #20324f; color: #fff; border-color: #20324f; }
+    main {
+      display: grid;
+      grid-template-columns: 360px minmax(560px, 1fr) 420px;
+      min-height: calc(100vh - 142px);
+    }
+    .left-rail, aside {
+      background: var(--panel);
+      overflow: auto;
+      max-height: calc(100vh - 142px);
+    }
+    .left-rail { border-right: 1px solid var(--line); }
+    aside { border-left: 1px solid var(--line); }
+    .panel { padding: 18px; border-bottom: 1px solid var(--line); }
+    .panel h2 { margin: 0 0 12px; font-size: 18px; letter-spacing: 0; }
+    .journey-card {
+      width: 100%;
+      text-align: left;
+      margin: 0 0 10px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .journey-card.active { border-color: var(--accent); box-shadow: inset 4px 0 0 var(--accent); }
+    .journey-card strong { display: block; margin-bottom: 5px; }
+    .journey-card span { display: block; color: var(--muted); line-height: 1.4; font-size: 13px; }
+    .stepper { display: grid; grid-template-columns: 42px 1fr 42px; gap: 8px; margin-top: 12px; align-items: stretch; }
+    .stepbox { min-height: 124px; padding: 12px; background: var(--soft); border: 1px solid var(--line); border-radius: 8px; }
+    .stepbox .count { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .stepbox strong { display: block; margin-bottom: 6px; }
+    .stepbox p { margin: 0; line-height: 1.5; }
+    .canvas-wrap {
+      position: relative;
+      min-height: 700px;
+      overflow: hidden;
+      background:
+        linear-gradient(rgba(24,34,53,.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(24,34,53,.045) 1px, transparent 1px);
+      background-size: 32px 32px;
+    }
+    .canvas-note {
+      position: absolute;
+      left: 18px;
+      top: 18px;
+      max-width: 520px;
+      padding: 12px 14px;
+      background: rgba(255,255,255,.92);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 8px 26px rgba(19,33,56,.08);
+    }
+    .canvas-note strong { display: block; margin-bottom: 4px; }
+    .canvas-note p { margin: 0; color: var(--muted); line-height: 1.45; }
+    canvas { width: 100%; height: 100%; display: block; }
+    .legend {
+      position: absolute;
+      left: 18px;
+      bottom: 18px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      max-width: calc(100% - 36px);
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 9px;
+      background: rgba(255,255,255,.9);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 12px;
+      box-shadow: 0 8px 20px rgba(19,33,56,.08);
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .metric { padding: 10px; background: var(--soft); border: 1px solid var(--line); border-radius: 6px; }
+    .metric strong { display: block; font-size: 22px; line-height: 1.1; }
+    .metric span, small { color: var(--muted); font-size: 12px; }
+    .node-title { margin: 0 0 8px; font-size: 20px; }
+    .node-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .kv { margin: 13px 0 0; }
+    .kv h3, .node-list-section h3 {
+      margin: 0 0 5px;
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    .kv p, .kv ul { margin: 0; line-height: 1.48; }
+    .list, .focus-list { display: grid; gap: 8px; }
+    .list button, .focus-list button { width: 100%; text-align: left; padding: 10px; background: #fff; }
+    .list button:hover, .focus-list button:hover { border-color: var(--accent); }
+    .focus-list button.active { background: #20324f; color: #fff; border-color: #20324f; }
+    .gap-list button { border-left: 4px solid var(--red); }
+    .node-list-section { margin-top: 16px; }
+    code { background: #eef1f6; padding: 1px 4px; border-radius: 4px; }
+    a { color: var(--accent); }
+    @media (max-width: 1180px) {
+      .toolbar { grid-template-columns: 1fr 1fr; }
+      main { grid-template-columns: 1fr; }
+      .left-rail, aside { max-height: none; border: 0; border-bottom: 1px solid var(--line); }
+      .canvas-wrap { min-height: 540px; }
+    }
+  </style>
+</head>
+<body>
+<aside aria-label="Implementation scope" style="padding:1rem;margin:1rem;border:1px solid #888;border-radius:.5rem">Retained implementation topology reference. Dated claims describe their named scope. <a href="index.html">Current Python/Linux overview</a>.</aside>
+  <header>
+    <h1>Agent Harness Topology Explorer</h1>
+    <p class="lead">Guided topology surface generated from the canonical docs. Start with a journey, walk the steps, then use the canvas and gap queue for drill-down. The page is a support-plane view, not a second source of truth.</p>
+    <div class="sources" id="sources"></div>
+  </header>
+  <section class="toolbar" aria-label="Topology explorer controls">
+    <input id="search" type="search" placeholder="Search components, gaps, invariants, refs">
+    <button type="button" data-filter="all" class="active">All</button>
+    <button type="button" data-filter="component">Components</button>
+    <button type="button" data-filter="gap">Gaps</button>
+    <button type="button" data-filter="gate">Gates</button>
+    <button type="button" id="reset">Reset</button>
+  </section>
+  <main>
+    <nav class="left-rail" aria-label="Guided topology journeys">
+      <section class="panel">
+        <h2>Guided Paths</h2>
+        <div id="journeyList"></div>
+      </section>
+      <section class="panel">
+        <h2>Current Step</h2>
+        <div id="stepper"></div>
+      </section>
+      <section class="panel">
+        <h2>Path Focus</h2>
+        <div id="focusList" class="focus-list"></div>
+      </section>
+    </nav>
+    <section class="canvas-wrap" aria-label="Interactive topology canvas">
+      <div class="canvas-note" id="canvasNote"></div>
+      <canvas id="graph"></canvas>
+      <div id="legend" class="legend"></div>
+    </section>
+    <aside>
+      <section class="panel"><div class="metrics" id="metrics"></div></section>
+      <section class="panel" id="details"></section>
+      <section class="panel">
+        <h2>Open Gap Queue</h2>
+        <div id="gapList" class="list gap-list"></div>
+      </section>
+      <section class="panel">
+        <h2>Visible Nodes</h2>
+        <div id="nodeList" class="list"></div>
+      </section>
+    </aside>
+  </main>
+  <script type="application/json" id="topology-data">{
+  "schema": "agent-harness.topology-explorer.v1",
+  "title": "Agent Harness Topology Explorer",
+  "sourceFiles": [
+    {
+      "path": "docs/agent-harness-topology-contract.md",
+      "sha256": "4c99a0fdff36a7405727084d01e843ab28b168b5537f08cd96f77a2b71721c84"
+    }
+  ],
+  "syncCommand": "python tools/generate_topology_explorer.py",
+  "nodes": [
+    {
+      "id": "canon-topology-contract",
+      "label": "Topology Contract",
+      "group": "canon",
+      "state": "canonical",
+      "summary": "Canonical identity axes, ownership boundaries, impact matrix, scenario packs, and expected-vs-actual gaps.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "release-verification",
+      "label": "Release Verification",
+      "group": "canon",
+      "state": "published",
+      "summary": "Sanitized release verification is published in the changelog; machine-specific live evidence is not part of the public graph.",
+      "refs": [
+        "CHANGELOG.md"
+      ]
+    },
+    {
+      "id": "component-channel-identity",
+      "label": "channel_identity",
+      "group": "component",
+      "state": "implemented",
+      "summary": "fail-closed channel/account/agent binding",
+      "reads": "config identity bindings",
+      "writes": "identity-check receipts",
+      "invariants": "I1, I8",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-channel-state-channel-session-transition",
+      "label": "channel_state / channel_session_transition",
+      "group": "component",
+      "state": "implemented",
+      "summary": "slash-command state, active session metadata, and two-phase /stop//new boundaries; /think and /reasoning remain one control surface",
+      "reads": "channel command input, exact goal/lineage evidence, transition receipts",
+      "writes": "exact-lane channel state, frozen transition intent, cancel fence, boundary receipt",
+      "invariants": "I4, I8, I17, I36",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-channel-ingress-channel-runtime-channel-action",
+      "label": "channel_ingress / channel_runtime / channel_action",
+      "group": "component",
+      "state": "implemented",
+      "summary": "command-vs-agent-turn decision, exact process-generation/recovery-owned ingress WAL with retried handler-unwind settlement, pre-admission hold/replay during /new, and provider-neutral typed approval-action resolution",
+      "reads": "inbound platform event or callback, immutable claim identity, owner PID/start/recovery authority, channel state, public action id, protected approval capability",
+      "writes": "completed or explicitly retryable ingress claim, fatal-generation recovery marker when retry dispatch is unavailable, held-message record, runtime queue item, approval request/command outbox, or one deterministic effect continuation",
+      "invariants": "I1, I3, I5, I7, I8, I14, I17",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-runtime-queue-runtime-worker",
+      "label": "runtime_queue / runtime_worker",
+      "group": "component",
+      "state": "implemented",
+      "summary": "durable queue item lifecycle, canonical same-session FIFO, exact-lane execution ownership, class capacity, lane concurrency, persisted retry eligibility, and exact-lane child-cleanup fencing/restart reconciliation",
+      "reads": "pending queue, hot/cold receipt index, exact leases, child-cleanup fences, runtime class config, OS process-generation evidence",
+      "writes": "pending/status/lease receipts, typed retry schedule, and compare-removed child-cleanup fence state",
+      "invariants": "I1, I3, I5, I6, I8, I17",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-media-artifact-hygiene",
+      "label": "media / artifact hygiene",
+      "group": "component",
+      "state": "implemented",
+      "summary": "harness-contained artifact metadata, extraction summaries, prompt-safe artifact refs, outbound media policy decisions",
+      "reads": "inbound attachments, generated media/tool receipts, artifact metadata, outbound local paths and harness artifact refs",
+      "writes": "agent-harness.inbound-media-artifact.v1, agent-harness.outbound-media-policy.v1, prompt-safe artifact summaries",
+      "invariants": "I8, I11, I16",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-prompt-turns",
+      "label": "prompt / turns",
+      "group": "component",
+      "state": "implemented",
+      "summary": "exact-full-lane, agent-scoped prompt bundle, eight-file OpenClaw-style per-agent config manifest, agent-scoped skill source/usage-prior selection, and backend-generation reinjection",
+      "reads": "registry, selected agent home/workspace and shared allowlisted skill namespaces, agent workspace/config files including static MEMORY.md, dynamic per-agent memory recall, channel state, artifact summaries, full lane, backend context generation",
+      "writes": "prompt bundle, prompt manifest, skill-selection receipt, and lane-scoped injection ledger",
+      "invariants": "I8, I11, I20",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "label": "skill_shadow_runtime / virtual_skill_manifest / skill_episode / knowledge_classifier / skill_improvement",
+      "group": "component",
+      "state": "implemented",
+      "summary": "independently gated shadow-route observation, exact-virtual-session frozen manifest and delivery ledger, joined outcome/episode/terminal-review evidence, deterministic knowledge disposition, and reversible proposal-only improvement artifacts",
+      "reads": "active v4 selection, exact full/virtual lane, route receipt, backend generation, runtime terminal evidence, bounded verifier/correction evidence",
+      "writes": "privacy-safe route receipt, virtual manifest, delivery/outcome/episode/terminal-review/classification/target/proposal receipts; never serving or skill files from the observer path",
+      "invariants": "I8, I20, I28",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-workers-child-execution-policy",
+      "label": "workers / child execution policy",
+      "group": "component",
+      "state": "implemented",
+      "summary": "immutable per-child provider/model/reasoning/tool/sandbox/budget snapshot, pre-lease exhausted-job terminalization, and bounded execution/process-tree cancellation",
+      "reads": "parent operation plan, exact owner, child admission policy",
+      "writes": "worker job, immutable policy snapshot, lifecycle/terminal receipts",
+      "invariants": "I3, I4, I7, I8",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-operation-plan",
+      "label": "operation_plan",
+      "group": "component",
+      "state": "implemented",
+      "summary": "durable plan/item admission, dependency ordering, optimistic concurrency, and atomic mutation rejection",
+      "reads": "stored plan limits, current materialized items, expected item version, proposed dependencies and status",
+      "writes": "append-only item/event/receipt records plus atomic plan snapshot updates; invalid over-limit or cyclic mutations write nothing",
+      "invariants": "I6, I39",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-cron-scheduler-deterministic-cron",
+      "label": "cron_scheduler / deterministic_cron",
+      "group": "component",
+      "state": "implemented",
+      "summary": "exact crontab source discovery, timezone/calendar evaluation, per-entry execution policy, occurrence identity, watermarks, and catch-up authority",
+      "reads": "canonical cron entries, exact .crontab sources, scheduler config, prior tick evidence",
+      "writes": "CronRun/worker admission, occurrence metadata, job decisions, watermarks, tick receipts",
+      "invariants": "I3, I5, I7, I17",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-worker-result-mailbox-coordinator-resume",
+      "label": "worker result mailbox / coordinator resume",
+      "group": "component",
+      "state": "implemented",
+      "summary": "exact-owner child result collection and master-only durable continuation",
+      "reads": "typed terminal child receipts, bounded/redacted result summaries or opaque artifact pointers, exact-lane activity",
+      "writes": "mailbox claims, explicit failed omissions, resume intent, coordinator wait/consume receipts, structural-only master continuation context",
+      "invariants": "I2, I3, I8, I9",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-codex-runtime-goal-closure",
+      "label": "codex_runtime / goal_closure",
+      "group": "component",
+      "state": "implemented",
+      "summary": "app-server protocol, platform-contained Codex/MCP process-tree lifecycle, exact-owned parent-event classification, preflight/start/run, governed original-thread goal closure, prepared work-authority classification, deadline/bounded-yield control, elicitation parking, recovery, and web-search mode",
+      "reads": "prompt/config, exact queue lease and child-cleanup authority, task-family budget, closure intent, connector approval policy, provider capabilities, exact-lane policy",
+      "writes": "primary runtime outcome, containment-specific child binding and cleanup proof, quarantined foreign-event evidence, governed terminal projection, closure phase receipts, deadline/steer receipts, effect state, transcript/completion, and web-search evidence",
+      "invariants": "I2, I3, I5, I6, I7, I10, I13, I19, I31, I36, I37, I38",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-external-effect",
+      "label": "external_effect",
+      "group": "component",
+      "state": "implemented",
+      "summary": "exact-lane connector action authority, source-session and full approval-authority binding, expiring single-use capabilities, stable opaque idempotency markers/keys, mutation evidence, and readback-before-resubmission reconciliation",
+      "reads": "recognized MCP elicitation descriptor, connector policy, typed public action, exact source queue/lane/session, protected token snapshot, exact-bound marker or provider-idempotency readback evidence",
+      "writes": "append-only effect/transition records, public-action index, fenced token state, bounded expiry resolution, one exact-lane continuation intent, confirmed/absent/unprovable reconciliation",
+      "invariants": "I2, I3, I5, I6, I7, I10, I14, I17, I31",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-codex-web-search",
+      "label": "codex_web_search",
+      "group": "component",
+      "state": "implemented",
+      "summary": "deterministic intent/lane classification, capability-gated effective mode, thread binding, limitation surface, and privacy-safe action observation",
+      "reads": "user intent, trusted replay/offline/sensitive metadata, exact lane digest, modelProvider/capabilities/read, webSearch items",
+      "writes": "codex-web-search-decision.v1, codex-web-search-thread-binding.v1, codex-web-search-action.v1",
+      "invariants": "I8, I11, I31, I38",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-provider-request-policy",
+      "label": "provider_request_policy",
+      "group": "component",
+      "state": "implemented",
+      "summary": "provider/model capability gates and optional per-request acceleration overrides such as priority/fast mode",
+      "reads": "agent/session command state, provider route, model id, provider profile",
+      "writes": "request-plan overrides, command receipts, unsupported/skip reasons",
+      "invariants": "I7, I8",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-runtime-pipeline-task-transition-task-budget",
+      "label": "runtime_pipeline / task_transition / task_budget",
+      "group": "component",
+      "state": "implemented",
+      "summary": "run-once orchestration, mutation-aware retry/dead-letter, one typed source-closure resolver, final-outbox repair, visible policy parking, harness-owned task families and primary outcomes, bounded recovery, exact authority revalidation, interruption classification, media resolution, and terminal skill evidence",
+      "reads": "queue item, Codex and lease receipts, exact-lane Goal/OperationPlan/task-family state, external-effect authority, budgets, channel state, media policy, prepared virtual evidence",
+      "writes": "exactly one ordinary/campaign final, committed continuation, visible parked notice, or explicit non-delivery; closure kind/reason and derived source-final receipt fields; task budget; terminal review",
+      "invariants": "I2, I3, I5, I7, I8, I9, I10, I13, I17, I22, I31, I35, I37",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-provider-gateway-adapters",
+      "label": "provider gateway adapters",
+      "group": "component",
+      "state": "implemented",
+      "summary": "provider connection, Identify/READY lifecycle, explicit provider-visible presence where supported, heartbeat, inbound event normalization, and no-console child launch behavior; never supervisor authority",
+      "reads": "provider token/config, gateway protocol events, watched stop file",
+      "writes": "bounded adapter event log, wrapper-owned loop heartbeat, normalized ingress event, explicit Discord online presence",
+      "invariants": "I14, I26, I41",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-channel-delivery",
+      "label": "channel_delivery",
+      "group": "component",
+      "state": "implemented",
+      "summary": "provider-native delivery, retry, outbound presentation rendering, text chunking, terminal receipt precedence, attachment-kind-aware media upload, and provider-error URL/credential redaction",
+      "reads": "outbox JSONL, optional rich-message presentation payloads, policy-validated attachments, bounded provider status/transport failures",
+      "writes": "delivery receipts, per-provider rendered-unit receipts with attachment kind and per-chunk text ids, redacted provider diagnostics without request URLs or credentials",
+      "invariants": "I2, I7, I9, I11, I14, I16, I18",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-progress",
+      "label": "progress",
+      "group": "component",
+      "state": "implemented",
+      "summary": "source-authoritative progress narration delivery, separate from final replies, with terminal release bound to exact source-closure evidence and the derived source-final expectation; planning, delivery recording, and session supersession serialize through one state transaction gate",
+      "reads": "progress events/index, runtime receipt, exact-source outbox/delivery state, channel policy, superseded-session registry, watched stop file",
+      "writes": "progress outbox/delivery state, source cursor/cache, authoritative superseded-session commit, bounded best-effort surface-claim cleanup, and fail-closed warnings; unexplained new-format non-delivery cannot release progress",
+      "invariants": "I2, I4, I9, I17, I25, I27, I37",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-ledger-maintenance",
+      "label": "ledger_maintenance",
+      "group": "component",
+      "state": "implemented",
+      "summary": "source-aware, expensive runtime/channel-delivery/progress history retention outside interactive paths",
+      "reads": "coalesced terminal wakes, committed ledger/index state, maintenance policy",
+      "writes": "bounded per-ledger maintenance report and isolated warnings",
+      "invariants": "I3, I5, I9, I25",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-supervisor-plan-reconcile",
+      "label": "supervisor plan/reconcile",
+      "group": "component",
+      "state": "implemented",
+      "summary": "derive mode-aware Windows Task Scheduler or reconcile ownership from one authoritative harness topology, keep the current two process-ownership layers explicit, separate supervisor-owner identity from child-attempt health, isolate every reconcile-launched parent from the launcher console, suppress non-interactive child windows, and keep reconcile-managed ownership under one OS-owned root keeper",
+      "reads": "supervisor.manageAllLoops, enabled supervisor.telegramLoops, explicit services, loop/service identities, maintenance-owner selection, global keeper hold, hidden scheduler action, keeper plan/task readback, exact keeper process identity, exact per-service supervisor PID/start identity, and child health",
+      "writes": "generated hidden launch/start/stop scripts and scheduled-task plan receipt in scheduled-task mode; deployment-owned desired-service inventory, process-boundary/owner-fence launch receipts, user-scoped keeper plan/readback, and fresh keeper/service state in reconcile-managed mode",
+      "invariants": "I26",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-memory-session-history-retrieval",
+      "label": "memory / session-history retrieval",
+      "group": "component",
+      "state": "implemented",
+      "summary": "recall/lifecycle/store proposal namespaces and lane-bound session-history lookup",
+      "reads": "prompt bundle, memory config, pack artifact metadata",
+      "writes": "memory receipts, graph freshness receipts, pack retrieval receipts",
+      "invariants": "I8, I15",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "axis-platform",
+      "label": "platform",
+      "group": "identity",
+      "state": "required",
+      "summary": "Telegram, Discord, or another channel adapter.",
+      "preservedThrough": "ingress, queue, progress, outbox, delivery receipts, trace",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "axis-accountid",
+      "label": "accountId",
+      "group": "identity",
+      "state": "required",
+      "summary": "Provider account or bot identity when configured.",
+      "preservedThrough": "channel identity, outbox, delivery, receipts",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "axis-channelid",
+      "label": "channelId",
+      "group": "identity",
+      "state": "required",
+      "summary": "DM/chat/channel/thread address.",
+      "preservedThrough": "channel state, queue item, delivery intent, trace",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "axis-userid",
+      "label": "userId",
+      "group": "identity",
+      "state": "required",
+      "summary": "Sender identity inside the channel.",
+      "preservedThrough": "permission gate, channel state, session key, trace",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "axis-agentid",
+      "label": "agentId",
+      "group": "identity",
+      "state": "required",
+      "summary": "Runtime owner, not just persona text.",
+      "preservedThrough": "provider/model defaults, Codex home, prompt files, memory namespace, runtime lane, session freshness, outbox, delivery, OperationPlan scope",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "axis-sessionkey",
+      "label": "sessionKey",
+      "group": "identity",
+      "state": "required",
+      "summary": "Conversation/session continuity key.",
+      "preservedThrough": "command state, runtime queue, Codex plan, transcript, freshness guard, prompt/memory task boundary",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "axis-virtualsessionid",
+      "label": "virtualSessionId",
+      "group": "identity",
+      "state": "required",
+      "summary": "Stable task-continuity owner across concrete-session rollover.",
+      "preservedThrough": "working-context resolver, prompt manifest, operation plan, child result owner, coordinator resume",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "axis-runtimeclass",
+      "label": "runtimeClass",
+      "group": "identity",
+      "state": "required",
+      "summary": "Interactive, cron, worker, maintenance, or another runtime lane.",
+      "preservedThrough": "queue selection, lease, retry/dead-letter policy, status",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "axis-sourcequeueid",
+      "label": "sourceQueueId",
+      "group": "identity",
+      "state": "required",
+      "summary": "Correlation for one queued turn.",
+      "preservedThrough": "Codex completion, final outbox, delivery receipts, trace",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "axis-backendcontextgeneration",
+      "label": "backendContextGeneration",
+      "group": "identity",
+      "state": "required",
+      "summary": "Opaque Codex/backend context generation, not a routing wildcard.",
+      "preservedThrough": "prompt manifest, injection ledger, reinjection decision, prepared execution receipt",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-channel-identity-commands-or-state",
+      "label": "Channel identity, commands, or state",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "allow/deny and ambiguous-binding gates; non-main routing; /new and /stop intent-before-cancel ordering; exact active-goal closure; frozen replacement session; pre-admission hold/FIFO replay; duplicate/restart idempotency; agent-scoped state and fresh-task boundaries",
+      "reviewDocs": "docs/trust-boundaries.md, docs/configuration.md, docs/invariants.md, docs/schema-registry.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
+      "label": "Runtime queue, worker mailbox, coordinator, or leases",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "FIFO/class isolation; WorkerJobKind-derived route; typed terminal provenance; immutable heterogeneous policies; exact-owner mailbox; failed omissions; structural-only context; exact-lane mutual exclusion; idempotent replay; master-only user output",
+      "reviewDocs": "docs/agent-worker-dispatch-strategy.md, docs/configuration.md, docs/invariants.md, docs/schema-registry.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "Codex runtime, final outbox, delivery, or progress",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "completion/protocol-error terminality; evidence-based shell-start classification; one exact-authorized fresh-runtime shell recovery; bounded structural parent/subagent lifecycle evidence without raw content or identifiers; parent-only final ownership; duplicate and stale-owner suppression; progress/final separation; provider delivery and terminal receipt precedence; source-index freshness/defer; historical fresh-send suppression; watched-stop claim release; bounded interruption evidence",
+      "reviewDocs": "docs/invariants.md, docs/schema-registry.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-retry-productive-deadline-bounded-yield-task-continuation-mcp-elicitation-or-external-connector-effects",
+      "label": "Retry, productive deadline/bounded-yield task continuation, MCP elicitation, or external connector effects",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "queue-owner renewal before deadline renewal; prepared work authority; irreversible bounded yield; exact-owned parent completion; harness-owned primary outcome; one final/child/parked surface; nonblocking needs-user; native approval exact-authority validation; legacy text continuity; bounded expiry/decision race; token isolation/fencing; readback before ambiguous resubmission",
+      "reviewDocs": "docs/configuration.md, docs/invariants.md, docs/schema-registry.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-presentation-media-or-artifact-hygiene",
+      "label": "Presentation, media, or artifact hygiene",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "protected parsing; policy-gated artifact refs; bounded extracted context; provider escaping/batching; no raw payloads, credentials, provider URLs, or local paths in durable model-facing context",
+      "reviewDocs": "docs/invariants.md, docs/schema-registry.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-prompt-assembly-or-agent-selection",
+      "label": "Prompt assembly or agent selection",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "absent non-main directory isolation; safe worker agent ids and canonical session-path confinement; exact-lane/backend-generation manifest; eight static files and aliases; tombstones; dynamic-memory separation; /new isolation",
+      "reviewDocs": "docs/configuration.md, docs/invariants.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-skill-routing-virtual-manifest-episode-classification-or-improvement",
+      "label": "Skill routing, virtual manifest, episode, classification, or improvement",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "separately gated shadow routing and virtual-manifest observation; active-selection and prompt byte identity; exact virtual digest; rollover rehydration without route/use; /new closure; unknown-until-verified outcome; append-once episode/review joins; deterministic exclusion/defer/reference; selected-only attribution abstention; checksummed reversible proposal-only output",
+      "reviewDocs": "docs/configuration.md, docs/invariants.md, docs/schema-registry.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-provider-model-request-overrides",
+      "label": "Provider/model/request overrides",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "exact-route max; exact ultra rejection; legacy alias canonicalization; unsupported routes fail closed; command replies remain model-turn-free",
+      "reviewDocs": "docs/configuration.md, docs/invariants.md, docs/migration-0.8.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-memory-or-session-history-search",
+      "label": "Memory or session-history search",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "per-agent namespace; bounded provenance; no canonical writes through read caches; exact-lane session history; explicit project/global scope",
+      "reviewDocs": "docs/invariants.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-release-or-rollback-boundary",
+      "label": "Release or rollback boundary",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "candidate gates, idle boundary, no ultra enablement, source/V2 compatibility review, safe state rollback, and post-change health checks",
+      "reviewDocs": "docs/configuration.md, docs/invariants.md, docs/migration-0.8.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-supervisor-task-scheduler-or-cutover-ownership",
+      "label": "Supervisor, Task Scheduler, or cutover ownership",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "configured ownership mode and loop plan/reconcile parity; supervisor.manageAllLoops=true makes deployment-owned reconcile inventory authoritative and scheduled-task plan absence not applicable; generated scheduled-task bundles preserve enabled channel loops; dedicated maintenance owner and fresh post-cutover heartbeats",
+      "reviewDocs": "docs/invariants.md, docs/configuration.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "bounded-ledger-maintenance-live-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Bounded receipt history and isolated maintenance owner",
+      "designTarget": "Interactive ingress, progress, runtime completion, and final delivery read source-authoritative bounded snapshots and only signal retention; expensive compaction runs under the independently supervised ledger-maintenance-loop. Derived delivery indexes are single-version-owned while live: a candidate may inspect them only in an isolated snapshot or after the deployed topology is stopped and a stopped-state backup is captured.",
+      "currentEvidence": "Focused 100k history, busy-lock snapshot, wake-coalescing, failure-isolation, queue-index migration, deployed-v3 revision preservation, candidate-access fencing, and full-workspace staging tests are green. Candidate supervisor dry-run plans the owner; controlled live long-turn ordering/latency evidence remains pending.",
+      "promotionGate": "Promote only after candidate preflight includes the dedicated owner, proves the candidate did not touch live sidecars before stopped-state backup, and controlled live evidence proves progress/final delivery does not wait for retention, with bounded maintenance receipts and no recurring rebuild warning.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-standalone-master-portability-soak-gap",
+      "label": "standalone-master-portability-soak-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Mode-aware supervisor readiness, configured-loop parity, and root availability",
+      "designTarget": "Windows direct-owner mode uses one thin OS host adapter, one exclusive Rust master, and the exact deployment-owned desired-service inventory as direct children. Compatibility mode derives reconcile, readiness, health, and guarded stop/start from the same service topology, but retains one intermediate supervisor-run owner per service. The modes share one deployment ownership lease and cannot own services concurrently.",
+      "currentEvidence": "Hermetic replay covers the nine-service topology, overrides, multiple Telegram accounts, custom or disabled services, exact kinds, partial-mutation receipts, process-identity fencing, direct-child restart/backoff/breaker behavior, stopped-state import, bounded drain, nested gateway cleanup, and zero visible Windows console windows. Thirteen serial Windows process scenarios pass. A guarded cutover then read back one master and nine direct children under the thin Task Scheduler adapter, with healthy restart state, rollback readiness, and exact-lane Telegram and Discord delivery.",
+      "promotionGate": "The normal Windows cutover gate is passed. Broader claims require a controlled long-duration soak and native Linux/macOS containment, signal, host-recovery, and packaging evidence. Promotion of a release tag requires a separately hash-bound artifact readback.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "gpt56-max-prompt-coordinator-cutover-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "GPT-5.6 Max-only prompt/child/coordinator upgrade",
+      "designTarget": "GPT-5.6 routes accept catalog-supported efforts through exact max; exact ultra is unsupported and cannot be enabled through command, persisted state, child policy, or configuration. Prompt configuration is isolated per agent and exact full lane/backend generation. Heterogeneous child policies are immutable, child results carry bounded/redacted content or explicit failed omissions to the exact owner, and one exact-lane-safe master continuation owns user-facing output.",
+      "currentEvidence": "Fresh focused and full-workspace staging evidence is green for exact Max/Ultra command/catalog/runtime behavior, exact-lane prompt manifests, immutable heterogeneous child policy, typed mailbox/coordinator resume, and parent-only final routing. The 2026-07-15 guarded cutover and provider-visible T4 replay used the current exact V2 lane session, admitted two authoritative heterogeneous children (including exact max), completed the mailbox/resume path, and delivered one master final with no child final outbox.",
+      "promotionGate": "The initial cutover/T4 gate is passed. Promote to broader operational parity only after the scheduled read-only soak confirms no duplicate final surface, route/policy drift, queue convergence failure, or cross-lane regression; add a controlled cross-platform exercise when the changed deployment scope requires it.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "telegram-final-chunking-terminal-receipt-live-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Telegram final text delivery and terminal receipt precedence",
+      "designTarget": "Overlong Telegram final text should deliver as ordered provider-safe chunks under one logical delivery id, every provider message id should be captured as rendered-unit receipts, Telegram provider-permanent message is too long responses should terminal-skip instead of retrying unchanged payloads, and any terminal receipt must outrank later retryable failures for the same delivery id.",
+      "currentEvidence": "Staging tests cover UTF-16 chunk budgeting with labels, paragraph/line boundary preference, plain and rich-fallback chunk delivery, post-chunk permanent message is too long classification, Discord chunk regression, and channel_delivery::tests::terminal_delivery_receipt_outranks_later_retryable_failed_receipt.",
+      "promotionGate": "Promote after live or candidate-home provider evidence shows a long Telegram final produces ordered (i/n) messages, one delivery receipt with per-chunk rendered units, no retryable backlog, and no resurrection after terminal receipt.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-interrupted-command-observability-live-gap",
+      "label": "interrupted-command-observability-live-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Interrupted validation command observability",
+      "designTarget": "A same-lane newer turn that interrupts an in-flight Codex command should record interrupted_by_new_turn, command preview/cwd/log pointers, safe-rerun classification, and bounded continuation context; it must not be reported as a failed test without an observed failing exit code or assertion output.",
+      "currentEvidence": "Staging tests cover active command cancel evidence in codex_runtime, safe-rerun classification, runtime failure text that avoids failed-test wording, and structured lastInterruption prompt context with legacy fallback.",
+      "promotionGate": "Promote after controlled live-lane or candidate-home smoke proves interruption affects only the current execution lane, gateway/supervisor loops remain live, receipts contain bounded command evidence, and the continuation prompt names the resume action without stdout/stderr dumps.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-openclaw-mem-full-parity-gap",
+      "label": "openclaw-mem-full-parity-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "openclaw-mem graph autonomous matching",
+      "designTarget": "openclaw-mem / openclaw-mem-engine graph recall, capture, routeAuto/autonomous matching, provenance, and freshness operate at full product parity through the active memory owner.",
+      "currentEvidence": "Graph topology extract is green for the harness support plane. The 2026-06-29 live cutover has a bounded subprocess bridge path for active mem-engine status/recall/store ownership with request/response mirrors, fallback telemetry, approved-store fail-closed behavior, env-or-harness-config bridge routing, and post-cutover proof that status/recall/read-path smoke run with fallbackUsed=false. Graph autonomous matching is still not parity.",
+      "promotionGate": "Bridge/sidecar emits stable recall/store envelopes; Qdrant/native backend selected by the memory layer; routeAuto/autonomous matching fixture passes; provenance/freshness receipts are green; fallback is not used for the proof query; canonical writes remain governed by openclaw-mem policy.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-per-agent-memory-recall-compartment-gap",
+      "label": "per-agent-memory-recall-compartment-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Per-agent memory recall compartment",
+      "designTarget": "Non-main and public-facing agents should receive their own memory prompt/lifecycle/canvas/writeback context by default. Legacy/global imported memory should be opt-in, trust-tagged, and visibly scoped so a public or coach agent cannot accidentally inherit private main context.",
+      "currentEvidence": "Focused staging coverage includes memory::tests::non_main_memory_prompt_context_excludes_global_imported_snapshot_by_default, which proves a non-main agent recall context uses its per-agent memory root, reports globalImportedSnapshotAllowed=false, records source scope, and filters private global imported memory. A guarded bridge-primary cutover removed the active recall/store fallback dependency. memory::tests::public_agent_read_path_smoke_surfaces_source_allow_list_and_filtered_counts broadens the read-path smoke to expose public/non-main allow/deny source scopes, trust level, and filtered global-imported hit counts.",
+      "promotionGate": "Before promotion, run the focused memory regression plus candidate-home status/read-path smoke that surfaces the same scope/filter telemetry. Do not claim openclaw-mem full graph parity while native/Qdrant backend proof, routeAuto/autonomous matching fixtures, or provenance/freshness receipts remain open under openclaw-mem-full-parity-gap.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-channel-session-history-classification-gap",
+      "label": "channel-session-history-classification-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Channel session history classification",
+      "designTarget": "Requests like \"previous session\" or cross-session search should resolve within the current platform/account/channel/user/agent lane unless a result is explicitly broad-scope project/global history. Agent-space history must not be treated as one blended pool.",
+      "currentEvidence": "Channel session history classification staging adds memory_pack::tests::retrieval_scope_session_requires_same_agent_and_session_key, memory_pack::tests::retrieval_scope_session_rejects_bare_session_key_even_when_equal, memory_pack::tests::retrieval_scope_agent_private_rejects_bare_session_key_even_when_equal, memory_pack::tests::retrieval_candidate_does_not_fall_back_to_wrong_lane_concrete_history, memory_pack::tests::retrieval_candidate_uses_project_after_wrong_lane_concrete_candidate, memory_pack::tests::retrieve_wrong_lane_concrete_history_reports_scope_denied_not_missing, memory_pack::tests::retrieve_wrong_lane_concrete_then_project_returns_explicit_broad_scope, and memory_pack::tests::retrieve_wrong_lane_concrete_then_global_imported_returns_explicit_broad_scope, proving concrete session/agent-private history is same-agent/session only, bare concrete keys fail closed, wrong-lane concrete candidates do not become arbitrary fallbacks, denial receipts stay visible, and explicit project/global-imported fallback still works. Account/channel/user axes are currently enforced through lane-qualified sessionKey rather than separate pack-artifact columns.",
+      "promotionGate": "Promote only after cross-session search/retrieval replay covers Telegram vs Discord and main vs non-main axes, receipts distinguish same-lane, cross-agent/session denied, and explicit project/global fallback, and any future store that has separate account/channel/user columns compares those axes directly instead of relying only on sessionKey.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-multi-agent-full-matrix-gap",
+      "label": "multi-agent-full-matrix-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Multi-agent platform isolation",
+      "designTarget": "Any configured agent can be added without rebuilding the pipeline, then own its workspace/prompt source, channel state, provider/model settings, memory namespace, context history, runtime lane, worker/subagent leases, and delivery receipts while sharing harness infrastructure.",
+      "currentEvidence": "Imported-agent registry, per-agent session paths, per-agent /model and /think overrides, provider-specific Codex homes, per-agent memory roots, agent-aware runtime dispatch, worker master_agent_id, and subagent lifecycle receipts are implemented. A non-main group-lane regression showed one final-owner guard still used main as a proxy for parent ownership; the repaired gate uses lane-agent consistency, keeps owner-mismatch suppression, and adds runtime_pipeline::tests::run_runtime_queue_once_writes_final_outbox_for_non_main_agent_owned_group_lane plus runtime_pipeline::tests::run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox.",
+      "promotionGate": "Add or maintain a reusable matrix that creates a new configured agent and proves independent workspace/prompt files, channel command state, provider/model override, memory/context history, worker lease/subagent lifecycle, final outbox, and delivery trace while sharing the same harness queues and loops.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-virtual-session-continuity-gap",
+      "label": "virtual-session-continuity-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Virtual session and working-context continuity",
+      "designTarget": "Long tasks should survive repeated compaction, repeated high-risk stream instability, or interrupted long-task slice overruns by rolling into fresh concrete sessions inside a stable virtual session, carrying a bounded working set so repeated compression, broken stream retries, or timed-out tool slices do not silently distort task state. /new is a task-boundary command and must not inherit the previous virtual/task memory context.",
+      "currentEvidence": "context_rollover records compact counters, virtual-session records, working-set memory, session indexes, rollover episodes, and guarded requeue receipts. The current implementation injects a bounded, pointer-only Virtual session working context prompt section from resolve_virtual_session_working_context, emits a missing-reply-metadata hint from same-lane queue anchors, closes prior virtual-session records on /new, backfills codexThreadId from Codex completion capture, separates maxContinuationDepth from compact-count thresholds, exposes stream-unstable continuation knobs, surfaces lastInterruption continuation guidance, and marks max-depth virtual sessions terminal-failed. Replay and catalog coverage includes context_rollover::tests::three_turn_compact_rollover_replay_writes_continuation_working_set, runtime_pipeline::tests::stream_unstable_retry_continuation_requires_repeated_high_usage_stream_failure, runtime_pipeline::tests::polluted_thread_continuation_runs_at_terminal_failure_and_respects_depth_limit, runtime_pipeline::tests::tool_timeout_fallback_failure_retry_requeues_continuation, runtime_pipeline::tests::no_final_answer_terminal_interruption_requeues_continuation, prompt missing-reply/root-boundary/interruption guidance coverage, /new closure coverage, Codex thread-backfill coverage, and the virtual-session-rollover S1-S5 scenario-matrix labels. Live validation has confirmed model-visible working-context prompt injection and a real /new task-boundary readback without carrying prior working-set context. Remaining evidence before promotion is broader live soak plus traced final-delivery continuity across real channel turns.",
+      "promotionGate": "Replay requirements are met for the current implementation. Promote only after live soak demonstrates model-visible continuity through real Telegram/Discord turns, traced final delivery remains correct, interrupted long-command slices continue from working-set evidence, and /new task-boundary behavior remains verified without cross-lane or cross-agent substitution.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-virtual-session-v2-authority-gap",
+      "label": "virtual-session-v2-authority-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Exact-lane v2 virtual-session authority",
+      "designTarget": "New production completion must not create accountless v1 working-set state. The authority boundary is platform/account/channel/user/agent/runtime/root-virtual-session/concrete-session plus backend generation.",
+      "currentEvidence": "Runtime completion now calls only record_completed_turn_working_set_snapshot_for_lane, emits virtual-session-authority.v1, and resolves the result through FullLaneKeyV1. Default-account legacy migration remains explicit; non-default lanes reject it. Focused production and resolver tests verify no new legacy index, exact account/agent separation, opaque prompt references, and generation-bound diagnostics.",
+      "promotionGate": "Promote only after goal lineage, continuation intents, final gating, and virtual skill manifests consume the same authority receipt; candidate T3 must show no accountless new writes, stale-generation continuation, or cross-lane lookup.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-progress-delivery-volume-gap",
+      "label": "progress-delivery-volume-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Progress delivery and final-reply UX",
+      "designTarget": "A long-running channel turn should show bounded progress updates, then converge to one final reply or terminal notification without excessive provider edits, repeated body/status churn, non-terminal progress after completion, terminal progress closing before the source final provider delivery, or raw internal worker final text leaking into the visible progress action stream. The body/action lane is an event-history stream and may be capped; the status/current-step lane is a heartbeat/current-summary surface and must remain editable after the body cap.",
+      "currentEvidence": "Provider audits found both excessive progress edits and the inverse failure where a capped panel looked frozen while work continued. The bounded-volume implementation adds response.progressDeliveryMaxNonterminalUpdatesPerLane and progressDeliveryMaxNonterminalBodyUpdatesPerQueue, tracks delivered non-terminal lane counters in agent-harness.progress-delivery-state.v1, exposes volume_limited, keeps terminal convergence outside the volume cap, and adds a status heartbeat after the body cap. Replays cover immediate current-step updates, Telegram and Discord terminal convergence without late churn, bounded summaries instead of raw internal worker prose, and terminal progress waiting for the same source queue's provider delivery.",
+      "promotionGate": "Promote only after a replay/scenario gate proves per-queue body/action edit caps, status/current-step heartbeat after body cap, immediate current-step updates for new assistant execution summaries, worker-result action summaries, repeated text-hash suppression, terminal progress convergence after source final provider delivery, final-outbox presence, and no post-terminal edit churn across Telegram and Discord.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-progress-final-surface-gap",
+      "label": "progress-final-surface-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Progress narration and final surface separation",
+      "designTarget": "When assistantNarrationMode=progress_panel, progress/narration deltas should be visible only through progress panels or audit receipts. Final agent-reply outbox payloads should contain the final answer or terminal notification, not the in-progress diagnostic stream.",
+      "currentEvidence": "A provider replay found a long progress stream incorrectly written as agent-reply even though completion metadata identified progress-panel narration. Runtime-pipeline replay gates now keep narration out of repaired Telegram and Discord final payloads. A stdout-recovery subcase with no final_answer is covered by codex_runtime::tests::run_codex_runtime_rejects_stdout_recovery_narration_without_final_answer, which fails closed instead of using narration or raw assistant text as final.",
+      "promotionGate": "Promote only after the replay/scenario pack also covers compact-before-turn fallback or fresh-thread recovery and asserts Telegram and Discord final outbox payloads contain only the final answer while progress text stays in progress receipts/panels.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-tool-use-timeout-recovery-gap",
+      "label": "tool-use-timeout-recovery-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Codex tool-use timeout recovery",
+      "designTarget": "Long external tools should not be allowed to silently stall the app-server until the parent queue item is dead-lettered. The harness should stop the stalled tool path, surface the timeout to the model, and allow bounded recovery, virtual-session continuation, or a clear blocker report.",
+      "currentEvidence": "Active tool-use tracking converts an in-flight tool idle timeout into one fresh-thread recovery prompt with toolUseTimeout receipt metadata. Interrupted-task recovery rotates stale timeout stdout, routes failed tool-timeout fallback to virtual-session continuation, carries a bounded tool summary into the working-set decision, and keeps provider-outage-shaped timeouts out of the continuation predicate. This remains short of a dedicated per-tool supervisor with resumable cancellation.",
+      "promotionGate": "Promote to full parity only after per-tool cancellation semantics, retry budgets, trace replay, and long-review soak tests prove a timed-out tool can be killed or isolated without losing queue trace, final outbox, continuation prompt evidence, or follow-up model control.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-productive-deadline-live-evidence-gap",
+      "label": "productive-deadline-live-evidence-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Productive deadline grant and harness-owned bounded yield",
+      "designTarget": "A healthy prepared ordinary interactive turn may receive bounded deadline grants while it is making exact-owned progress and still owns its queue lease. Responsive reclaim uses one irreversible bounded yield; unresponsive idle/hard boundaries retain their primary outcome. Streamed goal projection and model markers are never authority.",
+      "currentEvidence": "Default-off off/shadow/authoritative policy, prepared work-authority classification, scored/deduplicated progress watermarks, previous-deadline arithmetic, hard cap/count/task-budget limits, owner-generation lease renewal, effective same-lane fairness, RPC-accepted versus prompt-observed steer evidence, completed-final-only advisory parsing, task-family authority, commit-before-enqueue continuation, one disposition recovery, and sanitized replay fixtures are implemented. Focused scenario replays cover authoritative lease-before-timer renewal with an active streamed goal projection, exact task-family continuation with one eventual final, incomplete-marker timeout preservation, and bounded indeterminate recovery.",
+      "promotionGate": "Promote beyond the reviewed cohort only after candidate shadow/authoritative/off comparison and controlled live soak prove one owner, no post-yield renewal, bounded same-lane access, one final/child/parked surface, restart idempotency, no duplicate external effect, preserved primary outcome, and privacy-safe receipts.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-codex-startup-executable-stability-gap",
+      "label": "codex-startup-executable-stability-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Codex app-server startup and executable stability",
+      "designTarget": "Service-mode runtime should invoke a spawn-stable Codex executable and classify startup/write failures as terminal receipts instead of losing queue trace or wedging channel callbacks.",
+      "currentEvidence": "A 2026-06-29 live incident found runtime execution vulnerable to Windows command-shim/native-binary drift after a Codex app update: app-server startup could exit with 0xC0000142, and stale Discord queues needed replay or explicit terminalization. Source hardening now prefers native Windows vendor codex.exe for npm codex.cmd shim installations and uses the shim only as fallback, while app-server startup/write failure records a terminal protocol-error receipt with focused regression coverage. The same follow-up makes CLI default Node resolution prefer an explicit Windows node.exe when no --node-exe is supplied, and the live Discord scheduled gateway script was hotpatched away from the bare node PATH shim. The live runtime was hotpatched to an explicit native Codex executable; broader binary cutover and soak remain separate gates.",
+      "promotionGate": "Promote only after Windows npm-shim/native-vendor tests, MSIX/extensionless rejection tests, Node default-resolution tests, early-exit/write-failure terminal receipt tests, and a live post-restart smoke prove pending queues and runtimeOpenItems converge to zero across Discord and Telegram.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-runtime-terminal-control-gap",
+      "label": "runtime-terminal-control-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Runtime queue terminal-control authority",
+      "designTarget": "Operator-written queue controls must be authoritative before runtime selection, preparation, lease return, run-once execution, worker reconciliation, coordinator resume, and progress delivery. Terminal run-once receipts, queue-skip control receipts, scoped-stop markers, and quarantine markers must prevent runnable work without manual state surgery and must close visible progress with one final terminal surface before going silent.",
+      "currentEvidence": "Resolver-backed terminal-control checks cover runtime selection/preparation and stale lease reconciliation, keep historical terminal statuses sticky, write at most one suppressed receipt, quarantine repeated unresumable prepared executions, and require fresh queue IDs for retries. Suppressed early-return paths write terminal progress evidence. Worker reconciliation preserves the exact terminal-control source: quarantine, scoped-stop, or queue-skip suppression atomically quarantines a waiting coordinator without publishing a resumable mailbox; the watchdog rechecks wait state, and ambiguous carriers remain unresolved. Checked-in ghost-queue and coordinator-revival replays cover these surfaces.",
+      "promotionGate": "Promote after regression coverage plus checked-in end-to-end and deployment-home replay prove terminal-controlled pending queues do not resurrect, suppression receipts are idempotent, quarantined children create no mailbox or resume job, progress emits one final terminal surface and then no further edits, retry uses a fresh runnable ID, and no-prepared-execution churn stops without manual queue edits.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-deterministic-cron-freshness-gap",
+      "label": "deterministic-cron-freshness-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Deterministic cron freshness and catch-up",
+      "designTarget": "Cron canon freshness must be evaluated by status/health independently of the keeper job, deterministic cron executions must be answerable by canonical cron id, and restart catch-up behavior must be explicit and receipted per job class. Each occurrence must come from one exact crontab source, use the declared timezone/calendar fields, and apply bounded per-entry timeout/attempt policy before enqueue. Notification/sender and backup-class jobs must not execute stale work unless an operator forces that path and the receipt says so.",
+      "currentEvidence": "The scheduler now filters exact crontab filenames, validates canonical timeoutMs / maxAttempts, honors TZ / CRON_TZ for current and catch-up slots, supports calendar day/month fields, passes stable occurrence metadata to workers, and terminalizes exhausted jobs before lease. Incident-shaped replay covers attempt-cap bypass, process-tree timeout, invalid policy, source-copy filtering, timezone, and unsafe backup catch-up suppression in addition to existing health/status and E2E-5 evidence.",
+      "promotionGate": "Promote after focused incident replay plus a candidate/live dry-run prove zero unsafe stale backup enqueue, one intended source per entry, valid execution bounds, correct local schedule evaluation, and post-cutover worker/scheduler readback shows no retry growth or duplicate occurrence.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-external-review-loop-resilience-gap",
+      "label": "external-review-loop-resilience-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "External review loop resilience",
+      "designTarget": "External review output is progress evidence for the parent task unless the parent queue explicitly reaches final completion. A review result, timeout, authentication failure, read-only inspection result, or non-owner agent result must not be mistaken for workflow closure.",
+      "currentEvidence": "Runtime replays prove review-only recovery output remains evidence, the parent queue stays resumable, and no final outbox is written. Additional coverage suppresses read-only review text and owner-mismatched completed output from user-facing agent-reply rows while a routed non-main channel parent remains eligible to write its own final.",
+      "promotionGate": "Keep the runtime-pipeline replay green and add live/soak evidence before promotion: final outbox closure must only happen after the parent workflow completes or emits an explicit terminal blocker, and structured owner/session identity must match before a completion can become a visible final reply.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-context-capacity-correlation-gap",
+      "label": "context-capacity-correlation-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Context capacity and preflight guard",
+      "designTarget": "A backend-reported modelContextWindow is capacity authority only for the same binding, provider/model route, and backend context generation while fresh. Pollution and model auto-compact policy run first; fresh live ratio then static route ratio run before the 120000 unknown/stale-capacity failsafe.",
+      "currentEvidence": "Durable usage/index fields record capacity source, route, generation, and observation time; preflight receipts expose effective capacity, source, and freshness. Focused tests prove fresh 258400-token capacity uses ratio policy and stale-generation capacity cannot cross into another binding. Existing pollution and fresh-thread tests remain authoritative before capacity policy.",
+      "promotionGate": "Promote only after the exact compact/resume incident replay proves restart-persisted capacity stays lane/generation-bound, the 120k failsafe appears only for unknown or stale capacity, and polluted contexts still checkpoint or roll over without final-surface leakage.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-compact-resume-goal-race-gap",
+      "label": "compact-resume-goal-race-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Resume-settle, compact correlation, and verified goal rollover",
+      "designTarget": "A successful thread/resume response is not settled state. The harness drains restored goal work before maintenance, correlates compact only by its request/thread/item lifecycle, and treats post-ack death as ambiguous. Safe fallback checkpoints bounded state and projects the active goal before opening a replacement generation; no explicit fallback turn is released until the new thread acknowledges and echoes the same active backend-goal checksum.",
+      "currentEvidence": "codex-resume-settle.v1, compact-attempt.v1, codex-goal-projection.v1, and codex-goal-rehydration.v1 retain resume/goal/compact/checkpoint correlation. Focused replays cover first-incident interrupted:null, compact-wins, reordered item-before-ack, and death-after-ack followed by verified thread-fresh goal echo. Completion criteria remain harness-authoritative via a separate checksum rather than being falsely attributed to the backend goal API.",
+      "promotionGate": "Promote only after v2 exact-lane authority, unified transition/continuation/final gates, duplicate/restart T3, and candidate/live readback prove one logical next slice and no campaign-final leakage.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-goal-lineage-reconciliation-gap",
+      "label": "goal-lineage-reconciliation-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Exact-lane goal lineage and reconciliation",
+      "designTarget": "Backend goal rows are execution observations, not autonomous authority by themselves. One protocol-state observer consumes every thread/goal/updated path, including stdout crash recovery. The harness derives a campaign family from exact lane, virtual session, and objective checksum, then binds each row to backend generation, source thread/turn, stable goal reference, projection checksum, completeness, and observation order.",
+      "currentEvidence": "Status-only updates inherit only an exact same-thread prior; incomplete updates remain fail-closed. Latest terminal status cannot fall back to an older active projection. goal-lineage-doctor is read-only and joins private goal projections with virtual-session-authority.v1; multiple active rows, wrong/missing identity, malformed receipts, and conflicting/tampered reconciliation fail closed. goal-lineage-supersede appends a deterministic same-campaign receipt and never deletes backend rows.",
+      "promotionGate": "Before goal-autonomy activation, run the doctor on the stopped-state candidate copy and retain a reviewed report showing exactly one runnable lineage. GOAL transition/intent/final gates and T3 remain required.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-goal-continuation-live-evidence-gap",
+      "label": "goal-continuation-live-evidence-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Unified goal transition and exactly-once continuation",
+      "designTarget": "Every normal completion, deadline drain, timeout, compact rollover, auth defer, restart, operator stop, newer same-lane input, older-lineage completion, and runtime failure is classified before final-outbox selection. Active Goal slices are progress-only unless the authoritative Goal state is terminal.",
+      "currentEvidence": "goal-transition.v1 and goal-slice.v1 bind the decision to exact lineage/lane/virtual-session/backend generation and a campaign slice generation independent from context recovery depth. With no goalAutonomy block, only an exact current-owned Goal with a canonical lane and authorized continuation receives bounded implicit autonomy; explicit observe or disabled remains an opt-out, and explicit active remains bound to activeLaneDigests. goal-continuation-intent.v1 commits a deterministic key and human-input generation before enqueue. A separate rollback-readable fence isolates malformed records and revokes stale authority. Restart and concurrent reconciliation create at most one child; post-lease and pre-effect gates revalidate the exact lane, virtual session, fence, and newer human input before acknowledgement or chaining. Ordinary same-lane text outranks an unleased autonomous continuation at the next scheduler checkpoint without bypassing an active lease; /steer remains the explicit same-turn control. A failed command start is eligible for one fresh-runtime recovery only when exact executable-drift evidence agrees. Terminal Goal state commits goal-terminal-outbox.v1 before append, and campaign budgets bound wall clock, slices, tokens, repeated progress, and recoveries.",
+      "promotionGate": "Keep the restart/concurrency, wrong-lane, worker, malformed-ledger, ordinary-input, and post-lease replay suite green. Before broader promotion, retain reviewed candidate and live evidence for one exact-lane long Goal followed by ordinary same-lane input, proving one continuation or final, no duplicate effect, no premature campaign final, and no stuck queued message.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-first-class-command-plane-gap",
+      "label": "first-class-command-plane-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "First-class command plane",
+      "designTarget": "User commands should be parsed as control-plane events before model dispatch, mutate scoped channel/session state deterministically, emit machine-readable command receipts, and skip LLM execution when the command is fully handled by the runtime. Commands should not depend on a chat-facing agent noticing and obeying command-shaped text.",
+      "currentEvidence": "Agent Harness has a command path for /new, /think, /model, /stop, /status, /steer, /btw, and protected restart requests: channel_runtime builds CommandReply steps, channel_state writes scoped state plus command receipts, and command replies do not enqueue agent turns. Command parsing and receipt coverage includes a checked-in agent-harness-cli::tests::e2e_4_restart_gateway_staging_closed_loop_replay for request, consumption, heartbeat, and completion acknowledgement. Remaining proof is provider/supervisor smoke for real supervised child restart and provider delivery, plus any lifecycle commands still intentionally model-assisted.",
+      "promotionGate": "Keep central command registry coverage for command-only, command-plus-reply, and command-plus-enqueue cases; emit stable command receipts for applied, unsupported, unknown, and skipped-not-command outcomes; prove handled commands do not create model turns; prove same platform/channel/user but different agentId state isolation; prove /stop cancellation is immediate and source-correlated; document which lifecycle commands are runtime-owned versus model-assisted; before live promotion, prove the restart loop with a real supervised child and provider-side acknowledgement delivery.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-skill-outcome-linked-upgrade-gap",
+      "label": "skill-outcome-linked-upgrade-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Skill ecosystem closed loop",
+      "designTarget": "Skills should behave as runtime state with deterministic per-agent discovery and selection, guarded prompt exposure, immutable mutation traces, guarded autonomous review/apply, reversible lifecycle curation, checksum-locked packs, and outcome-linked health evidence.",
+      "currentEvidence": "The current implementation includes matcher v4 with mixed CJK tokenization, category/tag scoring, exact-agent usage priors, per-agent source roots, hard agents allowlists, lifecycle and explicit/model invocation gates, catalog retrieval, lint, guard, reversible archive/restore/pin, file-based packs, guarded-autonomous-default synthesis, explicit --propose-only, open-work-only idle fencing, and skill-doctor. Retired or wrong-agent entries cannot reach prompt selection. Autonomous and operator-triggered apply both require proposal IDs, checksum validation, target locks, backups, lint/guard decisions, and receipts.",
+      "promotionGate": "Freeze a versioned skill card and deterministic catalog, rebaseline without serving mutation, compare a role-first shadow router on reviewed replay, join exact delivery to verified outcome and cost, then promote one reversible exact cohort and one selected-skill improvement loop. Expansion requires held-out improvement, quarantine coverage, exact rollback, and scenario replay; activity or model self-assessment is not promotion evidence.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-fast",
+      "label": "fast",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Provider request acceleration command",
+      "designTarget": "Users should be able to toggle provider-native fast/priority request behavior for the current agent/session without mutating prompt text, leaking across agents/channels, or sending unsupported request parameters to Codex/proxy/provider routes.",
+      "currentEvidence": "Hermes Agent upstream implements /fast normal, /fast fast, and /fast status as a command-state/request-override path: command registry plus CLI/gateway handlers, model capability checks, per-turn request_overrides, OpenAI service_tier=\"priority\" for supported routes, Anthropic speed=\"fast\" only for supported native routes, and defensive stripping for incompatible routes. Agent Harness now handles `/fast status",
+      "promotionGate": "normal",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-channel-media-delivery-gap",
+      "label": "channel-media-delivery-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Channel media delivery",
+      "designTarget": "Outbound files should be delivered through channel-native media APIs only after harness policy accepts the local path or resolvable artifactRef, while inbound and referenced channel media should remain prompt-safe artifacts with provenance.",
+      "currentEvidence": "Channel-media staging adds a shared media extension/kind policy, protected-span MEDIA directive parsing, rejection/lint receipts, inbound-media and generated-image/generated-media artifactRef resolution into attachments, Telegram photo albums plus document/audio/voice/video sends with caption overflow handling, Discord multipart file batching, Telegram non-image document/voice/audio/video/static-sticker/reply-media artifact extraction, Discord referenced-media fetching, and native-image-input context-bloat preflight. ArtifactRef resolution is intentionally limited to harness-owned URI namespaces plus the same outbound policy gate; arbitrary provider URLs and raw paths remain refused.",
+      "promotionGate": "Promote only after parser/policy/lint gates, provider batching gates, inbound/referenced media hygiene gates, native-image bloat rollover, public schema/topology docs, and live Telegram/Discord smoke all pass. Keep media.nativeImageInput and media.lintFailClosed default-off until post-cutover enablement evidence exists.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-rich-message-presentation-gap",
+      "label": "rich-message-presentation-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Rich message presentation",
+      "designTarget": "Final replies, attachments, links, buttons/actions, captions, and provider-native rich UI should be modeled as a semantic presentation payload rendered by channel adapters, not as raw model-authored Telegram/Discord syntax. Automatic projection is eligible only when every canonical text segment is represented.",
+      "currentEvidence": "Agent Harness has durable canonical ChannelOutboundMessage.text, optional agent-harness.rich-message-presentation.v1, provider renderers, safe chunking, attachment delivery, and progress/final separation. The issue #9 hotpatch makes the bridge loss-aware at the 16-block and per-block limits, revalidates persisted auto-bridge-like rows before any rich send, routes lossy rows through Discord \u003c=2,000-character or Telegram UTF-16 canonical chunks, and derives fullTextPreserved from complete accepted text units. rich-final-fidelity-and-fallback re-opens a durable legacy outbox row, delivers it through both adapter seams, records a terminal receipt, and proves replay suppression.",
+      "promotionGate": "Keep bridge boundary, legacy assessment, safe renderer, provider fallback, partial-failure, media, and restart/idempotency replays green. Promotion additionally requires public hygiene and candidate catalog readback; live Telegram/Discord long-final observation, action interaction re-entry, live preview, and generated artifact/provider URL redaction remain separately authorized gates.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-generic-artifact-context-hygiene-gap",
+      "label": "generic-artifact-context-hygiene-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Generic artifact/context hygiene",
+      "designTarget": "Binary and bulky artifacts should be stored and referenced through harness artifact metadata after extraction. Durable main-session prompt, memory, continuity, progress previews, and final replies should receive bounded extracted facts plus artifact refs, not raw bytes/base64/provider URLs/document bodies/tool blobs.",
+      "currentEvidence": "agent-harness.inbound-media-artifact.v1 includes optional lifecycleStatus and extractionSummary, generic prompt redaction covers raw payload signatures, provider URLs, tokens, and cookies, and media tests cover bounded summaries instead of payloads. Progress coverage proves generated image and tool previews do not persist raw data URLs, base64, provider URLs, or token-bearing strings. Discord attachment tests prove text and image attachments are copied into artifact storage and rendered through artifact refs plus bounded summaries while non-Discord URLs, raw provider errors, fake image bodies, and extension ambiguity fail closed. This is prompt, progress, and ingress-surface hygiene, not a complete artifact lifecycle service.",
+      "promotionGate": "Promote only after an end-to-end artifact-heavy Telegram/Discord replay proves extraction writes bounded facts, raw artifacts remain retrievable by pointer, memory/continuity do not persist blobs, generated media/tool outputs are stored as artifacts/receipts with capped previews, and image-only compact is not used as proof for audio/browser/document/log classes.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-image-route-vs-input-classification-gap",
+      "label": "image-route-vs-input-classification-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Codex image route-vs-input classification",
+      "designTarget": "Image generation receipts should distinguish a broken global image route from a specific prompt/reference input that failed to call the image tool after the route has been proven available.",
+      "currentEvidence": "An incident replay showed known-good inputs and canary route probes succeeded through the same gateway while one target input returned IMAGE_GENERATION_FAILED_NO_TOOL; older receipts classified that as image_tool_unavailable. The gateway now runs a route probe before returning unavailable and emits image_tool_not_called_for_input when the canary proves the route is available.",
+      "promotionGate": "Keep fake-route tests plus at least one staged route canary receipt proving available route and input-specific failure classification before using the classification for production image-task fallback decisions.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-repo-code-graph-support-gap",
+      "label": "repo-code-graph-support-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Repo code topology graph",
+      "designTarget": "A queryable repo/code knowledge graph can answer architecture, dependency, and diff-impact questions for behavior-changing changes.",
+      "currentEvidence": "Topology contract exists as canonical text; openclaw-mem topology extract currently covers cron/script/repo support-plane nodes, not full Rust code relationships.",
+      "promotionGate": "Understand-Anything or equivalent graph build runs with a reviewed ignore policy, public hygiene boundaries, commit hash metadata, and reviewer-confirmed usefulness against the topology contract.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-supervisor-service-health-precedence-gap",
+      "label": "supervisor-service-health-precedence-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Supervisor service health precedence",
+      "designTarget": "healthz, status --json, and supervisor control should present one canonical managed-service health view or explicitly label when service registry metadata is non-authoritative behind a fresher loop heartbeat.",
+      "currentEvidence": "A post-cutover readback found fresh gateway heartbeat and no reconcile action while healthz.supervisorServices still exposed an older gateway service record as spawning and stale. status::tests::loop_status_prefers_fresh_loop_heartbeat_over_spawning_service_state and health::tests::healthz_prefers_fresh_loop_heartbeat_over_spawning_service_state align the read models with the fresher heartbeat. Direct-owner mode uses the master and direct-child state as the canonical ownership view.",
+      "promotionGate": "Promote only after service state, loop heartbeat, healthz, status --json, and the selected ownership mode use the same precedence rules or surface stale service metadata as historical/non-authoritative, with a gateway spawn-boundary scenario proving no false stale alarm when the Node heartbeat is fresh.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-supervisor-process-instance-fencing-live-gap",
+      "label": "supervisor-process-instance-fencing-live-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Supervisor process-instance fencing",
+      "designTarget": "A stale service record may block a replacement only when its PID and recorded process-start identity still refer to the same live process instance. PID existence alone is not ownership because Windows can reuse a terminated loop's PID for an unrelated process.",
+      "currentEvidence": "supervisor_launch_guard_ignores_reused_pid_from_stale_generation is fail-first coverage for a stale worker record whose PID now belongs to a different process instance; existing live-owner tests still reject a matching current owner.",
+      "promotionGate": "A controlled cutover must reproduce a stale service record with a reused live PID, reconcile exactly one replacement generation, and finish with fresh heartbeats plus no missing, stale, or launch actions.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "active-runtime-stop-recovery-live-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Active runtime-task stop recovery",
+      "designTarget": "A scoped stop or service stop must not depend indefinitely on an in-process runtime task returning. The runtime loop polls exact active queue terminal control, waits a bounded cooperative grace, then exits: non-zero for terminal-control restart and cleanly for service shutdown. The next supervised generation reaps only the exited generation's fenced lease and re-evaluates durable terminal control before execution.",
+      "currentEvidence": "Focused core coverage proves nonblocking scoped-stop visibility; CLI coverage fixes the default and configurable grace boundary. Queue lease and supervisor process-instance regressions cover the recovery fences.",
+      "promotionGate": "Promote only after a controlled active task ignores cooperative cancellation, scoped stop causes one bounded runtime-loop restart, the dead generation's lease is reaped, the target is terminally suppressed, unrelated lanes remain runnable, and service stop also completes within the configured grace.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-scenario-matrix-coverage-gap",
+      "label": "scenario-matrix-coverage-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Release-gate scenario replay",
+      "designTarget": "Every topology-sensitive change maps changed modules to required scenario packs and invariant replay.",
+      "currentEvidence": "Invariants and release checklist exist; agent-boundary regression added for session freshness. agent-harness scenario-matrix now exposes a reusable catalog covering agent-boundary, final-outbox/delivery/trace, virtual-session rollover, progress surface/volume, and multi-agent memory compartment gates.",
+      "promotionGate": "Keep the scenario matrix catalog green and use it as the release gate selector for changed components. Promotion beyond coverage scaffolding still requires each selected scenario pack to have runnable replay evidence or a documented stronger equivalent.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "source": "release-verification",
+      "target": "canon-topology-contract",
+      "label": "verification maps to"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-channel-identity",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-channel-state-channel-session-transition",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-runtime-queue-runtime-worker",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-media-artifact-hygiene",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-prompt-turns",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-workers-child-execution-policy",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-operation-plan",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-cron-scheduler-deterministic-cron",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-worker-result-mailbox-coordinator-resume",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-codex-runtime-goal-closure",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-external-effect",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-codex-web-search",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-provider-request-policy",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-runtime-pipeline-task-transition-task-budget",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-provider-gateway-adapters",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-channel-delivery",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-progress",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-ledger-maintenance",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-supervisor-plan-reconcile",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-memory-session-history-retrieval",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "axis-platform",
+      "label": "defines"
+    },
+    {
+      "source": "axis-platform",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-platform",
+      "target": "component-runtime-queue-runtime-worker",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-platform",
+      "target": "component-channel-delivery",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-platform",
+      "target": "component-progress",
+      "label": "must survive through"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "axis-accountid",
+      "label": "defines"
+    },
+    {
+      "source": "axis-accountid",
+      "target": "component-channel-identity",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-accountid",
+      "target": "component-channel-state-channel-session-transition",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-accountid",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-accountid",
+      "target": "component-channel-delivery",
+      "label": "must survive through"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "axis-channelid",
+      "label": "defines"
+    },
+    {
+      "source": "axis-channelid",
+      "target": "component-channel-identity",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-channelid",
+      "target": "component-channel-state-channel-session-transition",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-channelid",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-channelid",
+      "target": "component-runtime-queue-runtime-worker",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-channelid",
+      "target": "component-channel-delivery",
+      "label": "must survive through"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "axis-userid",
+      "label": "defines"
+    },
+    {
+      "source": "axis-userid",
+      "target": "component-channel-identity",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-userid",
+      "target": "component-channel-state-channel-session-transition",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-userid",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-userid",
+      "target": "component-channel-delivery",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-userid",
+      "target": "component-memory-session-history-retrieval",
+      "label": "must survive through"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "axis-agentid",
+      "label": "defines"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-channel-state-channel-session-transition",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-runtime-queue-runtime-worker",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-prompt-turns",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-operation-plan",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-codex-runtime-goal-closure",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-codex-web-search",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-provider-request-policy",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-runtime-pipeline-task-transition-task-budget",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-provider-gateway-adapters",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-channel-delivery",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-supervisor-plan-reconcile",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-memory-session-history-retrieval",
+      "label": "must survive through"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "axis-sessionkey",
+      "label": "defines"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-channel-state-channel-session-transition",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-channel-ingress-channel-runtime-channel-action",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-runtime-queue-runtime-worker",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-prompt-turns",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-operation-plan",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-codex-runtime-goal-closure",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-codex-web-search",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-runtime-pipeline-task-transition-task-budget",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-supervisor-plan-reconcile",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-memory-session-history-retrieval",
+      "label": "must survive through"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "axis-virtualsessionid",
+      "label": "defines"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-prompt-turns",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-workers-child-execution-policy",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-operation-plan",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-worker-result-mailbox-coordinator-resume",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-supervisor-plan-reconcile",
+      "label": "must survive through"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "axis-runtimeclass",
+      "label": "defines"
+    },
+    {
+      "source": "axis-runtimeclass",
+      "target": "component-runtime-queue-runtime-worker",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-runtimeclass",
+      "target": "component-workers-child-execution-policy",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-runtimeclass",
+      "target": "component-provider-request-policy",
+      "label": "must survive through"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "axis-sourcequeueid",
+      "label": "defines"
+    },
+    {
+      "source": "axis-sourcequeueid",
+      "target": "component-codex-runtime-goal-closure",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sourcequeueid",
+      "target": "component-codex-web-search",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sourcequeueid",
+      "target": "component-channel-delivery",
+      "label": "must survive through"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "axis-backendcontextgeneration",
+      "label": "defines"
+    },
+    {
+      "source": "axis-backendcontextgeneration",
+      "target": "component-prompt-turns",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-backendcontextgeneration",
+      "target": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-backendcontextgeneration",
+      "target": "component-workers-child-execution-policy",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-backendcontextgeneration",
+      "target": "component-ledger-maintenance",
+      "label": "must survive through"
+    },
+    {
+      "source": "impact-channel-identity-commands-or-state",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "impact-channel-identity-commands-or-state",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "impact-channel-identity-commands-or-state",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "impact-channel-identity-commands-or-state",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "impact-channel-identity-commands-or-state",
+      "label": "changes trigger"
+    },
+    {
+      "source": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
+      "label": "changes trigger"
+    },
+    {
+      "source": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-progress",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "changes trigger"
+    },
+    {
+      "source": "impact-retry-productive-deadline-bounded-yield-task-continuation-mcp-elicitation-or-external-connector-effects",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-external-effect",
+      "target": "impact-retry-productive-deadline-bounded-yield-task-continuation-mcp-elicitation-or-external-connector-effects",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "impact-retry-productive-deadline-bounded-yield-task-continuation-mcp-elicitation-or-external-connector-effects",
+      "label": "changes trigger"
+    },
+    {
+      "source": "impact-presentation-media-or-artifact-hygiene",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-media-artifact-hygiene",
+      "target": "impact-presentation-media-or-artifact-hygiene",
+      "label": "changes trigger"
+    },
+    {
+      "source": "impact-prompt-assembly-or-agent-selection",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "impact-prompt-assembly-or-agent-selection",
+      "label": "changes trigger"
+    },
+    {
+      "source": "impact-skill-routing-virtual-manifest-episode-classification-or-improvement",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "impact-skill-routing-virtual-manifest-episode-classification-or-improvement",
+      "label": "changes trigger"
+    },
+    {
+      "source": "impact-provider-model-request-overrides",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "impact-provider-model-request-overrides",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "impact-provider-model-request-overrides",
+      "label": "changes trigger"
+    },
+    {
+      "source": "impact-memory-or-session-history-search",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "impact-memory-or-session-history-search",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "impact-memory-or-session-history-search",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "impact-memory-or-session-history-search",
+      "label": "changes trigger"
+    },
+    {
+      "source": "impact-release-or-rollback-boundary",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "impact-supervisor-task-scheduler-or-cutover-ownership",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "impact-supervisor-task-scheduler-or-cutover-ownership",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "impact-supervisor-task-scheduler-or-cutover-ownership",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "impact-supervisor-task-scheduler-or-cutover-ownership",
+      "label": "changes trigger"
+    },
+    {
+      "source": "gap-bounded-ledger-maintenance-live-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-operation-plan",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-ledger-maintenance",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-standalone-master-portability-soak-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-standalone-master-portability-soak-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-standalone-master-portability-soak-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-media-artifact-hygiene",
+      "target": "gap-standalone-master-portability-soak-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-standalone-master-portability-soak-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-standalone-master-portability-soak-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-standalone-master-portability-soak-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-standalone-master-portability-soak-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-standalone-master-portability-soak-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-standalone-master-portability-soak-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-interrupted-command-observability-live-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-openclaw-mem-full-parity-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-operation-plan",
+      "target": "gap-openclaw-mem-full-parity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-openclaw-mem-full-parity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-openclaw-mem-full-parity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-openclaw-mem-full-parity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-per-agent-memory-recall-compartment-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-per-agent-memory-recall-compartment-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-per-agent-memory-recall-compartment-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-channel-session-history-classification-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-media-artifact-hygiene",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-multi-agent-full-matrix-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-virtual-session-continuity-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-virtual-session-v2-authority-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-progress-delivery-volume-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-media-artifact-hygiene",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-progress-final-surface-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-tool-use-timeout-recovery-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-external-effect",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-productive-deadline-live-evidence-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-external-effect",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-productive-deadline-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-codex-startup-executable-stability-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-runtime-terminal-control-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-deterministic-cron-freshness-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-deterministic-cron-freshness-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-deterministic-cron-freshness-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-deterministic-cron-freshness-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-deterministic-cron-freshness-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-deterministic-cron-freshness-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-external-review-loop-resilience-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-external-effect",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-context-capacity-correlation-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-context-capacity-correlation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-external-effect",
+      "target": "gap-context-capacity-correlation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-context-capacity-correlation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-context-capacity-correlation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-compact-resume-goal-race-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-ledger-maintenance",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-goal-lineage-reconciliation-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-goal-continuation-live-evidence-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-external-effect",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-goal-continuation-live-evidence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-first-class-command-plane-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-operation-plan",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-skill-outcome-linked-upgrade-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-skill-outcome-linked-upgrade-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-skill-outcome-linked-upgrade-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-skill-outcome-linked-upgrade-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-skill-outcome-linked-upgrade-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-skill-outcome-linked-upgrade-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-skill-outcome-linked-upgrade-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-skill-outcome-linked-upgrade-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-skill-outcome-linked-upgrade-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-skill-outcome-linked-upgrade-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-fast",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-channel-media-delivery-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-media-artifact-hygiene",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-rich-message-presentation-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-generic-artifact-context-hygiene-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-media-artifact-hygiene",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-image-route-vs-input-classification-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-image-route-vs-input-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-image-route-vs-input-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-image-route-vs-input-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-image-route-vs-input-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-repo-code-graph-support-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-repo-code-graph-support-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-operation-plan",
+      "target": "gap-repo-code-graph-support-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-repo-code-graph-support-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-repo-code-graph-support-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-supervisor-service-health-precedence-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-supervisor-service-health-precedence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-supervisor-service-health-precedence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-supervisor-service-health-precedence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-gateway-adapters",
+      "target": "gap-supervisor-service-health-precedence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-supervisor-service-health-precedence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-supervisor-process-instance-fencing-live-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-supervisor-process-instance-fencing-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-supervisor-process-instance-fencing-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-supervisor-process-instance-fencing-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-supervisor-process-instance-fencing-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-active-runtime-stop-recovery-live-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime-channel-action",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime-goal-closure",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-scenario-matrix-coverage-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state-channel-session-transition",
+      "target": "gap-scenario-matrix-coverage-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-scenario-matrix-coverage-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-scenario-matrix-coverage-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-scenario-matrix-coverage-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-scenario-matrix-coverage-gap",
+      "label": "has gap"
+    }
+  ],
+  "journeys": [
+    {
+      "id": "turn-lifecycle",
+      "title": "Channel Turn Lifecycle",
+      "summary": "Follow one Discord or Telegram message from identity binding to queue, prompt, Codex runtime, final outbox, and delivery.",
+      "why": "Use this when a turn times out, replies on the wrong channel, or writes progress text into the final answer.",
+      "nodes": [
+        "axis-platform",
+        "axis-channelid",
+        "axis-agentid",
+        "axis-sessionkey",
+        "component-channel-identity",
+        "component-runtime-queue-runtime-worker",
+        "component-prompt-turns",
+        "component-channel-delivery"
+      ],
+      "steps": [
+        {
+          "title": "Prove the lane",
+          "body": "Confirm platform, account, channel, user, agent, and session before reconnecting prior work."
+        },
+        {
+          "title": "Queue the turn",
+          "body": "Ingress writes a source-correlated queue item and keeps runtime class and session freshness visible."
+        },
+        {
+          "title": "Assemble prompt",
+          "body": "Prompt files, selected skills, memory, and inbound context are scoped by the resolved agent."
+        },
+        {
+          "title": "Run and recover",
+          "body": "Codex runtime records completion, protocol errors, tool-use timeout summaries, and fresh-thread recovery attempts."
+        },
+        {
+          "title": "Deliver final",
+          "body": "Runtime pipeline and delivery must emit one final outbox or one terminal notification, separate from progress."
+        }
+      ]
+    },
+    {
+      "id": "agent-isolation",
+      "title": "Multi-Agent Isolation",
+      "summary": "Inspect where agentId must survive so main, non-main, and future agents do not cross-suppress or cross-pollute state.",
+      "why": "Use this when a non-main agent behaves like main, inherits the wrong memory, or loses final delivery because another agent owns shared state.",
+      "nodes": [
+        "axis-agentid",
+        "axis-sessionkey",
+        "component-prompt-turns",
+        "component-runtime-queue-runtime-worker",
+        "gap-multi-agent-full-matrix-gap",
+        "gap-per-agent-memory-recall-compartment-gap"
+      ],
+      "steps": [
+        {
+          "title": "Agent is a routing boundary",
+          "body": "agentId must survive channel state, prompt assembly, runtime lanes, outbox, delivery, and memory."
+        },
+        {
+          "title": "Artifacts are scoped",
+          "body": "Sessions and memory artifacts can be stored under per-agent paths."
+        },
+        {
+          "title": "Recall still needs stricter policy",
+          "body": "Public and non-main agents need an explicit recall compartment gate so they cannot inherit private global imported memory."
+        },
+        {
+          "title": "Promotion proof",
+          "body": "Run the full multi-agent matrix and a memory recall regression that excludes main private/global imported memories."
+        }
+      ]
+    },
+    {
+      "id": "long-task-resilience",
+      "title": "Long Task Resilience",
+      "summary": "Track the parts that keep a long running task observable without letting progress, tool use, or compaction destroy final delivery.",
+      "why": "Use this after idle app-server timeouts, excessive progress edits, missing final replies, or compact/retry confusion.",
+      "nodes": [
+        "component-runtime-queue-runtime-worker",
+        "component-progress",
+        "component-channel-delivery",
+        "gap-tool-use-timeout-recovery-gap",
+        "gap-progress-delivery-volume-gap",
+        "gap-progress-final-surface-gap",
+        "gap-virtual-session-continuity-gap"
+      ],
+      "steps": [
+        {
+          "title": "Keep the queue alive",
+          "body": "Leases and runtime classes prevent one slow task from hiding every other lane."
+        },
+        {
+          "title": "Bound external tools",
+          "body": "The runtime includes an initial active tool-use idle guard and one bounded recovery prompt."
+        },
+        {
+          "title": "Separate progress from final",
+          "body": "Progress panels can be verbose; final channel replies must stay final-answer only."
+        },
+        {
+          "title": "Preserve continuity",
+          "body": "Virtual-session rollover must prove fresh concrete sessions without losing working context or trace."
+        }
+      ]
+    },
+    {
+      "id": "memory-ownership",
+      "title": "Memory Ownership",
+      "summary": "Understand the Store / Pack / Observe boundary, current fallback posture, and what remains before openclaw-mem parity.",
+      "why": "Use this when recall quality, graph freshness, Qdrant Edge, or per-agent memory scope looks suspicious.",
+      "nodes": [
+        "gap-openclaw-mem-full-parity-gap",
+        "gap-per-agent-memory-recall-compartment-gap",
+        "gap-repo-code-graph-support-gap"
+      ],
+      "steps": [
+        {
+          "title": "Read the live posture",
+          "body": "The current live path is Ready through migration fallback while the mem-engine bridge response is absent."
+        },
+        {
+          "title": "Keep ownership clean",
+          "body": "Qdrant Edge is preserved snapshot evidence and read-index/cache, not canonical write ownership."
+        },
+        {
+          "title": "Fix public-agent recall",
+          "body": "Per-agent artifacts exist; recall must still become agent/channel-policy aware."
+        },
+        {
+          "title": "Promote only with receipts",
+          "body": "Bridge, native backend, routeAuto, provenance, and freshness must be green before claiming parity."
+        }
+      ]
+    },
+    {
+      "id": "release-review",
+      "title": "Release Review Path",
+      "summary": "Start from a changed area, jump to docs/tests, then inspect the expected-vs-actual gaps before release or cutover.",
+      "why": "Use this before a behavior-changing diff, especially runtime, channel, prompt, delivery, memory, or supervisor work.",
+      "nodes": [
+        "canon-topology-contract",
+        "gap-scenario-matrix-coverage-gap",
+        "gap-supervisor-service-health-precedence-gap"
+      ],
+      "steps": [
+        {
+          "title": "Pick the changed area",
+          "body": "The impact matrix gives the minimum docs and scenario pack for a diff."
+        },
+        {
+          "title": "Check open gaps",
+          "body": "Do not collapse usable fallback evidence into full design parity."
+        },
+        {
+          "title": "Update canon first",
+          "body": "Topology, invariants, release checklist, and operator docs move together when expectations change."
+        },
+        {
+          "title": "Regenerate the explorer",
+          "body": "Run the sync command after topology canon changes so the page remains a support-plane reflection."
+        }
+      ]
+    }
+  ]
+}</script>
+  <script>
+    const payload = JSON.parse(document.getElementById('topology-data').textContent);
+    const colors = { canon: '#20324f', component: '#2563a8', identity: '#15845c', gate: '#9a6700', gap: '#b13f3f' };
+    const columns = { canon: 130, identity: 300, component: 540, gate: 800, gap: 1060 };
+    const rows = { canon: 120, identity: 120, component: 120, gate: 140, gap: 120 };
+    const seen = {};
+    const nodes = payload.nodes.map(node => ({
+      ...node,
+      x: columns[node.group] || 540,
+      y: (rows[node.group] || 120) + ((seen[node.group] = (seen[node.group] || 0) + 1) - 1) * 76,
+      vx: 0,
+      vy: 0,
+      radius: node.group === 'canon' ? 22 : node.group === 'gap' ? 18 : 15
+    }));
+    const byId = new Map(nodes.map(node => [node.id, node]));
+    const edges = payload.edges
+      .map(edge => ({ ...edge, sourceNode: byId.get(edge.source), targetNode: byId.get(edge.target) }))
+      .filter(edge => edge.sourceNode && edge.targetNode);
+    const journeys = payload.journeys || [];
+    const canvas = document.getElementById('graph');
+    const ctx = canvas.getContext('2d');
+    let activeJourney = journeys[0] || null;
+    let activeStep = 0;
+    let selected = activeJourney ? byId.get(activeJourney.nodes[0]) || nodes[0] : nodes[0];
+    let filter = 'all';
+    let query = '';
+    let scale = 1;
+    let panX = 0;
+    let panY = 0;
+    let dragging = null;
+    let panning = false;
+    let lastPointer = null;
+
+    function escapeText(value) {
+      return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+    function journeySet() { return new Set(activeJourney ? activeJourney.nodes || [] : []); }
+    function activeStepNodeId() {
+      if (!activeJourney || !activeJourney.nodes.length) return null;
+      return activeJourney.nodes[Math.min(activeStep, activeJourney.nodes.length - 1)];
+    }
+    function visible(node) {
+      const matchesFilter = filter === 'all' || node.group === filter;
+      const matchesQuery = !query || JSON.stringify(node).toLowerCase().includes(query.toLowerCase());
+      return matchesFilter && matchesQuery;
+    }
+    function resize() {
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(640, Math.floor(rect.width * devicePixelRatio));
+      canvas.height = Math.max(520, Math.floor(rect.height * devicePixelRatio));
+      ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+      focusJourney();
+    }
+    function focusJourney() {
+      if (!activeJourney || !activeJourney.nodes.length || !canvas.clientWidth) { draw(); return; }
+      const selectedNodes = activeJourney.nodes.map(id => byId.get(id)).filter(Boolean);
+      if (!selectedNodes.length) { draw(); return; }
+      const minX = Math.min(...selectedNodes.map(n => n.x));
+      const maxX = Math.max(...selectedNodes.map(n => n.x));
+      const minY = Math.min(...selectedNodes.map(n => n.y));
+      const maxY = Math.max(...selectedNodes.map(n => n.y));
+      scale = Math.max(.46, Math.min(1.25, Math.min((canvas.clientWidth - 120) / Math.max(1, maxX - minX), (canvas.clientHeight - 160) / Math.max(1, maxY - minY))));
+      panX = canvas.clientWidth / 2 - ((minX + maxX) / 2) * scale;
+      panY = canvas.clientHeight / 2 - ((minY + maxY) / 2) * scale;
+      draw();
+    }
+    function screenToWorld(event) {
+      const rect = canvas.getBoundingClientRect();
+      return { x: (event.clientX - rect.left - panX) / scale, y: (event.clientY - rect.top - panY) / scale };
+    }
+    function hit(event) {
+      const p = screenToWorld(event);
+      return [...nodes].reverse().find(node => visible(node) && Math.hypot(node.x - p.x, node.y - p.y) <= node.radius + 8);
+    }
+    function draw() {
+      if (!canvas.clientWidth) return;
+      const activeIds = journeySet();
+      const stepId = activeStepNodeId();
+      ctx.save();
+      ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+      ctx.translate(panX, panY);
+      ctx.scale(scale, scale);
+      for (const edge of edges) {
+        if (!visible(edge.sourceNode) || !visible(edge.targetNode)) continue;
+        const inPath = activeIds.has(edge.source) && activeIds.has(edge.target);
+        ctx.beginPath();
+        ctx.strokeStyle = inPath ? 'rgba(37,99,168,.72)' : 'rgba(91,100,116,.24)';
+        ctx.lineWidth = inPath ? 2.5 / scale : 1.1 / scale;
+        ctx.moveTo(edge.sourceNode.x, edge.sourceNode.y);
+        ctx.lineTo(edge.targetNode.x, edge.targetNode.y);
+        ctx.stroke();
+      }
+      for (const node of nodes) {
+        if (!visible(node)) continue;
+        const inPath = activeIds.has(node.id);
+        const isStep = stepId === node.id;
+        ctx.globalAlpha = activeJourney && !inPath ? .34 : 1;
+        ctx.beginPath();
+        ctx.fillStyle = colors[node.group] || '#5b6474';
+        ctx.strokeStyle = isStep ? '#f59e0b' : node === selected ? '#111827' : '#fff';
+        ctx.lineWidth = isStep ? 5 / scale : node === selected ? 4 / scale : 2 / scale;
+        ctx.arc(node.x, node.y, isStep ? node.radius + 4 : node.radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#172033';
+        ctx.font = `${Math.max(10, 12 / scale)}px Segoe UI, Arial`;
+        ctx.textAlign = 'center';
+        ctx.fillText(node.label.length > 28 ? node.label.slice(0, 25) + '...' : node.label, node.x, node.y + node.radius + 14 / scale);
+      }
+      ctx.restore();
+    }
+    function settle() {
+      for (const node of nodes.filter(visible)) {
+        if (dragging === node) continue;
+        const targetX = columns[node.group] || 540;
+        node.vx += (targetX - node.x) * .0009;
+        node.vx *= .82;
+        node.vy *= .82;
+        node.x += node.vx;
+        node.y += node.vy;
+      }
+      draw();
+      requestAnimationFrame(settle);
+    }
+    function select(node) {
+      if (!node) return;
+      selected = node;
+      renderAll(false);
+    }
+    function renderSources() {
+      document.getElementById('sources').innerHTML = [
+        `<span>Sync: <code>${escapeText(payload.syncCommand)}</code></span>`,
+        ...payload.sourceFiles.map(source => `<span><code>${escapeText(source.path)}</code></span>`)
+      ].join('');
+    }
+    function renderMetrics() {
+      const counts = nodes.reduce((acc, node) => { acc[node.group] = (acc[node.group] || 0) + 1; return acc; }, {});
+      document.getElementById('metrics').innerHTML = [
+        ['Nodes', nodes.length],
+        ['Edges', edges.length],
+        ['Guided paths', journeys.length],
+        ['Open gaps', counts.gap || 0]
+      ].map(([label, value]) => `<div class="metric"><strong>${value}</strong><span>${label}</span></div>`).join('');
+    }
+    function renderJourneyList() {
+      document.getElementById('journeyList').innerHTML = journeys.map(journey => `
+        <button type="button" class="journey-card ${activeJourney && activeJourney.id === journey.id ? 'active' : ''}" data-journey="${escapeText(journey.id)}">
+          <strong>${escapeText(journey.title)}</strong>
+          <span>${escapeText(journey.summary)}</span>
+        </button>
+      `).join('');
+      document.querySelectorAll('[data-journey]').forEach(button => button.addEventListener('click', () => {
+        activeJourney = journeys.find(journey => journey.id === button.dataset.journey) || journeys[0];
+        activeStep = 0;
+        selected = byId.get(activeStepNodeId()) || selected;
+        renderAll(true);
+      }));
+    }
+    function renderStepper() {
+      if (!activeJourney) { document.getElementById('stepper').innerHTML = '<p>No guided paths available.</p>'; return; }
+      const steps = activeJourney.steps || [];
+      const step = steps[Math.min(activeStep, steps.length - 1)] || { title: activeJourney.title, body: activeJourney.summary };
+      document.getElementById('stepper').innerHTML = `
+        <div class="kv"><h3>Why this path matters</h3><p>${escapeText(activeJourney.why || activeJourney.summary)}</p></div>
+        <div class="stepper">
+          <button type="button" id="prevStep" aria-label="Previous step">‹</button>
+          <div class="stepbox">
+            <div class="count">Step ${Math.min(activeStep + 1, steps.length || 1)} / ${steps.length || 1}</div>
+            <strong>${escapeText(step.title)}</strong>
+            <p>${escapeText(step.body)}</p>
+          </div>
+          <button type="button" id="nextStep" aria-label="Next step">›</button>
+        </div>
+      `;
+      document.getElementById('prevStep').addEventListener('click', () => {
+        activeStep = Math.max(0, activeStep - 1);
+        selected = byId.get(activeStepNodeId()) || selected;
+        renderAll(false);
+      });
+      document.getElementById('nextStep').addEventListener('click', () => {
+        activeStep = Math.min(Math.max(0, steps.length - 1), activeStep + 1);
+        selected = byId.get(activeStepNodeId()) || selected;
+        renderAll(false);
+      });
+    }
+    function renderFocusList() {
+      const ids = activeJourney ? activeJourney.nodes || [] : [];
+      document.getElementById('focusList').innerHTML = ids.map((id, index) => {
+        const node = byId.get(id);
+        if (!node) return '';
+        return `<button type="button" data-focus-node="${escapeText(id)}" class="${selected && selected.id === id ? 'active' : ''}">${index + 1}. ${escapeText(node.label)}<br><small>${escapeText(node.group)} / ${escapeText(node.state)}</small></button>`;
+      }).join('');
+      document.querySelectorAll('[data-focus-node]').forEach(button => button.addEventListener('click', () => {
+        activeStep = Math.max(0, ids.indexOf(button.dataset.focusNode));
+        select(byId.get(button.dataset.focusNode));
+      }));
+    }
+    function renderCanvasNote() {
+      if (!activeJourney) return;
+      document.getElementById('canvasNote').innerHTML = `<strong>${escapeText(activeJourney.title)}</strong><p>${escapeText(activeJourney.summary)}</p>`;
+    }
+    function renderDetails() {
+      const node = selected || nodes[0];
+      const refs = (node.refs || []).map(ref => `<li><a href="${escapeText(ref)}">${escapeText(ref)}</a></li>`).join('');
+      const fields = [
+        ['Summary', node.summary],
+        ['Design Target', node.designTarget],
+        ['Current Evidence', node.currentEvidence],
+        ['Promotion Gate', node.promotionGate],
+        ['Reads', node.reads],
+        ['Writes', node.writes],
+        ['Invariants', node.invariants],
+        ['Review Docs', node.reviewDocs],
+        ['Preserved Through', node.preservedThrough]
+      ].filter(([, value]) => value);
+      const related = edges
+        .filter(edge => edge.sourceNode === node || edge.targetNode === node)
+        .slice(0, 18)
+        .map(edge => {
+          const other = edge.sourceNode === node ? edge.targetNode : edge.sourceNode;
+          return `<li><button type="button" data-node="${escapeText(other.id)}">${escapeText(edge.label)}: ${escapeText(other.label)}</button></li>`;
+        }).join('');
+      document.getElementById('details').innerHTML = `
+        <h2 class="node-title">${escapeText(node.label)}</h2>
+        <div class="node-meta"><span class="pill"><span class="dot" style="background:${colors[node.group] || '#5b6474'}"></span>${escapeText(node.group)}</span><span class="pill">${escapeText(node.state)}</span></div>
+        ${fields.map(([label, value]) => `<div class="kv"><h3>${escapeText(label)}</h3><p>${escapeText(value)}</p></div>`).join('')}
+        <div class="kv"><h3>Refs</h3><ul>${refs}</ul></div>
+        <div class="kv"><h3>Relationships</h3><ul>${related}</ul></div>
+      `;
+      document.querySelectorAll('#details [data-node]').forEach(button => button.addEventListener('click', () => select(byId.get(button.dataset.node))));
+    }
+    function renderGapList() {
+      const gaps = nodes.filter(node => node.group === 'gap').sort((a, b) => a.label.localeCompare(b.label));
+      document.getElementById('gapList').innerHTML = gaps.map(node => `
+        <button type="button" data-node="${escapeText(node.id)}">${escapeText(node.label)}<br><small>${escapeText(node.summary)}</small></button>
+      `).join('');
+      document.querySelectorAll('#gapList [data-node]').forEach(button => button.addEventListener('click', () => select(byId.get(button.dataset.node))));
+    }
+    function renderList() {
+      const list = nodes.filter(visible).sort((a, b) => a.group.localeCompare(b.group) || a.label.localeCompare(b.label));
+      const groups = [...new Set(list.map(node => node.group))];
+      document.getElementById('nodeList').innerHTML = groups.map(group => `
+        <div class="node-list-section">
+          <h3>${escapeText(group)}</h3>
+          <div class="list">${list.filter(node => node.group === group).map(node => `<button type="button" data-node="${escapeText(node.id)}">${escapeText(node.label)}<br><small>${escapeText(node.state)}</small></button>`).join('')}</div>
+        </div>
+      `).join('');
+      document.querySelectorAll('#nodeList [data-node]').forEach(button => button.addEventListener('click', () => select(byId.get(button.dataset.node))));
+    }
+    function renderLegend() {
+      document.getElementById('legend').innerHTML = Object.entries(colors)
+        .map(([group, color]) => `<span class="pill"><span class="dot" style="background:${color}"></span>${group}</span>`)
+        .join('');
+    }
+    function renderAll(refocus) {
+      renderJourneyList();
+      renderStepper();
+      renderFocusList();
+      renderCanvasNote();
+      renderMetrics();
+      renderDetails();
+      renderGapList();
+      renderList();
+      renderLegend();
+      if (refocus) focusJourney(); else draw();
+    }
+    document.getElementById('search').addEventListener('input', event => { query = event.target.value; renderList(); draw(); });
+    document.querySelectorAll('[data-filter]').forEach(button => button.addEventListener('click', () => {
+      filter = button.dataset.filter;
+      document.querySelectorAll('[data-filter]').forEach(b => b.classList.toggle('active', b === button));
+      renderList();
+      draw();
+    }));
+    document.getElementById('reset').addEventListener('click', () => {
+      scale = 1; panX = 0; panY = 0; query = ''; filter = 'all';
+      document.getElementById('search').value = '';
+      document.querySelectorAll('[data-filter]').forEach(b => b.classList.toggle('active', b.dataset.filter === 'all'));
+      renderAll(true);
+    });
+    canvas.addEventListener('pointerdown', event => {
+      const node = hit(event);
+      lastPointer = { x: event.clientX, y: event.clientY };
+      if (node) { dragging = node; select(node); } else { panning = true; }
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener('pointermove', event => {
+      if (!lastPointer) return;
+      if (dragging) {
+        const p = screenToWorld(event);
+        dragging.x = p.x; dragging.y = p.y; dragging.vx = 0; dragging.vy = 0;
+      } else if (panning) {
+        panX += event.clientX - lastPointer.x;
+        panY += event.clientY - lastPointer.y;
+      }
+      lastPointer = { x: event.clientX, y: event.clientY };
+      draw();
+    });
+    canvas.addEventListener('pointerup', event => {
+      dragging = null; panning = false; lastPointer = null; canvas.releasePointerCapture(event.pointerId);
+    });
+    canvas.addEventListener('wheel', event => {
+      event.preventDefault();
+      scale = Math.max(.45, Math.min(2.4, scale * (event.deltaY < 0 ? 1.08 : .92)));
+      draw();
+    }, { passive: false });
+    addEventListener('resize', resize);
+    renderSources();
+    renderAll(false);
+    resize();
+    requestAnimationFrame(settle);
+  </script>
+</body>
+</html>
